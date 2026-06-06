@@ -53,6 +53,24 @@ The trained classifier moves between machines via `pack_model.sh` / `unpack_mode
   corroborated by multiple tools.
 - `smoke_test.sh` — end-to-end pipeline test.
 
+## Benchmark (BigVul held-out test, 32,710 functions, 3.1% vulnerable)
+
+GraphCodeBERT fine-tuned 3 epochs on 134k BigVul functions (RTX 4090, fp16,
+class-weighted). Full metrics: `benchmarks/bigvul_test_metrics.json`.
+
+| | |
+|---|---|
+| ROC-AUC | **0.959** |
+| PR-AUC | 0.505 |
+| P / R / F1 @ tuned 0.91 | 0.50 / 0.70 / 0.585 |
+| P / R / F1 @ 0.5 | 0.41 / 0.80 / 0.540 |
+
+The tuned (max-F1) threshold is precision-oriented. For triage scanning,
+`--threshold 0.5` trades precision for recall — sensible when the LLM
+explainer filters findings downstream. Note: BigVul-trained models key on
+real-world CVE-style functions; textbook toy snippets score low (the heuristic
+regex explainer and the cppcheck/flawfinder ensemble cover those).
+
 ## Training
 
 `DATA=bigvul` (default) fetches BigVul from HF and builds deduplicated
