@@ -12,8 +12,8 @@ machine it's on and configures itself (`profiles.py` / `profiles.json`).
 ## 1. Clone and set up (both machines)
 
 ```bash
-git clone https://github.com/Axist-Infinit/C-Code-Reviewer.git
-cd C-Code-Reviewer
+git clone https://github.com/Axist-Infinit/C-Code-Review-LLM.git
+cd C-Code-Review-LLM
 ./setup_machine.sh
 ```
 
@@ -40,7 +40,7 @@ mv vuln-model-bigvul vuln-model            # if trained with OUT=vuln-model-bigv
 ```bash
 # on the machine that has the model:
 ./pack_model.sh vuln-model vuln-model-bigvul.tar.zst
-scp vuln-model-bigvul.tar.zst user@other-machine:~/C-Code-Reviewer/
+scp vuln-model-bigvul.tar.zst user@other-machine:~/C-Code-Review-LLM/
 
 # on the receiving machine:
 ./unpack_model.sh vuln-model-bigvul.tar.zst
