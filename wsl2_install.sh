@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# DEPRECATED: use ./setup_machine.sh instead — it handles newer CUDA versions
+# (12.5+/13.x), DGX Spark (aarch64), and skips torchvision (which breaks
+# datasets >=4.4). Kept for reference only.
 set -euo pipefail
 VENV="${VENV:-.venv}"; PY="${PYTHON:-python3}"
 echo "[INFO] $(uname -a)"

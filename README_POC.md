@@ -5,13 +5,14 @@ Local, offline-capable C/C++ vulnerability scanner:
 
 ## Quick start
 
-```bash
-# 1. Install + fetch BigVul + train classifier + relock offline (run on GPU box)
-./one_click_unlock_fetch_train_relock.sh
+Full per-machine instructions (4090 / DGX Spark): **[SETUP.md](SETUP.md)**
 
-# 2. Pull the explainer model for your machine (one-time, needs network)
-ollama pull qwen2.5-coder:14b    # RTX 4090
-ollama pull qwen2.5-coder:32b    # DGX Spark
+```bash
+# 1. Machine setup: venv, torch for this GPU/arch, deps, Ollama explainer model
+./setup_machine.sh
+
+# 2. Train the classifier (or transfer one: see SETUP.md option B)
+./one_click_unlock_fetch_train_relock.sh
 
 # 3. Scan
 SRC=path/to/code ./scan_repo.sh
