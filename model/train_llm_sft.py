@@ -33,14 +33,14 @@ def main():
     args = parse_args()
     print("[INFO] transformers:", tf.__version__)
     is_local = os.path.isdir(args.base) or os.path.isfile(os.path.join(args.base, "config.json"))
-    tk = AutoTokenizer.from_pretrained(args.base, use_fast=True, trust_remote_code=True,
+    tk = AutoTokenizer.from_pretrained(args.base, use_fast=True,
                                        local_files_only=is_local)
     if tk.pad_token is None and tk.eos_token is not None:
         tk.pad_token = tk.eos_token
 
     dtype = torch.float16 if args.fp16 and torch.cuda.is_available() else None
     model = AutoModelForCausalLM.from_pretrained(
-        args.base, trust_remote_code=True, local_files_only=is_local,
+        args.base, local_files_only=is_local,
         torch_dtype=dtype
     )
     if args.grad_ckpt:

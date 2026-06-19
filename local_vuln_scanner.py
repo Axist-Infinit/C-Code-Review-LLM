@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-import argparse, os, json
-import torch
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import argparse, os, json, glob
+
+# NOTE: torch / transformers are imported lazily inside load_model / score_chunks
+# so that the pure helpers (extract_functions, chunk_lines, load_threshold) stay
+# importable without the heavy ML stack installed (e.g. in unit tests / CI).
 
 from profiles import select_profile, add_profile_arg
 
@@ -31,6 +33,25 @@ def chunk_lines(lines, window=12, step=6):
         i += step
 
 
+def _signature_start(clean, brace_idx):
+    """Given comment/string-stripped lines and the index of the line holding a
+    depth-0 opening '{', walk back to the first line of the signature.
+
+    The signature begins right after the previous statement/block boundary: a
+    line whose (stripped) content ends with ';', '}', '{', or is blank, or a
+    preprocessor directive. This handles multi-line signatures, K&R param
+    declarations, structs, and same-line braces without the old fixed -2 guess.
+    """
+    start = brace_idx
+    while start > 0:
+        prev = clean[start - 1].strip()
+        if (prev == "" or prev.endswith(";") or prev.endswith("{")
+                or prev.endswith("}") or prev.startswith("#")):
+            break
+        start -= 1
+    return start
+
+
 def extract_functions(code, max_lines=200):
     """Best-effort C/C++ function extraction via brace matching.
 
@@ -41,11 +62,11 @@ def extract_functions(code, max_lines=200):
     Falls back to None when the file yields no functions (headers, macros).
     """
     lines = code.splitlines()
-    n = len(lines)
     spans = []
     depth = 0
     in_block_comment = False
     fn_start = None
+    clean = []  # comment/string-stripped version of each line, for boundary lookups
 
     for idx, raw in enumerate(lines):
         # strip strings/comments well enough for brace counting
@@ -71,15 +92,19 @@ def extract_functions(code, max_lines=200):
                 in_str = c; i += 1; continue
             s.append(c); i += 1
         stripped = "".join(s)
+        clean.append(stripped)
 
         for c in stripped:
             if c == "{":
                 if depth == 0 and fn_start is None:
                     # heuristic: opening brace at depth 0 preceded by a ')'
                     # somewhere on this or recent lines = function definition
-                    look = " ".join(lines[max(0, idx - 3):idx + 1])
+                    look = " ".join(clean[max(0, idx - 3):idx + 1])
                     if ")" in look and not look.rstrip().endswith(";"):
-                        fn_start = max(0, idx - 2)
+                        # walk back to the real signature boundary instead of a
+                        # fixed offset, so the captured span starts at the
+                        # function's first line (return type / qualifiers).
+                        fn_start = _signature_start(clean, idx)
                 depth += 1
             elif c == "}":
                 depth = max(0, depth - 1)
@@ -118,10 +143,37 @@ def load_threshold(model_dir, default=0.5):
     return default
 
 
+def _assert_safetensors(model_dir):
+    """Refuse to load legacy pickle weights: a malicious *.bin can execute
+    arbitrary code on unpickle. Require a *.safetensors and reject a model
+    directory that ships only pytorch_model.bin (no safetensors)."""
+    has_safetensors = bool(glob.glob(os.path.join(model_dir, "*.safetensors")))
+    has_pickle = bool(glob.glob(os.path.join(model_dir, "*.bin")) or
+                      glob.glob(os.path.join(model_dir, "pytorch_model*.bin")))
+    if not has_safetensors:
+        if has_pickle:
+            raise RuntimeError(
+                f"Refusing to load {model_dir}: only legacy pickle weights "
+                "(*.bin) found and no *.safetensors. Pickle weights can execute "
+                "arbitrary code on load. Re-save the model with "
+                "safe_serialization=True (produces *.safetensors)."
+            )
+        raise RuntimeError(
+            f"No *.safetensors weights found in {model_dir}; cannot load model."
+        )
+
+
 def load_model(model_dir, dtype_name="float32"):
+    import torch
+    from transformers import AutoTokenizer, AutoModelForSequenceClassification
+
     model_dir = os.path.abspath(model_dir)
-    tok = AutoTokenizer.from_pretrained(model_dir, local_files_only=True, use_fast=True)
-    model = AutoModelForSequenceClassification.from_pretrained(model_dir, local_files_only=True)
+    _assert_safetensors(model_dir)
+    revision = os.environ.get("HF_REVISION") or None
+    tok = AutoTokenizer.from_pretrained(model_dir, local_files_only=True, use_fast=True,
+                                        revision=revision)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_dir, local_files_only=True, use_safetensors=True, revision=revision)
     thr = load_threshold(model_dir)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     if dev == "cuda" and dtype_name in ("float16", "bfloat16"):
@@ -131,29 +183,31 @@ def load_model(model_dir, dtype_name="float32"):
     return tok, model, thr, dev
 
 
-@torch.no_grad()
 def score_chunks(tok, model, dev, code, batch_size=32, granularity="function"):
     """Score chunks of a file in batches. Default granularity is whole
     functions (matches BigVul training data); falls back to 12-line sliding
     windows for files where no functions are found."""
+    import torch
+
     chunks = None
     if granularity == "function":
         chunks = extract_functions(code)
     if chunks is None:
         chunks = list(chunk_lines(code.splitlines()))
     results = []
-    for b in range(0, len(chunks), batch_size):
-        batch = chunks[b:b + batch_size]
-        texts = ["\n".join(c[2]) for c in batch]
-        enc = tok(texts, truncation=True, max_length=512, padding=True, return_tensors="pt")
-        enc = {k: v.to(dev) for k, v in enc.items()}
-        logits = model(**enc).logits.float()
-        probs = torch.softmax(logits, dim=1)[:, 1].cpu().tolist()
-        for (i0, i1, chunk), prob in zip(batch, probs):
-            results.append({
-                "start_line": i0 + 1, "end_line": i1,
-                "score": float(prob), "snippet": "\n".join(chunk),
-            })
+    with torch.no_grad():
+        for b in range(0, len(chunks), batch_size):
+            batch = chunks[b:b + batch_size]
+            texts = ["\n".join(c[2]) for c in batch]
+            enc = tok(texts, truncation=True, max_length=512, padding=True, return_tensors="pt")
+            enc = {k: v.to(dev) for k, v in enc.items()}
+            logits = model(**enc).logits.float()
+            probs = torch.softmax(logits, dim=1)[:, 1].cpu().tolist()
+            for (i0, i1, chunk), prob in zip(batch, probs):
+                results.append({
+                    "start_line": i0 + 1, "end_line": i1,
+                    "score": float(prob), "snippet": "\n".join(chunk),
+                })
     return results
 
 

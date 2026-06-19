@@ -138,7 +138,7 @@ def write_html(explanations, html_path: str):
     Render a simple static HTML report for human consumption.
     `explanations` is the list we emit to JSON.
     """
-    os.makedirs(os.path.dirname(html_path), exist_ok=True)
+    os.makedirs(os.path.dirname(html_path) or ".", exist_ok=True)
 
     rows = []
     for item in explanations:

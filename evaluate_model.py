@@ -10,22 +10,25 @@ Usage: python evaluate_model.py --model ./vuln-model --test data/test.jsonl
 import argparse
 import json
 
-import torch
+# torch is imported lazily inside score_dataset so that the pure metrics_at
+# helper stays importable without the heavy ML stack (e.g. in unit tests / CI).
 
 from profiles import select_profile, add_profile_arg
 from local_vuln_scanner import load_model
 
 
-@torch.no_grad()
 def score_dataset(tok, model, dev, rows, batch_size=32):
+    import torch
+
     scores = []
-    for b in range(0, len(rows), batch_size):
-        batch = rows[b:b + batch_size]
-        enc = tok([r["code"] for r in batch], truncation=True, max_length=512,
-                  padding=True, return_tensors="pt")
-        enc = {k: v.to(dev) for k, v in enc.items()}
-        logits = model(**enc).logits.float()
-        scores.extend(torch.softmax(logits, dim=1)[:, 1].cpu().tolist())
+    with torch.no_grad():
+        for b in range(0, len(rows), batch_size):
+            batch = rows[b:b + batch_size]
+            enc = tok([r["code"] for r in batch], truncation=True, max_length=512,
+                      padding=True, return_tensors="pt")
+            enc = {k: v.to(dev) for k, v in enc.items()}
+            logits = model(**enc).logits.float()
+            scores.extend(torch.softmax(logits, dim=1)[:, 1].cpu().tolist())
     return scores
 
 

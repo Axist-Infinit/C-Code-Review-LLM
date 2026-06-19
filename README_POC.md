@@ -79,10 +79,39 @@ regex explainer and the cppcheck/flawfinder ensemble cover those).
 a model trained on it is a plumbing test, **not** a usable classifier.
 
 Environment knobs: `USE_GPU=1|0`, `EPOCHS`, `BATCH`, `OUT`, `HARD_RELOCK=1`
-(iptables egress drop after training), `CCR_PROFILE`.
+(scoped egress lock after training — see below), `CCR_PROFILE`, `HF_REVISION`
+(pin a commit sha for the fetched HF models; empty = upstream HEAD).
 
 ## Offline operation
 
 `offline_lockdown.sh` sets HF offline env vars; the one-click relocks the venv
 after training. Ollama needs no network after `ollama pull`. The heuristic
 explainer is the zero-dependency fallback.
+
+### `HARD_RELOCK` (host firewall — opt-in, reversible)
+
+`HARD_RELOCK=1` no longer flips the host's default `OUTPUT` policy to `DROP`
+(that severed the SSH session you ran it over and had no revert). It now:
+
+- requires an explicit `HARD_RELOCK_CONFIRM=yes`,
+- installs a **scoped** ruleset in a dedicated `CCR_EGRESS_LOCK` chain that
+  `ACCEPT`s loopback and `ESTABLISHED,RELATED` traffic **before** dropping new
+  egress, so existing connections (incl. your SSH session) are never cut,
+- ships a paired revert: `bash ./online_unlock.sh` removes the chain and unsets
+  the offline env vars.
+
+```bash
+HARD_RELOCK=1 HARD_RELOCK_CONFIRM=yes ./one_click_unlock_fetch_train_relock.sh
+bash ./online_unlock.sh   # revert the egress lock + go back online
+```
+
+This is a convenience guard, not a security boundary — enforce a true air-gap at
+the OS/hypervisor/network layer.
+
+### Supply-chain pinning (`HF_REVISION`)
+
+The model fetch scripts (`prep_llm_base.sh`, `fetch_graphcodebert.sh`, the
+one-click) accept `HF_REVISION=<commit-sha-or-tag>` to pin the exact HF revision
+downloaded. Default empty pulls the current upstream HEAD — documented risk: the
+upstream repo can change under you, so pin a sha for reproducible/audited builds.
+Loading enforces `*.safetensors` (legacy `*.bin` pickle weights are refused).
