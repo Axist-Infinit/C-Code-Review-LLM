@@ -42,12 +42,18 @@ The trained classifier moves between machines via `pack_model.sh` / `unpack_mode
 
 - `local_vuln_scanner.py SRC -o OUT` — classifier scan. Scores whole functions
   (matches BigVul training granularity); `--granularity window` for 12-line windows.
+  Function boundaries use **tree-sitter when installed** (`--parser auto`, the
+  default) and fall back to a dependency-free brace matcher otherwise. tree-sitter
+  correctly captures macro-heavy / K&R / nested definitions (signature + params)
+  that the brace heuristic truncates; force with `--parser treesitter|brace`.
   Threshold comes from the model's `inference.json` (tuned at train time);
   override with `--threshold`.
 - `llm_explain.py FINDINGS --out OUT.json [--html report.html]` — per-finding
   LLM analysis (issue, CWE, severity, fix, own vulnerability judgment) via local
-  Ollama. Auto-falls back to the heuristic regex explainer when Ollama is down
-  (`--backend heuristic` to force).
+  Ollama. Findings are explained **in parallel** (`--workers`, default from the
+  profile's `max_workers`; pair with `OLLAMA_NUM_PARALLEL` on the server). Auto-
+  falls back to the heuristic regex explainer when Ollama is down, and per-finding
+  on any single failed call (`--backend heuristic` to force).
 - `explain_findings.py` — pure-regex heuristic explainer (no LLM needed).
 - `evaluate_model.py --model ./vuln-model --test data/test.jsonl` — held-out
   P/R/F1/AUC + threshold sweep. Run this after training; ROC-AUC < 0.6 means
@@ -95,6 +101,28 @@ Environment knobs: `USE_GPU=1|0`, `EPOCHS`, `BATCH` (overrides profile),
 `MIN_TRAIN_ROWS`, `OUT`, `SKIP_EVAL=1`, `DATA=bigvul|bootstrap`, `HARD_RELOCK=1`
 (scoped egress lock after training — see below), `CCR_PROFILE`, `HF_REVISION`
 (pin a commit sha for the fetched HF models; empty = upstream HEAD).
+
+### Fine-tuning the explainer (optional, closes the loop)
+
+The explainer model can be specialized on **your** codebase's reviewed findings
+so it gets sharper on the bugs you actually see:
+
+```bash
+# 1. Run the pipeline, then keep the explanations an analyst agrees with.
+# 2. Turn those reviewed findings into SFT data ({code, analysis} JSONL):
+python model/build_sft_dataset.py scan_out/llm_findings.json \
+    --out-dir data --val-frac 0.1 --only-vulnerable
+
+# 3. LoRA fine-tune the local base model on them:
+python model/train_llm_sft.py --base ./llm-base \
+    --train data/sft_train.jsonl --val data/sft_val.jsonl --out ./llm-explainer-lora
+```
+
+`train_llm_sft.py` uses **completion-only loss masking** (the prompt is masked
+out, so the model is trained only on the analysis it should produce, not on
+echoing the input), validates the dataset up front (clear error on empty /
+malformed records), and picks precision from the hardware profile (`4090 → fp16`,
+`spark → bf16`, `cpu → fp32`) unless you pass `--fp16/--bf16`.
 
 ## Offline operation
 

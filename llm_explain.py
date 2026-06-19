@@ -9,6 +9,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import urllib.error
 import urllib.request
 
@@ -129,6 +130,94 @@ def apply_corroboration_floor(entry, score, matched, floor=CORROBORATION_SCORE_F
     return entry
 
 
+def explain_finding(f, *, backend, model, ollama_url, num_ctx, chat_fn=ollama_chat):
+    """Produce one explanation entry for a single classifier finding.
+
+    backend is "ollama" or "heuristic". All network access goes through chat_fn
+    (injectable so tests can drive the Ollama path without a server). If an
+    Ollama call fails, we fall back to the heuristic explainer for THIS finding
+    only — one bad call never aborts the run — and record the error under
+    "llm_error" for observability.
+    """
+    lines = f"{f.get('start_line')}-{f.get('end_line')}"
+    entry = {
+        "file": f.get("file"),
+        "start_line": f.get("start_line"),
+        "end_line": f.get("end_line"),
+        "score": f.get("score"),
+        "snippet": f.get("snippet", "").splitlines()[:60],
+    }
+    if backend != "ollama":
+        entry.update(heuristic_entry(f))
+        return entry
+    try:
+        snippet = f.get("snippet", "")
+        # Independently corroborate with the regex heuristic so we know whether
+        # a concrete dangerous API is actually present in the snippet.
+        _expl, _recs, matched = explain_snippet(snippet)
+        has_pattern = bool(matched)
+        llm = chat_fn(ollama_url, model, snippet, f.get("file"), lines, num_ctx)
+        entry.update({
+            "backend": "ollama", "model": model,
+            "is_vulnerable": bool(llm.get("is_vulnerable")),
+            "issue": str(llm.get("issue", "")),
+            "cwe": str(llm.get("cwe", "")),
+            "severity": str(llm.get("severity", "")),
+            "explanation": str(llm.get("explanation", "")),
+            "fix": str(llm.get("fix", "")),
+            "matched_patterns": sorted(matched),
+            "confidence": score_to_confidence(f.get("score"), has_pattern=has_pattern),
+        })
+        # Cross-check: a (possibly prompt-injected) LLM cannot bury a finding the
+        # classifier + heuristic already corroborate.
+        apply_corroboration_floor(entry, f.get("score"), matched)
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, KeyError, ValueError) as e:
+        entry["llm_error"] = str(e)
+        entry.update(heuristic_entry(f))
+    return entry
+
+
+def run_explanations(findings, *, backend, model, ollama_url, num_ctx,
+                     workers=1, chat_fn=ollama_chat, progress=None):
+    """Explain all findings, returning entries in the SAME order as `findings`.
+
+    For the Ollama backend the work is spread across up to `workers` threads:
+    Ollama serves requests concurrently when OLLAMA_NUM_PARALLEL > 1, and even
+    when it serializes, overlapping the HTTP round-trips removes idle time. The
+    heuristic backend is pure-CPU regex and always runs inline. `progress(done,
+    total, entry)` is invoked (thread-safe via the caller's lock) per completion.
+    """
+    total = len(findings)
+    results = [None] * total
+
+    def work(idx, f):
+        return idx, explain_finding(f, backend=backend, model=model,
+                                    ollama_url=ollama_url, num_ctx=num_ctx,
+                                    chat_fn=chat_fn)
+
+    effective = max(1, min(workers, total)) if backend == "ollama" else 1
+    done = 0
+    if effective <= 1:
+        for idx, f in enumerate(findings):
+            _, entry = work(idx, f)
+            results[idx] = entry
+            done += 1
+            if progress:
+                progress(done, total, entry)
+        return results
+
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=effective) as ex:
+        futs = [ex.submit(work, idx, f) for idx, f in enumerate(findings)]
+        for fut in concurrent.futures.as_completed(futs):
+            idx, entry = fut.result()
+            results[idx] = entry
+            done += 1
+            if progress:
+                progress(done, total, entry)
+    return results
+
+
 def main():
     ap = argparse.ArgumentParser(description="Explain classifier findings via local Ollama LLM")
     ap.add_argument("inp", nargs="?", help="classifier_findings.json")
@@ -137,6 +226,9 @@ def main():
     ap.add_argument("--html", help="Optional HTML report path")
     ap.add_argument("--model", default=None, help="Override the profile's Ollama model tag")
     ap.add_argument("--top-k", type=int, default=None, help="Explain only the top-K findings by score")
+    ap.add_argument("--workers", type=int, default=None,
+                    help="Parallel Ollama requests (default: profile max_workers). "
+                         "Tune alongside OLLAMA_NUM_PARALLEL on the Ollama server.")
     ap.add_argument("--ollama-url", default=os.environ.get("OLLAMA_HOST", "http://localhost:11434"))
     ap.add_argument("--backend", choices=["auto", "ollama", "heuristic"], default="auto",
                     help="auto = Ollama if reachable, else heuristic fallback")
@@ -176,49 +268,24 @@ def main():
             backend = "ollama"
             print(f"[profile] {prof_name}: ollama model={model} ctx={num_ctx} top_k={top_k}")
 
-    out_entries = []
-    for i, f in enumerate(findings, 1):
-        lines = f"{f.get('start_line')}-{f.get('end_line')}"
-        entry = {
-            "file": f.get("file"),
-            "start_line": f.get("start_line"),
-            "end_line": f.get("end_line"),
-            "score": f.get("score"),
-            "snippet": f.get("snippet", "").splitlines()[:60],
-        }
-        if backend == "ollama":
-            try:
-                snippet = f.get("snippet", "")
-                # Independently corroborate with the regex heuristic so we know
-                # whether a concrete dangerous API is actually present.
-                _expl, _recs, matched = explain_snippet(snippet)
-                has_pattern = bool(matched)
-                llm = ollama_chat(args.ollama_url, model, snippet,
-                                  f.get("file"), lines, num_ctx)
-                entry.update({
-                    "backend": "ollama", "model": model,
-                    "is_vulnerable": bool(llm.get("is_vulnerable")),
-                    "issue": str(llm.get("issue", "")),
-                    "cwe": str(llm.get("cwe", "")),
-                    "severity": str(llm.get("severity", "")),
-                    "explanation": str(llm.get("explanation", "")),
-                    "fix": str(llm.get("fix", "")),
-                    "matched_patterns": sorted(matched),
-                    # has_pattern now reflects the patterns actually matched in
-                    # the snippet, not a hardcoded True.
-                    "confidence": score_to_confidence(f.get("score"), has_pattern=has_pattern),
-                })
-                # Cross-check: a (possibly prompt-injected) LLM cannot bury a
-                # finding the classifier + heuristic already corroborate.
-                apply_corroboration_floor(entry, f.get("score"), matched)
-                print(f"  [{i}/{len(findings)}] {f.get('file')}:{lines} -> "
-                      f"{entry['severity'] or 'n/a'} {entry['cwe']}")
-            except (urllib.error.URLError, OSError, json.JSONDecodeError, KeyError) as e:
-                print(f"  [{i}/{len(findings)}] LLM failed ({e}); heuristic fallback for this finding")
-                entry.update(heuristic_entry(f))
-        else:
-            entry.update(heuristic_entry(f))
-        out_entries.append(entry)
+    workers = args.workers if args.workers is not None else prof.get("max_workers", 1)
+    if backend == "ollama":
+        print(f"[explain] {len(findings)} findings via {max(1, min(workers, len(findings)))} "
+              f"worker(s)")
+
+    _print_lock = threading.Lock()
+
+    def _progress(done, total, entry):
+        loc = f"{entry.get('file')}:{entry.get('start_line')}-{entry.get('end_line')}"
+        note = " (llm failed; heuristic fallback)" if entry.get("llm_error") else ""
+        with _print_lock:
+            print(f"  [{done}/{total}] {loc} -> "
+                  f"{entry.get('severity') or 'n/a'} {entry.get('cwe', '')}{note}")
+
+    out_entries = run_explanations(
+        findings, backend=backend, model=model, ollama_url=args.ollama_url,
+        num_ctx=num_ctx, workers=workers, progress=_progress,
+    )
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as fh:

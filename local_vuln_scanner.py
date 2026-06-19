@@ -52,11 +52,125 @@ def _signature_start(clean, brace_idx):
     return start
 
 
-def extract_functions(code, max_lines=200):
+def _window_long_spans(spans, lines, max_lines):
+    """Shared post-processing: emit (start, end, lines) tuples, windowing any
+    span longer than max_lines so nothing blows past the tokenizer limit."""
+    out = []
+    for a, b in spans:
+        b = min(b, len(lines))
+        if b <= a:
+            continue
+        if b - a <= max_lines:
+            out.append((a, b, lines[a:b]))
+        else:  # huge function: window it so nothing exceeds the token limit badly
+            for i0, i1, chunk in chunk_lines(lines[a:b], window=60, step=30):
+                out.append((a + i0, a + i1, chunk))
+    return out
+
+
+# --- optional tree-sitter backend -------------------------------------------
+# tree-sitter (with tree_sitter_c) gives a real parse tree, so it nails function
+# boundaries on macro-heavy, K&R, and deeply nested code where the brace
+# heuristic guesses. It is an OPTIONAL dependency: when absent we transparently
+# fall back to the brace matcher, keeping the core install light and CI simple.
+_TS_PARSER = None
+_TS_TRIED = False
+
+
+def _treesitter_parser():
+    """Return a cached tree-sitter Parser for C, or None if unavailable."""
+    global _TS_PARSER, _TS_TRIED
+    if _TS_TRIED:
+        return _TS_PARSER
+    _TS_TRIED = True
+    try:
+        import tree_sitter_c as tsc
+        from tree_sitter import Language, Parser
+
+        lang = Language(tsc.language())
+        try:
+            _TS_PARSER = Parser(lang)  # tree_sitter >= 0.22
+        except TypeError:  # pragma: no cover - older tree_sitter API
+            parser = Parser()
+            if hasattr(parser, "set_language"):
+                parser.set_language(lang)
+            else:
+                parser.language = lang
+            _TS_PARSER = parser
+    except Exception:  # ImportError, ABI mismatch, ... -> brace fallback
+        _TS_PARSER = None
+    return _TS_PARSER
+
+
+def treesitter_available():
+    """True when the tree-sitter C backend can be loaded."""
+    return _treesitter_parser() is not None
+
+
+def _extract_functions_treesitter(code, max_lines=200):
+    """Extract whole functions using a tree-sitter parse tree.
+
+    Returns the same (start_idx, end_idx, lines) shape as the brace matcher
+    (0-based, [start, end)), or None when the file declares no functions.
+    Returns None (so callers can fall back) if tree-sitter is unavailable.
+    """
+    parser = _treesitter_parser()
+    if parser is None:
+        return None
+    lines = code.splitlines()
+    tree = parser.parse(code.encode("utf-8", errors="ignore"))
+    spans = []
+    # Iterative pre-order walk; do not descend into a function once captured
+    # (nested C functions are rare and would double-count the body).
+    stack = [tree.root_node]
+    while stack:
+        node = stack.pop()
+        if node.type == "function_definition":
+            spans.append((node.start_point[0], node.end_point[0] + 1))
+            continue
+        stack.extend(reversed(node.children))
+    if not spans:
+        return None
+    spans.sort()
+    return _window_long_spans(spans, lines, max_lines)
+
+
+def extract_functions(code, max_lines=200, parser=None):
+    """Extract whole functions from C/C++ source for whole-function scoring.
+
+    parser selects the boundary engine:
+      "auto" (default) - tree-sitter when installed, else the brace matcher.
+      "treesitter"     - force tree-sitter (raises if it cannot be loaded).
+      "brace"          - force the dependency-free brace heuristic.
+    When parser is None the CCR_PARSER env var is consulted, defaulting to auto.
+
+    Returns (start_idx, end_idx, lines) tuples, 0-based [start, end), or None
+    when the file yields no functions (headers, macros).
+    """
+    mode = (parser or os.environ.get("CCR_PARSER") or "auto").strip().lower()
+    if mode in ("ts", "tree-sitter", "tree_sitter"):
+        mode = "treesitter"
+    if mode == "treesitter":
+        if not treesitter_available():
+            raise RuntimeError(
+                "parser='treesitter' requested but tree-sitter is not installed. "
+                "Install it with: pip install tree_sitter tree_sitter_c"
+            )
+        return _extract_functions_treesitter(code, max_lines)
+    if mode == "auto":
+        res = _extract_functions_treesitter(code, max_lines)
+        if res is not None:
+            return res
+        # tree-sitter unavailable, or parsed but found nothing -> brace matcher.
+    return _extract_functions_brace(code, max_lines)
+
+
+def _extract_functions_brace(code, max_lines=200):
     """Best-effort C/C++ function extraction via brace matching.
 
-    The classifier is trained on whole functions (BigVul granularity), so
-    scoring whole functions at inference avoids a train/test mismatch.
+    Dependency-free fallback used when tree-sitter is unavailable. The
+    classifier is trained on whole functions (BigVul granularity), so scoring
+    whole functions at inference avoids a train/test mismatch.
     Returns (start_idx, end_idx, lines) tuples, 0-based [start, end).
     Functions longer than max_lines are split into sliding windows.
     Falls back to None when the file yields no functions (headers, macros).
@@ -114,15 +228,7 @@ def extract_functions(code, max_lines=200):
 
     if not spans:
         return None
-
-    out = []
-    for a, b in spans:
-        if b - a <= max_lines:
-            out.append((a, b, lines[a:b]))
-        else:  # huge function: window it so nothing exceeds the token limit badly
-            for i0, i1, chunk in chunk_lines(lines[a:b], window=60, step=30):
-                out.append((a + i0, a + i1, chunk))
-    return out
+    return _window_long_spans(spans, lines, max_lines)
 
 
 def load_threshold(model_dir, default=0.5):
@@ -183,15 +289,17 @@ def load_model(model_dir, dtype_name="float32"):
     return tok, model, thr, dev
 
 
-def score_chunks(tok, model, dev, code, batch_size=32, granularity="function"):
+def score_chunks(tok, model, dev, code, batch_size=32, granularity="function",
+                 parser=None):
     """Score chunks of a file in batches. Default granularity is whole
     functions (matches BigVul training data); falls back to 12-line sliding
-    windows for files where no functions are found."""
+    windows for files where no functions are found. `parser` selects the
+    function-boundary engine (see extract_functions)."""
     import torch
 
     chunks = None
     if granularity == "function":
-        chunks = extract_functions(code)
+        chunks = extract_functions(code, parser=parser)
     if chunks is None:
         chunks = list(chunk_lines(code.splitlines()))
     results = []
@@ -242,11 +350,17 @@ def main():
                     help="Cap findings per file after merging (0 = no cap)")
     ap.add_argument("--granularity", choices=["function", "window"], default="function",
                     help="Score whole functions (matches training data) or 12-line windows")
+    ap.add_argument("--parser", choices=["auto", "treesitter", "brace"], default="auto",
+                    help="Function-boundary engine: auto (tree-sitter if installed), "
+                         "treesitter (force), or brace (dependency-free fallback)")
     add_profile_arg(ap)
     args = ap.parse_args()
 
     prof_name, prof = select_profile(args.profile)
-    print(f"[profile] {prof_name}: batch={prof['classifier_batch_size']} dtype={prof['classifier_dtype']}")
+    parser_engine = "tree-sitter" if (args.parser in ("auto", "treesitter")
+                                      and treesitter_available()) else "brace"
+    print(f"[profile] {prof_name}: batch={prof['classifier_batch_size']} "
+          f"dtype={prof['classifier_dtype']} parser={parser_engine}")
 
     os.makedirs(args.out, exist_ok=True)
     tok, model, thr, dev = load_model(args.model, prof["classifier_dtype"])
@@ -259,7 +373,7 @@ def main():
         with open(path, "r", errors="ignore", encoding="utf-8") as fh:
             code = fh.read()
         chunks = score_chunks(tok, model, dev, code, prof["classifier_batch_size"],
-                              granularity=args.granularity)
+                              granularity=args.granularity, parser=args.parser)
         hot = [c for c in chunks if c["score"] >= thr]
         hot = merge_overlapping(hot)
         hot.sort(key=lambda x: x["score"], reverse=True)
