@@ -13,7 +13,7 @@ PULL_OLLAMA="${PULL_OLLAMA:-1}"
 say(){ printf "\n\033[1;36m[setup]\033[0m %s\n" "$*"; }
 warn(){ printf "\033[1;33m[warn]\033[0m %s\n" "$*"; }
 
-ARCH="$(uname -m)"
+# Arch is resolved inside lib_torch_install.sh (ccr_install_torch); just report it.
 say "Host: $(uname -srm)"
 
 # --- system deps ------------------------------------------------------------
@@ -29,32 +29,33 @@ source "$VENV/bin/activate"
 python -m pip install --upgrade pip wheel setuptools
 
 # --- torch (torch only; torchvision >=0.25 breaks datasets' torch formatter) -
-INDEX_URL="https://download.pytorch.org/whl/cpu"
-if [[ "$USE_GPU" == "1" ]] && command -v nvidia-smi >/dev/null; then
-  CUDA_VER=$(nvidia-smi | grep -oE "CUDA[ A-Za-z]* Version: [0-9]+\.[0-9]+" | grep -oE "[0-9]+\.[0-9]+" | head -1 || true)
-  case "$CUDA_VER" in
-    13.*)              INDEX_URL="https://download.pytorch.org/whl/cu130" ;;
-    12.8*|12.9*)       INDEX_URL="https://download.pytorch.org/whl/cu128" ;;
-    12.5*|12.6*|12.7*) INDEX_URL="https://download.pytorch.org/whl/cu126" ;;
-    12.*)              INDEX_URL="https://download.pytorch.org/whl/cu124" ;;
-    11.*)              INDEX_URL="https://download.pytorch.org/whl/cu118" ;;
-    *) [[ -n "$CUDA_VER" ]] && INDEX_URL="https://download.pytorch.org/whl/cu128" ;;
-  esac
-  # DGX Spark / Grace (aarch64 Blackwell sm_121): needs cu130+ aarch64 wheels
-  [[ "$ARCH" == "aarch64" ]] && INDEX_URL="https://download.pytorch.org/whl/cu130"
+# Arch-aware wheel selection lives in lib_torch_install.sh. On aarch64 (DGX
+# Spark, sm_121) this resolves to the cu130 NIGHTLY channel (no stable cu130
+# aarch64 wheel is guaranteed) and FAILS SOFT so a missing wheel does not abort
+# the whole setup under `set -e`.
+# shellcheck source=lib_torch_install.sh
+source "$(dirname "$0")/lib_torch_install.sh"
+TORCH_OK=1
+ccr_install_torch || TORCH_OK=0
+if [[ "$TORCH_OK" != "1" ]]; then
+  warn "torch install failed for this arch/CUDA. Setup CONTINUES (deps still install)."
+  warn "Resolve torch via the per-machine runbook, then run ./env_doctor_cuda.sh."
 fi
-say "Installing torch from $INDEX_URL"
-pip install --no-cache-dir --index-url "$INDEX_URL" torch
 
 say "Installing python deps"
 pip install --no-cache-dir -r requirements.txt
 
-# sanity: GPU visible to torch?
-python - <<'PY'
+# sanity: GPU visible to torch? (best-effort; do not abort if torch is missing)
+if [[ "$TORCH_OK" == "1" ]]; then
+  python - <<'PY' || warn "torch import/sanity failed; run ./env_doctor_cuda.sh on real hardware."
 import torch
 ok = torch.cuda.is_available()
 print(f"[setup] torch {torch.__version__} | cuda: {ok}" + (f" | {torch.cuda.get_device_name(0)}" if ok else ""))
 PY
+else
+  warn "Skipping torch sanity check (torch not installed). On real hardware run:"
+  warn "  ./env_doctor_cuda.sh   (asserts CUDA + a tiny matmul + compute capability)"
+fi
 
 # --- GraphCodeBERT base (needed for training; skipped if already present) ---
 if [[ ! -f models/graphcodebert-base/config.json ]]; then

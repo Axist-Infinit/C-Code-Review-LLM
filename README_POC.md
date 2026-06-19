@@ -5,14 +5,18 @@ Local, offline-capable C/C++ vulnerability scanner:
 
 ## Quick start
 
-Full per-machine instructions (4090 / DGX Spark): **[SETUP.md](SETUP.md)**
+Setup hub: **[SETUP.md](SETUP.md)** · per-machine runbooks:
+**[SETUP_4090.md](SETUP_4090.md)** (x86_64 / sm_89) ·
+**[SETUP_SPARK.md](SETUP_SPARK.md)** (aarch64 Grace-Blackwell / sm_121)
 
 ```bash
 # 1. Machine setup: venv, torch for this GPU/arch, deps, Ollama explainer model
 ./setup_machine.sh
+./env_doctor_cuda.sh           # on real hardware: assert CUDA + matmul + sm_89/sm_121 kernels
 
 # 2. Train the classifier (or transfer one: see SETUP.md option B)
-./one_click_unlock_fetch_train_relock.sh
+./preflight_doctor.sh || true  # model/threshold/profile/Ollama preflight
+DATA=bigvul ./one_click_unlock_fetch_train_relock.sh   # fetch -> merge(guarded) -> train -> eval -> relock
 
 # 3. Scan
 SRC=path/to/code ./scan_repo.sh
@@ -74,11 +78,21 @@ regex explainer and the cppcheck/flawfinder ensemble cover those).
 
 ## Training
 
-`DATA=bigvul` (default) fetches BigVul from HF and builds deduplicated
-80/10/10 splits. `DATA=bootstrap` writes a tiny disjoint smoke-test set —
-a model trained on it is a plumbing test, **not** a usable classifier.
+`DATA=bigvul` (default) fetches BigVul from HF and builds deduplicated splits
+(source splits preserved when present, else 80/10/10). The merge step
+**HARD-FAILS** (no silent bootstrap) if the fetch is empty or the train split is
+below `MIN_TRAIN_ROWS` (default 20000), so a failed online window can never
+quietly train a worthless model. `DATA=bootstrap` writes a tiny disjoint
+smoke-test set on purpose — a model trained on it is a plumbing test, **not** a
+usable classifier.
 
-Environment knobs: `USE_GPU=1|0`, `EPOCHS`, `BATCH`, `OUT`, `HARD_RELOCK=1`
+**Per-machine training config is wired in:** batch size + precision come from
+the detected profile (`profiles.json` via `profiles.py --training-env`):
+`4090 → --batch 64 --fp16`, `spark → --batch 128 --bf16`, `cpu → --batch 8`.
+Override with `BATCH=` / `CCR_PRECISION_FLAG=` / `CCR_PROFILE=`.
+
+Environment knobs: `USE_GPU=1|0`, `EPOCHS`, `BATCH` (overrides profile),
+`MIN_TRAIN_ROWS`, `OUT`, `SKIP_EVAL=1`, `DATA=bigvul|bootstrap`, `HARD_RELOCK=1`
 (scoped egress lock after training — see below), `CCR_PROFILE`, `HF_REVISION`
 (pin a commit sha for the fetched HF models; empty = upstream HEAD).
 

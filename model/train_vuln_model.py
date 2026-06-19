@@ -18,7 +18,10 @@ def parse_args():
     ap.add_argument("--weight_decay", type=float, default=0.0)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--class_weight", action="store_true")
-    ap.add_argument("--fp16", action="store_true")
+    ap.add_argument("--fp16", action="store_true",
+                    help="fp16 mixed precision (RTX 4090 / Ada sm_89).")
+    ap.add_argument("--bf16", action="store_true",
+                    help="bf16 mixed precision (DGX Spark / Grace-Blackwell sm_121).")
     return ap.parse_args()
 
 def _to_int(v):
@@ -84,13 +87,19 @@ def build_training_args(args):
     )
     eval_extra = dict(save_strategy="epoch", load_best_model_at_end=True,
                       metric_for_best_model="eval_loss", greater_is_better=False)
+    # fp16 and bf16 are mutually exclusive in HF TrainingArguments; refuse to set
+    # both. The per-machine wiring (profiles.py -> train.sh) only ever passes one,
+    # but a manual override could pass both — fail loud rather than silently.
+    if args.fp16 and args.bf16:
+        raise SystemExit("[ERR] --fp16 and --bf16 are mutually exclusive; pass at most one.")
+    prec = dict(fp16=args.fp16, bf16=args.bf16)
     # transformers >=4.46 renamed evaluation_strategy -> eval_strategy; try both
     # spellings WITH eval enabled before ever falling back to a no-eval config.
     attempts = [
-        dict(fp16=args.fp16, report_to=[], eval_strategy="epoch", **eval_extra),
-        dict(fp16=args.fp16, report_to=[], evaluation_strategy="epoch", **eval_extra),
-        dict(fp16=args.fp16, report_to=[]),
-        dict(fp16=args.fp16),
+        dict(report_to=[], eval_strategy="epoch", **prec, **eval_extra),
+        dict(report_to=[], evaluation_strategy="epoch", **prec, **eval_extra),
+        dict(report_to=[], **prec),
+        dict(**prec),
         dict(),
     ]
     for i, extra in enumerate(attempts):

@@ -48,5 +48,9 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        print("[WARN] BigVul(HF) fetch failed:", e)
-        sys.exit(0)
+        # Fail LOUD (non-zero). A swallowed fetch failure previously let the
+        # pipeline silently degrade to a 12-row bootstrap set and train a
+        # worthless "model". The caller must re-run the online provisioning
+        # window, or explicitly choose DATA=bootstrap for a smoke-test.
+        print("[FATAL] BigVul(HF) fetch failed:", e, file=sys.stderr)
+        sys.exit(1)

@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 VENV="${VENV:-.venv}"; PY="${PYTHON:-python3}"; USE_GPU="${USE_GPU:-1}"
-EPOCHS="${EPOCHS:-3}"; BATCH="${BATCH:-16}"; OUT="${OUT:-vuln-model}"
+# BATCH is intentionally NOT defaulted here: when unset, the per-machine profile
+# batch (profiles.json) is used at train time; set BATCH to override the profile.
+EPOCHS="${EPOCHS:-3}"; OUT="${OUT:-vuln-model}"
 HARD_RELOCK="${HARD_RELOCK:-0}"; HF_CACHE="${HF_CACHE:-$PWD/hf_cache}"
 # HF_REVISION pins a specific commit sha / tag for the fetched HF models
 # (supply-chain integrity). Default empty = current upstream HEAD (documented
@@ -20,36 +22,36 @@ git lfs install || true
 [[ -d "$VENV" ]] || $PY -m venv "$VENV"
 source "$VENV/bin/activate"
 python -m pip install --upgrade pip wheel setuptools
-INDEX_URL=""
-if [[ "$USE_GPU" == "1" ]] && command -v nvidia-smi >/dev/null; then
-  # match both "CUDA Version: 12.4" and newer "CUDA UMD Version: 13.3" formats
-  CUDA_VER=$(nvidia-smi | grep -oE "CUDA[ A-Za-z]* Version: [0-9]+\.[0-9]+" | grep -oE "[0-9]+\.[0-9]+" | head -1 || true)
-  case "$CUDA_VER" in
-    13.*)        INDEX_URL="https://download.pytorch.org/whl/cu130" ;;
-    12.8*|12.9*) INDEX_URL="https://download.pytorch.org/whl/cu128" ;;
-    12.5*|12.6*|12.7*) INDEX_URL="https://download.pytorch.org/whl/cu126" ;;
-    12.4*)       INDEX_URL="https://download.pytorch.org/whl/cu124" ;;
-    12.1*|12.2*|12.3*) INDEX_URL="https://download.pytorch.org/whl/cu121" ;;
-    11.*)        INDEX_URL="https://download.pytorch.org/whl/cu118" ;;
-    *) [[ -n "$CUDA_VER" ]] && INDEX_URL="https://download.pytorch.org/whl/cu128" ;;
-  esac
-  # DGX Spark (aarch64 Grace Blackwell, sm_121) needs cu130+ aarch64 wheels
-  if [[ "$(uname -m)" == "aarch64" && -n "$INDEX_URL" ]]; then
-    INDEX_URL="https://download.pytorch.org/whl/cu130"
-  fi
+# Arch-aware torch install (shared helper). aarch64 -> cu130 NIGHTLY torch-only;
+# x86_64 -> channel matching the driver's CUDA. FAILS SOFT so a missing aarch64
+# wheel doesn't abort the run before we even reach training. torch only —
+# torchvision/torchaudio are unused and torchvision >=0.25 breaks datasets.
+# shellcheck source=lib_torch_install.sh
+source "$(dirname "$0")/lib_torch_install.sh"
+if ! ccr_install_torch; then
+  warn "torch install failed for this arch/CUDA; resolve via the per-machine runbook"
+  warn "(SETUP_SPARK.md / SETUP_4090.md) and re-run, or run ./install_torch_nightly_for_new_gpu.sh."
+  exit 1
 fi
-# torch only — torchvision/torchaudio are unused and torchvision >=0.25 breaks datasets' torch formatter
-if [[ -n "$INDEX_URL" ]]; then pip install --no-cache-dir --index-url "$INDEX_URL" torch; else pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch; fi
 pip install --no-cache-dir -r requirements.txt
 export HF_HOME="$HF_CACHE"; export TRANSFORMERS_CACHE="$HF_CACHE"; export HF_DATASETS_CACHE="$HF_CACHE"; mkdir -p "$HF_CACHE"
 # Dataset: DATA=bigvul (default) fetches BigVul from HF and builds real
 # train/val/test splits; DATA=bootstrap writes the tiny smoke-test set instead.
+# MIN_TRAIN_ROWS guards the real path: merge_and_split.py HARD-FAILS (no silent
+# bootstrap) if BigVul didn't yield at least this many train rows.
 DATA="${DATA:-bigvul}"
+MIN_TRAIN_ROWS="${MIN_TRAIN_ROWS:-20000}"
 if [[ "$DATA" == "bigvul" ]]; then
   say "Fetching BigVul -> data/ingest"
-  python scripts/py/fetch_bigvul_hf.py || warn "BigVul fetch failed; merge will fall back to bootstrap data"
-  python scripts/py/merge_and_split.py
+  # Hard-fail on fetch error: a failed fetch must NOT silently degrade to a
+  # 12-row bootstrap set and train a worthless model. The operator re-runs the
+  # online provisioning window (see SETUP_4090.md / SETUP_SPARK.md).
+  python scripts/py/fetch_bigvul_hf.py
+  # No --allow-bootstrap here: merge_and_split exits non-zero (caught by -e) if
+  # ingest is empty or the train split is below MIN_TRAIN_ROWS.
+  python scripts/py/merge_and_split.py --min-train-rows "$MIN_TRAIN_ROWS"
 else
+  say "DATA=$DATA -> writing tiny bootstrap (smoke-test) dataset"
   bash ./bootstrap_data.sh
 fi
 bash ./fetch_graphcodebert.sh || true
@@ -61,8 +63,23 @@ dest=os.path.join("models","graphcodebert-base")
 if not os.path.exists(dest) or not os.listdir(dest):
     snapshot_download(repo_id="microsoft/graphcodebert-base", local_dir=dest, revision=revision, local_dir_use_symlinks=False, resume_download=True)
 PY
-say "Train -> $OUT"
-python model/train_vuln_model.py --base ./models/graphcodebert-base --train data/train.jsonl --val data/val.jsonl --test data/test.jsonl --out "$OUT" --epochs "$EPOCHS" --batch "$BATCH" --class_weight
+# Per-machine training config from the detected profile (profiles.json):
+# 4090 -> batch 64 + --fp16, Spark -> batch 128 + --bf16, cpu -> batch 8 + fp32.
+# BATCH (env, default unset) overrides the profile batch; CCR_PRECISION_FLAG
+# overrides the precision flag.
+eval "$(python profiles.py --training-env)"
+TRAIN_BATCH="${BATCH:-$CCR_BATCH}"
+PRECISION_FLAG="${CCR_PRECISION_FLAG:-}"
+say "Train -> $OUT (profile=$CCR_PROFILE batch=$TRAIN_BATCH precision='${PRECISION_FLAG:-fp32}')"
+python model/train_vuln_model.py --base ./models/graphcodebert-base --train data/train.jsonl --val data/val.jsonl --test data/test.jsonl --out "$OUT" --epochs "$EPOCHS" --batch "$TRAIN_BATCH" --class_weight $PRECISION_FLAG
+
+# --- eval: prove the trained model carries signal before relocking ----------
+# Set SKIP_EVAL=1 to skip (e.g. CI). ROC-AUC well below ~0.6 means no signal.
+if [[ "${SKIP_EVAL:-0}" != "1" ]]; then
+  say "Eval -> held-out test split ($OUT)"
+  python evaluate_model.py --model "$OUT" --test data/test.jsonl || warn "eval reported an issue; inspect metrics before trusting scans"
+fi
+
 # Relock: offline env flags + optional iptables
 cat > .env.locked <<EOF
 export HF_HOME="$HF_CACHE"
