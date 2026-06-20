@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, os, json, glob
+import argparse, os, json, glob, importlib
 
 # NOTE: torch / transformers are imported lazily inside load_model / score_chunks
 # so that the pure helpers (extract_functions, chunk_lines, load_threshold) stay
@@ -7,7 +7,13 @@ import argparse, os, json, glob
 
 from profiles import select_profile, add_profile_arg
 
-C_EXTS = (".c", ".cpp", ".cc", ".h", ".hpp")
+C_EXTS = (".c", ".cpp", ".cc", ".cxx", ".c++", ".h", ".hpp", ".hh", ".hxx", ".h++")
+
+# Extensions parsed with the C++ grammar. ".h" is ambiguous (C or C++ header)
+# and handled separately, preferring C++ since that grammar is a near-superset
+# and still parses plain C definitions correctly.
+_CPP_EXTS = {".cpp", ".cc", ".cxx", ".c++", ".hpp", ".hh", ".hxx", ".h++",
+             ".tcc", ".ipp", ".inl"}
 
 
 def list_sources(src):
@@ -69,63 +75,95 @@ def _window_long_spans(spans, lines, max_lines):
 
 
 # --- optional tree-sitter backend -------------------------------------------
-# tree-sitter (with tree_sitter_c) gives a real parse tree, so it nails function
-# boundaries on macro-heavy, K&R, and deeply nested code where the brace
-# heuristic guesses. It is an OPTIONAL dependency: when absent we transparently
-# fall back to the brace matcher, keeping the core install light and CI simple.
-_TS_PARSER = None
-_TS_TRIED = False
+# tree-sitter gives a real parse tree, so it nails function boundaries on
+# macro-heavy, K&R, and deeply nested code where the brace heuristic guesses,
+# and it understands C++ (class methods, constructors, templates, namespaces,
+# operator overloads) which the brace matcher cannot. It is an OPTIONAL
+# dependency: when absent we transparently fall back to the brace matcher,
+# keeping the core install light and CI simple.
+_TS_MODULES = {"c": "tree_sitter_c", "cpp": "tree_sitter_cpp"}
+_TS_PARSERS = {}  # normalized lang -> Parser or None (cached, including failures)
 
 
-def _treesitter_parser():
-    """Return a cached tree-sitter Parser for C, or None if unavailable."""
-    global _TS_PARSER, _TS_TRIED
-    if _TS_TRIED:
-        return _TS_PARSER
-    _TS_TRIED = True
+def _normalize_lang(lang):
+    return "cpp" if str(lang or "c").lower() in ("cpp", "c++", "cxx", "cc") else "c"
+
+
+def _treesitter_parser(lang="c"):
+    """Return a cached tree-sitter Parser for `lang` ("c"|"cpp"), or None."""
+    lang = _normalize_lang(lang)
+    if lang in _TS_PARSERS:
+        return _TS_PARSERS[lang]
+    parser = None
     try:
-        import tree_sitter_c as tsc
+        grammar = importlib.import_module(_TS_MODULES[lang])
         from tree_sitter import Language, Parser
 
-        lang = Language(tsc.language())
+        language = Language(grammar.language())
         try:
-            _TS_PARSER = Parser(lang)  # tree_sitter >= 0.22
+            parser = Parser(language)  # tree_sitter >= 0.22
         except TypeError:  # pragma: no cover - older tree_sitter API
             parser = Parser()
             if hasattr(parser, "set_language"):
-                parser.set_language(lang)
+                parser.set_language(language)
             else:
-                parser.language = lang
-            _TS_PARSER = parser
+                parser.language = language
     except Exception:  # ImportError, ABI mismatch, ... -> brace fallback
-        _TS_PARSER = None
-    return _TS_PARSER
+        parser = None
+    _TS_PARSERS[lang] = parser
+    return parser
 
 
-def treesitter_available():
-    """True when the tree-sitter C backend can be loaded."""
-    return _treesitter_parser() is not None
+def treesitter_available(lang="c"):
+    """True when the tree-sitter backend for `lang` ("c"|"cpp") can be loaded."""
+    return _treesitter_parser(lang) is not None
 
 
-def _extract_functions_treesitter(code, max_lines=200):
-    """Extract whole functions using a tree-sitter parse tree.
+def lang_for_path(path, default="c"):
+    """Pick the tree-sitter grammar ("c"|"cpp") for a source path by extension.
 
-    Returns the same (start_idx, end_idx, lines) shape as the brace matcher
-    (0-based, [start, end)), or None when the file declares no functions.
-    Returns None (so callers can fall back) if tree-sitter is unavailable.
+    C++ extensions -> "cpp"; ".c" -> "c"; ".h" headers prefer "cpp" when that
+    grammar is installed (it parses C too); anything else -> `default`.
     """
-    parser = _treesitter_parser()
+    ext = os.path.splitext(path)[1].lower()
+    if ext in _CPP_EXTS:
+        return "cpp"
+    if ext == ".h":
+        return "cpp" if treesitter_available("cpp") else "c"
+    if ext == ".c":
+        return "c"
+    return default
+
+
+def _extract_functions_treesitter(code, max_lines=200, lang="c"):
+    """Extract whole functions/methods using a tree-sitter parse tree.
+
+    Handles C and C++: free functions, class member functions, constructors,
+    destructors, operator overloads, out-of-line definitions, and function
+    templates (the enclosing `template<...>` header is kept). Returns the same
+    (start_idx, end_idx, lines) shape as the brace matcher (0-based [start,end)),
+    None when the file declares no functions, or None if tree-sitter is absent.
+    """
+    parser = _treesitter_parser(lang)
     if parser is None:
         return None
     lines = code.splitlines()
     tree = parser.parse(code.encode("utf-8", errors="ignore"))
     spans = []
-    # Iterative pre-order walk; do not descend into a function once captured
-    # (nested C functions are rare and would double-count the body).
+    # Iterative pre-order walk. We do NOT descend into a captured function (its
+    # body — incl. lambdas — belongs to that one span), but we DO descend into
+    # classes/namespaces/class-templates to capture each member function.
     stack = [tree.root_node]
     while stack:
         node = stack.pop()
-        if node.type == "function_definition":
+        t = node.type
+        if t == "function_definition":
+            spans.append((node.start_point[0], node.end_point[0] + 1))
+            continue
+        if t == "template_declaration" and any(
+                c.type == "function_definition" for c in node.children):
+            # function template: capture the whole thing so the template<...>
+            # header travels with the function body.
             spans.append((node.start_point[0], node.end_point[0] + 1))
             continue
         stack.extend(reversed(node.children))
@@ -135,7 +173,7 @@ def _extract_functions_treesitter(code, max_lines=200):
     return _window_long_spans(spans, lines, max_lines)
 
 
-def extract_functions(code, max_lines=200, parser=None):
+def extract_functions(code, max_lines=200, parser=None, lang="c"):
     """Extract whole functions from C/C++ source for whole-function scoring.
 
     parser selects the boundary engine:
@@ -143,6 +181,8 @@ def extract_functions(code, max_lines=200, parser=None):
       "treesitter"     - force tree-sitter (raises if it cannot be loaded).
       "brace"          - force the dependency-free brace heuristic.
     When parser is None the CCR_PARSER env var is consulted, defaulting to auto.
+    lang ("c"|"cpp") picks the tree-sitter grammar; the brace fallback is
+    language-agnostic.
 
     Returns (start_idx, end_idx, lines) tuples, 0-based [start, end), or None
     when the file yields no functions (headers, macros).
@@ -151,14 +191,15 @@ def extract_functions(code, max_lines=200, parser=None):
     if mode in ("ts", "tree-sitter", "tree_sitter"):
         mode = "treesitter"
     if mode == "treesitter":
-        if not treesitter_available():
+        if not treesitter_available(lang):
+            grammar = _TS_MODULES[_normalize_lang(lang)]
             raise RuntimeError(
-                "parser='treesitter' requested but tree-sitter is not installed. "
-                "Install it with: pip install tree_sitter tree_sitter_c"
+                f"parser='treesitter' requested but the tree-sitter {lang} grammar "
+                f"is not installed. Install it with: pip install tree_sitter {grammar}"
             )
-        return _extract_functions_treesitter(code, max_lines)
+        return _extract_functions_treesitter(code, max_lines, lang)
     if mode == "auto":
-        res = _extract_functions_treesitter(code, max_lines)
+        res = _extract_functions_treesitter(code, max_lines, lang)
         if res is not None:
             return res
         # tree-sitter unavailable, or parsed but found nothing -> brace matcher.
@@ -290,16 +331,17 @@ def load_model(model_dir, dtype_name="float32"):
 
 
 def score_chunks(tok, model, dev, code, batch_size=32, granularity="function",
-                 parser=None):
+                 parser=None, lang="c"):
     """Score chunks of a file in batches. Default granularity is whole
     functions (matches BigVul training data); falls back to 12-line sliding
     windows for files where no functions are found. `parser` selects the
-    function-boundary engine (see extract_functions)."""
+    function-boundary engine and `lang` ("c"|"cpp") the tree-sitter grammar
+    (see extract_functions)."""
     import torch
 
     chunks = None
     if granularity == "function":
-        chunks = extract_functions(code, parser=parser)
+        chunks = extract_functions(code, parser=parser, lang=lang)
     if chunks is None:
         chunks = list(chunk_lines(code.splitlines()))
     results = []
@@ -353,6 +395,8 @@ def main():
     ap.add_argument("--parser", choices=["auto", "treesitter", "brace"], default="auto",
                     help="Function-boundary engine: auto (tree-sitter if installed), "
                          "treesitter (force), or brace (dependency-free fallback)")
+    ap.add_argument("--lang", choices=["auto", "c", "cpp"], default="auto",
+                    help="tree-sitter grammar: auto (per file extension), or force c/cpp")
     add_profile_arg(ap)
     args = ap.parse_args()
 
@@ -360,7 +404,7 @@ def main():
     parser_engine = "tree-sitter" if (args.parser in ("auto", "treesitter")
                                       and treesitter_available()) else "brace"
     print(f"[profile] {prof_name}: batch={prof['classifier_batch_size']} "
-          f"dtype={prof['classifier_dtype']} parser={parser_engine}")
+          f"dtype={prof['classifier_dtype']} parser={parser_engine} lang={args.lang}")
 
     os.makedirs(args.out, exist_ok=True)
     tok, model, thr, dev = load_model(args.model, prof["classifier_dtype"])
@@ -372,8 +416,9 @@ def main():
     for path in list_sources(args.src):
         with open(path, "r", errors="ignore", encoding="utf-8") as fh:
             code = fh.read()
+        lang = args.lang if args.lang in ("c", "cpp") else lang_for_path(path)
         chunks = score_chunks(tok, model, dev, code, prof["classifier_batch_size"],
-                              granularity=args.granularity, parser=args.parser)
+                              granularity=args.granularity, parser=args.parser, lang=lang)
         hot = [c for c in chunks if c["score"] >= thr]
         hot = merge_overlapping(hot)
         hot.sort(key=lambda x: x["score"], reverse=True)

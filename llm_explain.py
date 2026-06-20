@@ -14,7 +14,8 @@ import urllib.error
 import urllib.request
 
 from profiles import select_profile, add_profile_arg
-from explain_findings import explain_snippet, score_to_confidence, write_html
+from explain_findings import (explain_snippet, score_to_confidence, write_html,
+                              cwe_for_patterns)
 
 # Unambiguous delimiter that fences off the untrusted audited code. We tell the
 # model that everything between the markers is DATA, never instructions, so a
@@ -90,7 +91,7 @@ def heuristic_entry(f):
         "backend": "heuristic",
         "is_vulnerable": bool(matched),
         "issue": expl[0] if expl else "",
-        "cwe": "",
+        "cwe": cwe_for_patterns(matched),
         "severity": "medium" if matched else "info",
         "explanation": " ".join(expl),
         "fix": " ".join(recs[:2]),

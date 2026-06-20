@@ -46,6 +46,10 @@ The trained classifier moves between machines via `pack_model.sh` / `unpack_mode
   default) and fall back to a dependency-free brace matcher otherwise. tree-sitter
   correctly captures macro-heavy / K&R / nested definitions (signature + params)
   that the brace heuristic truncates; force with `--parser treesitter|brace`.
+  **C++ is fully supported** via the tree-sitter-cpp grammar — class member
+  functions, constructors/destructors, operator overloads, out-of-line method
+  definitions, function templates (header kept), and namespaces. The grammar is
+  chosen per file extension (`--lang auto`), or force `--lang c|cpp`.
   Threshold comes from the model's `inference.json` (tuned at train time);
   override with `--threshold`.
 - `llm_explain.py FINDINGS --out OUT.json [--html report.html]` — per-finding
@@ -54,7 +58,11 @@ The trained classifier moves between machines via `pack_model.sh` / `unpack_mode
   profile's `max_workers`; pair with `OLLAMA_NUM_PARALLEL` on the server). Auto-
   falls back to the heuristic regex explainer when Ollama is down, and per-finding
   on any single failed call (`--backend heuristic` to force).
-- `explain_findings.py` — pure-regex heuristic explainer (no LLM needed).
+- `explain_findings.py` — pure-regex heuristic explainer (no LLM needed). Each
+  pattern carries a CWE id, so heuristic findings get real SARIF rule ids. Covers
+  classic C footguns (gets/strcpy/strcat/sprintf/scanf/memcpy/memmove/alloca) and
+  **C++-specific issues**: `system`/`popen` (CWE-78), `reinterpret_cast`/
+  `const_cast` (CWE-704), and non-literal `printf` format strings (CWE-134).
 - `evaluate_model.py --model ./vuln-model --test data/test.jsonl` — held-out
   P/R/F1/AUC + threshold sweep. Run this after training; ROC-AUC < 0.6 means
   the model has no signal.

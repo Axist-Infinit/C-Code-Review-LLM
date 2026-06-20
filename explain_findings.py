@@ -6,10 +6,14 @@ import argparse, os, json, re, html
 # explanation + recommendations.
 # --------------------------------------------------------------------
 
+# Each pattern carries a CWE id so heuristic findings get a meaningful SARIF rule
+# id (not just the API name). Order is priority order: cwe_for_patterns() returns
+# the first matched pattern's CWE, so keep the most specific/severe items first.
 PATTERNS = [
     {
         "id": "gets",
         "regex": re.compile(r"\bgets\s*\("),
+        "cwe": "CWE-242",  # use of inherently dangerous function
         "why": "Use of gets() is unsafe and leads to buffer overflow.",
         "recs": [
             "Replace gets() with fgets() and pass the destination buffer size.",
@@ -17,8 +21,29 @@ PATTERNS = [
         ],
     },
     {
+        "id": "system",
+        "regex": re.compile(r"\bsystem\s*\("),
+        "cwe": "CWE-78",  # OS command injection
+        "why": "Passing attacker-influenced data to system() invites OS command injection.",
+        "recs": [
+            "Avoid the shell: use execve()/posix_spawn() with an explicit argument vector.",
+            "If a shell is unavoidable, strictly allow-list and escape every argument."
+        ],
+    },
+    {
+        "id": "popen",
+        "regex": re.compile(r"\bpopen\s*\("),
+        "cwe": "CWE-78",  # OS command injection
+        "why": "popen() runs its argument through /bin/sh; untrusted input enables command injection.",
+        "recs": [
+            "Replace popen() with a direct exec of the target binary and an argument vector.",
+            "Never interpolate untrusted data into a popen() command string."
+        ],
+    },
+    {
         "id": "strcpy",
         "regex": re.compile(r"\bstrcpy\s*\("),
+        "cwe": "CWE-120",  # classic buffer overflow
         "why": "strcpy() does not check destination size and can overflow the target buffer.",
         "recs": [
             "Replace strcpy() with strncpy()/strlcpy() and pass the destination size.",
@@ -28,6 +53,7 @@ PATTERNS = [
     {
         "id": "strcat",
         "regex": re.compile(r"\bstrcat\s*\("),
+        "cwe": "CWE-120",
         "why": "strcat() appends without bounds checks and can overflow the destination buffer.",
         "recs": [
             "Replace strcat() with strncat()/strlcat() and pass the remaining buffer capacity.",
@@ -37,6 +63,7 @@ PATTERNS = [
     {
         "id": "sprintf",
         "regex": re.compile(r"\bsprintf\s*\("),
+        "cwe": "CWE-120",
         "why": "sprintf() can overflow fixed‑size buffers if the formatted output is too long.",
         "recs": [
             "Replace sprintf() with snprintf() and cap the output size to the destination buffer.",
@@ -47,6 +74,7 @@ PATTERNS = [
         "id": "scanf_percent_s",
         # FIXED: properly quoted "%s" so the regex is valid Python.
         "regex": re.compile(r'\bscanf\s*\(\s*"%s"'),
+        "cwe": "CWE-120",
         "why": 'scanf("%s") with no width specifier can overflow destination buffers.',
         "recs": [
             'Use scanf with a width limit (e.g. scanf("%15s", buf)) or use fgets() with an explicit buffer size.',
@@ -56,10 +84,64 @@ PATTERNS = [
     {
         "id": "memcpy",
         "regex": re.compile(r"\bmemcpy\s*\("),
+        "cwe": "CWE-120",
         "why": "memcpy() with unchecked length can overflow or over‑read buffers.",
         "recs": [
             "Ensure the length passed to memcpy() is validated against both source and destination buffer sizes.",
             "Prefer higher‑level copy helpers where buffer sizes are tracked explicitly."
+        ],
+    },
+    {
+        "id": "memmove",
+        "regex": re.compile(r"\bmemmove\s*\("),
+        "cwe": "CWE-120",
+        "why": "memmove() with an unchecked length can overflow the destination buffer.",
+        "recs": [
+            "Validate the length against both buffer sizes before calling memmove().",
+            "Track buffer capacities explicitly (e.g. std::span) instead of raw pointers + length."
+        ],
+    },
+    {
+        "id": "alloca",
+        "regex": re.compile(r"\balloca\s*\("),
+        "cwe": "CWE-770",  # allocation without limits -> stack exhaustion
+        "why": "alloca() allocates on the stack; an attacker-influenced size can exhaust the stack.",
+        "recs": [
+            "Use a bounded stack buffer or heap allocation (with a checked size) instead of alloca().",
+            "Cap and validate any size derived from input before allocating."
+        ],
+    },
+    # --- C++-specific footguns ----------------------------------------------
+    {
+        "id": "reinterpret_cast",
+        "regex": re.compile(r"\breinterpret_cast\s*<"),
+        "cwe": "CWE-704",  # incorrect type conversion
+        "why": "reinterpret_cast performs an unchecked reinterpretation; misuse causes type confusion and UB.",
+        "recs": [
+            "Prefer static_cast/dynamic_cast, or std::bit_cast for value reinterpretation.",
+            "Verify the source and destination types are layout-compatible before reinterpreting."
+        ],
+    },
+    {
+        "id": "const_cast",
+        "regex": re.compile(r"\bconst_cast\s*<"),
+        "cwe": "CWE-704",
+        "why": "const_cast strips constness; writing through it to a truly const object is undefined behavior.",
+        "recs": [
+            "Redesign the interface so the object is mutable where it must be written.",
+            "Never const_cast away const to modify an object that was originally declared const."
+        ],
+    },
+    {
+        "id": "printf_format_string",
+        # printf called with a single bare identifier as the format -> attacker
+        # controls the format string. High-precision: printf(buf) not printf("...", buf).
+        "regex": re.compile(r"\bprintf\s*\(\s*[A-Za-z_]\w*\s*\)"),
+        "cwe": "CWE-134",  # uncontrolled format string
+        "why": "printf() called with a non-literal format string lets input control conversions (%n, %s).",
+        "recs": [
+            'Use a literal format string: printf("%s", buf) instead of printf(buf).',
+            "Never pass attacker-influenced data as the format argument of a *printf function."
         ],
     },
 ]
@@ -97,6 +179,19 @@ def score_to_confidence(score: float, has_pattern: bool):
         idx += 1
 
     return {"level": CONF_LEVELS[idx], "score": float(score)}
+
+
+def cwe_for_patterns(matched_ids):
+    """Return the most relevant CWE id for a set of matched pattern ids.
+
+    Patterns are scanned in PATTERNS (priority) order, so the first / most
+    specific matched pattern's CWE wins. Returns "" when nothing maps.
+    """
+    matched = set(matched_ids or ())
+    for pat in PATTERNS:
+        if pat["id"] in matched and pat.get("cwe"):
+            return pat["cwe"]
+    return ""
 
 
 def explain_snippet(snippet: str):
@@ -234,6 +329,7 @@ def main():
             "end_line": f.get("end_line"),
             "score": score,
             "confidence": conf,
+            "cwe": cwe_for_patterns(matched_ids),
             "matched_patterns": sorted(matched_ids),
             "explanations": expl,
             "snippet": snippet_lines,

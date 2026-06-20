@@ -92,6 +92,6 @@ def test_dispatch_auto_agrees_with_brace_on_fixture_shape():
 
 
 def test_dispatch_treesitter_mode_raises_when_unavailable(monkeypatch):
-    monkeypatch.setattr("local_vuln_scanner.treesitter_available", lambda: False)
-    with pytest.raises(RuntimeError, match="tree-sitter is not installed"):
+    monkeypatch.setattr("local_vuln_scanner.treesitter_available", lambda *a, **k: False)
+    with pytest.raises(RuntimeError, match="not installed"):
         extract_functions("int f(void){return 0;}", parser="treesitter")
