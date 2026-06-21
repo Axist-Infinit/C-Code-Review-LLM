@@ -44,8 +44,16 @@ def record_from_entry(entry):
     return {"code": code, "analysis": analysis}
 
 
-def build_records(entries, only_vulnerable=False, min_score=None):
-    """Build SFT records from explainer entries, applying optional filters."""
+def build_records(entries, only_vulnerable=False, min_score=None,
+                  corroboration=None, min_corroboration=0):
+    """Build SFT records from explainer entries, applying optional filters.
+
+    When `corroboration` (from load_corroboration) is supplied, each kept record
+    is annotated with how many independent static tools (cppcheck/flawfinder/
+    clang-tidy) flagged a line inside the finding's range, and `min_corroboration`
+    drops findings below that bar — yielding high-precision positives where the
+    ML classifier and static analyzers agree.
+    """
     records = []
     for e in entries:
         if only_vulnerable and e.get("is_vulnerable") is False:
@@ -54,10 +62,60 @@ def build_records(entries, only_vulnerable=False, min_score=None):
             score = e.get("score")
             if not isinstance(score, (int, float)) or score < min_score:
                 continue
+        n_corrob, tools = count_corroboration(e, corroboration)
+        if min_corroboration > 0 and n_corrob < min_corroboration:
+            continue
         rec = record_from_entry(e)
-        if rec is not None:
-            records.append(rec)
+        if rec is None:
+            continue
+        if corroboration is not None:
+            # Informational metadata for curation; the trainer reads only
+            # code/analysis, so this never pollutes the training target.
+            rec["corroboration"] = n_corrob
+            rec["corroborated_by"] = tools
+        records.append(rec)
     return records
+
+
+def load_corroboration(path):
+    """Index an ensemble_scan output by file -> [(line, tool), ...] for the
+    independent static tools (everything except the ML classifier itself)."""
+    data = json.load(open(path, "r", encoding="utf-8"))
+    by_file = {}
+    for f in data.get("findings", []):
+        tool = f.get("tool")
+        line = f.get("start_line")
+        if not tool or tool == "ml-classifier" or line is None:
+            continue
+        try:
+            line = int(line)
+        except (TypeError, ValueError):
+            continue
+        by_file.setdefault(f.get("file"), []).append((line, tool))
+    return by_file
+
+
+def count_corroboration(entry, corroboration):
+    """Count distinct static tools whose flagged line falls within the entry's
+    [start_line, end_line] range. Returns (count, sorted_tools).
+
+    Files are matched exactly first, then by basename (the ML scan and the
+    static tools may print paths differently for the same file).
+    """
+    if not corroboration:
+        return 0, []
+    path = entry.get("file")
+    start = entry.get("start_line")
+    end = entry.get("end_line") or start
+    if path is None or start is None:
+        return 0, []
+    candidates = corroboration.get(path)
+    if candidates is None:
+        base = os.path.basename(path)
+        candidates = [lt for k, v in corroboration.items()
+                      if os.path.basename(k) == base for lt in v]
+    tools = {tool for line, tool in candidates if start <= line <= end}
+    return len(tools), sorted(tools)
 
 
 def split_records(records, val_frac=0.1, seed=42):
@@ -101,14 +159,28 @@ def main():
                     help="Keep only entries judged vulnerable")
     ap.add_argument("--min-score", type=float, default=None,
                     help="Drop entries below this classifier score")
+    ap.add_argument("--ensemble", default=None,
+                    help="ensemble_scan output JSON to corroborate findings against")
+    ap.add_argument("--min-corroboration", type=int, default=0,
+                    help="Keep only findings flagged within range by >= N independent "
+                         "static tools (requires --ensemble)")
     args = ap.parse_args()
+
+    if args.min_corroboration > 0 and not args.ensemble:
+        ap.error("--min-corroboration requires --ensemble")
 
     entries = []
     for path in args.inputs:
         entries.extend(load_entries(path))
 
+    corroboration = load_corroboration(args.ensemble) if args.ensemble else None
     records = build_records(entries, only_vulnerable=args.only_vulnerable,
-                            min_score=args.min_score)
+                            min_score=args.min_score, corroboration=corroboration,
+                            min_corroboration=args.min_corroboration)
+    if corroboration is not None:
+        n_corrob = sum(1 for r in records if r.get("corroboration"))
+        print(f"[corroboration] {n_corrob}/{len(records)} kept records are "
+              f"corroborated by >=1 static tool")
     if not records:
         raise SystemExit("[ERR] no usable SFT records produced from inputs")
 

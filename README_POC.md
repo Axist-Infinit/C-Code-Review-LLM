@@ -93,7 +93,25 @@ The tuned (max-F1) threshold is precision-oriented. For triage scanning,
 `--threshold 0.5` trades precision for recall — sensible when the LLM
 explainer filters findings downstream. Note: BigVul-trained models key on
 real-world CVE-style functions; textbook toy snippets score low (the heuristic
-regex explainer and the cppcheck/flawfinder ensemble cover those).
+regex explainer and the cppcheck/flawfinder/clang-tidy ensemble cover those).
+
+### C++ held-out evaluation
+
+The classifier is trained on BigVul (overwhelmingly C). `benchmarks/cpp_eval.jsonl`
+is a curated, balanced set of 18 C++ methods (9 vulnerable / 9 clean across 9
+CWE categories) to measure how it actually generalizes to C++. Produce a
+per-category report with `./eval_cpp.sh` (writes `benchmarks/cpp_eval_metrics.json`),
+or directly:
+
+```bash
+python evaluate_model.py --model ./vuln-model \
+    --test benchmarks/cpp_eval.jsonl --group-by category \
+    --out benchmarks/cpp_eval_metrics.json
+```
+
+Every case is a single function that the cpp grammar extracts as one unit, so the
+scores reflect the same whole-function granularity the scanner uses. Weak
+per-category numbers are the signal to add C++ training data (see below).
 
 ## Training
 
@@ -130,6 +148,21 @@ python model/build_sft_dataset.py scan_out/llm_findings.json \
 python model/train_llm_sft.py --base ./llm-base \
     --train data/sft_train.jsonl --val data/sft_val.jsonl --out ./llm-explainer-lora
 ```
+
+**Corroboration-driven curation (highest-precision positives).** Run the
+ensemble, then keep only findings that the ML classifier *and* the independent
+static tools agree on — these make the cleanest training signal:
+
+```bash
+python ensemble_scan.py SRC --ml scan_out/llm_findings.json -o scan_out/ensemble.json
+python model/build_sft_dataset.py scan_out/llm_findings.json \
+    --ensemble scan_out/ensemble.json --min-corroboration 1 --only-vulnerable \
+    --out-dir data
+```
+
+A finding is corroborated when a cppcheck/flawfinder/clang-tidy diagnostic lands
+inside its line range; each kept record is tagged with `corroboration` (count)
+and `corroborated_by` (tools) for auditability.
 
 `train_llm_sft.py` uses **completion-only loss masking** (the prompt is masked
 out, so the model is trained only on the analysis it should produce, not on

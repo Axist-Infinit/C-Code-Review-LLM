@@ -12,6 +12,8 @@ from model.build_sft_dataset import (
     build_records,
     split_records,
     load_entries,
+    load_corroboration,
+    count_corroboration,
 )
 from model.train_llm_sft import (
     format_prompt,
@@ -83,6 +85,76 @@ def test_load_entries_accepts_both_shapes(tmp_path):
     p2.write_text(json.dumps({"findings": [_entry()]}))
     assert len(load_entries(str(p1))) == 1
     assert len(load_entries(str(p2))) == 1
+
+
+# --- corroboration from ensemble output -------------------------------------
+
+ENSEMBLE = {
+    "tools": {"clang-tidy": 2, "flawfinder": 1, "ml-classifier": 1},
+    "findings": [
+        {"tool": "clang-tidy", "file": "src/a.c", "start_line": 12, "rule": "x"},
+        {"tool": "flawfinder", "file": "src/a.c", "start_line": 13, "rule": "y"},
+        {"tool": "clang-tidy", "file": "src/a.c", "start_line": 99, "rule": "z"},
+        {"tool": "ml-classifier", "file": "src/a.c", "start_line": 12},  # must be ignored
+    ],
+}
+
+
+def test_load_corroboration_ignores_ml_classifier(tmp_path):
+    p = tmp_path / "ens.json"
+    p.write_text(json.dumps(ENSEMBLE))
+    corrob = load_corroboration(str(p))
+    lines_tools = corrob["src/a.c"]
+    assert (12, "clang-tidy") in lines_tools
+    assert (13, "flawfinder") in lines_tools
+    assert all(tool != "ml-classifier" for _ln, tool in lines_tools)
+
+
+def test_count_corroboration_within_range_counts_distinct_tools():
+    corrob = {"src/a.c": [(12, "clang-tidy"), (13, "flawfinder"), (99, "clang-tidy")]}
+    entry = {"file": "src/a.c", "start_line": 10, "end_line": 20}
+    n, tools = count_corroboration(entry, corrob)
+    assert n == 2                                  # clang-tidy + flawfinder in [10,20]
+    assert tools == ["clang-tidy", "flawfinder"]
+
+
+def test_count_corroboration_out_of_range_is_zero():
+    corrob = {"src/a.c": [(99, "clang-tidy")]}
+    entry = {"file": "src/a.c", "start_line": 10, "end_line": 20}
+    assert count_corroboration(entry, corrob) == (0, [])
+
+
+def test_count_corroboration_matches_by_basename():
+    corrob = {"/abs/build/a.c": [(15, "cppcheck")]}
+    entry = {"file": "src/a.c", "start_line": 10, "end_line": 20}  # different dir, same base
+    n, tools = count_corroboration(entry, corrob)
+    assert n == 1 and tools == ["cppcheck"]
+
+
+def test_count_corroboration_none_or_missing_fields():
+    assert count_corroboration({"file": "a.c", "start_line": 1}, None) == (0, [])
+    assert count_corroboration({"start_line": 1}, {"a.c": [(1, "t")]}) == (0, [])
+
+
+def test_build_records_min_corroboration_filters_and_annotates():
+    entries = [
+        {**_entry(), "file": "src/a.c", "start_line": 10, "end_line": 20},   # corroborated
+        {**_entry(), "file": "src/b.c", "start_line": 5, "end_line": 8},     # not corroborated
+    ]
+    corrob = {"src/a.c": [(12, "clang-tidy"), (13, "flawfinder")]}
+    kept = build_records(entries, corroboration=corrob, min_corroboration=2)
+    assert len(kept) == 1
+    assert kept[0]["corroboration"] == 2
+    assert kept[0]["corroborated_by"] == ["clang-tidy", "flawfinder"]
+
+
+def test_build_records_corroboration_annotates_even_at_zero_bar():
+    entries = [{**_entry(), "file": "src/b.c", "start_line": 5, "end_line": 8}]
+    kept = build_records(entries, corroboration={"src/a.c": [(1, "t")]},
+                         min_corroboration=0)
+    assert len(kept) == 1
+    assert kept[0]["corroboration"] == 0
+    assert kept[0]["corroborated_by"] == []
 
 
 # --- trainer pure helpers ---------------------------------------------------
