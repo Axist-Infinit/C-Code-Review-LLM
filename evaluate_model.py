@@ -46,11 +46,36 @@ def metrics_at(scores, labels, thr):
                 tp=tp, fp=fp, fn=fn, tn=tn)
 
 
+def group_metrics(scores, labels, groups, thr):
+    """Per-group confusion metrics at a threshold.
+
+    scores/labels/groups are parallel lists; `groups[i]` is the bucket key for
+    sample i (e.g. its vulnerability category or language). Returns an ordered
+    dict {group: metrics_at(...)} with a per-group sample count `n`. Pure /
+    torch-free so the per-category breakdown is unit-testable.
+    """
+    buckets = {}
+    for s, y, g in zip(scores, labels, groups):
+        sc, lb = buckets.setdefault(g, ([], []))
+        sc.append(s)
+        lb.append(y)
+    out = {}
+    for g in sorted(buckets, key=str):
+        sc, lb = buckets[g]
+        m = metrics_at(sc, lb, thr)
+        m["n"] = len(sc)
+        out[g] = m
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="vuln-model")
     ap.add_argument("--test", default="data/test.jsonl")
     ap.add_argument("--out", default=None, help="Optional: write metrics JSON here")
+    ap.add_argument("--group-by", default=None,
+                    help="Row field to break metrics down by (e.g. category, lang). "
+                         "Useful with benchmarks/cpp_eval.jsonl to see C++ per-CWE results.")
     add_profile_arg(ap)
     args = ap.parse_args()
 
@@ -101,6 +126,15 @@ def main():
         sweep.append(m)
         print(f"  {t:.1f}   {m['precision']:.3f}  {m['recall']:.3f}  {m['f1']:.3f}")
     result["sweep"] = sweep
+
+    if args.group_by:
+        groups = [str(r.get(args.group_by, "?")) for r in rows]
+        grouped = group_metrics(scores, labels, groups, thr)
+        result["by_" + args.group_by] = grouped
+        print(f"\nBreakdown by {args.group_by} (at threshold {thr:.2f}):")
+        print(f"  {'group':<20} n   prec   rec    f1")
+        for g, m in grouped.items():
+            print(f"  {g:<20} {m['n']:<3} {m['precision']:.3f}  {m['recall']:.3f}  {m['f1']:.3f}")
 
     if args.out:
         with open(args.out, "w", encoding="utf-8") as f:

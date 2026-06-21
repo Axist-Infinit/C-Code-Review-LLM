@@ -65,11 +65,16 @@ The trained classifier moves between machines via `pack_model.sh` / `unpack_mode
   `const_cast` (CWE-704), and non-literal `printf` format strings (CWE-134).
 - `evaluate_model.py --model ./vuln-model --test data/test.jsonl` — held-out
   P/R/F1/AUC + threshold sweep. Run this after training; ROC-AUC < 0.6 means
-  the model has no signal.
+  the model has no signal. Add `--group-by category` (or `lang`) for a per-bucket
+  breakdown — e.g. against `benchmarks/cpp_eval.jsonl` to measure how the
+  C-trained classifier actually scores C++ per vulnerability class:
+  `python evaluate_model.py --model ./vuln-model --test benchmarks/cpp_eval.jsonl --group-by category`.
 - `to_sarif.py FINDINGS -o out.sarif` — SARIF 2.1.0 for CI / GitHub code scanning.
 - `ensemble_scan.py SRC --ml FINDINGS -o out.json` — merge with cppcheck /
-  flawfinder results (skipped gracefully if not installed); marks findings
-  corroborated by multiple tools.
+  flawfinder / **clang-tidy** results (each skipped gracefully if not installed);
+  marks findings corroborated by multiple tools. clang-tidy is the AST-aware C++
+  companion (`bugprone-*`/`cert-*` + the security analyzer); tune with
+  `--clang-tidy-checks` or disable with `--no-clang-tidy`.
 - `smoke_test.sh` — end-to-end pipeline test.
 
 ## Benchmark (BigVul held-out test, 32,710 functions, 3.1% vulnerable)

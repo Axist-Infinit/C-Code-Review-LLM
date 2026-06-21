@@ -5,7 +5,7 @@ module here does not require torch.
 """
 import math
 
-from evaluate_model import metrics_at
+from evaluate_model import metrics_at, group_metrics
 
 
 def test_perfect_separation():
@@ -66,3 +66,29 @@ def test_empty_inputs_do_not_divide_by_zero():
     assert m["f1"] == 0.0
     assert m["accuracy"] == 0.0
     assert m["tp"] == m["fp"] == m["fn"] == m["tn"] == 0
+
+
+def test_group_metrics_splits_by_key():
+    #            score label group
+    scores = [0.9, 0.1, 0.8, 0.2]
+    labels = [1,   0,   1,   1]
+    groups = ["bof", "bof", "fmt", "fmt"]
+    g = group_metrics(scores, labels, groups, 0.5)
+    assert set(g) == {"bof", "fmt"}
+    # bof: perfect separation
+    assert g["bof"]["n"] == 2
+    assert g["bof"]["tp"] == 1 and g["bof"]["tn"] == 1
+    assert g["bof"]["f1"] == 1.0
+    # fmt: one caught (0.8>=0.5, label 1), one missed (0.2<0.5, label 1) -> recall .5
+    assert g["fmt"]["n"] == 2
+    assert g["fmt"]["tp"] == 1 and g["fmt"]["fn"] == 1
+    assert g["fmt"]["recall"] == 0.5
+
+
+def test_group_metrics_keys_are_sorted():
+    g = group_metrics([0.9, 0.9, 0.9], [1, 1, 1], ["z", "a", "m"], 0.5)
+    assert list(g.keys()) == ["a", "m", "z"]
+
+
+def test_group_metrics_empty():
+    assert group_metrics([], [], [], 0.5) == {}
