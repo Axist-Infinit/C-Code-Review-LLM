@@ -108,11 +108,24 @@ steps:
 ```
 
 Inputs: `source` (path), `output` (SARIF path), `lang` (`auto|c|cpp`),
-`only-vulnerable`. For full ML-classifier results in CI, run `local_vuln_scanner.py`
-with a provisioned `vuln-model` instead of `heuristic_scan.py` (heavier: needs
-torch + the model artifact). This open-core split — free heuristic Action for
-adoption, the ML classifier + LLM explanations for depth — is the intended entry
-point for teams.
+`only-vulnerable`, plus `annotate` / `github-token` (below). For full
+ML-classifier results in CI, run `local_vuln_scanner.py` with a provisioned
+`vuln-model` instead of `heuristic_scan.py` (heavier: needs torch + the model
+artifact).
+
+### Inline PR review comments
+
+Set `annotate: "true"` (and pass `github-token: ${{ github.token }}` with
+`pull-requests: write`) to also post findings as **inline review comments** on
+pull requests — pinned to the exact line, with severity, CWE, and fix. Findings
+on lines outside the PR diff are rolled into the review summary. On non-PR (push)
+builds the step skips quietly. This is `annotate_pr.py`, which also runs
+standalone:
+
+```bash
+python annotate_pr.py scan_out/llm_findings.json --repo OWNER/REPO --pr 123
+python annotate_pr.py scan_out/llm_findings.json --dry-run   # preview, no API call
+```
 
 ## Benchmark (BigVul held-out test, 32,710 functions, 3.1% vulnerable)
 

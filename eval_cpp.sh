@@ -13,9 +13,11 @@ source "$VENV/bin/activate"
 MODEL="${MODEL:-./vuln-model}"
 TEST="${TEST:-benchmarks/cpp_eval.jsonl}"
 OUT="${OUT:-benchmarks/cpp_eval_metrics.json}"
+SCORES="${SCORES:-benchmarks/cpp_eval_scores.jsonl}"
 PROFILE_ARG=""
 [[ -n "${CCR_PROFILE:-}" ]] && PROFILE_ARG="--profile $CCR_PROFILE"
 
 python ./evaluate_model.py --model "$MODEL" --test "$TEST" \
-  --group-by category --out "$OUT" $PROFILE_ARG
-echo "[OK] C++ eval metrics -> $OUT"
+  --group-by category --save-scores "$SCORES" --out "$OUT" $PROFILE_ARG
+echo "[OK] C++ eval metrics  -> $OUT"
+echo "[OK] per-sample scores -> $SCORES"

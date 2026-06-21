@@ -76,6 +76,9 @@ def main():
     ap.add_argument("--group-by", default=None,
                     help="Row field to break metrics down by (e.g. category, lang). "
                          "Useful with benchmarks/cpp_eval.jsonl to see C++ per-CWE results.")
+    ap.add_argument("--save-scores", default=None,
+                    help="Write per-sample JSONL {name,category,cwe,label,score,pred} "
+                         "for diagnosing exactly which cases the model misses.")
     add_profile_arg(ap)
     args = ap.parse_args()
 
@@ -96,6 +99,15 @@ def main():
         print("[WARN] Test set is single-class; precision/recall are not meaningful.")
 
     scores = score_dataset(tok, model, dev, rows, prof["classifier_batch_size"])
+
+    if args.save_scores:
+        with open(args.save_scores, "w", encoding="utf-8") as fh:
+            for r, s in zip(rows, scores):
+                rec = {k: r[k] for k in ("name", "category", "cwe", "lang") if k in r}
+                rec.update({"label": int(r["label"]), "score": float(s),
+                            "pred": int(s >= thr)})
+                fh.write(json.dumps(rec) + "\n")
+        print(f"[OK] per-sample scores -> {args.save_scores}")
 
     result = {"n": len(rows), "n_pos": n_pos, "n_neg": n_neg,
               "tuned": metrics_at(scores, labels, thr)}
