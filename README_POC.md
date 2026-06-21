@@ -58,6 +58,10 @@ The trained classifier moves between machines via `pack_model.sh` / `unpack_mode
   profile's `max_workers`; pair with `OLLAMA_NUM_PARALLEL` on the server). Auto-
   falls back to the heuristic regex explainer when Ollama is down, and per-finding
   on any single failed call (`--backend heuristic` to force).
+- `heuristic_scan.py SRC -o OUT` — **model-free** scan: extracts functions with
+  tree-sitter (C/C++) and flags any whose body matches the unsafe-API/CWE pattern
+  set, emitting the same `classifier_findings.json` schema. No model, torch, or
+  Ollama — this is the zero-setup path used by the GitHub Action (see below).
 - `explain_findings.py` — pure-regex heuristic explainer (no LLM needed). Each
   pattern carries a CWE id, so heuristic findings get real SARIF rule ids. Covers
   classic C footguns (gets/strcpy/strcat/sprintf/scanf/memcpy/memmove/alloca) and
@@ -76,6 +80,39 @@ The trained classifier moves between machines via `pack_model.sh` / `unpack_mode
   companion (`bugprone-*`/`cert-*` + the security analyzer); tune with
   `--clang-tidy-checks` or disable with `--no-clang-tidy`.
 - `smoke_test.sh` — end-to-end pipeline test.
+
+## CI integration (GitHub Action)
+
+A composite action (`action.yml`) runs the **model-free** path —
+`heuristic_scan.py → llm_explain.py --backend heuristic → to_sarif.py` — and
+emits SARIF for the repository's **Code scanning** tab. No model, GPU, or network
+is required, so it runs on any stock GitHub runner with zero setup.
+
+```yaml
+# .github/workflows/code-scan.yml  (template in ci/code-scan.yml)
+permissions:
+  contents: read
+  security-events: write
+steps:
+  - uses: actions/checkout@v4
+  - uses: actions/setup-python@v5
+    with: { python-version: "3.12" }
+  - id: scan
+    uses: axist-infinit/c-code-review-llm@main
+    with:
+      source: "."
+      only-vulnerable: "true"
+  - uses: github/codeql-action/upload-sarif@v3
+    with:
+      sarif_file: ${{ steps.scan.outputs.sarif-file }}
+```
+
+Inputs: `source` (path), `output` (SARIF path), `lang` (`auto|c|cpp`),
+`only-vulnerable`. For full ML-classifier results in CI, run `local_vuln_scanner.py`
+with a provisioned `vuln-model` instead of `heuristic_scan.py` (heavier: needs
+torch + the model artifact). This open-core split — free heuristic Action for
+adoption, the ML classifier + LLM explanations for depth — is the intended entry
+point for teams.
 
 ## Benchmark (BigVul held-out test, 32,710 functions, 3.1% vulnerable)
 
