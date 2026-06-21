@@ -14,6 +14,8 @@ def parse_args():
     ap.add_argument("--out", required=True)
     ap.add_argument("--epochs", type=int, default=5)
     ap.add_argument("--batch", type=int, default=16)
+    ap.add_argument("--max-length", type=int, default=512,
+                    help="Tokenizer truncation length (lower = faster, esp. on CPU)")
     ap.add_argument("--lr", type=float, default=5e-5)
     ap.add_argument("--weight_decay", type=float, default=0.0)
     ap.add_argument("--seed", type=int, default=42)
@@ -122,7 +124,7 @@ def main():
 
     tok = AutoTokenizer.from_pretrained(args.base)
     ds = load_dataset("json", data_files={"train":args.train,"validation":args.val,"test":args.test})
-    def tok_fn(ex): return tok(ex["code"], truncation=True, max_length=512)
+    def tok_fn(ex): return tok(ex["code"], truncation=True, max_length=args.max_length)
     ds = ds.map(tok_fn, batched=True).rename_column("label","labels").with_format(
         "torch", columns=["input_ids","attention_mask","labels"]
     )
