@@ -31,7 +31,12 @@ COMPLETION_HEADER = "\n\n### Security Analysis:\n"
 
 # Fields of the structured analysis, mirroring llm_explain's output schema so a
 # fine-tuned model emits exactly what the pipeline already consumes.
-ANALYSIS_FIELDS = ("is_vulnerable", "issue", "cwe", "severity", "explanation", "fix")
+# Keep in sync with model/build_sft_dataset.py ANALYSIS_FIELDS (a test asserts it).
+# Reason-then-judge order: dict order == JSON emission order (py3.7+), so the model
+# is trained to DESCRIBE (what/risk/vuln) before it CONCLUDES (verdict/cwe/fix).
+ANALYSIS_FIELDS = ("what_code_does", "what_could_go_wrong", "vulnerability",
+                   "is_vulnerable", "issue", "cwe", "severity",
+                   "explanation", "fix")
 
 
 def format_prompt(code):
@@ -75,6 +80,17 @@ def validate_records(records):
         completion = format_completion(r["analysis"]).strip()
         if not completion or completion in ("{}", "null"):
             raise ValueError(f"record {i}: 'analysis' is empty")
+        # With the 9-field schema an all-empty analysis serializes to a non-empty
+        # JSON object full of nulls (e.g. {"what_code_does": null, ...}), which the
+        # checks above do NOT catch. Reject records whose analysis has no usable
+        # text content (booleans alone are not a learnable target).
+        if isinstance(r["analysis"], dict):
+            has_content = any(
+                v is not None and not isinstance(v, bool) and str(v).strip()
+                for v in r["analysis"].values()
+            )
+            if not has_content:
+                raise ValueError(f"record {i}: 'analysis' has no usable content")
     return len(records)
 
 

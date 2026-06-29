@@ -129,6 +129,11 @@ def load_ml(path):
             "rule": e.get("cwe", ""), "severity": e.get("severity", ""),
             "issue": e.get("issue", "") or "Flagged by vulnerability classifier",
             "score": e.get("score"),
+            # Carry the structured narrative so the merged file stays usable by
+            # to_sarif.py / annotate_pr.py (defaults to "" for classifier-only input).
+            "what_code_does": e.get("what_code_does", ""),
+            "what_could_go_wrong": e.get("what_could_go_wrong", ""),
+            "vulnerability": e.get("vulnerability", ""),
         })
     return out
 

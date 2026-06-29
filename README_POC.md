@@ -53,11 +53,24 @@ The trained classifier moves between machines via `pack_model.sh` / `unpack_mode
   Threshold comes from the model's `inference.json` (tuned at train time);
   override with `--threshold`.
 - `llm_explain.py FINDINGS --out OUT.json [--html report.html]` — per-finding
-  LLM analysis (issue, CWE, severity, fix, own vulnerability judgment) via local
-  Ollama. Findings are explained **in parallel** (`--workers`, default from the
-  profile's `max_workers`; pair with `OLLAMA_NUM_PARALLEL` on the server). Auto-
-  falls back to the heuristic regex explainer when Ollama is down, and per-finding
-  on any single failed call (`--backend heuristic` to force).
+  LLM analysis via local Ollama. Each finding is reported in a structured
+  **3-part review format** so a human can act on it without reading the model's
+  raw reasoning:
+  - **What the code is doing** (`what_code_does`) — the relevant operation,
+  - **What could go wrong** (`what_could_go_wrong`) — the failure mode, how it is
+    triggered, and the impact,
+  - **Vulnerability** (`vulnerability`) — the identified vulnerability class/name,
+
+  alongside `is_vulnerable`, `issue`, `cwe`, `severity`, and a concrete `fix`.
+  These fields render in the HTML report, the SARIF message, and inline PR
+  comments. The reviewer prompt explicitly walks a security checklist (bounds,
+  integer overflow, use-after-free/double-free, injection, format strings, weak
+  crypto/PRNG, TOCTOU) and traces taint to the sink before flagging, to cut false
+  positives. If the model omits the structured fields they are backfilled from the
+  regex heuristic. Findings are explained **in parallel** (`--workers`, default
+  from the profile's `max_workers`; pair with `OLLAMA_NUM_PARALLEL` on the
+  server). Auto-falls back to the heuristic regex explainer when Ollama is down,
+  and per-finding on any single failed call (`--backend heuristic` to force).
 - `heuristic_scan.py SRC -o OUT` — **model-free** scan: extracts functions with
   tree-sitter (C/C++) and flags any whose body matches the unsafe-API/CWE pattern
   set, emitting the same `classifier_findings.json` schema. No model, torch, or

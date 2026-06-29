@@ -19,7 +19,11 @@ import os
 import random
 
 # The analysis fields we carry into training, mirroring llm_explain's schema.
-ANALYSIS_FIELDS = ("is_vulnerable", "issue", "cwe", "severity", "explanation", "fix")
+# Keep in sync with model/train_llm_sft.py ANALYSIS_FIELDS (a test asserts it).
+# Reason-then-judge order (describe before concluding) — see train_llm_sft.py.
+ANALYSIS_FIELDS = ("what_code_does", "what_could_go_wrong", "vulnerability",
+                   "is_vulnerable", "issue", "cwe", "severity",
+                   "explanation", "fix")
 
 
 def _snippet_text(entry):
@@ -39,7 +43,8 @@ def record_from_entry(entry):
     if not code:
         return None
     analysis = {k: entry.get(k) for k in ANALYSIS_FIELDS}
-    if not any(str(analysis.get(k) or "").strip() for k in ("issue", "explanation", "cwe")):
+    meaningful = ("issue", "explanation", "cwe", "vulnerability", "what_could_go_wrong")
+    if not any(str(analysis.get(k) or "").strip() for k in meaningful):
         return None  # nothing meaningful for the model to learn
     return {"code": code, "analysis": analysis}
 

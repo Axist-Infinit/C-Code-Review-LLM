@@ -42,11 +42,29 @@ def finding_body(entry):
     sev = str(entry.get("severity", "")).lower()
     emoji = SEVERITY_EMOJI.get(sev, "⚪")
     cwe = entry.get("cwe") or ""
-    title = entry.get("issue") or "Potential vulnerability"
+    title = entry.get("issue") or entry.get("vulnerability") or "Potential vulnerability"
     head = f"{emoji} **{title}**" + (f" ({cwe})" if cwe else "")
     parts = [head]
-    if entry.get("explanation"):
+
+    # Preferred: the structured 3-part narrative. Fall back to the flat
+    # explanation when those fields are absent (older findings files).
+    structured = False
+    for label, key in (("What the code is doing", "what_code_does"),
+                       ("What could go wrong", "what_could_go_wrong"),
+                       ("Vulnerability", "vulnerability")):
+        val = str(entry.get(key, "") or "").strip()
+        if val:
+            parts.append(f"**{label}:** {val}")
+            structured = True
+    if not structured and entry.get("explanation"):
         parts.append(str(entry["explanation"]))
+
+    # Always surface the corroboration cross-check note (a trust signal), even
+    # when the structured narrative replaced the flat explanation.
+    cross = str(entry.get("cross_check", "") or "").strip()
+    if cross and cross not in "\n\n".join(parts):
+        parts.append(cross)
+
     if entry.get("fix"):
         parts.append(f"**Fix:** {entry['fix']}")
     parts.append(SIGNATURE)

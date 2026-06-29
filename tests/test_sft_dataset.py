@@ -168,9 +168,42 @@ def test_format_prompt_and_completion_roundtrip():
     assert parsed["cwe"] == "CWE-1" and parsed["is_vulnerable"] is True
 
 
+def test_analysis_fields_in_sync_and_have_new_format():
+    # The builder and trainer must agree on the schema exactly (no drift).
+    from model.build_sft_dataset import ANALYSIS_FIELDS as BUILD_FIELDS
+    from model.train_llm_sft import ANALYSIS_FIELDS as TRAIN_FIELDS
+    assert BUILD_FIELDS == TRAIN_FIELDS
+    for f in ("what_code_does", "what_could_go_wrong", "vulnerability"):
+        assert f in TRAIN_FIELDS
+    # reason-then-judge: the narrative fields precede the boolean verdict
+    assert TRAIN_FIELDS.index("what_code_does") < TRAIN_FIELDS.index("is_vulnerable")
+
+
 def test_validate_records_happy_path():
     recs = [{"code": "int x;", "analysis": {"issue": "i", "explanation": "e"}}]
     assert validate_records(recs) == 1
+
+
+def test_validate_records_rejects_all_null_nine_field_analysis():
+    # An analysis with every field null/empty serializes to a non-empty JSON of
+    # nulls; it must still be rejected as having nothing to learn.
+    null_analysis = {k: None for k in
+                     ("what_code_does", "what_could_go_wrong", "vulnerability",
+                      "is_vulnerable", "issue", "cwe", "severity", "explanation", "fix")}
+    with pytest.raises(ValueError, match="no usable content"):
+        validate_records([{"code": "int x;", "analysis": null_analysis}])
+
+
+def test_validate_records_rejects_bool_only_analysis():
+    # is_vulnerable alone (no text) is not a learnable target.
+    with pytest.raises(ValueError, match="no usable content"):
+        validate_records([{"code": "int x;", "analysis": {"is_vulnerable": True}}])
+
+
+def test_validate_records_keeps_record_with_only_new_fields():
+    rec = [{"code": "gets(b);", "analysis": {"what_could_go_wrong": "overflow",
+                                             "vulnerability": "Stack buffer overflow"}}]
+    assert validate_records(rec) == 1
 
 
 @pytest.mark.parametrize("bad,msg", [

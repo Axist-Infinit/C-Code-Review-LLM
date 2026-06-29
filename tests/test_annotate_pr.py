@@ -48,6 +48,19 @@ def test_finding_body_has_severity_cwe_and_fix():
     assert "C-Code-Review-LLM" in body
 
 
+def test_finding_body_renders_structured_narrative():
+    body = finding_body({"severity": "critical", "cwe": "CWE-242",
+                         "issue": "Stack buffer overflow",
+                         "what_code_does": "reads input with gets()",
+                         "what_could_go_wrong": "input longer than the buffer overflows it",
+                         "vulnerability": "Stack buffer overflow",
+                         "fix": "use fgets()"})
+    assert "**What the code is doing:** reads input with gets()" in body
+    assert "**What could go wrong:** input longer than the buffer overflows it" in body
+    assert "**Vulnerability:** Stack buffer overflow" in body
+    assert "**Fix:** use fgets()" in body
+
+
 def test_match_file_exact_and_basename():
     addr = {"src/a.c": {3, 4}}
     key, lines = match_file("src/a.c", addr)
