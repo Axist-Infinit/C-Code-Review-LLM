@@ -104,6 +104,74 @@ def test_kb_notes_block_empty_when_no_match():
 
 # --- pool_samples ----------------------------------------------------------
 
+def test_number_lines_prefixes_each_line():
+    assert sr.number_lines("a();\nb();") == "   1| a();\n   2| b();"
+
+
+def test_render_walkthrough_and_per_finding_code():
+    rv = {"subsystem": "X",
+          "what_the_code_does": [
+              {"file": "snip.c", "lines": "1-2", "code": "char d[8];\nstrcpy(d, s);",
+               "explanation": "declares an 8-byte buffer then copies into it."}],
+          "what_could_go_wrong": [
+              {"file": "snip.c", "lines": "2", "code": "strcpy(d, s);",
+               "explanation": "an over-long s overflows d."}],
+          "reviewed_anchors": [],
+          "findings": [{"title": "T", "anchor": "strcpy", "file": "snip.c", "line": "2",
+                        "code": "strcpy(d, s);", "cwe": "CWE-120", "severity": "high",
+                        "failure_mode": "overflow"}]}
+    md = sr.render_markdown(rv, ["snip.c"])
+    assert "## What is this code doing?" in md and "**snip.c:1-2**" in md  # file-attributed
+    assert "declares an 8-byte buffer" in md
+    assert "## What could go wrong?" in md and "an over-long s overflows d" in md
+    assert "snip.c:2" in md                          # per-finding location citation
+    assert "```c\nstrcpy(d, s);\n```" in md          # quoted code snippet
+
+
+def test_canonicalize_cwes_fixes_direction_without_merging():
+    findings = [
+        {"title": "append underflow", "anchor": "dhcp_option_append", "cwe": "CWE-190",
+         "failure_mode": "size - offset underflows", "cve_analog": ""},
+        {"title": "uaf", "anchor": "DHCP_CLIENT_DONT_DESTROY", "cwe": "CWE-401",
+         "failure_mode": "freed during callback"},
+    ]
+    out = sr.canonicalize_cwes(findings)
+    assert len(out) == 2                       # no merging
+    assert out[0]["cwe"] == "CWE-787" and out[0]["cve_analog"] == "CVE-2018-15688"
+    assert out[1]["cwe"] == "CWE-416"
+
+
+def test_overload_param_in_append_signature_is_not_mis_bucketed():
+    # The dhcp_option_append signature contains a `uint8_t overload` parameter;
+    # it must canonicalise to the append-overflow CWE (787), not overload (674).
+    append = {"title": "Buffer Overflow in dhcp_option_append",
+              "anchor": "int dhcp_option_append(DHCPMessage *m, size_t size, size_t *offset, "
+                        "uint8_t overload, uint8_t code, size_t optlen, const void *optval)",
+              "bug_class": "Heap buffer overflow (unsigned underflow)", "cwe": "CWE-190",
+              "failure_mode": "optlen exceeds remaining buffer space"}
+    overload = {"title": "Overload re-parse", "anchor": "enum { DHCP_OVERLOAD_FILE = 1 }",
+                "bug_class": "recursion", "cwe": "CWE-674", "failure_mode": "sname re-parsed twice"}
+    out = sr.canonicalize_cwes([append, overload])
+    assert out[0]["cwe"] == "CWE-787"          # append, not 674
+    assert out[1]["cwe"] == "CWE-674"          # genuine overload still 674
+
+
+def test_render_walkthrough_tolerates_plain_string():
+    md = sr.render_markdown({"what_the_code_does": "a plain paragraph.",
+                             "reviewed_anchors": [], "findings": []}, ["x"])
+    assert "a plain paragraph." in md
+
+
+def test_pool_samples_carries_narratives():
+    walkthrough = [{"lines": "3", "code": "x();", "explanation": "does X"}]
+    s = {"subsystem": "DHCP", "what_the_code_does": walkthrough,
+         "what_could_go_wrong": [{"lines": "5", "code": "y();", "explanation": "risk"}],
+         "reviewed_anchors": [], "findings": [], "audit_checklist": []}
+    pooled, _ = sr.pool_samples([("m#1", s)])
+    assert pooled["what_the_code_does"] == walkthrough
+    assert pooled["what_could_go_wrong"][0]["lines"] == "5"
+
+
 def test_pool_samples_dedups_findings_and_reports_max_single():
     s1 = {"subsystem": "DHCP", "reviewed_anchors": [
               {"anchor": "options[0]", "disposition": "finding"}],

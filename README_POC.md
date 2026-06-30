@@ -105,6 +105,15 @@ every field / macro / signature, and emit a ranked multi-finding threat model
 (JSON + Markdown), reviewing all input files **together** so cross-file contracts
 are visible.
 
+Every review answers two questions as **thorough, line-numbered walkthroughs** —
+**"What is this code doing?"** and **"What could go wrong?"** — each an ordered
+sequence of `file:line` → code snippet → detailed explanation. Source is fed to
+the model with line-number prefixes so citations are grounded (the verbatim code
+snippet is the exact anchor; line numbers reset per file, so every citation is
+file-qualified). Every finding likewise carries `file`, `line`, and a verbatim
+`code` snippet, and CWEs are canonicalised deterministically (so an unsigned
+underflow can't ship as CWE-190 instead of CWE-787).
+
 ```bash
 # Single-model, two-pass (enumerate -> completeness critic), offline retrieval hints on
 python surface_review.py playground/dhcp-internal.h playground/dhcp-protocol.h \

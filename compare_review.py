@@ -20,6 +20,7 @@ import argparse
 import json
 import os
 import sys
+import urllib.error
 
 import surface_review as sr
 from local_vuln_scanner import list_sources
@@ -29,7 +30,7 @@ CLAUDE_MODEL = "claude-opus-4-8"  # see the claude-api reference for current IDs
 
 
 def context_from_code(code, label="snippet"):
-    body = f"/* ===== {label} ===== */\n{code}"
+    body = f"/* ===== {label} ===== */\n{sr.number_lines(code)}"
     return (f"Files under review: {label}\n\n"
             f"{sr.SNIPPET_BEGIN}\n{body}\n{sr.SNIPPET_END}")
 
@@ -44,11 +45,21 @@ def _strip_fences(text):
 
 
 def local_review(context, extra_system, url, model, num_ctx):
-    """The local model's review: enumerate-first pass + completeness critic."""
+    """The local model's review: enumerate-first pass + completeness critic.
+
+    Mirrors surface_review's pipeline so the comparison's local side is the same
+    product the standalone tool produces: a thorough walkthrough, then a critic
+    pass (degrading gracefully to pass-1 if it fails/truncates), then deterministic
+    CWE canonicalization.
+    """
     review = sr.ollama_review(url, model, context, num_ctx, extra_system)
-    critiqued = sr.ollama_critique(url, model, context, review, num_ctx, extra_system)
-    if len(critiqued.get("findings", [])) >= len(review.get("findings", [])):
-        review = critiqued
+    try:
+        critiqued = sr.ollama_critique(url, model, context, review, num_ctx, extra_system)
+        if len(critiqued.get("findings", [])) >= len(review.get("findings", [])):
+            review = critiqued
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError):
+        pass  # keep the complete pass-1 walkthrough
+    review["findings"] = sr.canonicalize_cwes(review.get("findings", []))
     return review
 
 

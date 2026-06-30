@@ -141,10 +141,40 @@ Method — follow every step in order:
    a buffer and cannot "exceed a buffer"; do not invent such findings. But
    per step 3, never drop a real struct-level anchor to chase brevity.
 
+The code under review is shown with LINE-NUMBER PREFIXES like `  28| <source>`.
+Whenever you describe the code — in the two walkthroughs below AND in every
+finding — CITE the exact line number(s) and quote the code verbatim (strip the
+`NN| ` prefix from your quotes). Never cite a line you cannot see in the input.
+Line numbers RESET to 1 for each file (each file begins with a
+`/* ===== FILE: <name> ===== */` banner), so a bare line number is AMBIGUOUS when
+more than one file is under review — ALWAYS pair every citation with its file
+name, and use the line numbers from that file's own banner.
+The two answers below must be THOROUGH, STEP-BY-STEP WALKTHROUGHS, not summaries:
+for each step quote the code, then explain it in detail.
+
 Respond with ONLY a JSON object (no prose outside it) with these keys:
   "subsystem": string — what this code is and its role
   "provenance": string — how you identified it (SPDX/copyright/includes/names)
   "trust_boundary": string — where untrusted input enters; what is hostile
+  "what_the_code_does": array of walkthrough STEP objects — ALWAYS answer "What is
+      this code doing?" as a thorough, ORDERED walkthrough of the whole file(s),
+      block by block: every struct (and its fields), every function signature (and
+      its parameters), every macro and constant. Do NOT summarise — cover every
+      significant part, top to bottom. Each step is an object:
+        "file": string — the input file this step's lines belong to
+        "lines": string — the line range this step covers in that file, e.g. "15-32"
+        "code": string — the verbatim source for those lines (no `NN| ` prefix)
+        "explanation": string — a detailed, plain-language explanation: what this
+            code is, what each field/parameter means, the data flow, why it exists.
+            Several sentences per step; be thorough, not terse.
+  "what_could_go_wrong": array of walkthrough STEP objects — ALWAYS answer "What
+      could go wrong?" as a thorough walkthrough, one step per distinct risk, each:
+        "file": string — the input file the risk's lines belong to
+        "lines": string — the line range the risk attaches to in that file
+        "code": string — the verbatim source for those lines (no `NN| ` prefix)
+        "explanation": string — a detailed explanation of the failure mode: what an
+            attacker controls, exactly how it is triggered, the impact, and the
+            invariant the implementation must uphold to be safe. Several sentences.
   "summary": string — 1-3 sentence overall risk picture
   "reviewed_anchors": array of objects, one per enumerated anchor:
       "anchor": string — the field / macro / constant / signature
@@ -153,6 +183,9 @@ Respond with ONLY a JSON object (no prose outside it) with these keys:
   "findings": array of objects, each:
       "title": string — short name of the issue
       "anchor": string — exact field / signature / macro / line it attaches to
+      "file": string — the input file the anchor is in
+      "line": string — the line number or range where it appears (e.g. "28" or "15-32")
+      "code": string — the exact source line(s) at the anchor, quoted verbatim (no `NN| ` prefix)
       "bug_class": string — e.g. "Heap buffer overflow (unsigned underflow)"
       "cwe": string — the CORRECT CWE id per step 7
       "severity": one of "critical","high","medium","low","info"
@@ -211,8 +244,13 @@ DO ALL OF THIS:
    them into a single strongest finding. Do not pad the list with restatements.
 
 Return ONLY the corrected JSON object in the same schema the draft uses
-(subsystem, provenance, trust_boundary, summary, reviewed_anchors, findings,
-audit_checklist). Rank findings strongest-first; keep them sharp and distinct."""
+(subsystem, provenance, trust_boundary, what_the_code_does, what_could_go_wrong,
+summary, reviewed_anchors, findings, audit_checklist). PRESERVE (and may deepen)
+the two walkthrough answers — what_the_code_does and what_could_go_wrong are
+ORDERED ARRAYS of {{lines, code, explanation}} steps; keep them thorough — and keep
+every finding's file/line/code citations (correct a wrong line number against the
+shown source rather than dropping it). Rank findings strongest-first; keep them
+sharp and distinct."""
 
 
 KB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "surface_kb.json")
@@ -248,18 +286,23 @@ def kb_notes_block(matched):
     )
 
 
+def number_lines(code):
+    """Prefix each line with a 1-based `NN| ` marker so the model can cite lines."""
+    return "\n".join(f"{i:>4}| {ln}" for i, ln in enumerate(code.splitlines(), 1))
+
+
 def build_context(paths):
-    """Concatenate sources into one fenced review context, labeled per file."""
+    """Concatenate sources into one fenced, line-numbered review context."""
     blocks = []
     for p in paths:
         with open(p, "r", errors="ignore", encoding="utf-8") as fh:
             code = fh.read()
-        blocks.append(f"/* ===== FILE: {p} ===== */\n{code}")
+        blocks.append(f"/* ===== FILE: {p} ===== */\n{number_lines(code)}")
     body = "\n\n".join(blocks)
     return f"Files under review: {', '.join(paths)}\n\n{SNIPPET_BEGIN}\n{body}\n{SNIPPET_END}"
 
 
-def ollama_review(base_url, model, context, num_ctx, extra_system="", temperature=0.3, timeout=900):
+def ollama_review(base_url, model, context, num_ctx, extra_system="", temperature=0.3, timeout=1800):
     payload = {
         "model": model,
         "messages": [
@@ -280,7 +323,7 @@ def ollama_review(base_url, model, context, num_ctx, extra_system="", temperatur
     return json.loads(resp.get("message", {}).get("content", "{}"))
 
 
-def ollama_critique(base_url, model, context, draft, num_ctx, extra_system="", timeout=900):
+def ollama_critique(base_url, model, context, draft, num_ctx, extra_system="", timeout=1800):
     """Second pass: hand the draft review back for completion + de-hallucination."""
     user = (f"{context}\n\nDRAFT REVIEW TO CORRECT AND COMPLETE (JSON):\n"
             f"{json.dumps(draft, indent=2)}")
@@ -343,11 +386,14 @@ Priorities, in order:
    clearly matches; otherwise "".
 
 Return ONLY the consolidated JSON object in the same schema (subsystem,
-provenance, trust_boundary, summary, reviewed_anchors, findings,
-audit_checklist). Rank findings strongest-first; each finding distinct."""
+provenance, trust_boundary, what_the_code_does, what_could_go_wrong, summary,
+reviewed_anchors, findings, audit_checklist). Keep the two walkthrough answers
+(what_the_code_does / what_could_go_wrong: ORDERED ARRAYS of {{lines, code,
+explanation}} steps — keep them thorough) and every finding's file/line/code
+citations. Rank findings strongest-first; each finding distinct."""
 
 
-def ollama_consolidate(base_url, model, context, pooled, num_ctx, extra_system="", timeout=1200):
+def ollama_consolidate(base_url, model, context, pooled, num_ctx, extra_system="", timeout=1800):
     """Union+dedup+de-hallucinate findings pooled from multiple review samples."""
     user = (f"{context}\n\nPOOLED FINDINGS FROM MULTIPLE INDEPENDENT REVIEWS "
             f"(consolidate per your instructions; duplicates and conflicts are "
@@ -444,11 +490,11 @@ _TOPIC_SIGS = [
     ("null-deref",       r"null[- ]?deref|null pointer|->\s*xid|logging macro|log_dhcp", "CWE-476", ""),
     ("sign-cast",        r"sign[- ]?conversion|signed cast|int32_t|sign-?conversion hygiene", "CWE-195", ""),
     ("dns-label",        r"fqdn|dns[- ]?wire|dns label|compression pointer", "CWE-125", ""),
-    ("overload-reparse", r"overload|re-?parse|option space|sname|\bfile\b", "CWE-674", ""),
+    ("overload-reparse", r"dhcp_overload|overloaded|re-?parse|option space|once-?guard|\bsname\b", "CWE-674", ""),
     ("length-vs-buffer", r"\bhlen\b|chaddr|hardware address length", "CWE-120", ""),
     ("packed-offset",    r"\bihl\b|iphdr|ip header|variable[- ]?length ip|verify_headers|fixed[- ]?offset|assumed offset", "CWE-125", ""),
     ("validation-gate",  r"magic|endian|byte[- ]?swap|cookie|flags field", "CWE-20", ""),
-    ("append-overflow",  r"option_append|append", "CWE-787", "CVE-2018-15688"),
+    ("append-overflow",  r"dhcp_option_append", "CWE-787", "CVE-2018-15688"),
     ("parse-overread",   r"option_parse|option length|\btlv\b|option parsing", "CWE-125", ""),
     ("flexible-array",   r"flexible[- ]?array|options\[\s*0\s*\]|\bfam\b", "CWE-787", ""),
     ("checksum",         r"checksum", "CWE-125", ""),
@@ -487,6 +533,23 @@ def topic_consolidate(findings):
     return list(buckets.values())
 
 
+def canonicalize_cwes(findings):
+    """Set each finding's CWE to its security-topic canonical (and restore a known
+    CVE), WITHOUT merging. Runs in every mode so even a single pass with no critic
+    cannot ship a wrong-direction CWE (e.g. an unsigned underflow tagged CWE-190
+    instead of CWE-787, or a read path tagged as a write)."""
+    out = []
+    for f in findings:
+        topic, cwe, cve = _finding_topic(f)
+        if topic:
+            f = dict(f)
+            f["cwe"] = cwe
+            if cve and not f.get("cve_analog"):
+                f["cve_analog"] = cve
+        out.append(f)
+    return out
+
+
 def pool_samples(samples):
     """Merge several review dicts into one pooled draft for consolidation.
 
@@ -510,6 +573,8 @@ def pool_samples(samples):
         "subsystem": head.get("subsystem", ""),
         "provenance": head.get("provenance", ""),
         "trust_boundary": head.get("trust_boundary", ""),
+        "what_the_code_does": head.get("what_the_code_does", ""),
+        "what_could_go_wrong": head.get("what_could_go_wrong", ""),
         "summary": head.get("summary", ""),
         "reviewed_anchors": list(anchors.values()),
         "findings": pooled_findings,
@@ -522,30 +587,73 @@ def pool_samples(samples):
 _SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 
 
+def _walkthrough_md(section):
+    """Render a what_does / what_could_go_wrong section.
+
+    Accepts the structured form (a list of {lines, code, explanation} steps) and
+    renders each as a line-range heading, a fenced code block, and the prose. Also
+    tolerates a plain string (older single-paragraph output) for back-compat.
+    """
+    if not section:
+        return []
+    if isinstance(section, str):
+        return [section, ""]
+    out = []
+    for step in section:
+        if isinstance(step, str):
+            out += [step, ""]
+            continue
+        if not isinstance(step, dict):
+            continue
+        lines = str(step.get("lines", "")).strip()
+        fname = os.path.basename(str(step.get("file", "")).strip())
+        loc = (f"{fname}:{lines}" if fname and lines else
+               fname or (f"Lines {lines}" if lines else "—"))
+        out.append(f"**{loc}**")
+        if step.get("code"):
+            out += ["", "```c", str(step["code"]).rstrip(), "```"]
+        if step.get("explanation"):
+            out += ["", str(step["explanation"]).strip()]
+        out.append("")
+    return out
+
+
 def render_markdown(review, paths):
     sev = lambda f: _SEV_ORDER.get(str(f.get("severity", "")).lower(), 9)
     findings = sorted(review.get("findings", []), key=sev)
     anchors = review.get("reviewed_anchors", [])
-    n_find = sum(1 for a in anchors if a.get("disposition") == "finding")
     out = ["# Attack-surface review", "",
            f"**Files:** {', '.join(paths)}  ",
            f"**Subsystem:** {review.get('subsystem','?')}  ",
            f"**Provenance:** {review.get('provenance','?')}  ",
            f"**Trust boundary:** {review.get('trust_boundary','?')}", "",
            f"> {review.get('summary','')}", ""]
+    wtd = _walkthrough_md(review.get("what_the_code_does"))
+    if wtd:
+        out += ["## What is this code doing?", ""] + wtd
+    wcg = _walkthrough_md(review.get("what_could_go_wrong"))
+    if wcg:
+        out += ["## What could go wrong?", ""] + wcg
+    dismissed = [a for a in anchors if a.get("disposition") == "dismissed"]
     if anchors:
-        out += [f"_Enumerated {len(anchors)} anchors → {n_find} findings, "
-                f"{len(anchors) - n_find} dismissed._", ""]
+        # Count by the consolidated findings, not the (possibly pooled) anchor list.
+        out += [f"_Enumerated {len(anchors)} anchors → {len(findings)} findings, "
+                f"{len(dismissed)} dismissed._", ""]
     out += [f"## Findings ({len(findings)})", ""]
     for i, f in enumerate(findings, 1):
         cve = f.get("cve_analog") or ""
+        loc = ":".join(x for x in (str(f.get("file", "")).strip(),
+                                   str(f.get("line", "")).strip()) if x)
         out += [f"### {i}. {f.get('title','(untitled)')}  "
                 f"`{str(f.get('severity','')).upper()}` "
                 f"{f.get('cwe','')}" + (f" · analog {cve}" if cve else ""),
-                f"- **Anchor:** `{f.get('anchor','')}`",
+                f"- **Anchor:** `{f.get('anchor','')}`"
+                + (f"  ·  **{loc}**" if loc else ""),
                 f"- **Bug class:** {f.get('bug_class','')}",
-                f"- **Lives in:** {f.get('where_it_lives','')}",
-                f"- **Invariant:** {f.get('invariant','')}",
+                f"- **Lives in:** {f.get('where_it_lives','')}"]
+        if f.get("code"):
+            out += ["", "```c", str(f["code"]).rstrip(), "```"]
+        out += [f"- **Invariant:** {f.get('invariant','')}",
                 f"- **Failure mode:** {f.get('failure_mode','')}",
                 f"- **Confirm:** {f.get('what_to_confirm','')}", ""]
     dismissed = [a for a in anchors if a.get("disposition") == "dismissed"]
@@ -627,14 +735,21 @@ def main():
 
         if n_runs == 1:
             # Single-source path: completeness-critic second pass (original behavior).
+            # The pass-1 review already carries the full walkthrough + findings, so a
+            # slow/failed/truncated critic degrades gracefully to it instead of
+            # crashing the run (the thorough walkthrough makes the critic re-send big).
             review = samples[0][1]
             if not args.no_critic:
-                critiqued = ollama_critique(args.ollama_url, critic_model, context, review,
-                                            args.num_ctx, extra_system)
+                try:
+                    critiqued = ollama_critique(args.ollama_url, critic_model, context, review,
+                                                args.num_ctx, extra_system)
+                except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError) as ce:
+                    critiqued = {}
+                    print(f"[critic] failed ({ce}); keeping pass-1 review")
                 if len(critiqued.get("findings", [])) >= len(review.get("findings", [])):
                     review = critiqued
                     print(f"[critic] {len(review.get('findings', []))} findings after completion")
-                else:
+                elif critiqued:
                     print(f"[critic] kept pass-1 ({len(critiqued.get('findings', []))} "
                           f"< {len(review.get('findings', []))}; no regression accepted)")
         else:
@@ -666,7 +781,8 @@ def main():
     except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError) as e:
         sys.exit(f"[ERR] Ollama review failed: {e}")
 
-    findings = review.get("findings", [])
+    review["findings"] = canonicalize_cwes(review.get("findings", []))
+    findings = review["findings"]
     anchors = review.get("reviewed_anchors", [])
     print(f"[OK] {len(anchors)} anchors enumerated, {len(findings)} findings; "
           f"subsystem: {review.get('subsystem','?')}")
