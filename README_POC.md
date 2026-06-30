@@ -125,6 +125,25 @@ python surface_review.py SRC --models qwen2.5-coder:14b,qwen2.5-coder:32b --samp
 - Reviews headers the body-scanners skip; pooling reached ~9/10 of a Claude
   reference threat model on the systemd DHCP headers, fully offline.
 
+### Compare the local model against Claude Opus (`compare_review.py`)
+
+To see how the local model measures up on **your** code, `compare_review.py` runs
+the *identical* review prompt (same system prompt, same KB hints, same fenced
+snippet) against both the local Ollama model and Claude Opus 4.8, and prints them
+finding-for-finding. The only variable is the model.
+
+```bash
+python compare_review.py path/to/snippet.c        # a file or directory
+python compare_review.py --code 'void f(char*s){char b[8];strcpy(b,s);}'
+echo '<code>' | python compare_review.py -          # snippet from stdin
+```
+
+The Claude side is the **opt-in cloud tier** — the only part of this project that
+leaves the machine. It needs the official SDK and a key: `pip install anthropic`
+(optional, not in `requirements.txt`) and `export ANTHROPIC_API_KEY=...`. Use
+`--no-claude` / `--no-local` to run a single side; both reports land in
+`scan_out/compare/`.
+
 ## CI integration (GitHub Action)
 
 A composite action (`action.yml`) runs the **model-free** path —
