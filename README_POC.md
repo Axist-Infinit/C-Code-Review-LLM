@@ -94,6 +94,37 @@ The trained classifier moves between machines via `pack_model.sh` / `unpack_mode
   `--clang-tidy-checks` or disable with `--no-clang-tidy`.
 - `smoke_test.sh` — end-to-end pipeline test.
 
+### Attack-surface / contract review (headers, whole modules)
+
+The classifier and heuristic scanners score function **bodies** — they are blind
+to a declaration-only header, where the struct layouts, size macros, and function
+**signatures** define the attack surface and the contracts the implementation must
+uphold. `surface_review.py` reviews those contracts instead: it asks the local
+Ollama model to identify the subsystem, establish the trust boundary, enumerate
+every field / macro / signature, and emit a ranked multi-finding threat model
+(JSON + Markdown), reviewing all input files **together** so cross-file contracts
+are visible.
+
+```bash
+# Single-model, two-pass (enumerate -> completeness critic), offline retrieval hints on
+python surface_review.py playground/dhcp-internal.h playground/dhcp-protocol.h \
+    --json scan_out/surface/review.json --md scan_out/surface/report.md
+
+# Union finisher: sample several models/temperatures, pool, deterministically consolidate
+python surface_review.py SRC --models qwen2.5-coder:14b,qwen2.5-coder:32b --samples 2
+```
+
+- **Offline retrieval hints** (`surface_kb.json`) inject trigger-matched facts
+  (known CVEs, RFC/protocol semantics, correct CWEs) into the prompt — the single
+  biggest quality lever for the knowledge-bound findings. `--no-kb` to disable.
+- **Union finisher** (`--models a,b --samples N`) pools findings across samples
+  (different models catch different issues) and consolidates them. Consolidation
+  is **deterministic by default** (`topic_consolidate`: merge by security-topic,
+  canonicalise CWE, restore known CVE) — reliable and VRAM-free; `--llm-consolidate`
+  opts into an LLM consolidation pass when a critic model fits in memory.
+- Reviews headers the body-scanners skip; pooling reached ~9/10 of a Claude
+  reference threat model on the systemd DHCP headers, fully offline.
+
 ## CI integration (GitHub Action)
 
 A composite action (`action.yml`) runs the **model-free** path —
