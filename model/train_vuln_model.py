@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-import argparse, os, json, torch
+import argparse, os, sys, json, torch
 from datasets import load_dataset
 from transformers import (AutoTokenizer, AutoModelForSequenceClassification,
                           Trainer, TrainingArguments, DataCollatorWithPadding)
 import transformers as tf
 
-def parse_args():
+def parse_args(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--train", required=True)
     ap.add_argument("--val", required=True)
@@ -24,7 +24,17 @@ def parse_args():
                     help="fp16 mixed precision (RTX 4090 / Ada sm_89).")
     ap.add_argument("--bf16", action="store_true",
                     help="bf16 mixed precision (DGX Spark / Grace-Blackwell sm_121).")
-    return ap.parse_args()
+    ap.add_argument("--resume", action="store_true",
+                    help="Opt IN to resuming from the latest checkpoint in --out. "
+                         "Default is to train fresh even when checkpoints exist "
+                         "(stale/bootstrap checkpoints in a reused out dir must "
+                         "never silently contaminate or no-op a real run).")
+    # Deprecated no-op, kept so older wrappers/docs passing it do not break:
+    # fresh training is now the default, so --no-resume is implied.
+    ap.add_argument("--no-resume", action="store_true",
+                    help="Deprecated no-op: fresh training is the default; "
+                         "pass --resume to continue from a checkpoint.")
+    return ap.parse_args(argv)
 
 def _to_int(v):
     try: return int(v)
@@ -86,6 +96,10 @@ def build_training_args(args):
         weight_decay=args.weight_decay,
         logging_steps=50,
         seed=args.seed,
+        # keep only the 2 newest checkpoints so per-epoch saves on the 134k-row
+        # BigVul run cannot fill the disk (best model is still kept when
+        # load_best_model_at_end applies).
+        save_total_limit=2,
     )
     eval_extra = dict(save_strategy="epoch", load_best_model_at_end=True,
                       metric_for_best_model="eval_loss", greater_is_better=False)
@@ -116,11 +130,61 @@ def build_training_args(args):
             continue
     return TrainingArguments(**base)
 
+def find_resume_checkpoint(out_dir):
+    """Latest HF checkpoint under out_dir, or None. Detection only — whether to
+    resume from it is decided by resolve_resume (resume is strictly opt-in).
+
+    Uses transformers' own checkpoint detection (lazy import so the module's
+    pure helpers stay importable without the ML stack).
+    """
+    if not out_dir or not os.path.isdir(out_dir):
+        return None
+    try:
+        from transformers.trainer_utils import get_last_checkpoint
+    except ImportError:
+        return None
+    try:
+        return get_last_checkpoint(out_dir)
+    except Exception:
+        return None
+
+def resolve_resume(out_dir, resume_requested):
+    """Value for trainer.train(resume_from_checkpoint=...). Resume is OPT-IN:
+    without --resume this always returns None (train fresh), even when a
+    checkpoint exists — but it PRINTS a notice so operators discover --resume
+    instead of a stale/bootstrap checkpoint silently poisoning the run."""
+    detected = find_resume_checkpoint(out_dir)
+    if resume_requested:
+        if detected:
+            print(f"[INFO] --resume: continuing from checkpoint {detected}")
+        else:
+            print(f"[WARN] --resume requested but no checkpoint found under "
+                  f"{out_dir}; training fresh.")
+        return detected
+    if detected:
+        print(f"[NOTICE] Ignoring existing checkpoint {detected} under {out_dir}; "
+              "training FRESH (pass --resume to continue from it).")
+    return None
+
+def build_inference_payload(threshold, max_length, provenance=None):
+    """The inference.json contract: threshold + the training truncation length
+    (so eval/scan tokenize exactly as trained) + optional provenance. Pure."""
+    payload = {"threshold": threshold, "max_length": max_length,
+               "notes": "Max F1 on validation"}
+    if provenance:
+        payload["provenance"] = provenance
+    return payload
+
 def main():
     args = parse_args()
     print("[INFO] transformers version in use:", tf.__version__)
     print("[INFO] module:", getattr(tf, "__file__", "unknown"))
-    torch.manual_seed(args.seed)
+    try:
+        # set_seed also seeds python/numpy, unlike torch.manual_seed alone.
+        from transformers import set_seed
+        set_seed(args.seed)
+    except ImportError:
+        torch.manual_seed(args.seed)
 
     tok = AutoTokenizer.from_pretrained(args.base)
     ds = load_dataset("json", data_files={"train":args.train,"validation":args.val,"test":args.test})
@@ -150,7 +214,8 @@ def main():
                               eval_dataset=ds["validation"], tokenizer=tok,
                               data_collator=collator, compute_metrics=compute_metrics,
                               class_weights=class_weights)
-    trainer.train()
+    resume = resolve_resume(args.out, args.resume)
+    trainer.train(resume_from_checkpoint=resume)
     os.makedirs(args.out, exist_ok=True)
     trainer.save_model(args.out); tok.save_pretrained(args.out)
 
@@ -159,8 +224,21 @@ def main():
     val_scores = torch.softmax(torch.tensor(val_logits), dim=1)[:,1].numpy().tolist()
     val_labels = [int(x) for x in ds["validation"]["labels"]]
     t,f1 = best_threshold_f1(val_scores, val_labels)
+    provenance = None
+    try:
+        # build_provenance lives with the (torch-free) eval helpers at repo root;
+        # a provenance failure must never lose the threshold of a finished run.
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from evaluate_model import build_provenance, dataset_provenance
+        provenance = build_provenance(extra={
+            "seed": args.seed,
+            "base_model": args.base,
+            "datasets": dataset_provenance([args.train, args.val, args.test]),
+        })
+    except Exception as e:
+        print(f"[WARN] provenance skipped: {e}")
     with open(os.path.join(args.out, "inference.json"), "w") as f:
-        json.dump({"threshold": t, "notes": "Max F1 on validation"}, f, indent=2)
+        json.dump(build_inference_payload(t, args.max_length, provenance), f, indent=2)
     print(f"[OK] Saved model to {args.out}; threshold={t:.2f} (F1={f1:.3f})")
 
 if __name__ == "__main__":

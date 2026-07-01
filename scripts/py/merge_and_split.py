@@ -84,8 +84,10 @@ def merge_rows(files):
     """Dedup-merge ingest files into (rows, src_splits).
 
     Pure function: ``files`` is a list of paths. ``rows`` is the deduplicated
-    list of {"code","label"} dicts; ``src_splits`` maps a code hash to its
-    source split name when the filename declared one. Stdlib only.
+    list of {"code","label"} dicts — plus the additive provenance tags
+    (cwe/source/lang) when the ingest row carried them, so downstream eval can
+    group by them; ``src_splits`` maps a code hash to its source split name
+    when the filename declared one. Stdlib only.
     """
     seen = set()
     rows = []
@@ -104,7 +106,11 @@ def merge_rows(files):
                 lab = int(r.get("label", 0))
             except Exception:
                 lab = 0
-            rows.append({"code": code, "label": lab})
+            row = {"code": code, "label": lab}
+            for k in ("cwe", "source", "lang"):
+                if r.get(k) is not None:
+                    row[k] = r[k]
+            rows.append(row)
             if sp:
                 src_splits[h] = sp
     return rows, src_splits
@@ -151,6 +157,29 @@ def write_bootstrap(data_dir=DATA_DIR):
                 f.write(json.dumps(r) + "\n")
 
 
+def real_data_guard(n_train, environ=None):
+    """Env-driven belt-and-braces guard for callers that demand REAL data.
+
+    When CCR_REQUIRE_REAL_DATA=1, a train split smaller than CCR_MIN_TRAIN_ROWS
+    (default 1000) is fatal even in bootstrap mode — this catches wrappers that
+    pass --allow-bootstrap unconditionally but were asked for BigVul-style data.
+    Returns an error message string, or None when the guard passes / is off.
+    Pure: pass ``environ`` for tests, defaults to os.environ.
+    """
+    env = os.environ if environ is None else environ
+    if env.get("CCR_REQUIRE_REAL_DATA", "") != "1":
+        return None
+    try:
+        min_rows = int(env.get("CCR_MIN_TRAIN_ROWS", "1000"))
+    except ValueError:
+        min_rows = 1000
+    if n_train < min_rows:
+        return (f"CCR_REQUIRE_REAL_DATA=1 but the train split has only {n_train} "
+                f"rows (< {min_rows} required via CCR_MIN_TRAIN_ROWS). The BigVul "
+                "fetch likely failed; refusing to train on bootstrap-sized data.")
+    return None
+
+
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--ingest-dir", default=INGEST_DIR)
@@ -180,6 +209,10 @@ def main(argv=None):
     # --- no usable ingest data ---------------------------------------------
     if not rows:
         if args.allow_bootstrap:
+            err = real_data_guard(0)
+            if err:
+                print("[FATAL]", err, file=sys.stderr)
+                return 4
             print("[WARN] No usable ingest rows; writing tiny bootstrap dataset (smoke-test only).")
             write_bootstrap(args.data_dir)
             print("[OK] Wrote bootstrap data to", args.data_dir)
@@ -193,9 +226,10 @@ def main(argv=None):
         return 2
 
     train, val, test, preserved = split_rows(rows, src_splits)
-    write_splits(train, val, test, args.data_dir)
-    print(("[OK] Preserved source dataset splits; " if preserved else "[OK] ") +
-          f"merge complete: train={len(train)} val={len(val)} test={len(test)}")
+
+    # Both guards run BEFORE write_splits (matching the pre-write guard on the
+    # bootstrap path above): a rejected run must leave NO train/val/test.jsonl
+    # behind for a later train.sh to silently pick up.
 
     # --- guard: real run must have a real-sized train split ----------------
     if not args.allow_bootstrap and len(train) < args.min_train_rows:
@@ -204,6 +238,16 @@ def main(argv=None):
               "train on a bootstrap-sized set. Re-provision BigVul, or pass "
               "--allow-bootstrap for a smoke-test only.", file=sys.stderr)
         return 3
+
+    # --- env guard: CCR_REQUIRE_REAL_DATA overrides even bootstrap mode ----
+    err = real_data_guard(len(train))
+    if err:
+        print("[FATAL]", err, file=sys.stderr)
+        return 4
+
+    write_splits(train, val, test, args.data_dir)
+    print(("[OK] Preserved source dataset splits; " if preserved else "[OK] ") +
+          f"merge complete: train={len(train)} val={len(val)} test={len(test)}")
     return 0
 
 

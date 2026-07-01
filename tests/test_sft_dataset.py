@@ -22,6 +22,8 @@ from model.train_llm_sft import (
     mask_labels,
     tokenize_example,
     has_trainable_tokens,
+    parse_args as sft_parse_args,
+    build_base_args,
     COMPLETION_HEADER,
 )
 
@@ -249,3 +251,24 @@ def test_tokenize_example_all_masked_when_prompt_exceeds_max_length():
     ex = tokenize_example(_FakeTok(), "a b c d e f g h",
                           {"issue": "i", "explanation": "e"}, max_length=3)
     assert not has_trainable_tokens(ex["labels"])       # nothing to train on
+
+
+# --- trainer CLI / TrainingArguments assembly --------------------------------
+
+_SFT_CLI = ["--base", "b", "--train", "t", "--val", "v", "--out", "adapter"]
+
+
+def test_sft_parse_args_seed_default_and_override():
+    assert sft_parse_args(_SFT_CLI).seed == 42
+    assert sft_parse_args(_SFT_CLI + ["--seed", "7"]).seed == 7
+
+
+def test_sft_build_base_args_checkpoint_hygiene_and_seed():
+    args = sft_parse_args(_SFT_CLI + ["--seed", "7", "--batch", "2"])
+    kw = build_base_args(args, use_fp16=True, use_bf16=False)
+    assert kw["save_total_limit"] == 2   # per-epoch adapters must not pile up
+    assert kw["seed"] == 7
+    assert kw["fp16"] is True and kw["bf16"] is False
+    assert kw["save_strategy"] == "epoch"
+    assert kw["output_dir"] == "adapter"
+    assert kw["per_device_train_batch_size"] == 2

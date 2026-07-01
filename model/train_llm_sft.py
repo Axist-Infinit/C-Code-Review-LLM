@@ -149,6 +149,7 @@ def parse_args(argv=None):
     ap.add_argument("--accum", type=int, default=16)
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--max-length", type=int, default=2048)
+    ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--fp16", action="store_true", help="Force fp16 (else from profile)")
     ap.add_argument("--bf16", action="store_true", help="Force bf16 (else from profile)")
     ap.add_argument("--grad_ckpt", action="store_true")
@@ -158,6 +159,29 @@ def parse_args(argv=None):
     ap.add_argument("--profile", default=None,
                     help="Hardware profile for precision defaults (4090|spark|cpu)")
     return ap.parse_args(argv)
+
+
+def build_base_args(args, use_fp16, use_bf16):
+    """TrainingArguments kwargs shared by the eval-key spelling attempts.
+
+    Pure dict assembly (no transformers import) so checkpoint hygiene and
+    seeding are unit-testable without the ML stack.
+    """
+    return dict(
+        output_dir=args.out,
+        per_device_train_batch_size=args.batch,
+        per_device_eval_batch_size=args.batch,
+        gradient_accumulation_steps=args.accum,
+        num_train_epochs=args.epochs,
+        learning_rate=args.lr,
+        logging_steps=20,
+        report_to=[],
+        save_strategy="epoch",
+        save_total_limit=2,  # per-epoch adapter checkpoints must not pile up
+        seed=args.seed,
+        fp16=use_fp16,
+        bf16=use_bf16,
+    )
 
 
 def _load_jsonl(path):
@@ -195,6 +219,10 @@ def main():
                               Trainer, TrainingArguments)
     from peft import LoraConfig, get_peft_model, TaskType
     print("[INFO] transformers:", tf.__version__)
+
+    set_seed = getattr(tf, "set_seed", None)
+    if set_seed:
+        set_seed(args.seed)  # seeds python/numpy/torch in one call
 
     use_fp16, use_bf16 = resolve_precision(args)
 
@@ -258,19 +286,7 @@ def main():
             "labels": torch.tensor(labels, dtype=torch.long),
         }
 
-    base_args = dict(
-        output_dir=args.out,
-        per_device_train_batch_size=args.batch,
-        per_device_eval_batch_size=args.batch,
-        gradient_accumulation_steps=args.accum,
-        num_train_epochs=args.epochs,
-        learning_rate=args.lr,
-        logging_steps=20,
-        report_to=[],
-        save_strategy="epoch",
-        fp16=use_fp16,
-        bf16=use_bf16,
-    )
+    base_args = build_base_args(args, use_fp16, use_bf16)
     # HF renamed evaluation_strategy -> eval_strategy; try modern spelling first.
     for eval_key in ("eval_strategy", "evaluation_strategy", None):
         try:
