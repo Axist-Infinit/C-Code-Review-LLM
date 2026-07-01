@@ -1,11 +1,22 @@
-"""Tests for the clang-tidy integration in ensemble_scan.
+"""Tests for the clang-tidy integration and merge logic in ensemble_scan.
 
-parse_clang_tidy_output is pure, so it is tested directly; run_clang_tidy is
-checked only for graceful no-op when the binary is absent (no clang-tidy needed
-in CI).
+parse_clang_tidy_output / split_files_by_lang / corroborate / dedup_findings are
+pure, so they are tested directly; run_clang_tidy is checked for graceful no-op
+when the binary is absent and for per-language invocation via a mocked
+subprocess (no clang-tidy needed in CI).
 """
+import json
+import subprocess
+
 import ensemble_scan
-from ensemble_scan import parse_clang_tidy_output, run_clang_tidy
+from ensemble_scan import (
+    corroborate,
+    dedup_findings,
+    load_ml,
+    parse_clang_tidy_output,
+    run_clang_tidy,
+    split_files_by_lang,
+)
 
 SAMPLE = """\
 /src/a.cpp:12:5: warning: function 'strcpy' is insecure; use 'strncpy' [clang-analyzer-security.insecureAPI.strcpy]
@@ -51,3 +62,120 @@ def test_empty_output_yields_no_findings():
 def test_run_clang_tidy_skips_gracefully_when_not_installed(monkeypatch):
     monkeypatch.setattr(ensemble_scan.shutil, "which", lambda _name: None)
     assert run_clang_tidy("anything") == []
+
+
+def test_split_files_by_lang_puts_headers_with_cpp():
+    groups = split_files_by_lang(["a.c", "b.cpp", "c.h", "d.cc", "e.hpp"])
+    assert groups["c"] == ["a.c"]
+    assert groups["cpp"] == ["b.cpp", "c.h", "d.cc", "e.hpp"]
+
+
+class _FakeProc:
+    stdout = ""
+    stderr = ""
+
+
+def test_run_clang_tidy_invokes_per_language_with_matching_std(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return _FakeProc()
+
+    monkeypatch.setattr(ensemble_scan.shutil, "which", lambda _n: "/usr/bin/clang-tidy")
+    monkeypatch.setattr(ensemble_scan, "list_sources", lambda _s: ["a.c", "b.cpp", "c.h"])
+    monkeypatch.setattr(ensemble_scan.subprocess, "run", fake_run)
+    assert run_clang_tidy("src") == []
+    assert len(calls) == 2
+    c_cmd = next(c for c in calls if "-std=c11" in c)
+    cpp_cmd = next(c for c in calls if "-std=c++17" in c)
+    assert "a.c" in c_cmd and "b.cpp" not in c_cmd and "c.h" not in c_cmd
+    assert "b.cpp" in cpp_cmd and "c.h" in cpp_cmd and "a.c" not in cpp_cmd
+
+
+def test_run_clang_tidy_skips_c_invocation_when_no_c_files(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return _FakeProc()
+
+    monkeypatch.setattr(ensemble_scan.shutil, "which", lambda _n: "/usr/bin/clang-tidy")
+    monkeypatch.setattr(ensemble_scan, "list_sources", lambda _s: ["b.cpp"])
+    monkeypatch.setattr(ensemble_scan.subprocess, "run", fake_run)
+    run_clang_tidy("src")
+    assert len(calls) == 1
+    assert "-std=c++17" in calls[0]
+
+
+def test_tool_timeouts_are_caught_and_skipped(monkeypatch):
+    def boom(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, 600)
+
+    monkeypatch.setattr(ensemble_scan.shutil, "which", lambda _n: "/usr/bin/tool")
+    monkeypatch.setattr(ensemble_scan, "list_sources", lambda _s: ["a.c", "b.cpp"])
+    monkeypatch.setattr(ensemble_scan.subprocess, "run", boom)
+    assert run_clang_tidy("src") == []
+    assert ensemble_scan.run_cppcheck("src") == []
+    assert ensemble_scan.run_flawfinder("src") == []
+
+
+def test_load_ml_preserves_cwe_fix_verdict_and_anchors(tmp_path):
+    p = tmp_path / "llm_findings.json"
+    p.write_text(json.dumps({"explanations": [{
+        "file": "a.c", "start_line": 5, "end_line": 12, "score": 0.9,
+        "cwe": "CWE-120", "severity": "high", "issue": "strcpy overflow",
+        "fix": "Use strlcpy.", "is_vulnerable": True,
+        "matched_patterns": ["strcpy"], "match_lines": [7],
+        "cross_check": "corroborated by cppcheck",
+        "what_code_does": "copies", "what_could_go_wrong": "overflow",
+        "vulnerability": "buffer overflow",
+    }]}))
+    out = load_ml(str(p))
+    assert len(out) == 1
+    e = out[0]
+    assert e["cwe"] == "CWE-120"          # no longer renamed away
+    assert e["rule"] == "CWE-120"         # kept for tool-finding parity
+    assert e["fix"] == "Use strlcpy."
+    assert e["is_vulnerable"] is True
+    assert e["matched_patterns"] == ["strcpy"]
+    assert e["match_lines"] == [7]
+    assert e["cross_check"] == "corroborated by cppcheck"
+    assert e["what_could_go_wrong"] == "overflow"
+
+
+def test_load_ml_omits_absent_optional_keys(tmp_path):
+    p = tmp_path / "classifier_findings.json"
+    p.write_text(json.dumps({"findings": [
+        {"file": "a.c", "start_line": 1, "end_line": 3, "score": 0.7},
+    ]}))
+    e = load_ml(str(p))[0]
+    for key in ("fix", "is_vulnerable", "matched_patterns", "match_lines", "cross_check"):
+        assert key not in e
+
+
+def test_corroborate_uses_containment_not_exact_line():
+    ml = {"tool": "ml-classifier", "file": "a.c", "start_line": 5, "end_line": 12}
+    tool = {"tool": "cppcheck", "file": "a.c", "start_line": 7, "end_line": 7}
+    other_file = {"tool": "flawfinder", "file": "b.c", "start_line": 7, "end_line": 7}
+    outside = {"tool": "clang-tidy", "file": "a.c", "start_line": 99, "end_line": 99}
+    corroborate([ml, tool, other_file, outside])
+    assert ml["corroborated_by"] == ["cppcheck"]        # 7 in [5,12]; 99 is not
+    assert tool["corroborated_by"] == ["ml-classifier"]  # vice versa
+    assert other_file["corroborated_by"] == []           # different file
+    assert outside["corroborated_by"] == []
+
+
+def test_corroborate_same_tool_never_corroborates_itself():
+    a = {"tool": "cppcheck", "file": "a.c", "start_line": 3, "end_line": 3}
+    b = {"tool": "cppcheck", "file": "a.c", "start_line": 3, "end_line": 3}
+    corroborate([a, b])
+    assert a["corroborated_by"] == [] and b["corroborated_by"] == []
+
+
+def test_dedup_drops_identical_tool_file_line_rule_rows():
+    row = {"tool": "clang-tidy", "file": "a.c", "start_line": 3,
+           "rule": "cert-err34-c", "severity": "medium", "issue": "x"}
+    kept = dedup_findings([row, dict(row), {**row, "start_line": 4}])
+    assert len(kept) == 2
+    assert kept[0] is row                                # first occurrence wins

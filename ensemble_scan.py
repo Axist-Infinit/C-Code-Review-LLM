@@ -17,7 +17,7 @@ import re
 import shutil
 import subprocess
 
-from local_vuln_scanner import list_sources  # torch-free file lister
+from local_vuln_scanner import lang_for_path, list_sources  # torch-free helpers
 
 # Security/bug-oriented default check set. AST-matcher checks (bugprone-*/cert-*)
 # work without a compilation database; the security analyzer catches insecure C
@@ -37,7 +37,11 @@ def run_cppcheck(src):
         return []
     cmd = ["cppcheck", "--enable=warning,portability", "--inline-suppr",
            "--template={file}\t{line}\t{severity}\t{id}\t{message}", "--quiet", src]
-    out = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    except subprocess.TimeoutExpired:
+        print("[WARN] cppcheck timed out after 600s; skipping")
+        return []
     findings = []
     for line in out.stderr.splitlines():
         parts = line.split("\t")
@@ -57,8 +61,12 @@ def run_flawfinder(src):
     if not shutil.which("flawfinder"):
         print("[WARN] flawfinder not installed (apt install flawfinder); skipping")
         return []
-    out = subprocess.run(["flawfinder", "--csv", src],
-                         capture_output=True, text=True, timeout=600)
+    try:
+        out = subprocess.run(["flawfinder", "--csv", src],
+                             capture_output=True, text=True, timeout=600)
+    except subprocess.TimeoutExpired:
+        print("[WARN] flawfinder timed out after 600s; skipping")
+        return []
     findings = []
     import csv
     import io
@@ -102,18 +110,43 @@ def parse_clang_tidy_output(text):
     return findings
 
 
-def run_clang_tidy(src, checks=DEFAULT_CLANG_TIDY_CHECKS, std="c++17"):
+def split_files_by_lang(files):
+    """Group source files for per-language clang-tidy invocations. Headers go
+    with the C++ group (the C++ frontend parses C headers too)."""
+    groups = {"c": [], "cpp": []}
+    for f in files:
+        if os.path.splitext(f)[1].lower() == ".h":
+            groups["cpp"].append(f)
+        else:
+            groups[lang_for_path(f, default="c")].append(f)
+    return groups
+
+
+def run_clang_tidy(src, checks=DEFAULT_CLANG_TIDY_CHECKS):
     if not shutil.which("clang-tidy"):
         print("[WARN] clang-tidy not installed (apt install clang-tidy); skipping")
         return []
     files = list_sources(src)
     if not files:
         return []
-    # `-- -std=...` passes compiler flags directly, so no compile_commands.json
-    # is required for a loose-files pass.
-    cmd = ["clang-tidy", "--quiet", f"--checks={checks}", *files, "--", f"-std={std}"]
-    out = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-    return parse_clang_tidy_output(out.stdout)
+    groups = split_files_by_lang(files)
+    findings = []
+    # One invocation per language so .c files are not force-fed -std=c++17
+    # (clang rejects that and produces no analysis for them).
+    for lang, std in (("c", "c11"), ("cpp", "c++17")):
+        group = groups[lang]
+        if not group:
+            continue
+        # `-- -std=...` passes compiler flags directly, so no compile_commands.json
+        # is required for a loose-files pass.
+        cmd = ["clang-tidy", "--quiet", f"--checks={checks}", *group, "--", f"-std={std}"]
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        except subprocess.TimeoutExpired:
+            print(f"[WARN] clang-tidy ({std}) timed out after 600s; skipping")
+            continue
+        findings += parse_clang_tidy_output(out.stdout)
+    return findings
 
 
 def load_ml(path):
@@ -123,10 +156,13 @@ def load_ml(path):
     entries = data.get("explanations") or data.get("findings") or []
     out = []
     for e in entries:
-        out.append({
+        entry = {
             "tool": "ml-classifier", "file": e.get("file"),
             "start_line": e.get("start_line"), "end_line": e.get("end_line"),
-            "rule": e.get("cwe", ""), "severity": e.get("severity", ""),
+            "cwe": e.get("cwe", ""),
+            # keep "rule" too so consumers keyed on tool findings' shape still work
+            "rule": e.get("cwe", ""),
+            "severity": e.get("severity", ""),
             "issue": e.get("issue", "") or "Flagged by vulnerability classifier",
             "score": e.get("score"),
             # Carry the structured narrative so the merged file stays usable by
@@ -134,8 +170,62 @@ def load_ml(path):
             "what_code_does": e.get("what_code_does", ""),
             "what_could_go_wrong": e.get("what_could_go_wrong", ""),
             "vulnerability": e.get("vulnerability", ""),
-        })
+        }
+        # Remediation / verdict / anchoring fields must survive the merge so
+        # downstream SARIF, --only-vulnerable, and PR annotation keep working.
+        for key in ("fix", "is_vulnerable", "matched_patterns", "match_lines",
+                    "cross_check"):
+            if key in e:
+                entry[key] = e[key]
+        out.append(entry)
     return out
+
+
+def dedup_findings(findings):
+    """Drop identical (tool, file, start_line, rule) rows — overlapping tool
+    invocations (e.g. a header analyzed in several TUs) produce duplicates."""
+    seen = set()
+    out = []
+    for f in findings:
+        key = (f.get("tool"), f.get("file"), f.get("start_line"), f.get("rule"))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(f)
+    return out
+
+
+def _contains_line(f, line):
+    """True when `line` falls inside finding f's span (or its matched lines)."""
+    if line is None:
+        return False
+    if line in (f.get("match_lines") or []):
+        return True
+    start = f.get("start_line")
+    if start is None:
+        return False
+    end = f.get("end_line") or start
+    return start <= line <= end
+
+
+def corroborate(findings):
+    """Set corroborated_by on every finding: tools whose finding in the same
+    file overlaps this one. Containment, not exact-line equality — ML/heuristic
+    findings span whole functions while tools report the call line."""
+    by_file = {}
+    for f in findings:
+        by_file.setdefault(f.get("file"), []).append(f)
+    for group in by_file.values():
+        for f in group:
+            others = set()
+            for g in group:
+                if g is f or g.get("tool") == f.get("tool"):
+                    continue
+                if _contains_line(f, g.get("start_line")) \
+                        or _contains_line(g, f.get("start_line")):
+                    others.add(g["tool"])
+            f["corroborated_by"] = sorted(others)
+    return findings
 
 
 def main():
@@ -156,15 +246,8 @@ def main():
         findings += run_clang_tidy(args.src, checks=args.clang_tidy_checks)
     findings += load_ml(args.ml)
 
-    # group by location so agreement between tools is visible
-    by_loc = {}
-    for f in findings:
-        key = (f["file"], f["start_line"])
-        by_loc.setdefault(key, []).append(f)
-    for group in by_loc.values():
-        tools = sorted({g["tool"] for g in group})
-        for g in group:
-            g["corroborated_by"] = [t for t in tools if t != g["tool"]]
+    findings = dedup_findings(findings)
+    corroborate(findings)
 
     findings.sort(key=lambda f: (str(f.get("file")), f.get("start_line") or 0))
     counts = {}

@@ -37,7 +37,7 @@ def load_findings(path, only_vulnerable=True):
     return entries
 
 
-def finding_body(entry):
+def finding_body(entry, signature=True):
     """Markdown body for one inline review comment."""
     sev = str(entry.get("severity", "")).lower()
     emoji = SEVERITY_EMOJI.get(sev, "⚪")
@@ -67,7 +67,8 @@ def finding_body(entry):
 
     if entry.get("fix"):
         parts.append(f"**Fix:** {entry['fix']}")
-    parts.append(SIGNATURE)
+    if signature:
+        parts.append(SIGNATURE)
     return "\n\n".join(parts)
 
 
@@ -90,6 +91,8 @@ def diff_addressable_lines(patch):
             new_ln += 1
         elif line.startswith("-") and not line.startswith("---"):
             pass  # removed line: the new side does not advance
+        elif line.startswith("\\"):
+            pass  # "\ No newline at end of file" marker: not a source line
         else:
             addressable.add(new_ln)  # context line is part of the hunk
             new_ln += 1
@@ -115,7 +118,16 @@ def match_file(path, addressable_by_file):
 
 
 def commentable_line(entry, addressable):
-    """First line within the finding's [start,end] range that is in the diff."""
+    """Line to anchor the inline comment on: the first matched-pattern line
+    that is in the diff when the finding carries match_lines, else the first
+    line of the finding's [start,end] range that is in the diff."""
+    for ln in entry.get("match_lines") or []:
+        try:
+            ln = int(ln)
+        except (TypeError, ValueError):
+            continue
+        if ln in addressable:
+            return ln
     start = entry.get("start_line")
     if start is None:
         return None
@@ -128,16 +140,22 @@ def commentable_line(entry, addressable):
 
 def build_review(findings, addressable_by_file):
     """Split findings into inline review comments (on diff lines) and an overflow
-    list (outside the diff). Returns (comments, overflow)."""
-    comments, overflow = [], []
+    list (outside the diff). Findings that anchor to the same (file, line) are
+    merged into ONE comment. Returns (comments, overflow)."""
+    overflow = []
+    by_anchor = {}
     for e in findings:
         key, addr = match_file(e.get("file"), addressable_by_file)
         line = commentable_line(e, addr)
         if line is not None:
-            comments.append({"path": key, "line": line, "side": "RIGHT",
-                             "body": finding_body(e)})
+            by_anchor.setdefault((key, line), []).append(e)
         else:
             overflow.append(e)
+    comments = []
+    for (path, line), group in by_anchor.items():
+        body = "\n\n---\n\n".join(finding_body(e, signature=False) for e in group)
+        comments.append({"path": path, "line": line, "side": "RIGHT",
+                         "body": body + "\n\n" + SIGNATURE})
     return comments, overflow
 
 

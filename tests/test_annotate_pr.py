@@ -38,6 +38,26 @@ def test_diff_addressable_lines_empty_patch():
     assert diff_addressable_lines(None) == set()
 
 
+def test_diff_no_newline_marker_is_not_a_phantom_line():
+    patch = ("@@ -1,3 +1,3 @@\n"
+             " int a;\n"
+             " int b;\n"
+             "+int c;\n"
+             "\\ No newline at end of file\n")
+    assert diff_addressable_lines(patch) == {1, 2, 3}
+
+
+def test_diff_no_newline_marker_mid_patch_keeps_following_lines_aligned():
+    # old side lacked a trailing newline: the marker follows the removed line,
+    # and the added line after it must still be new-side line 2 (not 3)
+    patch = ("@@ -1,2 +1,2 @@\n"
+             " int keep;\n"
+             "-old last\n"
+             "\\ No newline at end of file\n"
+             "+new last\n")
+    assert diff_addressable_lines(patch) == {1, 2}
+
+
 def test_finding_body_has_severity_cwe_and_fix():
     body = finding_body({"severity": "high", "cwe": "CWE-120",
                          "issue": "buffer overflow", "explanation": "unbounded copy",
@@ -77,6 +97,16 @@ def test_commentable_line_picks_first_in_range():
     assert commentable_line({"start_line": None}, {1}) is None
 
 
+def test_commentable_line_prefers_match_lines_over_range_start():
+    entry = {"start_line": 2, "end_line": 10, "match_lines": [7, 9]}
+    # 5 is the first in-range diff line, but the matched call is on 7
+    assert commentable_line(entry, {5, 7, 9}) == 7
+    # no match line in the diff -> fall back to the range scan
+    assert commentable_line(entry, {5}) == 5
+    # neither match lines nor range lines in the diff -> None
+    assert commentable_line(entry, {99}) is None
+
+
 def test_build_review_splits_inline_and_overflow():
     findings = [
         {"file": "src/a.c", "start_line": 2, "end_line": 3, "is_vulnerable": True,
@@ -91,6 +121,30 @@ def test_build_review_splits_inline_and_overflow():
     assert comments[0]["line"] in (2, 3)
     assert comments[0]["side"] == "RIGHT"
     assert "strcpy" in comments[0]["body"]
+
+
+def test_build_review_merges_findings_on_same_anchor_line():
+    findings = [
+        {"file": "src/a.c", "start_line": 2, "end_line": 2, "issue": "strcpy",
+         "cwe": "CWE-120", "severity": "high"},
+        {"file": "src/a.c", "start_line": 2, "end_line": 2, "issue": "gets",
+         "cwe": "CWE-242", "severity": "critical"},
+    ]
+    comments, overflow = build_review(findings, {"src/a.c": {2}})
+    assert overflow == []
+    assert len(comments) == 1
+    body = comments[0]["body"]
+    assert "strcpy" in body and "gets" in body
+    assert body.count("C-Code-Review-LLM") == 1        # one signature, not two
+
+
+def test_build_review_anchors_on_match_line():
+    findings = [{"file": "src/a.c", "start_line": 2, "end_line": 9,
+                 "match_lines": [7], "issue": "system", "cwe": "CWE-78",
+                 "severity": "high"}]
+    comments, overflow = build_review(findings, {"src/a.c": {2, 3, 7}})
+    assert overflow == []
+    assert comments[0]["line"] == 7
 
 
 def test_review_summary_lists_overflow():

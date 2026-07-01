@@ -40,6 +40,17 @@ def test_annotate_step_is_guarded_by_input():
     assert annotate[0]["if"] == "${{ inputs.annotate == 'true' }}"
 
 
+def test_tree_sitter_install_is_best_effort():
+    """The action claims 'no network required': the pip install must not fail
+    the run when the runner is offline (the brace-parser fallback covers it)."""
+    steps = _load(ACTION)["runs"]["steps"]
+    pip_steps = [s for s in steps if "pip install" in s.get("run", "")]
+    assert len(pip_steps) == 1
+    run = pip_steps[0]["run"]
+    assert "||" in run, "pip install step has no failure fallback"
+    assert "::notice::" in run, "fallback should surface a workflow notice"
+
+
 def test_example_workflow_requests_sarif_upload_permissions():
     wf = _load(WORKFLOW)
     # workflows put 'on' as a bare key; YAML may parse it as the boolean True
