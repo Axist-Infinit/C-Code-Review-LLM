@@ -756,7 +756,8 @@ def test_build_multi_python_splits_full_and_model_free_at_the_floor(tmp_path):
     assert any(" -r " in c for c in calls_312)
 
     import glob as _glob
-    stage = _glob.glob(str(out / "ccr-airgap-*"))[0]
+    stage = next(p for p in _glob.glob(str(out / "ccr-airgap-*"))
+                 if os.path.isdir(p))
     kind_310 = open(os.path.join(stage, "wheels", "x86_64", "cp310",
                                  "WHEELHOUSE_KIND")).read().strip()
     kind_312 = open(os.path.join(stage, "wheels", "x86_64", "cp312",

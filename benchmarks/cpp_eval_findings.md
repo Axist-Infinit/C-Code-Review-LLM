@@ -75,3 +75,35 @@ python evaluate_model.py --model vuln-model-smalltrain --test data/bigvul_ctest.
 python evaluate_model.py --model vuln-model-smalltrain --test benchmarks/cpp_eval.jsonl \
     --group-by category --save-scores benchmarks/cpp_eval_scores.jsonl
 ```
+
+## Update 2026-07-01 — real-C++ eval set built (recommendation 1 done)
+
+`benchmarks/cpp_eval_real.jsonl` now exists: **822 real C++ CVE functions
+(411 vulnerable / 411 fixed-clean, 361 CVEs, 3.1 MB)** drawn from the paired
+config of **PrimeVul** (HF mirror `colin/PrimeVul` pinned @ `4fd7158`, mirror of
+the official `DLVulDet/PrimeVul` release). Rows are vuln/fixed pairs from the
+same fix commit — the same `func_before`/`func_after` hard-negative convention
+the classifier was trained with — restricted to unambiguous C++ files
+(`.cpp/.cc/.cxx/.hpp/.hh/.hxx`; `.h` and metadata-less rows excluded).
+
+**Leakage control** (builder default, recorded in
+`benchmarks/cpp_eval_real.provenance.json`): every pair whose fix `commit_id`
+appears anywhere in `bstee615/bigvul` @ `4d8647a` is dropped (12 rows), and
+every remaining function is hash-matched by whitespace-normalized text against
+all 171,707 BigVul `func_before`/`func_after` bodies (0 additional hits) — so
+the set is disjoint from the BigVul training corpus. Rebuild with
+`scripts/py/build_cpp_eval_real.py`; schema/provenance are guarded by
+`tests/test_cpp_eval_real_dataset.py`.
+
+`./eval_cpp.sh` now scores this set automatically (→
+`benchmarks/cpp_eval_real_metrics.json` / `_scores.jsonl`, per-CWE via
+`--group-by category`) alongside the synthetic regression set. **Scoring
+awaits the production 0.959-AUC model on the GPU box** — the committed
+`vuln-model/` is the bootstrap smoke artifact and its numbers would be
+meaningless here. Caveat for reading the results: TensorFlow contributes 296 of
+822 rows (~36%), so check the per-project provenance before generalizing.
+
+Dataset attribution (MIT, Copyright (c) 2024 DLVulDet — see `NOTICE`):
+Ding, Y., Fu, Y., Ibrahim, O., Sitawarin, C., Chen, X., Alomair, B., Wagner,
+D., Ray, B., Chen, Y. *"Vulnerability Detection with Code Language Models: How
+Far Are We?"* arXiv:2403.18624 (ICSE 2025).
