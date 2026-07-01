@@ -20,7 +20,11 @@ Usage: ./build_airgap_bundle.sh [options]   (ONLINE machine; needs pip >= 23)
   --model DIR          trained model dir to bundle (default: vuln-model)
   --out DIR            output dir (default: dist/airgap)
   --arch LIST          comma-separated target arches (default: x86_64,aarch64)
-  --python X.Y         target python minor version for wheels (default: 3.12)
+  --python LIST        comma-separated target python minor versions
+                       (default: 3.10,3.11,3.12,3.13). The pinned ML deps need
+                       >= 3.11 (numpy), so pythons below that get a model-free
+                       (tree-sitter only) wheelhouse; the installer detects
+                       this and degrades to the model-free lane automatically.
   --skip-ml            model-free bundle: wheels limited to the tree-sitter
                        trio (tree_sitter, tree_sitter_c, tree_sitter_cpp);
                        no torch, no ML requirements. The model-free lane
@@ -37,7 +41,8 @@ EOF
 MODEL_DIR="vuln-model"
 OUT_DIR="dist/airgap"
 ARCHES="x86_64,aarch64"
-PYVER="3.12"
+PYVERS="3.10,3.11,3.12,3.13"
+ML_PY_FLOOR_MINOR=11   # requirements pins (numpy==2.3.3) need python >= 3.11
 SKIP_ML=0
 OLLAMA_MODELS_DIR=""
 
@@ -46,7 +51,7 @@ while [[ $# -gt 0 ]]; do
     --model)         MODEL_DIR="$2"; shift 2;;
     --out)           OUT_DIR="$2"; shift 2;;
     --arch)          ARCHES="$2"; shift 2;;
-    --python)        PYVER="$2"; shift 2;;
+    --python)        PYVERS="$2"; shift 2;;
     --skip-ml)       SKIP_ML=1; shift;;
     --ollama-models) OLLAMA_MODELS_DIR="$2"; shift 2;;
     -h|--help)       usage; exit 0;;
@@ -62,8 +67,15 @@ REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$REPO_ROOT"
 
 python3 -m pip --version >/dev/null 2>&1 || die "python3 -m pip not available; this builder runs on the CONNECTED machine"
-[[ "$PYVER" =~ ^3\.[0-9]+$ ]] || die "--python must look like 3.12 (got: $PYVER)"
-PYTAG="cp${PYVER//./}"
+IFS=',' read -r -a PYVER_LIST <<< "$PYVERS"
+CLEAN_PYVERS=()
+for PV in "${PYVER_LIST[@]}"; do
+  PV="${PV// /}"
+  [[ -n "$PV" ]] || continue
+  [[ "$PV" =~ ^3\.[0-9]+$ ]] || die "--python entries must look like 3.12 (got: $PV)"
+  CLEAN_PYVERS+=("$PV")
+done
+[[ ${#CLEAN_PYVERS[@]} -gt 0 ]] || die "--python resolved to an empty list"
 
 VERSION="$(git rev-parse --short HEAD 2>/dev/null || date +%Y%m%d)"
 BUNDLE="ccr-airgap-${VERSION}"
@@ -152,35 +164,35 @@ platform_ladder() {
 }
 
 download_wheel() {
-  # $1=spec $2=dest $3=arch; remaining args are extra pip flags (--index-url ...)
-  local spec="$1" dest="$2" arch="$3"; shift 3
+  # $1=spec $2=dest $3=arch $4=pyver; remaining args are extra pip flags
+  local spec="$1" dest="$2" arch="$3" pyver="$4"; shift 4
   # shellcheck disable=SC2046  # ladder flags are intentionally word-split
   if python3 -m pip download "$spec" -d "$dest" \
        --only-binary=:all: \
        $(platform_ladder "$arch") \
-       --python-version "$PYVER" --implementation cp \
+       --python-version "$pyver" --implementation cp \
        "$@"; then
     return 0
   fi
-  warn "pip download '$spec' failed (arch $arch, full manylinux ladder)"
+  warn "pip download '$spec' failed (arch $arch, python $pyver, full manylinux ladder)"
   return 1
 }
 
 download_requirements() {
-  # $1=reqfile $2=dest $3=arch — resolve the WHOLE requirements file in ONE
-  # pip call (consistent resolution across the pins); --find-links "$dest"
-  # lets the pre-downloaded +cpu torch satisfy the torch dependency of
+  # $1=reqfile $2=dest $3=arch $4=pyver — resolve the WHOLE requirements file
+  # in ONE pip call (consistent resolution across the pins); --find-links
+  # "$dest" lets the pre-downloaded +cpu torch satisfy the torch dependency of
   # peft/accelerate so pip never reaches for PyPI's CUDA torch.
-  local reqfile="$1" dest="$2" arch="$3"
+  local reqfile="$1" dest="$2" arch="$3" pyver="$4"
   # shellcheck disable=SC2046  # ladder flags are intentionally word-split
   if python3 -m pip download -r "$reqfile" -d "$dest" \
        --only-binary=:all: \
        $(platform_ladder "$arch") \
-       --python-version "$PYVER" --implementation cp \
+       --python-version "$pyver" --implementation cp \
        --find-links "$dest"; then
     return 0
   fi
-  warn "pip download -r '$reqfile' failed (arch $arch, full manylinux ladder)"
+  warn "pip download -r '$reqfile' failed (arch $arch, python $pyver, full manylinux ladder)"
   return 1
 }
 
@@ -208,61 +220,74 @@ check_wheelhouse_cpu_only() {
   exit 1
 }
 
-if [[ "$SKIP_ML" == "1" ]]; then
-  # Model-free lane: heuristic_scan/llm_explain/to_sarif are pure stdlib; the
-  # tree-sitter trio only improves function-boundary detection (--parser brace
-  # is the dependency-free fallback). Nothing else is needed.
-  mapfile -t REQS < <(grep -E '^tree_sitter' "$STAGE/repo/requirements.txt")
-  [[ ${#REQS[@]} -gt 0 ]] || REQS=(tree_sitter tree_sitter_c tree_sitter_cpp)
-else
-  mapfile -t REQS < <(grep -vE '^[[:space:]]*(#|$)' "$STAGE/repo/requirements.txt" | sed 's/[[:space:]]*#.*$//')
-fi
+# Model-free lane: heuristic_scan/llm_explain/to_sarif are pure stdlib; the
+# tree-sitter trio only improves function-boundary detection (--parser brace
+# is the dependency-free fallback). Nothing else is needed.
+mapfile -t TRIO_REQS < <(grep -E '^tree_sitter' "$STAGE/repo/requirements.txt")
+[[ ${#TRIO_REQS[@]} -gt 0 ]] || TRIO_REQS=(tree_sitter tree_sitter_c tree_sitter_cpp)
+mapfile -t FULL_REQS < <(grep -vE '^[[:space:]]*(#|$)' "$STAGE/repo/requirements.txt" | sed 's/[[:space:]]*#.*$//')
 
 IFS=',' read -r -a ARCH_LIST <<< "$ARCHES"
 for ARCH in "${ARCH_LIST[@]}"; do
   ARCH="${ARCH// /}"
   [[ -n "$ARCH" ]] || continue
-  DEST="$STAGE/wheels/$ARCH/$PYTAG"
-  mkdir -p "$DEST"
+  for PYVER in "${CLEAN_PYVERS[@]}"; do
+    PYTAG="cp${PYVER//./}"
+    DEST="$STAGE/wheels/$ARCH/$PYTAG"
+    mkdir -p "$DEST"
 
-  if [[ "$SKIP_ML" == "1" ]]; then
-    # Model-free lane: tree-sitter trio only, one download per spec.
-    say "Wheelhouse for $ARCH / $PYTAG (${#REQS[@]} requirement(s))"
-    for spec in "${REQS[@]}"; do
-      if ! download_wheel "$spec" "$DEST" "$ARCH"; then
-        warn "FAILED wheel: '$spec' ($ARCH/$PYTAG) — continuing with the rest"
-        FAILED+=("$ARCH/$PYTAG: $spec")
-      fi
-    done
-    continue
-  fi
+    # The pinned ML deps need python >= 3.ML_PY_FLOOR_MINOR; below that this
+    # wheelhouse carries only the tree-sitter trio and is marked model-free so
+    # the installer degrades gracefully instead of failing pip install.
+    PY_MINOR="${PYVER#3.}"
+    KIND="full"
+    if [[ "$SKIP_ML" == "1" ]]; then
+      KIND="model-free"
+    elif (( PY_MINOR < ML_PY_FLOOR_MINOR )); then
+      KIND="model-free"
+      warn "python $PYVER is below the ML floor (3.$ML_PY_FLOOR_MINOR needed by the numpy pin):"
+      warn "wheels/$ARCH/$PYTAG will be a model-free (tree-sitter only) wheelhouse."
+    fi
+    echo "$KIND" > "$DEST/WHEELHOUSE_KIND"
 
-  # Full-ML lane, step 1: CPU torch FIRST so the requirements resolution below
-  # finds it locally (see the ordering note above).
-  TORCH_SPEC="${CCR_TORCH_SPEC:-torch}"
-  say "CPU torch for $ARCH ($TORCH_SPEC from download.pytorch.org/whl/cpu)"
-  if ! download_wheel "$TORCH_SPEC" "$DEST" "$ARCH" --index-url "https://download.pytorch.org/whl/cpu"; then
-    warn "FAILED wheel: '$TORCH_SPEC' cpu channel ($ARCH/$PYTAG)"
-    FAILED+=("$ARCH/$PYTAG: $TORCH_SPEC (cpu channel)")
-  fi
+    if [[ "$KIND" == "model-free" ]]; then
+      say "Wheelhouse for $ARCH / $PYTAG (model-free: ${#TRIO_REQS[@]} requirement(s))"
+      for spec in "${TRIO_REQS[@]}"; do
+        if ! download_wheel "$spec" "$DEST" "$ARCH" "$PYVER"; then
+          warn "FAILED wheel: '$spec' ($ARCH/$PYTAG) — continuing with the rest"
+          FAILED+=("$ARCH/$PYTAG: $spec")
+        fi
+      done
+      continue
+    fi
 
-  # Step 2: one pip call for the whole requirements file (consistent
-  # resolution); per-spec fallback (also --find-links'd to the local +cpu
-  # torch) only if the single call fails, so one missing wheel does not lose
-  # the rest of the wheelhouse.
-  say "Wheelhouse for $ARCH / $PYTAG (single-resolution pip download -r requirements.txt)"
-  if ! download_requirements "$STAGE/repo/requirements.txt" "$DEST" "$ARCH"; then
-    warn "single-call resolution failed — falling back to per-requirement downloads"
-    for spec in "${REQS[@]}"; do
-      if ! download_wheel "$spec" "$DEST" "$ARCH" --find-links "$DEST"; then
-        warn "FAILED wheel: '$spec' ($ARCH/$PYTAG) — continuing with the rest"
-        FAILED+=("$ARCH/$PYTAG: $spec")
-      fi
-    done
-  fi
+    # Full-ML lane, step 1: CPU torch FIRST so the requirements resolution
+    # below finds it locally (see the ordering note above).
+    TORCH_SPEC="${CCR_TORCH_SPEC:-torch}"
+    say "CPU torch for $ARCH / $PYTAG ($TORCH_SPEC from download.pytorch.org/whl/cpu)"
+    if ! download_wheel "$TORCH_SPEC" "$DEST" "$ARCH" "$PYVER" --index-url "https://download.pytorch.org/whl/cpu"; then
+      warn "FAILED wheel: '$TORCH_SPEC' cpu channel ($ARCH/$PYTAG)"
+      FAILED+=("$ARCH/$PYTAG: $TORCH_SPEC (cpu channel)")
+    fi
 
-  # Step 3: hard gate — no CUDA stack, no non-+cpu torch (fails the build).
-  check_wheelhouse_cpu_only "$DEST" "$ARCH"
+    # Step 2: one pip call for the whole requirements file (consistent
+    # resolution); per-spec fallback (also --find-links'd to the local +cpu
+    # torch) only if the single call fails, so one missing wheel does not lose
+    # the rest of the wheelhouse.
+    say "Wheelhouse for $ARCH / $PYTAG (single-resolution pip download -r requirements.txt)"
+    if ! download_requirements "$STAGE/repo/requirements.txt" "$DEST" "$ARCH" "$PYVER"; then
+      warn "single-call resolution failed — falling back to per-requirement downloads"
+      for spec in "${FULL_REQS[@]}"; do
+        if ! download_wheel "$spec" "$DEST" "$ARCH" "$PYVER" --find-links "$DEST"; then
+          warn "FAILED wheel: '$spec' ($ARCH/$PYTAG) — continuing with the rest"
+          FAILED+=("$ARCH/$PYTAG: $spec")
+        fi
+      done
+    fi
+
+    # Step 3: hard gate — no CUDA stack, no non-+cpu torch (fails the build).
+    check_wheelhouse_cpu_only "$DEST" "$ARCH"
+  done
 done
 
 # --- optional Ollama blob store -------------------------------------------------
@@ -281,27 +306,37 @@ WHEEL_COUNTS=""
 for ARCH in "${ARCH_LIST[@]}"; do
   ARCH="${ARCH// /}"
   [[ -n "$ARCH" ]] || continue
-  N="$(find "$STAGE/wheels/$ARCH/$PYTAG" -name '*.whl' 2>/dev/null | wc -l | tr -d ' ')"
-  WHEEL_COUNTS+="${ARCH}=${N} "
+  for PYVER in "${CLEAN_PYVERS[@]}"; do
+    PYTAG="cp${PYVER//./}"
+    D="$STAGE/wheels/$ARCH/$PYTAG"
+    N="$(find "$D" -name '*.whl' 2>/dev/null | wc -l | tr -d ' ')"
+    K="$(cat "$D/WHEELHOUSE_KIND" 2>/dev/null || echo full)"
+    WHEEL_COUNTS+="${ARCH}/${PYTAG}:${K}=${N} "
+  done
 done
 FAILED_JOINED=""
 [[ ${#FAILED[@]} -gt 0 ]] && FAILED_JOINED="$(printf '%s\n' "${FAILED[@]}")"
-CCR_MANIFEST_VERSION="$VERSION" CCR_MANIFEST_PYVER="$PYVER" \
+CCR_MANIFEST_VERSION="$VERSION" CCR_MANIFEST_PYVERS="$PYVERS" \
 CCR_MANIFEST_SKIP_ML="$SKIP_ML" CCR_MANIFEST_MODEL_SHA="$MODEL_SHA" \
 CCR_MANIFEST_WHEELS="$WHEEL_COUNTS" CCR_MANIFEST_FAILED="$FAILED_JOINED" \
 python3 - "$STAGE/bundle_manifest.json" <<'PY'
 import json, os, sys, time
-wheels = {}
+wheelhouses = []
+arches = set()
 for tok in os.environ.get("CCR_MANIFEST_WHEELS", "").split():
-    arch, _, n = tok.partition("=")
-    wheels[arch] = int(n or 0)
+    where, _, n = tok.partition("=")
+    loc, _, kind = where.partition(":")
+    arch, _, pytag = loc.partition("/")
+    arches.add(arch)
+    wheelhouses.append({"arch": arch, "python": pytag, "kind": kind or "full",
+                        "wheels": int(n or 0)})
 manifest = {
     "version": os.environ["CCR_MANIFEST_VERSION"],
     "built": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    "arches": sorted(wheels),
-    "python": os.environ["CCR_MANIFEST_PYVER"],
+    "arches": sorted(arches),
+    "pythons": [p.strip() for p in os.environ["CCR_MANIFEST_PYVERS"].split(",") if p.strip()],
     "skip_ml": os.environ["CCR_MANIFEST_SKIP_ML"] == "1",
-    "wheel_counts": wheels,
+    "wheelhouses": wheelhouses,
     "model_sha256": os.environ.get("CCR_MANIFEST_MODEL_SHA") or None,
     "failed_wheels": [l for l in os.environ.get("CCR_MANIFEST_FAILED", "").splitlines() if l],
 }

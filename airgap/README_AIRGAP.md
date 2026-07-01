@@ -11,15 +11,23 @@ Needs: network, `git`, `python3` with `pip >= 23` (older pips mishandle
 cross-platform `--platform` downloads), and ideally `zstd`.
 
 ```bash
-# full bundle: both arches, python 3.12 wheels, ML lane + model-free lane
+# full bundle: both arches, python 3.10–3.13 wheels, ML lane + model-free lane
 ./build_airgap_bundle.sh --model /path/to/real-model
 
 # common variations
-./build_airgap_bundle.sh --arch x86_64 --python 3.11        # one arch, py3.11 target
+./build_airgap_bundle.sh --arch x86_64 --python 3.11,3.12   # one arch, two pythons
 ./build_airgap_bundle.sh --skip-ml                          # model-free lane only
 CCR_TORCH_SPEC='torch==2.6.*' ./build_airgap_bundle.sh      # pin the CPU torch
 ./build_airgap_bundle.sh --ollama-models ~/.ollama/models   # bundle LLM blobs too
 ```
+
+The default `--python 3.10,3.11,3.12,3.13` covers any reasonably current
+distro. The pinned ML deps need python **>= 3.11** (the numpy pin), so pythons
+below that get a **model-free** wheelhouse (tree-sitter trio only), and the
+installer on such a machine automatically degrades to the model-free lane with
+a notice — it never fails halfway through a pip install. Each wheelhouse
+carries a `WHEELHOUSE_KIND` marker (`full` / `model-free`) so the installer
+knows which lane it can offer.
 
 Output: `dist/airgap/ccr-airgap-<gitrev>.tar[.zst]` containing
 
@@ -140,7 +148,8 @@ back to the heuristic backend automatically.
 | symptom | cause | fix |
 | --- | --- | --- |
 | `no wheelhouse for this machine: wheels/aarch64/cp312` + a combo list | bundle built for other arch/python | rebuild with `--arch <uname -m>` / `--python <X.Y>`; the error prints what the bundle does contain |
-| `python3 is 3.10 but the ML install needs >= 3.11` | target python too old for the numpy pin | install python3.11+ (`deadsnakes`/distro backport, offline .debs), or use a `--skip-ml` bundle |
+| `python3 is 3.10 but the ML install needs >= 3.11` | full wheelhouse selected on a python below the numpy-pin floor (only possible with a custom-built bundle) | install python3.11+ (`deadsnakes`/distro backport, offline .debs), or pass `--skip-ml` |
+| `wheelhouse ... is model-free` notice during a full install | this machine's python is below the ML floor — default bundles ship a tree-sitter-only wheelhouse for it | expected: the model-free lane installs and works; for the ML lane install python3.11+ and re-run (its full wheelhouse is already in the bundle) |
 | `SHA256SUMS verification FAILED` | corrupt/tampered transfer | re-copy the tarball; compare `sha256sum` of the tarball on both machines |
 | `archive sha256 mismatch` from unpack_model.sh | model tar corrupt | rebuild/re-copy; the manifest travels next to the tar |
 | `zstd not found` | zstd not installed on target | install the OS `zstd` package (offline .deb) — it is intentionally not bundled |

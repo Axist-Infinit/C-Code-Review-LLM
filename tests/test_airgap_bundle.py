@@ -95,7 +95,7 @@ def test_install_help_exits_zero():
 # install_offline.sh verification paths (fabricated mini-bundle)
 # --------------------------------------------------------------------------
 
-def _make_bundle(tmp_path, skip_ml=False, arch="x86_64", pytag="cp312"):
+def _make_bundle(tmp_path, skip_ml=False, arch="x86_64", pytag="cp312", kind=None):
     """Fabricate a minimal bundle dir with a valid SHA256SUMS."""
     b = tmp_path / "bundle"
     (b / "repo").mkdir(parents=True)
@@ -103,6 +103,8 @@ def _make_bundle(tmp_path, skip_ml=False, arch="x86_64", pytag="cp312"):
     wheel_dir = b / "wheels" / arch / pytag
     wheel_dir.mkdir(parents=True)
     (wheel_dir / "dummy-1.0-py3-none-any.whl").write_bytes(b"not a real wheel")
+    if kind is not None:
+        (wheel_dir / "WHEELHOUSE_KIND").write_text(kind + "\n")
     (b / "bundle_manifest.json").write_text(json.dumps(
         {"version": "test", "skip_ml": skip_ml, "python": "3.12",
          "arches": [arch], "wheel_counts": {arch: 1}}) + "\n")
@@ -192,6 +194,31 @@ def test_skip_ml_flag_overrides_full_bundle_floor(tmp_path):
     b = _make_bundle(tmp_path, skip_ml=False, pytag="cp310")
     res = _verify(b, "--skip-ml", env_extra={"CCR_PY_VER": "3.10"})
     assert res.returncode == 0, res.stdout + res.stderr
+
+
+@needs_bash
+@needs_sha256sum
+def test_model_free_wheelhouse_auto_degrades_full_install_on_310(tmp_path):
+    # A default multi-python build marks the cp310 wheelhouse model-free; a
+    # 3.10 machine installing WITHOUT --skip-ml must degrade to the model-free
+    # lane (with a notice) instead of dying at the python floor.
+    b = _make_bundle(tmp_path, skip_ml=False, pytag="cp310", kind="model-free")
+    res = _verify(b, env_extra={"CCR_PY_VER": "3.10"})
+    out = res.stdout + res.stderr
+    assert res.returncode == 0, out
+    assert "model-free" in out.lower()
+    assert "skip_ml=1" in out
+
+
+@needs_bash
+@needs_sha256sum
+def test_full_wheelhouse_kind_keeps_ml_floor(tmp_path):
+    # An explicit 'full' marker must behave exactly like the unmarked case:
+    # 3.10 + full ML wheelhouse is still refused at the floor.
+    b = _make_bundle(tmp_path, skip_ml=False, pytag="cp310", kind="full")
+    res = _verify(b, env_extra={"CCR_PY_VER": "3.10"})
+    assert res.returncode != 0
+    assert "3.11" in (res.stdout + res.stderr)
 
 
 @needs_bash
@@ -616,7 +643,7 @@ def _run_build(tmp_path, mode, *extra_args):
     env["PIP_STUB_REQS_MODE"] = mode
     res = subprocess.run(
         ["bash", BUILD, "--model", str(model), "--out", str(out),
-         "--arch", "x86_64", *extra_args],
+         "--arch", "x86_64", "--python", "3.12", *extra_args],
         capture_output=True, text=True, env=env)
     return res, out, log
 
@@ -706,3 +733,38 @@ def test_build_skip_ml_wheel_path_unchanged(tmp_path):
     assert calls, "no downloads logged"
     assert all("download.pytorch.org" not in c and " -r " not in c for c in calls)
     assert all("tree_sitter" in c.split()[1] for c in calls)
+
+
+@needs_bash
+def test_build_multi_python_splits_full_and_model_free_at_the_floor(tmp_path):
+    """--python 3.10,3.12: the cp310 wheelhouse (below the numpy 3.11 floor)
+    gets only the tree-sitter trio and a model-free marker; cp312 keeps the
+    full torch-first + single -r shape and a full marker."""
+    res, out, log = _run_build(tmp_path, "ok", "--python", "3.10,3.12")
+    assert res.returncode == 0, res.stdout + res.stderr
+
+    calls = _download_calls(log)
+    calls_310 = [c for c in calls if "--python-version 3.10" in c]
+    calls_312 = [c for c in calls if "--python-version 3.12" in c]
+    assert calls_310 and calls_312
+    # cp310: trio only — no torch channel, no -r resolution
+    assert all("download.pytorch.org" not in c and " -r " not in c
+               for c in calls_310)
+    assert all("tree_sitter" in c.split()[1] for c in calls_310)
+    # cp312: torch first, then the single -r resolution
+    assert any("download.pytorch.org/whl/cpu" in c for c in calls_312)
+    assert any(" -r " in c for c in calls_312)
+
+    import glob as _glob
+    stage = _glob.glob(str(out / "ccr-airgap-*"))[0]
+    kind_310 = open(os.path.join(stage, "wheels", "x86_64", "cp310",
+                                 "WHEELHOUSE_KIND")).read().strip()
+    kind_312 = open(os.path.join(stage, "wheels", "x86_64", "cp312",
+                                 "WHEELHOUSE_KIND")).read().strip()
+    assert kind_310 == "model-free" and kind_312 == "full"
+
+    manifest = json.loads(open(os.path.join(stage, "bundle_manifest.json")).read())
+    kinds = {(w["arch"], w["python"]): w["kind"] for w in manifest["wheelhouses"]}
+    assert kinds[("x86_64", "cp310")] == "model-free"
+    assert kinds[("x86_64", "cp312")] == "full"
+    assert manifest["pythons"] == ["3.10", "3.12"]

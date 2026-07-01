@@ -100,14 +100,24 @@ if [[ ! -d "$WHEELS" ]]; then
   exit 1
 fi
 
-# --- 3. python floor -------------------------------------------------------------
-# The pinned ML deps (numpy==2.3.3) need python >= 3.11. The model-free lane
-# (--skip-ml) is pure stdlib and runs on 3.10+.
+# --- 3. wheelhouse kind + python floor ---------------------------------------------
+# The builder marks each wheelhouse: 'full' (ML deps + CPU torch) or
+# 'model-free' (tree-sitter trio only — built for pythons below the 3.11 numpy
+# floor, or under --skip-ml). A model-free wheelhouse degrades this install to
+# the model-free lane instead of failing pip install halfway.
+WHEELHOUSE_KIND="$(cat "$WHEELS/WHEELHOUSE_KIND" 2>/dev/null || echo full)"
+if [[ "$WHEELHOUSE_KIND" == "model-free" && "$SKIP_ML" != "1" ]]; then
+  warn "wheelhouse $WHEELS is model-free (python $PY_VER is below the ML floor 3.11, or the bundle was built --skip-ml)."
+  warn "Installing the MODEL-FREE lane: heuristic scan + regex explainer + SARIF — no torch/classifier."
+  warn "For the ML lane on this machine: install python3.11+ and re-run (a full wheelhouse for it is in this bundle if it was built with the default --python list)."
+  SKIP_ML=1
+fi
+
 version_ge(){ python3 -c "import sys; sys.exit(0 if tuple(map(int, '$1'.split('.'))) >= ($2) else 1)"; }
 if [[ "$SKIP_ML" == "1" ]]; then
   version_ge "$PY_VER" "3, 10" || die "python3 is $PY_VER; even the model-free lane needs >= 3.10."
 else
-  version_ge "$PY_VER" "3, 11" || die "python3 is $PY_VER but the ML install needs >= 3.11 (numpy pin). Install python3.11+, or use a --skip-ml bundle / pass --skip-ml."
+  version_ge "$PY_VER" "3, 11" || die "python3 is $PY_VER but the ML install needs >= 3.11 (numpy pin). Install python3.11+, or pass --skip-ml."
 fi
 
 say "Preflight OK: arch=$ARCH python=$PY_VER wheelhouse=$WHEELS skip_ml=$SKIP_ML"
