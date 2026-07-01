@@ -87,6 +87,56 @@ def test_namespaced_function_is_captured():
 
 
 @cpp
+def test_namespace_scope_lambda_captured():
+    # A lambda assigned to a variable at namespace scope is a declaration, not
+    # a function_definition; the walker must still capture the whole thing.
+    code = (
+        "namespace n {\n"
+        "auto handler = [](const char *s) {\n"
+        "    return s[0];\n"
+        "};\n"
+        "}\n"
+    )
+    res = _extract_functions_treesitter(code, lang="cpp")
+    assert res is not None
+    assert [(a, b) for (a, b, _l) in res] == [(1, 4)]
+    assert "handler" in res[0][2][0]
+
+
+@cpp
+def test_file_scope_lambda_captured():
+    code = "auto add1 = [](int x) {\n    return x + 1;\n};\n"
+    res = _extract_functions_treesitter(code, lang="cpp")
+    assert res is not None and len(res) == 1
+    assert res[0][0] == 0 and "add1" in res[0][2][0]
+
+
+@cpp
+def test_lambda_inside_function_still_not_split():
+    # capturing declarations must not start splitting lambdas out of bodies
+    code = "int f() {\n    auto g = [](int x){ return x + 1; };\n    return g(1);\n}\n"
+    res = _extract_functions_treesitter(code, lang="cpp")
+    assert len(res) == 1 and res[0][0] == 0
+
+
+@cpp
+def test_doubled_template_header_member_template():
+    # out-of-line member template: template<T> template<U> void Box<T>::set(U)
+    # must be captured once, from the OUTER template header.
+    code = (
+        "template <typename T>\n"
+        "template <typename U>\n"
+        "void Box<T>::set(U u) {\n"
+        "    v_ = static_cast<T>(u);\n"
+        "}\n"
+    )
+    res = _extract_functions_treesitter(code, lang="cpp")
+    assert res is not None
+    assert [(a, b) for (a, b, _l) in res] == [(0, 5)]
+    assert res[0][2][0].startswith("template")
+
+
+@cpp
 def test_extract_functions_dispatch_cpp_lang():
     code = open(FIXTURE, encoding="utf-8").read()
     res = extract_functions(code, parser="auto", lang="cpp")

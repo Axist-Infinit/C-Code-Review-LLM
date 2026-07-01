@@ -95,3 +95,21 @@ def test_dispatch_treesitter_mode_raises_when_unavailable(monkeypatch):
     monkeypatch.setattr("local_vuln_scanner.treesitter_available", lambda *a, **k: False)
     with pytest.raises(RuntimeError, match="not installed"):
         extract_functions("int f(void){return 0;}", parser="treesitter")
+
+
+def test_parser_engine_banner_respects_cpp_only_grammar(monkeypatch):
+    # The banner used to consult only the default C grammar, reporting "brace"
+    # even when the cpp grammar was installed and would be used per-file.
+    import local_vuln_scanner as lvs
+    monkeypatch.setattr(lvs, "treesitter_available", lambda lang="c": lang == "cpp")
+    assert lvs._parser_engine("auto", "cpp") == "tree-sitter"
+    assert lvs._parser_engine("auto", "auto") == "tree-sitter"   # any grammar counts
+    assert lvs._parser_engine("auto", "c") == "brace"
+    assert lvs._parser_engine("brace", "cpp") == "brace"
+
+
+def test_parser_engine_banner_brace_when_no_grammars(monkeypatch):
+    import local_vuln_scanner as lvs
+    monkeypatch.setattr(lvs, "treesitter_available", lambda lang="c": False)
+    assert lvs._parser_engine("auto", "auto") == "brace"
+    assert lvs._parser_engine("treesitter", "cpp") == "brace"
