@@ -8,6 +8,7 @@ Falls back to the heuristic regex explainer when Ollama is unavailable.
 import argparse
 import json
 import os
+import re
 import sys
 import threading
 import urllib.error
@@ -44,6 +45,11 @@ SYSTEM_PROMPT = (
     "(CWE-78/22/89); uncontrolled format strings (CWE-134); missing validation of "
     "untrusted input and unchecked return values (CWE-20/252); weak crypto or "
     "predictable randomness (CWE-327/330); and race conditions / TOCTOU (CWE-362).\n"
+    "For C++ code additionally check: use-after-move of moved-from objects; "
+    "iterator or reference invalidation after container mutation; dangling "
+    "pointers from c_str()/data() or a string_view bound to a temporary; "
+    "new[]/delete (and new/delete[]) mismatches; and exception-safety/RAII "
+    "violations that leak or double-free during unwinding.\n"
     "Trace whether attacker-controllable data can actually reach the dangerous "
     "operation before calling something vulnerable; do not flag a safe, bounded use.\n"
     "\n"
@@ -76,10 +82,51 @@ def ollama_available(base_url, model, timeout=5):
         return False, False
 
 
+# Fallback extension mapping used when local_vuln_scanner is unimportable;
+# mirrors its _CPP_EXTS set.
+_CPP_HINT_EXTS = {".cpp", ".cc", ".cxx", ".c++", ".hpp", ".hh", ".hxx", ".h++",
+                  ".tcc", ".ipp", ".inl"}
+
+
+def language_hint(file_path):
+    """Return "C++" or "C" for the prompt, derived from the file extension.
+
+    Defers to the scanner's lang_for_path when importable so both lanes agree
+    on ambiguous headers; otherwise falls back to a plain extension check.
+    """
+    try:
+        from local_vuln_scanner import lang_for_path
+        lang = lang_for_path(file_path or "")
+    except Exception:
+        ext = os.path.splitext(file_path or "")[1].lower()
+        lang = "cpp" if ext in _CPP_HINT_EXTS else "c"
+    return "C++" if lang == "cpp" else "C"
+
+
+def parse_chat_response(resp):
+    """Extract and parse the model's JSON reply from an /api/chat body.
+
+    Ollama returns {"message": {"content": "<json string>"}}. Anything else
+    (list body, null message, null content) raises ValueError so the caller's
+    per-finding heuristic fallback handles it instead of an AttributeError/
+    TypeError escaping the except tuple and aborting the whole run.
+    """
+    if not isinstance(resp, dict):
+        raise ValueError(f"non-object chat response body: {type(resp).__name__}")
+    message = resp.get("message")
+    if not isinstance(message, dict):
+        raise ValueError(f"chat response 'message' is {type(message).__name__}, not an object")
+    content = message.get("content")
+    if not isinstance(content, str):
+        raise ValueError(f"chat response 'content' is {type(content).__name__}, not a string")
+    return json.loads(content)
+
+
 def ollama_chat(base_url, model, snippet, file_path, lines, num_ctx, timeout=600):
     # Fence the untrusted snippet with explicit markers (matched in SYSTEM_PROMPT)
     # so in-code instructions cannot be confused with the reviewer's task.
-    user = (f"File: {file_path} (lines {lines})\n\n"
+    user = (f"File: {file_path} (lines {lines})\n"
+            f"Language: {language_hint(file_path)}\n\n"
             f"{SNIPPET_BEGIN}\n{snippet}\n{SNIPPET_END}")
     payload = {
         "model": model,
@@ -98,8 +145,7 @@ def ollama_chat(base_url, model, snippet, file_path, lines, num_ctx, timeout=600
     )
     with urllib.request.urlopen(req, timeout=timeout) as r:
         resp = json.load(r)
-    content = resp.get("message", {}).get("content", "")
-    return json.loads(content)
+    return parse_chat_response(resp)
 
 
 def heuristic_entry(f):
@@ -131,6 +177,30 @@ def heuristic_entry(f):
 # silently downgrade the finding to "not vulnerable" / "info" / "low".
 CORROBORATION_SCORE_FLOOR = 0.80
 _SEVERITY_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+
+ALLOWED_SEVERITIES = frozenset(_SEVERITY_RANK)
+_CWE_FORM_RE = re.compile(r"^(?:CWE[\s_-]*)?(\d{1,5})$", re.IGNORECASE)
+
+
+def normalize_severity(value):
+    """Lowercased/stripped severity if in the allow-list, else None."""
+    sev = str(value or "").strip().lower()
+    return sev if sev in ALLOWED_SEVERITIES else None
+
+
+def normalize_cwe(value):
+    """Canonical 'CWE-<n>' for forms like 'cwe-120'/'CWE 120'/'120', else None.
+
+    Leading zeros are stripped ('CWE-078' -> 'CWE-78') so one weakness cannot
+    split into distinct SARIF ruleIds (and dead zero-padded MITRE helpUris).
+    CWE 0 does not exist, so 'CWE-0'/'CWE-000' are rejected like any other
+    invalid form and fall back to the heuristic cwe.
+    """
+    m = _CWE_FORM_RE.match(str(value or "").strip())
+    if not m:
+        return None
+    num = int(m.group(1))
+    return f"CWE-{num}" if num > 0 else None
 
 
 def apply_corroboration_floor(entry, score, matched, floor=CORROBORATION_SCORE_FLOOR):
@@ -177,6 +247,10 @@ def explain_finding(f, *, backend, model, ollama_url, num_ctx, chat_fn=ollama_ch
         "score": f.get("score"),
         "snippet": (f.get("snippet") or "").splitlines()[:60],
     }
+    # C2/C3 contract: heuristic findings may carry absolute matched line
+    # numbers; pass them through so SARIF/PR annotators can anchor tightly.
+    if f.get("match_lines") is not None:
+        entry["match_lines"] = f["match_lines"]
     if backend != "ollama":
         entry.update(heuristic_entry(f))
         return entry
@@ -200,12 +274,27 @@ def explain_finding(f, *, backend, model, ollama_url, num_ctx, chat_fn=ollama_ch
         risk = str(llm.get("what_could_go_wrong", "") or "").strip() or fallback["what_could_go_wrong"]
         vuln = str(llm.get("vulnerability", "") or "").strip() or fallback["vulnerability"]
         explanation = str(llm.get("explanation", "") or "").strip() or risk
+        # Allow-list validation: a (possibly prompt-injected or hallucinating)
+        # LLM cannot smuggle garbage vocabulary into SARIF ruleIds / severity
+        # levels. Invalid values fall back to the heuristic for the matched
+        # patterns, and the substitution is recorded for observability.
+        field_fallbacks = []
+        severity = normalize_severity(llm.get("severity"))
+        if severity is None:
+            severity = severity_for_patterns(matched) if matched else "info"
+            if severity != str(llm.get("severity", "") or "").strip().lower():
+                field_fallbacks.append("severity")
+        cwe = normalize_cwe(llm.get("cwe"))
+        if cwe is None:
+            cwe = cwe_for_patterns(matched)
+            if cwe != str(llm.get("cwe", "") or "").strip():
+                field_fallbacks.append("cwe")
         entry.update({
             "backend": "ollama", "model": model,
             "is_vulnerable": bool(llm.get("is_vulnerable")),
             "issue": str(llm.get("issue", "")),
-            "cwe": str(llm.get("cwe", "")),
-            "severity": str(llm.get("severity", "")),
+            "cwe": cwe,
+            "severity": severity,
             "what_code_does": what,
             "what_could_go_wrong": risk,
             "vulnerability": vuln,
@@ -214,6 +303,8 @@ def explain_finding(f, *, backend, model, ollama_url, num_ctx, chat_fn=ollama_ch
             "matched_patterns": sorted(matched),
             "confidence": score_to_confidence(f.get("score"), has_pattern=has_pattern),
         })
+        if field_fallbacks:
+            entry["llm_field_fallbacks"] = field_fallbacks
         # Cross-check: a (possibly prompt-injected) LLM cannot bury a finding the
         # classifier + heuristic already corroborate.
         apply_corroboration_floor(entry, f.get("score"), matched)
@@ -223,8 +314,34 @@ def explain_finding(f, *, backend, model, ollama_url, num_ctx, chat_fn=ollama_ch
     return entry
 
 
+def checkpoint_path(out_path):
+    """The JSONL checkpoint path paired with a final output path."""
+    return out_path + ".partial.jsonl"
+
+
+def append_checkpoint(path, idx, entry):
+    """Append one completed explanation as a JSONL line and flush it.
+
+    Each line is {"index": <input position>, "entry": {...}} so a crashed run
+    leaves every completed explanation recoverable in input order.
+    """
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"index": idx, "entry": entry}) + "\n")
+        fh.flush()
+
+
+def write_json_atomic(path, payload):
+    """Write JSON via a temp file + os.replace so readers never see a torn file."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+    os.replace(tmp, path)
+
+
 def run_explanations(findings, *, backend, model, ollama_url, num_ctx,
-                     workers=1, chat_fn=ollama_chat, progress=None):
+                     workers=1, chat_fn=ollama_chat, progress=None,
+                     checkpoint=None):
     """Explain all findings, returning entries in the SAME order as `findings`.
 
     For the Ollama backend the work is spread across up to `workers` threads:
@@ -232,24 +349,37 @@ def run_explanations(findings, *, backend, model, ollama_url, num_ctx,
     when it serializes, overlapping the HTTP round-trips removes idle time. The
     heuristic backend is pure-CPU regex and always runs inline. `progress(done,
     total, entry)` is invoked (thread-safe via the caller's lock) per completion.
+    When `checkpoint` is a path, every completed entry is appended there as
+    JSONL (truncated at start), so a crash mid-run loses no finished work.
     """
     total = len(findings)
     results = [None] * total
+    if checkpoint:  # drop stale lines from a previous run
+        os.makedirs(os.path.dirname(checkpoint) or ".", exist_ok=True)
+        open(checkpoint, "w", encoding="utf-8").close()
 
     def work(idx, f):
         return idx, explain_finding(f, backend=backend, model=model,
                                     ollama_url=ollama_url, num_ctx=num_ctx,
                                     chat_fn=chat_fn)
 
-    effective = max(1, min(workers, total)) if backend == "ollama" else 1
     done = 0
+
+    def record(idx, entry):
+        # Runs only on the consumer (main) thread, so no lock is needed.
+        nonlocal done
+        results[idx] = entry
+        done += 1
+        if checkpoint:
+            append_checkpoint(checkpoint, idx, entry)
+        if progress:
+            progress(done, total, entry)
+
+    effective = max(1, min(workers, total)) if backend == "ollama" else 1
     if effective <= 1:
         for idx, f in enumerate(findings):
             _, entry = work(idx, f)
-            results[idx] = entry
-            done += 1
-            if progress:
-                progress(done, total, entry)
+            record(idx, entry)
         return results
 
     import concurrent.futures
@@ -257,10 +387,7 @@ def run_explanations(findings, *, backend, model, ollama_url, num_ctx,
         futs = [ex.submit(work, idx, f) for idx, f in enumerate(findings)]
         for fut in concurrent.futures.as_completed(futs):
             idx, entry = fut.result()
-            results[idx] = entry
-            done += 1
-            if progress:
-                progress(done, total, entry)
+            record(idx, entry)
     return results
 
 
@@ -328,15 +455,18 @@ def main():
             print(f"  [{done}/{total}] {loc} -> "
                   f"{entry.get('severity') or 'n/a'} {entry.get('cwe', '')}{note}")
 
+    partial = checkpoint_path(args.out)
     out_entries = run_explanations(
         findings, backend=backend, model=model, ollama_url=args.ollama_url,
-        num_ctx=num_ctx, workers=workers, progress=_progress,
+        num_ctx=num_ctx, workers=workers, progress=_progress, checkpoint=partial,
     )
 
-    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-    with open(args.out, "w", encoding="utf-8") as fh:
-        json.dump({"backend": backend, "model": model if backend == "ollama" else None,
-                   "profile": prof_name, "explanations": out_entries}, fh, indent=2)
+    write_json_atomic(args.out, {
+        "backend": backend, "model": model if backend == "ollama" else None,
+        "profile": prof_name, "explanations": out_entries,
+    })
+    if os.path.exists(partial):  # full output landed; the checkpoint is obsolete
+        os.remove(partial)
     print(f"[OK] {len(out_entries)} explanations -> {args.out}")
 
     if args.html:
