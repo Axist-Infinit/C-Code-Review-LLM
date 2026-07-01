@@ -483,31 +483,82 @@ def dedup_findings(findings):
 
 # Deterministic consolidation: bucket findings by a security-TOPIC signature so
 # the same issue stated by several samples (with different anchors/CWEs) collapses
-# to one, and the canonical CWE (+ known CVE) is restored. Order matters: more
-# specific evidence patterns are checked first. Each entry: (topic, regex, cwe, cve).
+# to one. Order matters: more specific evidence patterns are checked first
+# (parse-overread before the broader overload-reparse, the append signature
+# before anything its parameter names could trip). Each entry:
+# (topic, regex, canonical cwe, acceptable cwes, cve). A finding whose CWE is
+# already in the acceptable set keeps it; only missing/out-of-set CWEs are
+# rewritten to the canonical one, and a topic's CVE analog is attached only
+# when that override actually happened (see _apply_topic).
 _TOPIC_SIGS = [
-    ("use-after-free",   r"use[- ]?after[- ]?free|re-?entranc|dont_destroy|freed during|destroyed during", "CWE-416", ""),
-    ("null-deref",       r"null[- ]?deref|null pointer|->\s*xid|logging macro|log_dhcp", "CWE-476", ""),
-    ("sign-cast",        r"sign[- ]?conversion|signed cast|int32_t|sign-?conversion hygiene", "CWE-195", ""),
-    ("dns-label",        r"fqdn|dns[- ]?wire|dns label|compression pointer", "CWE-125", ""),
-    ("overload-reparse", r"dhcp_overload|overloaded|re-?parse|option space|once-?guard|\bsname\b", "CWE-674", ""),
-    ("length-vs-buffer", r"\bhlen\b|chaddr|hardware address length", "CWE-120", ""),
-    ("packed-offset",    r"\bihl\b|iphdr|ip header|variable[- ]?length ip|verify_headers|fixed[- ]?offset|assumed offset", "CWE-125", ""),
-    ("validation-gate",  r"magic|endian|byte[- ]?swap|cookie|flags field", "CWE-20", ""),
-    ("append-overflow",  r"dhcp_option_append", "CWE-787", "CVE-2018-15688"),
-    ("parse-overread",   r"option_parse|option length|\btlv\b|option parsing", "CWE-125", ""),
-    ("flexible-array",   r"flexible[- ]?array|options\[\s*0\s*\]|\bfam\b", "CWE-787", ""),
-    ("checksum",         r"checksum", "CWE-125", ""),
+    # The append topic needs the function name AND corroborating overflow/write/
+    # bounds evidence: a different bug class (e.g. a null-deref) that merely
+    # mentions dhcp_option_append must not be rebadged as the known overflow.
+    ("append-overflow",
+     r"(?=.*dhcp_option_append)(?=.*(?:overflow|underflow|out[- ]of[- ]bounds"
+     r"|\boob\b|exceed|bounds?\b|unbounded|wrap|memcpy|write|smash|corrupt))",
+     "CWE-787", {"CWE-787", "CWE-191"}, "CVE-2018-15688"),
+    # CWE-190 is acceptable per the KB's c-tlv-length-parse note, case (c):
+    # 'offset + len' wrapping past the end pointer is an integer overflow.
+    ("parse-overread",   r"option_parse|option length|\btlv\b|option parsing",
+     "CWE-125", {"CWE-125", "CWE-191", "CWE-190"}, ""),
+    ("use-after-free",   r"use[- ]?after[- ]?free|re-?entranc|dont_destroy|freed during|destroyed during",
+     "CWE-416", {"CWE-416"}, ""),
+    # 'dereference' prose alone must not route here: OOB/UAF failure modes say
+    # "dereference" routinely, so the deref token requires nearby null context.
+    ("null-deref",
+     r"null[- ]?deref|null pointer|->\s*xid"
+     r"|derefer\w*.{0,120}?\bnull|\bnull\w*.{0,120}?derefer",
+     "CWE-476", {"CWE-476"}, ""),
+    ("sign-cast",        r"sign[- ]?conversion|signed cast|int32_t.*(?:cast|negative|sign)|(?:cast|negative|sign).*int32_t",
+     "CWE-195", {"CWE-195", "CWE-196"}, ""),
+    ("dns-label",        r"fqdn|dns[- ]?wire|dns label|compression pointer",
+     "CWE-125", {"CWE-125"}, ""),
+    ("overload-reparse", r"dhcp_overload|\bsname\b|\bfile field\b|once-?guard",
+     "CWE-674", {"CWE-674", "CWE-400"}, ""),
+    ("length-vs-buffer", r"\bhlen\b|chaddr|hardware address length",
+     "CWE-120", {"CWE-120", "CWE-787"}, ""),
+    ("packed-offset",    r"\bihl\b|iphdr|ip header|variable[- ]?length ip|verify_headers|fixed[- ]?offset|assumed offset",
+     "CWE-125", {"CWE-125"}, ""),
+    ("flexible-array",   r"flexible[- ]?array|options\[\s*0\s*\]|\bfam\b",
+     "CWE-787", {"CWE-787", "CWE-125"}, ""),
+    ("validation-gate",  r"magic|endian|byte[- ]?swap|cookie|flags field",
+     "CWE-20", {"CWE-20", "CWE-697"}, ""),
+    ("checksum",         r"checksum.*(?:over-?read|out[- ]?of[- ]?bounds|past the|read[s]? beyond|length)|(?:over-?read|length).*checksum",
+     "CWE-125", {"CWE-125"}, ""),
 ]
 
 
 def _finding_topic(f):
     text = " ".join(str(f.get(k, "")) for k in
                     ("title", "anchor", "bug_class", "failure_mode")).lower()
-    for topic, pat, cwe, cve in _TOPIC_SIGS:
-        if re.search(pat, text):
-            return topic, cwe, cve
-    return None, None, None
+    for topic, pat, cwe, accept, cve in _TOPIC_SIGS:
+        if re.search(pat, text, re.S):
+            return topic, cwe, accept, cve
+    return None, None, None, None
+
+
+def _canon_cwe(current, canonical, accept):
+    """Keep the finding's CWE when it is already acceptable for the topic;
+    rewrite only missing or out-of-set CWEs to the canonical one."""
+    cur = str(current or "").strip().upper()
+    return cur if cur in accept else canonical
+
+
+def _apply_topic(cand, canonical, accept, cve):
+    """Canonicalise cand's CWE for its topic, in place.
+
+    The topic's CVE analog is attached ONLY when the CWE was actually
+    overridden into the canonical CWE-787 — i.e. the finding really is the
+    known overflow the topic documents. A finding that carries an acceptable
+    (kept) CWE gets no CVE fabricated onto it; an existing cve_analog is
+    always preserved.
+    """
+    before = str(cand.get("cwe") or "").strip().upper()
+    cand["cwe"] = _canon_cwe(before, canonical, accept)
+    if (cve and before not in accept and cand["cwe"] == "CWE-787"
+            and not cand.get("cve_analog")):
+        cand["cve_analog"] = cve
 
 
 def topic_consolidate(findings):
@@ -520,13 +571,11 @@ def topic_consolidate(findings):
     """
     buckets = {}
     for f in findings:
-        topic, cwe, cve = _finding_topic(f)
+        topic, cwe, accept, cve = _finding_topic(f)
         key = topic or _anchor_key(f)
         cand = {k: v for k, v in f.items() if k != "_source"}
         if topic:
-            cand["cwe"] = cwe
-            if cve and not cand.get("cve_analog"):
-                cand["cve_analog"] = cve
+            _apply_topic(cand, cwe, accept, cve)
         cur = buckets.get(key)
         if cur is None or len(str(f.get("failure_mode", ""))) > len(str(cur.get("failure_mode", ""))):
             buckets[key] = cand
@@ -534,19 +583,112 @@ def topic_consolidate(findings):
 
 
 def canonicalize_cwes(findings):
-    """Set each finding's CWE to its security-topic canonical (and restore a known
-    CVE), WITHOUT merging. Runs in every mode so even a single pass with no critic
-    cannot ship a wrong-direction CWE (e.g. an unsigned underflow tagged CWE-190
-    instead of CWE-787, or a read path tagged as a write)."""
+    """Conservatively correct each finding's CWE against its security-topic
+    (and restore a known CVE), WITHOUT merging. A CWE already in the topic's
+    acceptable set is kept — the model's judgment wins on code the topic table
+    was not tuned for; only a missing or wrong-direction CWE is rewritten
+    (e.g. an unsigned underflow tagged CWE-190 instead of CWE-787, or a read
+    path tagged as a write). Findings matching no topic are left untouched."""
     out = []
     for f in findings:
-        topic, cwe, cve = _finding_topic(f)
+        topic, cwe, accept, cve = _finding_topic(f)
         if topic:
             f = dict(f)
-            f["cwe"] = cwe
-            if cve and not f.get("cve_analog"):
-                f["cve_analog"] = cve
+            _apply_topic(f, cwe, accept, cve)
         out.append(f)
+    return out
+
+
+def anchor_coverage(review):
+    """The set of anchor identifiers a review actually enumerated."""
+    return {k for k in (_ident(a.get("anchor", ""))
+                        for a in review.get("reviewed_anchors", [])) if k}
+
+
+def critique_acceptable(draft, critiqued):
+    """Gate the critic pass on ANCHOR COVERAGE, not raw finding count.
+
+    The critic must strip hallucinated findings (CRITIC_SYSTEM_PROMPT step 2),
+    which a plain `len(findings) >= len(findings)` gate forbids. Accept the
+    critique when it does not regress coverage: it must enumerate at least as
+    many anchors as the draft, and when it drops findings it must still cover
+    every anchor the draft covered — or have added at least as many findings
+    as it removed. A draft with NO reviewed_anchors (missing or empty) gives
+    coverage no signal — 'empty <= empty' is vacuously true — so it falls back
+    to the count gate: a critique may never wipe findings for free just
+    because the draft model omitted its anchor list.
+    """
+    if not isinstance(critiqued, dict) or not critiqued:
+        return False
+    count_ok = len(critiqued.get("findings", [])) >= len(draft.get("findings", []))
+    d_cov, c_cov = anchor_coverage(draft), anchor_coverage(critiqued)
+    if not d_cov:
+        return count_ok
+    if len(c_cov) < len(d_cov):
+        return False
+    if count_ok:
+        return True
+    return d_cov <= c_cov
+
+
+_PIPELINE_SEVERITIES = {"critical", "high", "medium", "low", "info"}
+_SEVERITY_SYNONYMS = {"moderate": "medium", "important": "high", "severe": "high",
+                      "warning": "medium", "informational": "info", "note": "info",
+                      "blocker": "critical", "none": "info"}
+
+
+def _norm_severity(sev):
+    s = _SEVERITY_SYNONYMS.get(str(sev or "").strip().lower(),
+                               str(sev or "").strip().lower())
+    return s if s in _PIPELINE_SEVERITIES else "medium"
+
+
+def _line_numbers(value):
+    """All line numbers in a surface 'line' value ('12', '12-15', '12, 14').
+
+    Clamped to >= 1: models sometimes emit 0-based lines ('0'), but match_lines
+    are contractually ABSOLUTE 1-based and SARIF regions require lines >= 1.
+    """
+    return sorted({max(1, int(t)) for t in re.findall(r"\d+", str(value or ""))})
+
+
+def findings_to_pipeline(review):
+    """Adapt a surface review to the scan-pipeline findings schema.
+
+    to_sarif.py and annotate_pr.py read {file, start_line, end_line, issue,
+    severity, ...}; surface findings carry {file, line: "12"|"12-15", title,
+    failure_mode, ...}. This maps one onto the other so header reviews reach
+    SARIF / PR annotation through the existing tools unchanged. An unparsable
+    'line' value degrades to line 1 (no match_lines) rather than being dropped.
+    """
+    out = []
+    for f in review.get("findings", []):
+        nums = _line_numbers(f.get("line"))
+        does = []
+        if str(f.get("where_it_lives", "") or "").strip():
+            does.append(f"Lives in {str(f['where_it_lives']).strip()}.")
+        if str(f.get("invariant", "") or "").strip():
+            does.append(f"Invariant: {str(f['invariant']).strip()}")
+        entry = {
+            "file": str(f.get("file", "") or ""),
+            "start_line": nums[0] if nums else 1,
+            "end_line": nums[-1] if nums else 1,
+            "score": 1.0,
+            "issue": str(f.get("title", "") or ""),
+            "cwe": str(f.get("cwe", "") or ""),
+            "bug_class": str(f.get("bug_class", "") or ""),
+            "severity": _norm_severity(f.get("severity")),
+            "what_code_does": " ".join(does),
+            "what_could_go_wrong": str(f.get("failure_mode", "") or ""),
+            "vulnerability": str(f.get("bug_class") or f.get("title") or ""),
+            "fix": str(f.get("what_to_confirm", "") or ""),
+            "explainer_backend": "surface",
+        }
+        if nums:
+            entry["match_lines"] = nums
+        if f.get("cve_analog"):
+            entry["cve_analog"] = str(f["cve_analog"])
+        out.append(entry)
     return out
 
 
@@ -656,7 +798,6 @@ def render_markdown(review, paths):
         out += [f"- **Invariant:** {f.get('invariant','')}",
                 f"- **Failure mode:** {f.get('failure_mode','')}",
                 f"- **Confirm:** {f.get('what_to_confirm','')}", ""]
-    dismissed = [a for a in anchors if a.get("disposition") == "dismissed"]
     if dismissed:
         out += ["## Dismissed anchors", ""]
         out += [f"- `{a.get('anchor','')}` — {a.get('reason','')}" for a in dismissed]
@@ -673,6 +814,9 @@ def main():
     ap.add_argument("paths", nargs="+", help="Source files or directories to review together")
     ap.add_argument("--json", dest="json_out", help="Write the raw review JSON here")
     ap.add_argument("--md", dest="md_out", help="Write a Markdown report here")
+    ap.add_argument("--pipeline-out", dest="pipeline_out",
+                    help="Write findings in the scan-pipeline schema here "
+                         "({\"findings\": [...]}; consumable by to_sarif.py / annotate_pr.py)")
     ap.add_argument("--model", default=None, help="Override the profile's Ollama model tag")
     ap.add_argument("--models", default=None,
                     help="Comma-separated models to sample for the union finisher "
@@ -720,68 +864,90 @@ def main():
             print(f"[kb] {len(matched)} retrieval hint(s) injected: "
                   f"{', '.join(e['id'] for e in matched)}")
 
-    try:
-        # --- sampling: pass-1 reviews across models x samples (temp-diversified) ---
-        samples = []
-        for m in models:
-            for k in range(max(1, args.samples)):
-                temp = 0.3 if k == 0 else 0.6
+    # --- sampling: pass-1 reviews across models x samples (temp-diversified).
+    # Each sample is fault-isolated: one failed/truncated Ollama call is warned
+    # about and skipped, and whatever succeeded is pooled — a multi-hour
+    # multi-model run must not be discarded because one sample died.
+    samples = []
+    for m in models:
+        for k in range(max(1, args.samples)):
+            temp = 0.3 if k == 0 else 0.6
+            src = f"{m}#{k + 1}"
+            try:
                 rev = ollama_review(args.ollama_url, m, context, args.num_ctx,
                                     extra_system, temperature=temp)
-                src = f"{m}#{k + 1}"
-                samples.append((src, rev))
-                print(f"[sample {src}] {len(rev.get('findings', []))} findings "
-                      f"(temp={temp})")
+                if not isinstance(rev, dict):
+                    # Ollama's format:"json" guarantees valid JSON, not a JSON
+                    # OBJECT — a reply parsing to []/42/"x" must be skipped like
+                    # any other failed sample, not crash the whole run.
+                    raise ValueError(f"reply parsed to {type(rev).__name__}, "
+                                     f"expected a JSON object")
+            except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError) as se:
+                print(f"[sample {src}] FAILED ({se}); skipping")
+                continue
+            samples.append((src, rev))
+            print(f"[sample {src}] {len(rev.get('findings', []))} findings "
+                  f"(temp={temp})")
+    if not samples:
+        sys.exit(f"[ERR] Ollama review failed: all {n_runs} sample(s) failed")
+    if len(samples) < n_runs:
+        print(f"[warn] {n_runs - len(samples)} of {n_runs} sample(s) failed; "
+              f"continuing with the {len(samples)} that succeeded")
 
-        if n_runs == 1:
-            # Single-source path: completeness-critic second pass (original behavior).
-            # The pass-1 review already carries the full walkthrough + findings, so a
-            # slow/failed/truncated critic degrades gracefully to it instead of
-            # crashing the run (the thorough walkthrough makes the critic re-send big).
-            review = samples[0][1]
-            if not args.no_critic:
-                try:
-                    critiqued = ollama_critique(args.ollama_url, critic_model, context, review,
-                                                args.num_ctx, extra_system)
-                except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError) as ce:
-                    critiqued = {}
-                    print(f"[critic] failed ({ce}); keeping pass-1 review")
-                if len(critiqued.get("findings", [])) >= len(review.get("findings", [])):
-                    review = critiqued
-                    print(f"[critic] {len(review.get('findings', []))} findings after completion")
-                elif critiqued:
-                    print(f"[critic] kept pass-1 ({len(critiqued.get('findings', []))} "
-                          f"< {len(review.get('findings', []))}; no regression accepted)")
-        else:
-            # Union finisher: pool all samples, then consolidate (union+dedup+de-hallucinate).
-            pooled, max_single = pool_samples(samples)
-            print(f"[pool] {len(pooled['findings'])} deduped findings across {n_runs} runs")
-            review = pooled  # the pooled union is always a usable, high-recall result
-            if args.llm_consolidate and not args.no_critic:
-                # Optional: an LLM union/dedup pass. Isolated so a slow/failed pass
-                # degrades gracefully to the deterministic deduper below.
-                try:
-                    consolidated = ollama_consolidate(args.ollama_url, critic_model, context,
-                                                      pooled, args.num_ctx, extra_system)
-                except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError) as ce:
-                    consolidated = {}
-                    print(f"[consolidate] LLM pass failed ({ce}); using deterministic deduper")
-                if len(consolidated.get("findings", [])) >= max_single:
-                    review = consolidated
-                    print(f"[consolidate] LLM: {len(review.get('findings', []))} findings")
-                elif consolidated:
-                    print(f"[consolidate] LLM regressed ({len(consolidated.get('findings', []))} "
-                          f"< best single {max_single}); using deterministic deduper")
-            if review is pooled:
-                # Default path: deterministic topic-based consolidation (no flaky LLM).
-                merged = topic_consolidate(pooled["findings"])
-                review = {**pooled, "findings": merged}
-                print(f"[consolidate] deterministic topic-dedup: "
-                      f"{len(pooled['findings'])} -> {len(merged)} findings")
-    except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError) as e:
-        sys.exit(f"[ERR] Ollama review failed: {e}")
+    if len(samples) == 1:
+        # Single-source path: completeness-critic second pass (original behavior).
+        # The pass-1 review already carries the full walkthrough + findings, so a
+        # slow/failed/truncated critic degrades gracefully to it instead of
+        # crashing the run (the thorough walkthrough makes the critic re-send big).
+        review = samples[0][1]
+        if not args.no_critic:
+            try:
+                critiqued = ollama_critique(args.ollama_url, critic_model, context, review,
+                                            args.num_ctx, extra_system)
+                if not isinstance(critiqued, dict):
+                    raise ValueError(f"critic reply parsed to "
+                                     f"{type(critiqued).__name__}, expected a JSON object")
+            except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError) as ce:
+                critiqued = {}
+                print(f"[critic] failed ({ce}); keeping pass-1 review")
+            if critique_acceptable(review, critiqued):
+                review = critiqued
+                print(f"[critic] {len(review.get('findings', []))} findings after critique")
+            elif critiqued:
+                print(f"[critic] kept pass-1 ({len(critiqued.get('findings', []))} findings "
+                      f"but anchor coverage regressed; no regression accepted)")
+    else:
+        # Union finisher: pool all samples, then consolidate (union+dedup+de-hallucinate).
+        pooled, max_single = pool_samples(samples)
+        print(f"[pool] {len(pooled['findings'])} deduped findings across {len(samples)} runs")
+        review = pooled  # the pooled union is always a usable, high-recall result
+        if args.llm_consolidate and not args.no_critic:
+            # Optional: an LLM union/dedup pass. Isolated so a slow/failed pass
+            # degrades gracefully to the deterministic deduper below.
+            try:
+                consolidated = ollama_consolidate(args.ollama_url, critic_model, context,
+                                                  pooled, args.num_ctx, extra_system)
+                if not isinstance(consolidated, dict):
+                    raise ValueError(f"consolidation reply parsed to "
+                                     f"{type(consolidated).__name__}, expected a JSON object")
+            except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError) as ce:
+                consolidated = {}
+                print(f"[consolidate] LLM pass failed ({ce}); using deterministic deduper")
+            if len(consolidated.get("findings", [])) >= max_single:
+                review = consolidated
+                print(f"[consolidate] LLM: {len(review.get('findings', []))} findings")
+            elif consolidated:
+                print(f"[consolidate] LLM regressed ({len(consolidated.get('findings', []))} "
+                      f"< best single {max_single}); using deterministic deduper")
+        if review is pooled:
+            # Default path: deterministic topic-based consolidation (no flaky LLM).
+            merged = topic_consolidate(pooled["findings"])
+            review = {**pooled, "findings": merged}
+            print(f"[consolidate] deterministic topic-dedup: "
+                  f"{len(pooled['findings'])} -> {len(merged)} findings")
 
     review["findings"] = canonicalize_cwes(review.get("findings", []))
+    review["reviewed_anchors"] = clean_anchors(review.get("reviewed_anchors", []))
     findings = review["findings"]
     anchors = review.get("reviewed_anchors", [])
     print(f"[OK] {len(anchors)} anchors enumerated, {len(findings)} findings; "
@@ -791,6 +957,11 @@ def main():
         os.makedirs(os.path.dirname(args.json_out) or ".", exist_ok=True)
         json.dump(review, open(args.json_out, "w", encoding="utf-8"), indent=2)
         print(f"[OK] JSON  -> {args.json_out}")
+    if args.pipeline_out:
+        os.makedirs(os.path.dirname(args.pipeline_out) or ".", exist_ok=True)
+        json.dump({"findings": findings_to_pipeline(review)},
+                  open(args.pipeline_out, "w", encoding="utf-8"), indent=2)
+        print(f"[OK] pipeline findings -> {args.pipeline_out}")
     md = render_markdown(review, files)
     if args.md_out:
         os.makedirs(os.path.dirname(args.md_out) or ".", exist_ok=True)

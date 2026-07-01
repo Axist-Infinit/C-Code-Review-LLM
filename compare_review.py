@@ -55,10 +55,23 @@ def local_review(context, extra_system, url, model, num_ctx):
     review = sr.ollama_review(url, model, context, num_ctx, extra_system)
     try:
         critiqued = sr.ollama_critique(url, model, context, review, num_ctx, extra_system)
-        if len(critiqued.get("findings", [])) >= len(review.get("findings", [])):
+        if sr.critique_acceptable(review, critiqued):
             review = critiqued
     except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError):
         pass  # keep the complete pass-1 walkthrough
+    review["findings"] = sr.canonicalize_cwes(review.get("findings", []))
+    return review
+
+
+def parse_claude_reply(text):
+    """Parse Claude's JSON reply and apply the SAME deterministic CWE
+    canonicalisation the local side gets, so the printed comparison is
+    symmetric (docstring promise: the only variable is the model)."""
+    try:
+        review = json.loads(_strip_fences(text))
+    except json.JSONDecodeError as e:
+        review = {"subsystem": "(unparsed)", "findings": [],
+                  "summary": f"Claude reply was not valid JSON ({e}).", "_raw": text}
     review["findings"] = sr.canonicalize_cwes(review.get("findings", []))
     return review
 
@@ -83,11 +96,7 @@ def claude_review(context, extra_system, model, max_tokens=32000):
     ) as stream:
         msg = stream.get_final_message()
     text = next((b.text for b in msg.content if b.type == "text"), "")
-    try:
-        review = json.loads(_strip_fences(text))
-    except json.JSONDecodeError as e:
-        review = {"subsystem": "(unparsed)", "findings": [],
-                  "summary": f"Claude reply was not valid JSON ({e}).", "_raw": text}
+    review = parse_claude_reply(text)
     review["_model"] = msg.model
     review["_usage"] = {"input": msg.usage.input_tokens, "output": msg.usage.output_tokens}
     return review
@@ -105,7 +114,7 @@ def _summary_rows(review):
     return rows
 
 
-def print_comparison(local, claude):
+def print_comparison(local, claude, out_dir="scan_out/compare"):
     print("\n" + "=" * 78)
     print("COMPARISON  ·  local model  vs  Claude Opus")
     print("=" * 78)
@@ -123,7 +132,7 @@ def print_comparison(local, claude):
     if local is not None and claude is not None:
         ln, cn = len(local.get("findings", [])), len(claude.get("findings", []))
         print(f"\n  -> local {ln} findings vs Claude {cn}. "
-              f"Full reports written to scan_out/compare/.")
+              f"Full reports written to {out_dir}/.")
 
 
 def main():
@@ -181,7 +190,7 @@ def main():
         json.dump(claude, open(os.path.join(args.out, "claude.json"), "w"), indent=2)
         open(os.path.join(args.out, "claude.md"), "w").write(sr.render_markdown(claude, label_paths))
 
-    print_comparison(local, claude)
+    print_comparison(local, claude, args.out)
 
 
 if __name__ == "__main__":
