@@ -18,6 +18,7 @@ check failed. ``--require-ollama`` promotes the Ollama check from warn to fail.
 import argparse
 import json
 import os
+import shutil
 import sys
 
 # Reuse the SAME reachability probe the explainer uses, so preflight and the
@@ -30,15 +31,19 @@ REQUIRED = "required"
 WARN = "warn"
 
 
-def evaluate_preflight(facts, require_ollama=False):
+def evaluate_preflight(facts, require_ollama=False, ml_expected=True):
     """Pure decision logic. ``facts`` keys:
         model_dir, model_dir_exists, has_config, has_weights,
         threshold (float|None), profile_name, profile_ok (bool),
-        ollama_reachable (bool), ollama_model_present (bool), ollama_model (str)
+        ollama_reachable (bool), ollama_model_present (bool), ollama_model (str),
+        python_version (tuple|None), zstd_present (bool), zstd_path (str|None),
+        offline_env (dict var -> bool)
 
     Returns (ok: bool, checks: list[dict]). Each check:
         {name, level, passed, detail}. ``ok`` is False iff any REQUIRED check
-        failed. Ollama checks are WARN unless ``require_ollama`` is set.
+        failed. Ollama checks are WARN unless ``require_ollama`` is set; the
+        python>=3.11 floor is REQUIRED when ``ml_expected`` (the pinned ML deps
+        need it) and report-only otherwise (model-free lane runs on 3.10).
     """
     checks = []
 
@@ -63,6 +68,25 @@ def evaluate_preflight(facts, require_ollama=False):
     add("hardware profile resolves", REQUIRED, facts.get("profile_ok"),
         f"profile={facts.get('profile_name')}" if facts.get("profile_ok")
         else "could not resolve a hardware profile")
+
+    pv = facts.get("python_version")
+    pv_str = ".".join(str(x) for x in pv) if pv else "unknown"
+    pv_ok = bool(pv) and tuple(pv) >= (3, 11)
+    add("python >= 3.11", REQUIRED if ml_expected else WARN, pv_ok,
+        f"python {pv_str}" if pv_ok
+        else f"python {pv_str} — the pinned ML deps (numpy==2.3.3) need 3.11+"
+             + ("" if ml_expected else " (report-only: model-free lane runs on 3.10)"))
+
+    add("zstd available", REQUIRED if ml_expected else WARN, facts.get("zstd_present"),
+        f"zstd at {facts.get('zstd_path')}" if facts.get("zstd_present")
+        else "zstd binary missing — pack/unpack_model.sh need it (apt-get install zstd)"
+             + ("" if ml_expected else " (report-only: no model transfer on the model-free lane)"))
+
+    offline = facts.get("offline_env") or {}
+    set_vars = sorted(k for k, v in offline.items() if v)
+    add("offline env state", WARN, True,
+        ("offline: " + ", ".join(set_vars) + " set") if set_vars
+        else "no HF_*_OFFLINE vars set (this shell is online-capable)")
 
     ollama_level = REQUIRED if require_ollama else WARN
     add("ollama reachable", ollama_level, facts.get("ollama_reachable"),
@@ -96,6 +120,14 @@ def gather_facts(model_dir, profile_name, ollama_url):
             thr = None
     facts["threshold"] = thr
 
+    facts["python_version"] = tuple(sys.version_info[:2])
+    facts["zstd_path"] = shutil.which("zstd")
+    facts["zstd_present"] = bool(facts["zstd_path"])
+    facts["offline_env"] = {
+        k: os.environ.get(k, "") not in ("", "0")
+        for k in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE")
+    }
+
     profile = None
     try:
         profile, prof = select_profile(name=profile_name)
@@ -121,11 +153,14 @@ def main(argv=None):
     ap.add_argument("--ollama-url", default=os.environ.get("OLLAMA_HOST", "http://localhost:11434"))
     ap.add_argument("--require-ollama", action="store_true",
                     help="Treat an unreachable Ollama / missing model as a failure, not a warning.")
+    ap.add_argument("--skip-ml", action="store_true",
+                    help="Model-free lane only: the python>=3.11 floor becomes report-only.")
     add_profile_arg(ap)
     args = ap.parse_args(argv)
 
     facts = gather_facts(args.model, args.profile, args.ollama_url)
-    ok, checks = evaluate_preflight(facts, require_ollama=args.require_ollama)
+    ok, checks = evaluate_preflight(facts, require_ollama=args.require_ollama,
+                                    ml_expected=not args.skip_ml)
     for c in checks:
         if c["passed"]:
             mark, color = "PASS", "32"

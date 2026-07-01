@@ -134,7 +134,7 @@ boundary — enforce a real air-gap at the OS/hypervisor layer):
 
 ```bash
 HARD_RELOCK=1 HARD_RELOCK_CONFIRM=yes ./one_click_unlock_fetch_train_relock.sh
-bash ./online_unlock.sh             # revert the egress lock + go back online
+source ./online_unlock.sh           # revert the lock + go back online (source, not bash)
 ```
 
 ### The hard-fail guard (no silent bootstrap)

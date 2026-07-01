@@ -4,6 +4,26 @@ ARCHIVE="${1:-trained_model.tar.zst}"; DEST="${2:-.}"
 
 [[ -f "$ARCHIVE" ]] || { echo "[err] archive not found: $ARCHIVE" >&2; exit 1; }
 
+# --- Manifest verification ----------------------------------------------------
+# pack_model.sh emits <archive>.manifest.json with the archive's sha256. When
+# it travelled alongside the tar, verify integrity BEFORE any extraction.
+# Older bundles have no manifest; those proceed with a note.
+MANIFEST="${ARCHIVE}.manifest.json"
+if [[ -f "$MANIFEST" ]]; then
+  echo "[info] verifying $ARCHIVE against $MANIFEST ..."
+  EXPECTED="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("archive_sha256") or "")' "$MANIFEST")"
+  [[ -n "$EXPECTED" ]] || { echo "[err] manifest carries no archive_sha256: $MANIFEST" >&2; exit 1; }
+  ACTUAL="$(sha256sum "$ARCHIVE" | awk '{print $1}')"
+  if [[ "$ACTUAL" != "$EXPECTED" ]]; then
+    echo "[err] archive sha256 mismatch (expected $EXPECTED, got $ACTUAL)" >&2
+    echo "[err] the model archive is corrupt or tampered — refusing to extract" >&2
+    exit 1
+  fi
+  echo "[ok] archive sha256 verified"
+else
+  echo "[info] no manifest ($MANIFEST) — skipping sha256 verification (older bundle)"
+fi
+
 # --- Path-traversal / symlink guard -------------------------------------------
 # A malicious .tar.zst could carry absolute paths ("/etc/..."), parent-dir
 # escapes ("../../"), or symlinks/hardlinks that, once extracted, write or point

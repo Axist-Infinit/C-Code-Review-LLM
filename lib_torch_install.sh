@@ -24,6 +24,22 @@
 ccr_t_say(){ printf "\033[1;36m[torch]\033[0m %s\n" "$*"; }
 ccr_t_warn(){ printf "\033[1;33m[torch][warn]\033[0m %s\n" "$*"; }
 
+# Append 'arch channel torch==<version> date' to ./torch.lock after a
+# successful install, so the exact working wheel is on record (the runbooks
+# previously asked the operator to note it by hand). Best-effort: never fails
+# the caller.
+ccr_record_torch(){
+  local arch="$1" channel="$2" ver
+  ver="$(pip show torch 2>/dev/null | grep -i '^Version:' | awk '{print $2}')" || true
+  if [[ -n "${ver:-}" ]]; then
+    echo "$arch $channel torch==$ver $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> torch.lock
+    ccr_t_say "recorded torch==$ver ($arch, $channel) in torch.lock"
+  else
+    ccr_t_warn "could not determine the installed torch version; torch.lock not updated"
+  fi
+  return 0
+}
+
 ccr_detect_cuda_ver(){
   command -v nvidia-smi >/dev/null 2>&1 || { echo ""; return 0; }
   # match both "CUDA Version: 12.4" and newer "CUDA UMD Version: 13.3" formats
@@ -69,8 +85,11 @@ ccr_install_torch(){
 
   if [[ "$use_gpu" != "1" ]] || ! command -v nvidia-smi >/dev/null 2>&1; then
     ccr_t_say "No GPU requested/visible; installing CPU torch."
-    pip install --no-cache-dir --index-url "https://download.pytorch.org/whl/cpu" $pip_pkg
-    return $?
+    if ! pip install --no-cache-dir --index-url "https://download.pytorch.org/whl/cpu" $pip_pkg; then
+      return 1
+    fi
+    ccr_record_torch "$arch" "https://download.pytorch.org/whl/cpu"
+    return 0
   fi
 
   local cuda; cuda="$(ccr_detect_cuda_ver)"
@@ -84,6 +103,7 @@ ccr_install_torch(){
       ccr_t_warn "Runbook: SETUP_SPARK.md -> 'torch on DGX Spark' (NGC SBSA container)."
       return 1
     fi
+    ccr_record_torch "$arch" "$idx"
     return 0
   fi
 
@@ -95,5 +115,6 @@ ccr_install_torch(){
     ccr_t_warn "Or run: ./install_torch_nightly_for_new_gpu.sh"
     return 1
   fi
+  ccr_record_torch "$arch" "$idx"
   return 0
 }

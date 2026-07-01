@@ -21,6 +21,11 @@ if command -v apt-get >/dev/null; then $SUDO apt-get update -y && $SUDO apt-get 
 git lfs install || true
 [[ -d "$VENV" ]] || $PY -m venv "$VENV"
 source "$VENV/bin/activate"
+# UNLOCK: a previously relocked venv re-exports the offline flags from
+# .env.locked on activation (hook appended below on first run). Everything up
+# to the relock step is an ONLINE phase, so clear them explicitly here or the
+# HF/BigVul fetches hard-fail on every re-run.
+unset HF_HUB_OFFLINE TRANSFORMERS_OFFLINE HF_DATASETS_OFFLINE
 python -m pip install --upgrade pip wheel setuptools
 # Arch-aware torch install (shared helper). aarch64 -> cu130 NIGHTLY torch-only;
 # x86_64 -> channel matching the driver's CUDA. FAILS SOFT so a missing aarch64
@@ -89,7 +94,14 @@ export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 EOF
-if ! grep -q HF_HUB_OFFLINE "$VENV/bin/activate"; then echo -e '\n# relock\n test -f "$VIRTUAL_ENV/../.env.locked" && set -a && . "$VIRTUAL_ENV/../.env.locked" && set +a' >> "$VENV/bin/activate"; fi
+# Relock hook (if-form, idempotent). It MUST be an `if ...; then ...; fi` — a
+# bare `test -f ... && ...` as the LAST line of activate makes `source activate`
+# return 1 once online_unlock.sh retires .env.locked, killing every `set -e`
+# script that activates the venv (including this one at its own `source` above).
+# The guard greps for the new hook text, so a venv carrying the old broken
+# one-liner still gets the fixed hook appended after it (the if-form then ends
+# activate with exit status 0, curing the old venv too).
+if ! grep -qF 'if test -f "$VIRTUAL_ENV/../.env.locked"' "$VENV/bin/activate"; then printf '\n# relock\nif test -f "$VIRTUAL_ENV/../.env.locked"; then set -a; . "$VIRTUAL_ENV/../.env.locked"; set +a; fi\n' >> "$VENV/bin/activate"; fi
 # Optional host-firewall relock. The previous version ran an UNCONDITIONAL
 # `iptables -P OUTPUT DROP`, which severs the SSH session you are running this
 # over and has no revert. We now:
@@ -103,11 +115,11 @@ if ! grep -q HF_HUB_OFFLINE "$VENV/bin/activate"; then echo -e '\n# relock\n tes
 if [[ "$HARD_RELOCK" == "1" ]]; then
   if [[ "$HARD_RELOCK_CONFIRM" != "yes" ]]; then
     warn "HARD_RELOCK requested but HARD_RELOCK_CONFIRM!=yes; skipping host-firewall mutation."
-    warn "Re-run with HARD_RELOCK=1 HARD_RELOCK_CONFIRM=yes to apply (revert: bash ./online_unlock.sh)."
+    warn "Re-run with HARD_RELOCK=1 HARD_RELOCK_CONFIRM=yes to apply (revert: source ./online_unlock.sh)."
   elif [[ -z "$SUDO" ]]; then
     warn "HARD_RELOCK requested but sudo is unavailable; skipping host-firewall mutation."
   else
-    say "Applying scoped egress lock (loopback + established preserved; revert: bash ./online_unlock.sh)"
+    say "Applying scoped egress lock (loopback + established preserved; revert: source ./online_unlock.sh)"
     for IPT in iptables ip6tables; do
       command -v "$IPT" >/dev/null 2>&1 || continue
       $SUDO "$IPT" -N CCR_EGRESS_LOCK 2>/dev/null || $SUDO "$IPT" -F CCR_EGRESS_LOCK || true

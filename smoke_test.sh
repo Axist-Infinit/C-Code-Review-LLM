@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # End-to-end smoke test of the pipeline. Requires a trained model in ./vuln-model.
 set -euo pipefail
-source .venv/bin/activate
+VENV="${VENV:-.venv}"
+source "$VENV/bin/activate"
 T="$(mktemp -d)"
 trap 'rm -rf "$T"' EXIT
 pass(){ printf "\033[1;32m[PASS]\033[0m %s\n" "$*"; }

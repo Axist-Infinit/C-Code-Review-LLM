@@ -111,8 +111,10 @@ sequence of `file:line` → code snippet → detailed explanation. Source is fed
 the model with line-number prefixes so citations are grounded (the verbatim code
 snippet is the exact anchor; line numbers reset per file, so every citation is
 file-qualified). Every finding likewise carries `file`, `line`, and a verbatim
-`code` snippet, and CWEs are canonicalised deterministically (so an unsigned
-underflow can't ship as CWE-190 instead of CWE-787).
+`code` snippet, and CWEs are corrected conservatively against per-topic
+allow-lists (a model CWE already acceptable for the topic is kept; only
+mismatches are overridden — an unsigned underflow can't ship as CWE-190
+instead of CWE-787, and correct model CWEs survive on unfamiliar code).
 
 ```bash
 # Single-model, two-pass (enumerate -> completeness critic), offline retrieval hints on
@@ -307,12 +309,14 @@ explainer is the zero-dependency fallback.
 - installs a **scoped** ruleset in a dedicated `CCR_EGRESS_LOCK` chain that
   `ACCEPT`s loopback and `ESTABLISHED,RELATED` traffic **before** dropping new
   egress, so existing connections (incl. your SSH session) are never cut,
-- ships a paired revert: `bash ./online_unlock.sh` removes the chain and unsets
-  the offline env vars.
+- ships a paired revert: `source ./online_unlock.sh` removes the chain, unsets
+  the offline env vars in the CURRENT shell, and retires `.env.locked` so the
+  venv stops re-locking on every activation (with `bash` instead of `source`,
+  the env-var unsets die with the child shell).
 
 ```bash
 HARD_RELOCK=1 HARD_RELOCK_CONFIRM=yes ./one_click_unlock_fetch_train_relock.sh
-bash ./online_unlock.sh   # revert the egress lock + go back online
+source ./online_unlock.sh   # revert the egress lock + go back online
 ```
 
 This is a convenience guard, not a security boundary — enforce a true air-gap at

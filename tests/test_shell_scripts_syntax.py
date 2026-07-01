@@ -17,6 +17,7 @@ _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 def _scripts():
     paths = sorted(glob.glob(os.path.join(_REPO, "*.sh")))
+    paths += sorted(glob.glob(os.path.join(_REPO, "airgap", "*.sh")))
     paths += sorted(glob.glob(os.path.join(_REPO, "scripts", "**", "*.sh"), recursive=True))
     return paths
 
@@ -33,5 +34,6 @@ def test_found_some_scripts():
     names = {os.path.basename(p) for p in _scripts()}
     for required in ("setup_machine.sh", "one_click_unlock_fetch_train_relock.sh",
                      "install_torch_nightly_for_new_gpu.sh", "env_doctor_cuda.sh",
-                     "lib_torch_install.sh", "train.sh", "train_classifier.sh"):
+                     "lib_torch_install.sh", "train.sh", "train_classifier.sh",
+                     "build_airgap_bundle.sh", "install_offline.sh"):
         assert required in names, f"missing {required}"
