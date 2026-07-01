@@ -1,5 +1,354 @@
 #!/usr/bin/env python3
-import argparse, os, json, re, html
+import argparse, functools, os, json, re, html
+
+# --------------------------------------------------------------------
+# Comment/string masking. Patterns are matched against masked text so that
+# commented-out code (`/* strcpy(d, s); */`) and log strings ("call system()")
+# cannot trip API regexes. Masking is same-shape (char-for-char, newlines
+# kept), so match offsets and line numbers align with the original snippet.
+# Patterns that must inspect string literal contents (scanf format strings,
+# hardcoded credentials) set "needs_strings": True and are matched against a
+# variant where only comments are masked. Patterns whose TRIGGER must not see
+# literals but whose confirmation must (the '\0' terminator store after
+# strncpy) set "confirm_needs_strings": True instead.
+# --------------------------------------------------------------------
+
+# C++11 raw string literals: R"delim( ... )delim", optionally u8/u/U/L-prefixed.
+# Backslashes and quotes inside the body are literal, so the lexer must consume
+# the whole literal as one unit or it desyncs and masks real code after it.
+_RAW_DELIM_RE = re.compile(r'([^\s()\\"]{0,16})\(')
+
+
+def _raw_string_open(code, i):
+    """True when code[i] is the '"' of a raw string opener (R", u8R", LR", ...)."""
+    j = i - 1
+    if j < 0 or code[j] != "R":
+        return False
+    p = j - 1
+    if p >= 1 and code[p] == "8" and code[p - 1] == "u":
+        p -= 2
+    elif p >= 0 and code[p] in "uUL":
+        p -= 1
+    # the prefix must be a token of its own, not the tail of an identifier
+    return not (p >= 0 and (code[p].isalnum() or code[p] == "_"))
+
+
+def _raw_string_span(code, i):
+    """For the opening '"' of a raw string at code[i], return (content_start,
+    content_end, literal_end): the body between the parens and the index just
+    past the closing quote. None when malformed/unterminated — the caller then
+    falls back to ordinary string handling."""
+    m = _RAW_DELIM_RE.match(code, i + 1)
+    if m is None:
+        return None
+    closer = ")" + m.group(1) + '"'
+    k = code.find(closer, m.end())
+    if k == -1:
+        return None
+    return m.end(), k, k + len(closer)
+
+
+def _mask_code(code, mask_strings=True):
+    """Return `code` with comments (always) and string/char literal contents
+    (when mask_strings) replaced by spaces. Same length, newlines preserved.
+    Raw string literals (R"delim(...)delim") are lexed as single units so
+    embedded quotes/braces cannot desync the masker."""
+    out = list(code)
+    i, n = 0, len(code)
+    state = None  # None (code) | "line" | "block" | '"' | "'"
+    while i < n:
+        c = code[i]
+        if state is None:
+            if c == "/" and i + 1 < n and code[i + 1] == "/":
+                state = "line"
+                out[i] = out[i + 1] = " "
+                i += 2
+                continue
+            if c == "/" and i + 1 < n and code[i + 1] == "*":
+                state = "block"
+                out[i] = out[i + 1] = " "
+                i += 2
+                continue
+            if c == '"' and _raw_string_open(code, i):
+                span = _raw_string_span(code, i)
+                if span is not None:
+                    cs, ce, le = span
+                    if mask_strings:
+                        for k in range(cs, ce):
+                            if code[k] != "\n":
+                                out[k] = " "
+                    i = le
+                    continue
+                # malformed/unterminated raw literal: ordinary handling below
+            # A ' preceded by a word char is a C++14 digit separator (1'000),
+            # not a char literal — treating it as one would mask real code.
+            if c == '"' or (c == "'" and not (i > 0 and (code[i - 1].isalnum() or code[i - 1] == "_"))):
+                state = c
+                i += 1
+                continue
+            i += 1
+            continue
+        if state == "line":
+            if c == "\n":
+                state = None
+            else:
+                out[i] = " "
+            i += 1
+            continue
+        if state == "block":
+            if c == "*" and i + 1 < n and code[i + 1] == "/":
+                out[i] = out[i + 1] = " "
+                state = None
+                i += 2
+                continue
+            if c != "\n":
+                out[i] = " "
+            i += 1
+            continue
+        # inside a string/char literal
+        if c == "\\" and i + 1 < n:
+            if mask_strings:
+                out[i] = " "
+                if code[i + 1] != "\n":
+                    out[i + 1] = " "
+            i += 2
+            continue
+        if c == state:
+            state = None
+            i += 1
+            continue
+        if c == "\n":
+            # unterminated literal: bail back to code state instead of masking
+            # the rest of the snippet (defensive on macro/snippet fragments)
+            state = None
+            i += 1
+            continue
+        if mask_strings:
+            out[i] = " "
+        i += 1
+    return "".join(out)
+
+
+def _mask_fallback(code):
+    """Local stand-in for local_vuln_scanner.mask_comments_and_strings."""
+    return _mask_code(code, mask_strings=True)
+
+
+_mask_all_impl = None
+
+
+def _mask_all(code):
+    """Comments AND string contents masked (shared helper when available)."""
+    global _mask_all_impl
+    if _mask_all_impl is None:
+        try:
+            from local_vuln_scanner import mask_comments_and_strings as impl
+        except Exception:  # helper not present in this checkout
+            impl = _mask_fallback
+        _mask_all_impl = impl
+    return _mask_all_impl(code)
+
+
+# --------------------------------------------------------------------
+# Inline suppression, mirroring heuristic_scan's semantics so re-explaining a
+# snippet downstream (explain_findings CLI, llm_explain heuristic backend)
+# cannot resurrect a rule the scan already suppressed: a match whose line
+# contains `ccr-ignore` is dropped; `ccr-ignore: rule1,rule2` limits the
+# suppression to those pattern ids. Checked against the RAW snippet lines
+# because the marker lives in a comment, which masking blanks out.
+# --------------------------------------------------------------------
+
+_IGNORE_RE = re.compile(r"ccr-ignore(?:\s*:\s*([\w\s,-]+))?")
+
+
+def _suppressed_rules(line):
+    """None when the line has no ccr-ignore; empty set = every rule suppressed."""
+    m = _IGNORE_RE.search(line)
+    if m is None:
+        return None
+    if m.group(1):
+        return {r.strip() for r in m.group(1).split(",") if r.strip()}
+    return set()
+
+
+# --------------------------------------------------------------------
+# Context-sensitive confirmation helpers. A pattern may carry an optional
+# "confirm": callable(text, match) -> bool; a regex hit only counts when the
+# callable returns True, letting a rule look before/after its trigger (e.g.
+# free(p) ... *p) without a monster regex. `text` is the masked snippet the
+# trigger matched in.
+# --------------------------------------------------------------------
+
+_ASSIGN_NEXT = re.compile(r"\s*=(?!=)")
+_DEREF_NEXT = re.compile(r"\s*(?:->|\[)")
+_REINIT_NEXT = re.compile(r"\s*\.\s*(?:clear|reset|assign)\s*\(")
+
+
+def _call_args(text, open_idx):
+    """Top-level comma-split argument strings of the call whose '(' is at
+    text[open_idx]; None when the parens never balance (truncated snippet)."""
+    if open_idx >= len(text) or text[open_idx] != "(":
+        return None
+    depth, args, start = 0, [], open_idx + 1
+    for i in range(open_idx, len(text)):
+        c = text[i]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+            if depth == 0:
+                args.append(text[start:i])
+                return args
+        elif c == "," and depth == 1:
+            args.append(text[start:i])
+            start = i + 1
+    return None
+
+
+_SIZEOF_ARG_RE = re.compile(
+    r"^sizeof(?:\s*\(\s*(?P<par>.+)\s*\)|\s+(?P<bare>[A-Za-z_][\w.\[\]>-]*))\s*$")
+
+
+def _mem_len_not_dst_sizeof(text, m):
+    """Keep a generic memcpy/memmove hit unless the length argument is exactly
+    sizeof(<destination arg>) — a copy bounded by the destination's own size."""
+    args = _call_args(text, m.end() - 1)
+    if not args or len(args) < 3:
+        return True
+    mo = _SIZEOF_ARG_RE.match(args[2].strip())
+    if not mo:
+        return True
+    operand = re.sub(r"\s+", "", mo.group("par") or mo.group("bare") or "")
+    return operand != re.sub(r"\s+", "", args[0])
+
+
+def _confirm_new_delete_mismatch(text, m):
+    array_delete, ident = m.group(1), re.escape(m.group(2))
+    if array_delete:  # delete[] p — mismatch when p came from scalar new
+        return re.search(
+            r"\b%s\s*=\s*new\s+[\w:]+(?:\s*<[^;\n]*>)?\s*(?:\(|\{|;)" % ident, text) is not None
+    return re.search(  # delete p — mismatch when p came from new T[...]
+        r"\b%s\s*=\s*new\s+[\w:]+(?:\s*<[^;\n]*>)?\s*\[" % ident, text) is not None
+
+
+def _confirm_use_after_move(text, m):
+    ident = m.group(1)
+    nxt = re.compile(r"\b%s\b" % re.escape(ident)).search(text, m.end())
+    if not nxt:
+        return False
+    # `x = ...` / `x.clear()` right after the move re-initialises the object
+    if _ASSIGN_NEXT.match(text, nxt.end()) or _REINIT_NEXT.match(text, nxt.end()):
+        return False
+    return True
+
+
+def _confirm_dangling_cstr(text, m):
+    ret_id = m.group(1)
+    if ret_id is None:  # `char *p = s.c_str()` — pointer aliases string internals
+        return True
+    # `return t.c_str()` only counts when t is a std::string declared locally
+    decl = re.compile(r"\b(?:std\s*::\s*)?string\s+[\w\s,*&]*\b%s\b" % re.escape(ret_id))
+    return decl.search(text, 0, m.start()) is not None
+
+
+def _confirm_strncpy_no_nul(text, m):
+    dst = re.escape(m.group(1))
+    return re.search(r"%s\s*\[[^\]\n]*\]\s*=\s*(?:'\\0'|0\b)" % dst, text) is None
+
+
+def _confirm_free_then_use(text, m):
+    ident = m.group(1)
+    for um in re.compile(r"\b%s\b" % re.escape(ident)).finditer(text, m.end()):
+        s, e = um.start(), um.end()
+        if _ASSIGN_NEXT.match(text, e):  # p = ... — reassigned before any use
+            return False
+        if _DEREF_NEXT.match(text, e):   # p-> or p[
+            return True
+        k = s - 1
+        while k >= 0 and text[k] in " \t":
+            k -= 1
+        if k >= 0 and text[k] == "*":    # *p
+            return True
+    return False
+
+
+def _confirm_double_free(text, m):
+    ident = re.escape(m.group(1))
+    nxt = re.compile(r"\bfree\s*\(\s*%s\s*\)" % ident).search(text, m.end())
+    if not nxt:
+        return False
+    assign = re.compile(r"\b%s\s*=(?!=)" % ident).search(text, m.end())
+    return assign is None or assign.start() > nxt.start()
+
+
+def _confirm_iterator_invalidation(text, m):
+    cont = m.group(1)
+    n = len(text)
+    i = m.end()
+    while i < n and text[i] in " \t\r\n":
+        i += 1
+    if i < n and text[i] == "{":  # braced body: match to the closing brace
+        depth, j = 0, i
+        while j < n:
+            if text[j] == "{":
+                depth += 1
+            elif text[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        body = text[i:j + 1]
+    else:  # single-statement body
+        j = text.find(";", i)
+        body = text[i:(j + 1 if j != -1 else n)]
+    return re.search(
+        r"\b%s\s*\.\s*(?:push_back|insert|erase|emplace_back|emplace)\s*\(" % re.escape(cont),
+        body) is not None
+
+
+# A checked pointer is often a member chain (s->buf, cfg.ptr): match the whole
+# chain and credit every component identifier, so `if (!s->buf)` counts as a
+# null check for the `s->buf = malloc(...)` trigger (which captures the member
+# name `buf`, not the base object).
+_ID_CHAIN = r"[A-Za-z_]\w*(?:\s*(?:->|\.)\s*[A-Za-z_]\w*)*"
+
+
+@functools.lru_cache(maxsize=8)
+def _null_checked_idents(text):
+    """Identifiers appearing in any NULL-check context in `text`. Computed once
+    per snippet (all malloc triggers share the same masked text) so the confirm
+    below stays linear on files with many allocations."""
+    ids = set()
+    for pat in (r"!\s*(%s)\b" % _ID_CHAIN,
+                r"\b(%s)\s*[=!]=\s*(?:NULL|nullptr|0)\b" % _ID_CHAIN,
+                r"\b(?:NULL|nullptr|0)\s*[=!]=\s*(%s)\b" % _ID_CHAIN,
+                r"\b(?:if|while|assert)\s*\(\s*(%s)\s*(?:\)|&&|\|\|)" % _ID_CHAIN):
+        for mm in re.finditer(pat, text):
+            ids.update(re.findall(r"[A-Za-z_]\w*", mm.group(1)))
+    return frozenset(ids)
+
+
+def _confirm_malloc_no_null_check(text, m):
+    esc = re.escape(m.group(1))
+    if m.group(1) in _null_checked_idents(text):
+        return False  # a null check exists somewhere — stay quiet
+    end = m.end()
+    for _ in range(4):  # rest of the alloc line + the next ~3 lines
+        nl = text.find("\n", end)
+        if nl == -1:
+            end = len(text)
+            break
+        end = nl + 1
+    window = text[m.end():end]
+    # sizeof(*p) inspects the type, not the pointer — drop before deref checks
+    window = re.sub(r"\bsizeof\s*\([^()\n]*\)|\bsizeof\s+\**\s*\w+", " ", window)
+    for pat in (r"\b%s\s*->" % esc, r"\*\s*%s\b" % esc, r"\b%s\s*\[" % esc,
+                r"\bmem(?:cpy|move|set)\s*\(\s*%s\s*," % esc,
+                r"\bstr\w*cpy\s*\(\s*%s\s*," % esc):
+        if re.search(pat, window):
+            return True
+    return False
+
 
 # --------------------------------------------------------------------
 # Pattern definitions: each ties a concrete API pattern to a specific
@@ -16,6 +365,16 @@ import argparse, os, json, re, html
 #   "risk" -> "What could go wrong:"          (the security failure mode)
 #   "vuln" -> the vulnerability that was identified (its class/name)
 # "why" stays as the one-line summary used for backward-compatible explanations.
+#
+# Optional per-pattern keys:
+#   "needs_strings": True -> matched against text where only comments are
+#                            masked (the rule inspects string literal contents)
+#   "confirm": callable(text, match) -> bool -> contextual second check; a
+#                            regex hit only counts when it returns True
+#   "confirm_needs_strings": True -> only the confirm callable receives the
+#                            strings-kept variant (same shape, so the trigger
+#                            match's offsets stay valid) — for confirmations
+#                            that must see literal contents ('\0' stores)
 PATTERNS = [
     {
         "id": "gets",
@@ -111,6 +470,7 @@ PATTERNS = [
         "id": "scanf_percent_s",
         # FIXED: properly quoted "%s" so the regex is valid Python.
         "regex": re.compile(r'\bscanf\s*\(\s*"%s"'),
+        "needs_strings": True,  # the trigger lives inside the format literal
         "cwe": "CWE-120",
         "severity": "high",
         "why": 'scanf("%s") with no width specifier can overflow destination buffers.',
@@ -126,6 +486,8 @@ PATTERNS = [
     {
         "id": "memcpy",
         "regex": re.compile(r"\bmemcpy\s*\("),
+        # length == sizeof(dst) is bounded by construction — don't flag it
+        "confirm": _mem_len_not_dst_sizeof,
         "cwe": "CWE-120",
         "severity": "medium",
         "why": "memcpy() with unchecked length can overflow or over‑read buffers.",
@@ -141,6 +503,7 @@ PATTERNS = [
     {
         "id": "memmove",
         "regex": re.compile(r"\bmemmove\s*\("),
+        "confirm": _mem_len_not_dst_sizeof,
         "cwe": "CWE-120",
         "severity": "medium",
         "why": "memmove() with an unchecked length can overflow the destination buffer.",
@@ -247,6 +610,7 @@ PATTERNS = [
     {
         "id": "hardcoded_credentials",
         "regex": re.compile(r'''(?i)\b(?:passwd|password|secret|api_?key|access_?key|secret_?key|private_?key|client_?secret|passphrase|auth_?token|access_?token|credential)\b\s*(?:\[[^\]]*\])?\s*=\s*"[^"]{3,}"'''),
+        "needs_strings": True,  # the credential literal is the evidence
         "cwe": "CWE-798",
         "severity": "high",
         "why": "Credentials baked into source ship in the binary and version control; anyone with read access can extract them, and rotating a compromised secret requires a code change and redeploy.",
@@ -345,6 +709,7 @@ PATTERNS = [
     {
         "id": "scanf_family_unbounded",
         "regex": re.compile(r'''\b(?:sscanf|fscanf|vsscanf|vfscanf|vscanf|scanf)\s*\([^;]*(?:%s|%\[)'''),
+        "needs_strings": True,  # %s / %[ live inside the format literal
         "cwe": "CWE-120",
         "severity": "high",
         "why": "A %s or %[...] conversion without a width reads an arbitrarily long token into a fixed-size buffer, overflowing it; this covers the cases (e.g. sscanf(s, \"%d %s\", ...)) the bare scanf(\"%s\") rule misses.",
@@ -618,6 +983,180 @@ PATTERNS = [
             "Drop group privileges and supplementary groups before the user ID, then re-verify with getresuid()/getresgid() that the drop actually took effect.",
         ],
     },
+    # --- C++ / lifetime additions (context-confirmed patterns) ---------------
+    {
+        "id": "new_delete_mismatch",
+        "regex": re.compile(r"\bdelete\s*(?:(\[\s*\])\s*|\s+)([A-Za-z_]\w*)"),
+        "confirm": _confirm_new_delete_mismatch,
+        "cwe": "CWE-762",
+        "severity": "high",
+        "why": "Memory from new[] released with delete (or new released with delete[]) is undefined behavior and corrupts the allocator.",
+        "what": "Releases a pointer with a delete form that does not match how it was allocated: new T[...] freed with plain delete, or a scalar new freed with delete[].",
+        "risk": "The mismatched form skips (or fabricates) element destructors and hands the allocator a block layout it did not create, corrupting heap metadata — a classic primitive for heap exploitation.",
+        "vuln": "Mismatched new[]/delete deallocation",
+        "recs": [
+            "Pair new[] with delete[] and scalar new with delete, always.",
+            "Prefer std::vector / std::unique_ptr<T[]> so the correct deallocation form is automatic.",
+        ],
+    },
+    {
+        "id": "free_then_use",
+        "regex": re.compile(r"\bfree\s*\(\s*([A-Za-z_]\w*)\s*\)"),
+        "confirm": _confirm_free_then_use,
+        "cwe": "CWE-416",
+        "severity": "high",
+        "why": "The pointer is dereferenced after free() without being reassigned — a use-after-free.",
+        "what": "Calls free() on a pointer and later dereferences the same pointer (p->, *p, or p[...]) without reassigning it first.",
+        "risk": "The freed block can be reallocated and attacker-controlled by the time it is read or written, turning the stale dereference into information disclosure or arbitrary memory corruption.",
+        "vuln": "Use after free",
+        "recs": [
+            "Set the pointer to NULL immediately after free() and check before reuse.",
+            "Restructure ownership so each allocation has one clear release point (or use RAII/smart pointers in C++).",
+        ],
+    },
+    {
+        "id": "double_free",
+        "regex": re.compile(r"\bfree\s*\(\s*([A-Za-z_]\w*)\s*\)"),
+        "confirm": _confirm_double_free,
+        "cwe": "CWE-415",
+        "severity": "high",
+        "why": "The same pointer is passed to free() twice without an intervening reassignment.",
+        "what": "Calls free() twice on the same pointer variable with no reassignment in between.",
+        "risk": "Freeing a block twice corrupts the allocator's free lists; attackers routinely turn double frees into overlapping allocations and from there into arbitrary write primitives.",
+        "vuln": "Double free",
+        "recs": [
+            "Set the pointer to NULL after free(); free(NULL) is a safe no-op.",
+            "Give every allocation exactly one owner responsible for releasing it.",
+        ],
+    },
+    {
+        "id": "use_after_move",
+        "regex": re.compile(r"\bstd\s*::\s*move\s*\(\s*([A-Za-z_]\w*)\s*\)"),
+        "confirm": _confirm_use_after_move,
+        "cwe": "CWE-672",
+        "severity": "medium",
+        "why": "The object is read again after std::move() handed its contents to another owner.",
+        "what": "Passes an object through std::move() and then uses the same variable again before reassigning or re-initialising it.",
+        "risk": "A moved-from object is in a valid but unspecified state: reads return garbage or empty values and invariants the code assumes (non-null handles, sizes) may no longer hold, causing logic errors or crashes.",
+        "vuln": "Use of a moved-from object",
+        "recs": [
+            "Do not touch a variable after std::move() until it is reassigned or re-initialised.",
+            "Scope moved-from variables tightly (move as the last use, e.g. in a return or emplace).",
+        ],
+    },
+    {
+        "id": "dangling_cstr",
+        "regex": re.compile(
+            r"(?:\bconst\s+)?\bchar\s*\*\s*(?:const\s+)?[A-Za-z_]\w*\s*=\s*[^;\n]*?\.\s*c_str\s*\(\s*\)"
+            r"|\breturn\s+([A-Za-z_]\w*)\s*\.\s*c_str\s*\(\s*\)\s*;"),
+        "confirm": _confirm_dangling_cstr,
+        "cwe": "CWE-416",
+        "severity": "medium",
+        "why": "The raw pointer from .c_str() only lives as long as the owning std::string; storing or returning it invites a dangling read.",
+        "what": "Stores the pointer returned by std::string::c_str() in a named char* variable, or returns a local string's c_str() from the function.",
+        "risk": "The pointer is invalidated as soon as the string is mutated, reallocated, or destroyed (immediately, for a returned local), so later reads walk freed or reused heap memory.",
+        "vuln": "Dangling pointer from std::string::c_str()",
+        "recs": [
+            "Keep the std::string itself alive and call .c_str() at the point of use instead of caching the pointer.",
+            "Return std::string (or std::string_view with documented lifetime) rather than a local's c_str().",
+        ],
+    },
+    {
+        "id": "string_view_temporary",
+        "regex": re.compile(
+            r"\b(?:std\s*::\s*)?string_view\s+[A-Za-z_]\w*\s*=\s*[^;\n]*?(?:\bstring\s*\(|\)\s*\.\s*substr\s*\()"),
+        "cwe": "CWE-416",
+        "severity": "medium",
+        "why": "Binding a std::string_view to a temporary std::string leaves the view dangling when the temporary is destroyed at the end of the statement.",
+        "what": "Initialises a std::string_view from a temporary std::string (an explicit std::string(...) construction or a .substr() result of a call).",
+        "risk": "The temporary's buffer is freed at the end of the full expression, so every later use of the view reads destroyed memory — silently returning garbage or crashing.",
+        "vuln": "Dangling std::string_view over a destroyed temporary",
+        "recs": [
+            "Bind the std::string to a named variable that outlives the view, then take the view from it.",
+            "Pass string_view only down the call stack; never store one built from a temporary.",
+        ],
+    },
+    {
+        "id": "iterator_invalidation",
+        "regex": re.compile(r"\bfor\s*\(\s*[^;()\n]*:\s*([A-Za-z_]\w*)\s*\)"),
+        "confirm": _confirm_iterator_invalidation,
+        "cwe": "CWE-672",
+        "severity": "medium",
+        "why": "Mutating a container inside its own range-for loop invalidates the iterators the loop is built on.",
+        "what": "Iterates a container with a range-based for loop while the loop body calls push_back/insert/erase/emplace on that same container.",
+        "risk": "Growth can reallocate the backing store and erase shifts elements, so the loop's hidden iterators dangle — reads go through freed memory and writes corrupt the heap (undefined behavior that often survives testing).",
+        "vuln": "Iterator invalidation (container mutated during iteration)",
+        "recs": [
+            "Collect changes in a second container and apply them after the loop.",
+            "Use index-based iteration with explicit bounds refresh, or the erase(remove_if(...)) idiom.",
+        ],
+    },
+    {
+        "id": "vprintf_format",
+        "regex": re.compile(
+            r"\bvprintf\s*\(\s*[A-Za-z_]\w*\s*,"
+            r"|\b(?:vfprintf|vsyslog)\s*\(\s*[^,;\n]+,\s*[A-Za-z_]\w*\s*,"
+            r"|\bvsnprintf\s*\(\s*[^,;\n]+,\s*[^,;\n]+,\s*[A-Za-z_]\w*\s*,"),
+        "cwe": "CWE-134",
+        "severity": "high",
+        "why": "A v*printf function called with a variable format string lets input control conversions (%n, %s).",
+        "what": "Calls vprintf()/vfprintf()/vsnprintf()/vsyslog() with a bare variable (non-literal) as the format argument.",
+        "risk": "These varargs wrappers are how attacker data most often reaches a format string: %x/%s/%n conversions then read the stack or write to memory, leading to crashes or code execution.",
+        "vuln": "Uncontrolled format string (v*printf family)",
+        "recs": [
+            "Pass a literal format: vfprintf(fp, \"%s\", ap-rendered-text) style, never the raw variable.",
+            "Audit varargs wrapper functions: mark them with __attribute__((format(printf, ...))) so the compiler checks callers.",
+        ],
+    },
+    {
+        "id": "strncpy_no_nul",
+        "regex": re.compile(r"\bstrncpy\s*\(\s*([A-Za-z_](?:->|[\w.\[\]])*)\s*,"),
+        "confirm": _confirm_strncpy_no_nul,
+        # The trigger runs on fully masked text (a log string mentioning
+        # strncpy(...) must not fire); only the CONFIRM needs literals kept, to
+        # see the '\0' terminator store that makes the copy safe.
+        "confirm_needs_strings": True,
+        "cwe": "CWE-170",
+        "severity": "medium",
+        "why": "strncpy() does not NUL-terminate when the source fills the buffer, and no explicit terminator store follows.",
+        "what": "Copies a string with strncpy() without any later dst[...] = '\\0' (or = 0) statement terminating the destination.",
+        "risk": "When the source is as long as the size limit the destination is left unterminated, so the next strlen/strcpy/printf reads past the buffer — leaking adjacent memory or overflowing a later copy.",
+        "vuln": "Missing NUL termination after strncpy",
+        "recs": [
+            "Follow every strncpy(dst, src, n) with dst[n-1] = '\\0'; (or use strlcpy/snprintf which terminate).",
+            "Treat all fixed-size string buffers as length+1 and reserve the last byte for the terminator.",
+        ],
+    },
+    {
+        "id": "malloc_no_null_check",
+        "regex": re.compile(
+            r"\b([A-Za-z_]\w*)\s*=\s*(?:\([^()\n]*\)\s*)?\b(?:malloc|calloc|realloc)\s*\("),
+        "confirm": _confirm_malloc_no_null_check,
+        "cwe": "CWE-476",
+        "severity": "medium",
+        "why": "The allocation result is dereferenced immediately with no NULL check anywhere in the function.",
+        "what": "Assigns the result of malloc/calloc/realloc to a pointer and dereferences it within the next few lines, with no NULL test for that pointer in the snippet.",
+        "risk": "Under memory pressure (or an attacker-driven huge size) the allocator returns NULL and the unchecked dereference crashes the process — or, with an offset, writes near address zero where mapped pages make it exploitable.",
+        "vuln": "NULL pointer dereference of an unchecked allocation",
+        "recs": [
+            "Check the allocation result (if (!p) ...) before the first dereference and fail cleanly.",
+            "Centralise allocation in a checked helper (xmalloc-style) so no call site can forget the test.",
+        ],
+    },
+    {
+        "id": "strtok_nonreentrant",
+        "regex": re.compile(r"\bstrtok\s*\("),
+        "cwe": "CWE-676",
+        "severity": "low",
+        "why": "strtok() keeps hidden global state, so it is non-reentrant and unsafe with threads or nested tokenising.",
+        "what": "Tokenises a string with strtok(), which stores its position in hidden static state.",
+        "risk": "Concurrent or nested strtok() calls silently interleave that shared state, producing tokens from the wrong string — parsing bugs that can bypass input validation; it also writes NULs into the source buffer.",
+        "vuln": "Use of non-reentrant strtok()",
+        "recs": [
+            "Use strtok_r() (POSIX) or strtok_s() (C11 Annex K) with an explicit save-pointer.",
+            "In C++ prefer std::string_view-based splitting that does not mutate the source.",
+        ],
+    },
 ]
 
 GENERIC_REC = [
@@ -747,20 +1286,55 @@ def primary_vuln(matched_ids):
     return p.get("vuln", "") if p else ""
 
 
-def explain_snippet(snippet: str):
+def _dedup(seq):
+    """Order-preserving dedup."""
+    out, seen = [], set()
+    for x in seq:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+def explain_snippet_detailed(snippet: str):
+    """Return (explanations, recommendations, matched_ids, matches).
+
+    `matches` is a sorted list of (pattern_id, line_no) tuples with line_no
+    1-based within the snippet — the anchors heuristic_scan turns into absolute
+    match_lines. Regexes run over comment-masked text (string contents also
+    masked unless the pattern sets "needs_strings"), so commented-out code and
+    log strings cannot match; masking is same-shape, so line numbers align with
+    the original snippet. `ccr-ignore` lines suppress matches here too (same
+    semantics as heuristic_scan), so re-explaining a snippet cannot resurrect
+    a rule the scan already suppressed.
     """
-    Return (explanations, recommendations, matched_ids)
-    explanations/recs are tightly tied to patterns we actually see in the snippet.
-    """
-    explanations = []
-    recs = []
+    masked_all = _mask_all(snippet)
+    masked_keep_strings = _mask_code(snippet, mask_strings=False)
+    raw_lines = snippet.splitlines()
+
+    explanations, recs = [], []
     matched_ids = set()
+    matches = []
 
     for pat in PATTERNS:
-        if pat["regex"].search(snippet):
-            matched_ids.add(pat["id"])
-            explanations.append(pat["why"])
-            recs.extend(pat["recs"])
+        text = masked_keep_strings if pat.get("needs_strings") else masked_all
+        # Confirms that must inspect literal contents get the strings-kept
+        # variant; same-shape masking keeps the trigger match's offsets valid.
+        ctext = masked_keep_strings if pat.get("confirm_needs_strings") else text
+        confirm = pat.get("confirm")
+        for m in pat["regex"].finditer(text):
+            if confirm is not None and not confirm(ctext, m):
+                continue
+            line_no = text.count("\n", 0, m.start()) + 1
+            raw_line = raw_lines[line_no - 1] if line_no <= len(raw_lines) else ""
+            rules = _suppressed_rules(raw_line)
+            if rules is not None and (not rules or pat["id"] in rules):
+                continue  # ccr-ignore'd on this line
+            if pat["id"] not in matched_ids:
+                matched_ids.add(pat["id"])
+                explanations.append(pat["why"])
+                recs.extend(pat["recs"])
+            matches.append((pat["id"], line_no))
 
     if not explanations:
         explanations.append(
@@ -769,16 +1343,16 @@ def explain_snippet(snippet: str):
         )
         recs.extend(GENERIC_REC)
 
-    # Dedup while preserving order
-    def dedup(seq):
-        out, seen = [], set()
-        for x in seq:
-            if x not in seen:
-                seen.add(x)
-                out.append(x)
-        return out
+    return _dedup(explanations), _dedup(recs), matched_ids, sorted(matches)
 
-    return dedup(explanations), dedup(recs), matched_ids
+
+def explain_snippet(snippet: str):
+    """
+    Return (explanations, recommendations, matched_ids)
+    explanations/recs are tightly tied to patterns we actually see in the snippet.
+    """
+    explanations, recs, matched_ids, _matches = explain_snippet_detailed(snippet)
+    return explanations, recs, matched_ids
 
 
 def write_html(explanations, html_path: str):
@@ -913,7 +1487,7 @@ def main():
         # store snippet as list of lines (good for JSON + HTML)
         snippet_lines = raw_snippet.splitlines()[:40]
 
-        explanations_out.append({
+        entry = {
             "file": f.get("file"),
             "start_line": f.get("start_line"),
             "end_line": f.get("end_line"),
@@ -928,7 +1502,10 @@ def main():
             "explanations": expl,
             "snippet": snippet_lines,
             "recommendations": recs,
-        })
+        }
+        if "match_lines" in f:  # anchor lines from heuristic_scan pass through
+            entry["match_lines"] = f["match_lines"]
+        explanations_out.append(entry)
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as f:
