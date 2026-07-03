@@ -39,9 +39,9 @@ def _load_builder():
 builder = _load_builder()
 
 
-def _load():
+def _load(path=DATASET):
     rows = []
-    with open(DATASET, encoding="utf-8") as fh:
+    with open(path, encoding="utf-8") as fh:
         for line in fh:
             line = line.strip()
             if line:
@@ -131,3 +131,46 @@ def test_leak_check_was_enabled_for_committed_artifact():
         prov = json.load(fh)
     assert prov["leak_check"]["enabled"] is True
     assert prov["leak_check"]["against"].startswith("bstee615/bigvul@")
+
+
+# --- the PrimeVul C control set (benchmarks/c_eval_control.jsonl) --------------
+# Built by the same builder with --lang c: the same-distribution control that
+# separates "C++ transfer gap" from "PrimeVul is harder than BigVul". Scored
+# results live in benchmarks/c_eval_control_metrics.json; see
+# benchmarks/cpp_eval_findings.md for the interpretation.
+
+CONTROL = os.path.join(REPO, "benchmarks", "c_eval_control.jsonl")
+CONTROL_PROV = os.path.join(REPO, "benchmarks", "c_eval_control.provenance.json")
+
+
+def test_control_set_schema_balance_and_lang():
+    rows = _load(CONTROL)
+    assert len(rows) >= 300
+    assert all(r["lang"] == "c" for r in rows)
+    assert all(r["label"] in (0, 1) for r in rows)
+    n_pos = sum(r["label"] for r in rows)
+    assert 0.35 <= n_pos / len(rows) <= 0.65
+    seen = set()
+    for r in rows:
+        h = builder.fingerprint(r["code"])
+        assert h not in seen, f"duplicate function in control set: {r['name']}"
+        seen.add(h)
+
+
+def test_control_provenance_matches_and_leak_checked():
+    rows = _load(CONTROL)
+    with open(CONTROL_PROV, encoding="utf-8") as fh:
+        prov = json.load(fh)
+    assert prov["rows"] == len(rows)
+    h = hashlib.sha256()
+    with open(CONTROL, "rb") as fh:
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            h.update(block)
+    assert prov["sha256"] == h.hexdigest()
+    assert prov["leak_check"]["enabled"] is True
+
+
+def test_control_and_cpp_sets_are_disjoint():
+    cpp_hashes = {builder.fingerprint(r["code"]) for r in _load()}
+    assert not any(builder.fingerprint(r["code"]) in cpp_hashes
+                   for r in _load(CONTROL))

@@ -53,8 +53,16 @@ BIGVUL_REVISION = "4d8647a9b52fdd2ae42343c60fd6c7c48bbff25e"
 # Unambiguous C++ extensions. `.h` is C/C++-ambiguous and `file_name` is the
 # literal string 'None' on ~1/3 of paired rows — both are excluded.
 CPP_EXTS = {".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx"}
+# Unambiguous C. Used by --lang c to build the same-distribution C control set
+# that separates "C++ transfer gap" from "PrimeVul is harder than BigVul".
+C_EXTS = {".c"}
+EXTS_BY_LANG = {"cpp": CPP_EXTS, "c": C_EXTS}
 
 DEFAULT_OUT = os.path.join("benchmarks", "cpp_eval_real.jsonl")
+DEFAULT_OUT_BY_LANG = {
+    "cpp": DEFAULT_OUT,
+    "c": os.path.join("benchmarks", "c_eval_control.jsonl"),
+}
 DEFAULT_MAX_ROWS = 1200
 DEFAULT_MAX_BYTES = 4_000_000
 DEFAULT_MAX_FUNC_CHARS = 30_000
@@ -76,15 +84,16 @@ def fingerprint(code):
     return hashlib.sha256(norm_ws(code).encode("utf-8")).hexdigest()
 
 
-def is_cpp_filename(file_name):
-    """True when file_name has an unambiguous C++ extension.
+def is_cpp_filename(file_name, exts=None):
+    """True when file_name has an unambiguous extension from `exts`
+    (default: the C++ set).
 
     PrimeVul serializes missing metadata as the literal string 'None'.
     """
     s = str(file_name or "").strip()
     if not s or s == "None":
         return False
-    return os.path.splitext(s)[1].lower() in CPP_EXTS
+    return os.path.splitext(s)[1].lower() in (CPP_EXTS if exts is None else exts)
 
 
 def norm_cwe(raw):
@@ -124,15 +133,17 @@ def pair_up(rows):
     return pairs, malformed
 
 
-def to_row(raw, split, pos, label, revision=PRIMEVUL_REVISION):
+def to_row(raw, split, pos, label, revision=PRIMEVUL_REVISION, lang="cpp"):
     """Map one PrimeVul record to the cpp_eval_real.jsonl schema. Pure."""
     cwe = norm_cwe(raw.get("cwe"))
     row = {
-        "name": f"primevul_{split}_{pos:04d}_{'vuln' if label else 'fixed'}",
+        "name": f"primevul_{lang}_{split}_{pos:04d}_{'vuln' if label else 'fixed'}"
+                if lang != "cpp" else
+                f"primevul_{split}_{pos:04d}_{'vuln' if label else 'fixed'}",
         "code": raw.get("func") or "",
         "label": label,
         "cwe": cwe,
-        "lang": "cpp",
+        "lang": lang,
         "category": cwe or "real",
         "source": f"{PRIMEVUL_ID}@{revision}",
     }
@@ -249,8 +260,9 @@ def build(args):
         split_pairs, malformed = pair_up(rows)
         stats["malformed_pairs"] += malformed
         for pos, (raw_v, raw_f) in enumerate(split_pairs):
-            if not (is_cpp_filename(raw_v.get("file_name"))
-                    and is_cpp_filename(raw_f.get("file_name"))):
+            exts = EXTS_BY_LANG[getattr(args, "lang", "cpp")]
+            if not (is_cpp_filename(raw_v.get("file_name"), exts)
+                    and is_cpp_filename(raw_f.get("file_name"), exts)):
                 continue
             stats["cpp_pairs"] += 1
             if str(raw_v.get("commit_id") or "") in leak_commits:
@@ -258,7 +270,8 @@ def build(args):
                 continue
             keep = []
             for raw, label in ((raw_v, 1), (raw_f, 0)):
-                row = to_row(raw, split, pos, label, args.revision)
+                row = to_row(raw, split, pos, label, args.revision,
+                             lang=getattr(args, "lang", "cpp"))
                 if not row["code"].strip():
                     continue
                 if len(row["code"]) > args.max_func_chars:
@@ -345,7 +358,14 @@ def write_outputs(out_rows, stats, args):
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(
         description="Build the real-C++ eval set from PrimeVul (paired)")
-    ap.add_argument("--out", default=DEFAULT_OUT)
+    ap.add_argument("--lang", choices=("cpp", "c"), default="cpp",
+                    help="Language slice: cpp (the eval set) or c (the "
+                         "same-distribution control that separates a C++ "
+                         "transfer gap from PrimeVul just being harder).")
+    ap.add_argument("--out", default=None,
+                    help=f"Output JSONL (default per --lang: "
+                         f"{DEFAULT_OUT_BY_LANG['cpp']} / "
+                         f"{DEFAULT_OUT_BY_LANG['c']})")
     ap.add_argument("--provenance", default=None,
                     help="Provenance JSON path (default: <out> with "
                          ".provenance.json instead of .jsonl)")
@@ -362,6 +382,8 @@ def parse_args(argv=None):
     ap.add_argument("--no-leak-check", dest="leak_check", action="store_false",
                     help="Skip the BigVul overlap filter (offline runs only).")
     args = ap.parse_args(argv)
+    if args.out is None:
+        args.out = DEFAULT_OUT_BY_LANG[args.lang]
     if args.provenance is None:
         base = args.out[:-6] if args.out.endswith(".jsonl") else args.out
         args.provenance = base + ".provenance.json"

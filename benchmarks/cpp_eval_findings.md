@@ -107,3 +107,61 @@ Dataset attribution (MIT, Copyright (c) 2024 DLVulDet — see `NOTICE`):
 Ding, Y., Fu, Y., Ibrahim, O., Sitawarin, C., Chen, X., Alomair, B., Wagner,
 D., Ray, B., Chen, Y. *"Vulnerability Detection with Code Language Models: How
 Far Are We?"* arXiv:2403.18624 (ICSE 2025).
+
+## Update 2026-07-03 — real-C++ scored, and the story changed
+
+The reference model was retrained from scratch with the current pipeline
+(`make_balanced_subset.py` seeded splits → `train_vuln_model.py` with
+provenance/`max_length` persisted into `inference.json`; git `699b824`,
+seed 42, balanced BigVul 2400/500, seq 256, 2 epochs, class-weighted,
+CPU-only) and scored on four sets. A **PrimeVul C control**
+(`benchmarks/c_eval_control.jsonl`, 816 rows built by the same builder with
+`--lang c`, same leakage filter — which dropped 1,978 C rows for BigVul
+commit overlap, vs 12 for C++) separates "C++ transfer gap" from "PrimeVul
+is just harder":
+
+| test set | n | ROC-AUC | PR-AUC | F1 @ tuned 0.32 |
+| --- | --- | --- | --- | --- |
+| BigVul C held-out (balanced)             | 800 | **0.904** | 0.903 | 0.828 |
+| PrimeVul **C** control (real functions)  | 816 | **0.492** | 0.498 | 0.540 |
+| PrimeVul **C++** (real functions)        | 822 | **0.492** | 0.494 | 0.602 |
+| synthetic C++ snippets (regression set)  | 18  | 0.407 | 0.520 | 0.000 |
+
+(Full metrics with embedded model/dataset provenance:
+`c_baseline_metrics.json`, `c_eval_control_metrics.json`,
+`cpp_eval_real_metrics.json`, `cpp_eval_metrics.json`.)
+
+**Conclusion: this is NOT a language gap — it is a cross-dataset
+generalization gap.** The model holds 0.904 on held-out BigVul C but is at
+chance on BigVul-disjoint PrimeVul functions *in both languages*
+(0.492 = 0.492). The earlier "snippet-length OOD, not a language gap"
+conclusion was right about language but missed the larger problem: the
+classifier's measured skill is largely BigVul-specific. This independently
+reproduces the PrimeVul paper's core finding (Ding et al., ICSE 2025) that
+BigVul-benchmark scores do not transfer to cleaner-labeled, cross-project
+data.
+
+Caveats before over-reading a chance-level number from a 2,400-row CPU
+reference model: the production model sees 134k rows / 66× more data and may
+transfer somewhat better — **re-run `./eval_cpp.sh` plus
+`evaluate_model.py --test benchmarks/c_eval_control.jsonl` against the
+production model on the GPU box before treating 0.492 as its number.**
+PrimeVul's post-fix negatives are also deliberately hard (single-commit
+differences), so "chance on PrimeVul" understates value on triage-style
+workloads with easier negatives.
+
+What this means for the roadmap:
+
+1. **Training-data diversification is now the top ML-lane priority** — add
+   PrimeVul-train / DiverseVul rows (both are BigVul-disjoint after the same
+   commit/hash filter) to the 4090 training mix, then re-measure all four
+   rows of the table above. The gate flags exist
+   (`evaluate_model.py --min-roc-auc/--min-pr-auc`) to enforce a
+   cross-dataset floor, not just a BigVul floor.
+2. **The heuristic lane is unaffected** — it needs no training distribution
+   and already catches the playground/synthetic cases the classifier misses;
+   keep it as the robust detection floor in CI.
+3. The C control is committed and test-guarded
+   (`tests/test_cpp_eval_real_dataset.py`), so this comparison is one
+   `eval_cpp.sh` + one `evaluate_model.py` invocation to reproduce on any
+   trained model.
