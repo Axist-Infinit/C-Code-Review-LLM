@@ -33,6 +33,26 @@ def _gpu_name():
     return None
 
 
+def _gpu_mem_mib():
+    """Total VRAM of the first GPU in MiB, or None if it can't be determined."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            return int(out.stdout.strip().splitlines()[0].split()[0])
+    except (FileNotFoundError, subprocess.TimeoutExpired, ValueError, IndexError):
+        pass
+    return None
+
+
+# A discrete GPU with less than this much VRAM cannot comfortably hold the 14b
+# model the "4090" profile assumes (~9GB weights + a 16k-ctx KV cache), so it is
+# routed to the "laptop" profile (qwen2.5-coder:7b) instead.
+_LAPTOP_VRAM_CEILING_MIB = 16000
+
+
 def detect_profile():
     """Best-effort hardware detection. Returns a profile name."""
     gpu = _gpu_name()
@@ -44,7 +64,12 @@ def detect_profile():
             return "spark"
         if "4090" in g:
             return "4090"
-        # Any other CUDA GPU: 4090 profile is the sane discrete-GPU default
+        # A smaller discrete GPU (e.g. a 12GB laptop card) can't hold the 14b
+        # model the 4090 profile assumes; route <16GB VRAM to the laptop profile.
+        mem = _gpu_mem_mib()
+        if mem is not None and mem < _LAPTOP_VRAM_CEILING_MIB:
+            return "laptop"
+        # Any other/unmeasurable CUDA GPU: 4090 profile is the sane default.
         return "4090"
     if arch in ("aarch64", "arm64"):
         return "spark"

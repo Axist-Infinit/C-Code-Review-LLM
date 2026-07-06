@@ -117,13 +117,26 @@ mismatches are overridden — an unsigned underflow can't ship as CWE-190
 instead of CWE-787, and correct model CWEs survive on unfamiliar code).
 
 ```bash
-# Single-model, two-pass (enumerate -> completeness critic), offline retrieval hints on
+# Easiest: one command for any file(s) — writes report.md + JSON + SARIF under
+# scan_out/surface/. Needs only a running Ollama (no torch / classifier).
+./surface_scan.sh playground/dhcp-internal.h playground/dhcp-protocol.h
+OUT=out ./surface_scan.sh src/                 # a whole directory, reviewed together
+
+# Or call the tool directly: single-model, two-pass (enumerate -> completeness critic)
 python surface_review.py playground/dhcp-internal.h playground/dhcp-protocol.h \
     --json scan_out/surface/review.json --md scan_out/surface/report.md
 
 # Union finisher: sample several models/temperatures, pool, deterministically consolidate
 python surface_review.py SRC --models qwen2.5-coder:14b,qwen2.5-coder:32b --samples 2
+SAMPLES=2 MODELS=qwen2.5-coder:14b,qwen2.5-coder:32b ./surface_scan.sh SRC   # same, via the wrapper
 ```
+
+> **Now wired in by default.** `scan_repo.sh` and `run_demo.sh` run this lane
+> automatically after the classifier/explainer (guarded on Ollama being up, and
+> `--soft-fail` so a missing model never breaks the run), so headers in any repo
+> you scan get a contract review without a separate command. The model is chosen
+> per hardware profile — a <16 GB GPU auto-selects the `laptop` profile
+> (`qwen2.5-coder:7b`); a 24 GB box gets `14b`; DGX Spark gets `32b`.
 
 - **Offline retrieval hints** (`surface_kb.json`) inject trigger-matched facts
   (known CVEs, RFC/protocol semantics, correct CWEs) into the prompt — the single

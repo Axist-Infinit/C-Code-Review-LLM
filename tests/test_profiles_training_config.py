@@ -59,6 +59,44 @@ def test_training_config_cpu_is_full_precision():
     assert cfg["bf16"] is False
 
 
+def test_training_config_laptop():
+    cfg = profiles.training_config(name="laptop")
+    assert cfg["profile"] == "laptop"
+    assert cfg["batch_size"] == 16
+    assert cfg["fp16"] is True and cfg["bf16"] is False
+    # the laptop profile serves the 7b model so it fits a <16GB GPU
+    _, prof = profiles.select_profile(name="laptop")
+    assert prof["ollama_model"] == "qwen2.5-coder:7b"
+
+
+def test_detect_profile_routes_small_gpu_to_laptop(monkeypatch):
+    # A discrete CUDA GPU with <16GB VRAM must not get the 4090 profile (whose
+    # 14b model won't fit) — it should fall through to the laptop profile.
+    monkeypatch.setattr(profiles, "_gpu_name", lambda: "NVIDIA GeForce RTX 5070 Ti Laptop GPU")
+    monkeypatch.setattr(profiles, "_gpu_mem_mib", lambda: 12227)
+    assert profiles.detect_profile() == "laptop"
+
+
+def test_detect_profile_keeps_big_gpu_on_4090(monkeypatch):
+    monkeypatch.setattr(profiles, "_gpu_name", lambda: "NVIDIA RTX A6000")
+    monkeypatch.setattr(profiles, "_gpu_mem_mib", lambda: 49140)
+    assert profiles.detect_profile() == "4090"
+
+
+def test_detect_profile_unmeasurable_vram_defaults_to_4090(monkeypatch):
+    # If VRAM can't be read, keep the historical discrete-GPU default (4090).
+    monkeypatch.setattr(profiles, "_gpu_name", lambda: "NVIDIA GeForce RTX 3080")
+    monkeypatch.setattr(profiles, "_gpu_mem_mib", lambda: None)
+    assert profiles.detect_profile() == "4090"
+
+
+def test_named_4090_still_wins_regardless_of_vram(monkeypatch):
+    # An explicit 4090 in the name is matched before the VRAM branch.
+    monkeypatch.setattr(profiles, "_gpu_name", lambda: "NVIDIA GeForce RTX 4090")
+    monkeypatch.setattr(profiles, "_gpu_mem_mib", lambda: 24564)
+    assert profiles.detect_profile() == "4090"
+
+
 def test_training_config_matches_profiles_json_batch_and_dtype():
     """The training config must faithfully reflect profiles.json — guard against
     drift between the JSON and the mapping."""

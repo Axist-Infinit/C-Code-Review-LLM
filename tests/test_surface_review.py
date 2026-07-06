@@ -646,3 +646,49 @@ def test_print_comparison_honors_out_dir(capsys):
     printed = capsys.readouterr().out
     assert "custom/outdir/" in printed
     assert "scan_out/compare" not in printed
+
+
+# --- Ollama chat-response hardening (crash fix) ------------------------------
+
+def test_chat_content_parses_valid_reply():
+    resp = {"message": {"content": json.dumps({"findings": [{"title": "x"}]})}}
+    assert sr._chat_content(resp) == {"findings": [{"title": "x"}]}
+
+
+def test_chat_content_null_message_raises_valueerror_not_attributeerror():
+    # Ollama can return {"message": null} on some errors; the old
+    # resp.get("message", {}).get(...) raised AttributeError (NOT in the sample
+    # loop's except tuple), aborting a whole multi-hour run. Must be ValueError.
+    with pytest.raises(ValueError):
+        sr._chat_content({"message": None})
+
+
+def test_chat_content_non_dict_body_and_non_str_content_raise_valueerror():
+    with pytest.raises(ValueError):
+        sr._chat_content([1, 2, 3])           # list body
+    with pytest.raises(ValueError):
+        sr._chat_content({"message": {"content": None}})   # null content
+    with pytest.raises(ValueError):
+        sr._chat_content({"message": {"content": {"not": "a string"}}})
+
+
+def test_normalize_ollama_url_adds_scheme_to_bare_host_port():
+    assert sr._normalize_ollama_url("127.0.0.1:11434") == "http://127.0.0.1:11434"
+    assert sr._normalize_ollama_url("localhost:11434") == "http://localhost:11434"
+    # full URLs pass through untouched (incl. https and remote hosts)
+    assert sr._normalize_ollama_url("http://localhost:11434") == "http://localhost:11434"
+    assert sr._normalize_ollama_url("https://gpu.lan:11434") == "https://gpu.lan:11434"
+
+
+def test_write_skip_outputs_emits_valid_empty_pipeline(tmp_path):
+    class Args:
+        json_out = str(tmp_path / "r.json")
+        md_out = str(tmp_path / "r.md")
+        pipeline_out = str(tmp_path / "p.json")
+    sr._write_skip_outputs(Args, "backend unreachable")
+    # pipeline-out must stay a valid, downstream-consumable {"findings": []}
+    pipe = json.load(open(Args.pipeline_out))
+    assert pipe == {"findings": []}
+    review = json.load(open(Args.json_out))
+    assert review["findings"] == [] and review["_skipped"] == "backend unreachable"
+    assert "Skipped" in open(Args.md_out).read()

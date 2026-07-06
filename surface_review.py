@@ -302,6 +302,36 @@ def build_context(paths):
     return f"Files under review: {', '.join(paths)}\n\n{SNIPPET_BEGIN}\n{body}\n{SNIPPET_END}"
 
 
+def _normalize_ollama_url(url):
+    """Ollama's native OLLAMA_HOST is a bare host:port (e.g. "127.0.0.1:11434");
+    urllib needs a scheme or it raises "unknown url type". Prepend http:// when
+    no scheme is present; pass through full URLs unchanged."""
+    if url and "://" not in url:
+        return "http://" + url
+    return url
+
+
+def _chat_content(resp):
+    """Extract and JSON-parse the model's reply from an Ollama /api/chat body.
+
+    Ollama normally returns {"message": {"content": "<json string>"}}, but on
+    some errors/timeouts it returns {"message": null} or a non-object body. A
+    bare resp.get("message", {}).get("content") then raises AttributeError,
+    which is NOT in the sampling loop's except tuple and would abort an entire
+    multi-hour multi-sample run. Raise ValueError instead so the caller's
+    per-sample fallback handles it. Mirrors llm_explain.parse_chat_response.
+    """
+    if not isinstance(resp, dict):
+        raise ValueError(f"non-object chat response body: {type(resp).__name__}")
+    message = resp.get("message")
+    if not isinstance(message, dict):
+        raise ValueError(f"chat response 'message' is {type(message).__name__}, not an object")
+    content = message.get("content")
+    if not isinstance(content, str):
+        raise ValueError(f"chat response 'content' is {type(content).__name__}, not a string")
+    return json.loads(content)
+
+
 def ollama_review(base_url, model, context, num_ctx, extra_system="", temperature=0.3, timeout=1800):
     payload = {
         "model": model,
@@ -320,7 +350,7 @@ def ollama_review(base_url, model, context, num_ctx, extra_system="", temperatur
     )
     with urllib.request.urlopen(req, timeout=timeout) as r:
         resp = json.load(r)
-    return json.loads(resp.get("message", {}).get("content", "{}"))
+    return _chat_content(resp)
 
 
 def ollama_critique(base_url, model, context, draft, num_ctx, extra_system="", timeout=1800):
@@ -344,7 +374,7 @@ def ollama_critique(base_url, model, context, draft, num_ctx, extra_system="", t
     )
     with urllib.request.urlopen(req, timeout=timeout) as r:
         resp = json.load(r)
-    return json.loads(resp.get("message", {}).get("content", "{}"))
+    return _chat_content(resp)
 
 
 CONSOLIDATE_SYSTEM_PROMPT = f"""\
@@ -415,7 +445,7 @@ def ollama_consolidate(base_url, model, context, pooled, num_ctx, extra_system="
     )
     with urllib.request.urlopen(req, timeout=timeout) as r:
         resp = json.load(r)
-    return json.loads(resp.get("message", {}).get("content", "{}"))
+    return _chat_content(resp)
 
 
 # C type keywords are not identifying — keying on them merges unrelated fields
@@ -808,6 +838,23 @@ def render_markdown(review, paths):
     return "\n".join(out)
 
 
+def _write_skip_outputs(args, reason):
+    """Write empty/stub outputs so --soft-fail can exit 0 in a set -e pipeline
+    (e.g. when no Ollama backend is reachable) without breaking downstream
+    consumers — the pipeline-out file is still a valid {"findings": []}."""
+    if args.json_out:
+        os.makedirs(os.path.dirname(args.json_out) or ".", exist_ok=True)
+        json.dump({"subsystem": "", "findings": [], "reviewed_anchors": [], "_skipped": reason},
+                  open(args.json_out, "w", encoding="utf-8"), indent=2)
+    if args.pipeline_out:
+        os.makedirs(os.path.dirname(args.pipeline_out) or ".", exist_ok=True)
+        json.dump({"findings": []}, open(args.pipeline_out, "w", encoding="utf-8"), indent=2)
+    if args.md_out:
+        os.makedirs(os.path.dirname(args.md_out) or ".", exist_ok=True)
+        open(args.md_out, "w", encoding="utf-8").write(
+            f"# Attack-surface review\n\n_Skipped: {reason}._\n")
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Attack-surface / contract security review for C/C++ (headers included)")
@@ -835,10 +882,17 @@ def main():
                     help="Skip the completeness-critic second pass (single pass only)")
     ap.add_argument("--no-kb", action="store_true",
                     help="Skip the offline retrieval hints (surface_kb.json)")
+    ap.add_argument("--soft-fail", action="store_true",
+                    help="If the LLM backend is unreachable (all samples fail), write empty "
+                         "outputs and exit 0 instead of erroring — safe to chain in a set -e "
+                         "pipeline when Ollama may be down.")
     ap.add_argument("--kb", default=KB_PATH, help="Path to the retrieval-hint KB JSON")
     ap.add_argument("--ollama-url", default=os.environ.get("OLLAMA_HOST", "http://localhost:11434"))
     add_profile_arg(ap)
     args = ap.parse_args()
+
+    # Normalize a bare host:port (Ollama's native OLLAMA_HOST form) to a URL.
+    args.ollama_url = _normalize_ollama_url(args.ollama_url)
 
     files = []
     for p in args.paths:
@@ -889,7 +943,13 @@ def main():
             print(f"[sample {src}] {len(rev.get('findings', []))} findings "
                   f"(temp={temp})")
     if not samples:
-        sys.exit(f"[ERR] Ollama review failed: all {n_runs} sample(s) failed")
+        reason = (f"Ollama review failed: all {n_runs} sample(s) failed "
+                  f"(backend {args.ollama_url} unreachable?)")
+        if args.soft_fail:
+            print(f"[skip] {reason} (--soft-fail: wrote empty outputs)")
+            _write_skip_outputs(args, reason)
+            return
+        sys.exit(f"[ERR] {reason}")
     if len(samples) < n_runs:
         print(f"[warn] {n_runs - len(samples)} of {n_runs} sample(s) failed; "
               f"continuing with the {len(samples)} that succeeded")
