@@ -1,0 +1,240 @@
+{
+  "subsystem": "BIND9 (ISC) authoritative/recursive name server configuration parser. Specifically the routine configure_zone_ssutable(), which translates a zone's `update-policy` clause from named.conf into a dns_ssutable_t (Simple Secure Update / dynamic-update access-control table). The SSU table it produces is the authorization policy consulted at run time to decide which principals (identities) may perform DNS UPDATE operations on which names and record types.",
+  "provenance": "Identified from the ISC libdns/named type vocabulary and API surface: cfg_obj_t/cfg_map_get/cfg_tuple_get/cfg_list_first (the named.conf config parser), dns_zone_t/dns_zone_getmctx/dns_zone_getorigin, dns_ssutable_create/dns_ssutable_addrule/dns_ssutable_detach, dns_fixedname_t/dns_name_fromtext/dns_rootname, dns_rdatatype_t/dns_rdatatype_fromtext, isc_mem_get/isc_mem_put, isc_result_t/ISC_R_SUCCESS, and the ns_g_server/ns_g_lctx globals. The `update-policy local` shorthand and DNS_SSUMATCHTYPE_* enums are BIND's dynamic-update ACL feature. The header banner (corpus/eval/eval_0044_cwe269.c) and sample tag `primevul_c_train_3321_fixed` mark this as the FIXED revision of a PrimeVul sample tagged CWE-269 (Improper Privilege Management); the code is nonetheless reviewed blind on its merits.",
+  "trust_boundary": "The direct input to this function (zconfig / the `update-policy` sub-tree, plus zname) originates in named.conf, which is written by a trusted administrator, not by a network peer — so this is NOT a wire-format parser and there is no remote memory-corruption surface here. The security significance is INDIRECT and privilege-oriented: the dns_ssutable_t this function emits is later consulted, per remote DNS UPDATE request, to decide whether a network client's TSIG/SIG(0) identity may rewrite zone data. A mis-parse (wrong grant/deny sense, wrong matchtype, wrong bound name, or an over-broad rule) therefore silently mis-grants update authority to network principals — the classic CWE-269 failure mode. The type list (`types`) sizes a heap allocation; the identity/name strings are parsed as DNS names; all are attacker-controllable only to the extent an attacker can influence configuration, which normally means they are not.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/eval/eval_0044_cwe269.c",
+      "lines": "2-10",
+      "code": "configure_zone_ssutable(const cfg_obj_t *zconfig, dns_zone_t *zone,\n\t\t\tconst char *zname)\n{\n\tconst cfg_obj_t *updatepolicy = NULL;\n\tconst cfg_listelt_t *element, *element2;\n\tdns_ssutable_t *table = NULL;\n\tisc_mem_t *mctx = dns_zone_getmctx(zone);\n\tbool autoddns = false;\n\tisc_result_t result;",
+      "explanation": "The function entry (its return type, elided above the shown window, is isc_result_t in BIND). Parameters: `zconfig` is the parsed config object for one zone, `zone` is the live dns_zone_t whose SSU table is being (re)built, and `zname` is the zone's textual name used only for log messages. Locals: `updatepolicy` will receive the `update-policy` sub-object; `element`/`element2` are outer/inner list cursors; `table` is the SSU table being constructed (NULL until created); `mctx` is the zone's memory context, from which the temporary `types` array is allocated and freed; `autoddns` records the `update-policy local;` shorthand; `result` carries the ISC status code returned to the caller."
+    },
+    {
+      "file": "corpus/eval/eval_0044_cwe269.c",
+      "lines": "12-17",
+      "code": "\t(void)cfg_map_get(zconfig, \"update-policy\", &updatepolicy);\n\n\tif (updatepolicy == NULL) {\n\t\tdns_zone_setssutable(zone, NULL);\n\t\treturn (ISC_R_SUCCESS);\n\t}",
+      "explanation": "Looks up the `update-policy` statement inside the zone config map. The return value is deliberately discarded with `(void)`; a lookup miss simply leaves `updatepolicy` at its NULL initializer. If the zone has no update-policy, the code clears any existing SSU table on the zone (dns_zone_setssutable(zone, NULL)) and returns success — meaning dynamic update is governed by other mechanisms (allow-update) rather than an SSU rule set. This is the no-policy fast path."
+    },
+    {
+      "file": "corpus/eval/eval_0044_cwe269.c",
+      "lines": "19-23",
+      "code": "\tif (cfg_obj_isstring(updatepolicy) &&\n\t    strcmp(\"local\", cfg_obj_asstring(updatepolicy)) == 0) {\n\t\tautoddns = true;\n\t\tupdatepolicy = NULL;\n\t}",
+      "explanation": "Handles the `update-policy local;` shorthand. When the update-policy object is the bare string \"local\" (rather than a list of rule tuples), it sets `autoddns = true` and nulls `updatepolicy` so the rule-parsing loop below is skipped. The actual default rule for this mode is synthesized later (lines 155-176). This shorthand auto-enables dynamic update for the locally-generated session key — a privilege-granting convenience, so its correctness matters for access control."
+    },
+    {
+      "file": "corpus/eval/eval_0044_cwe269.c",
+      "lines": "25-27",
+      "code": "\tresult = dns_ssutable_create(mctx, &table);\n\tif (result != ISC_R_SUCCESS)\n\t\treturn (result);",
+      "explanation": "Allocates a fresh, empty SSU table from the zone memory context. On allocation failure it returns immediately; note `table` is still NULL here so no cleanup is needed. From this point on, all error paths must reach the `cleanup:` label so the partially-built table is detached/freed."
+    },
+    {
+      "file": "corpus/eval/eval_0044_cwe269.c",
+      "lines": "29-46",
+      "code": "\tfor (element = cfg_list_first(updatepolicy);\n\t     element != NULL;\n\t     element = cfg_list_next(element))\n\t{\n\t\tconst cfg_obj_t *stmt = cfg_listelt_value(element);\n\t\tconst cfg_obj_t *mode = cfg_tuple_get(stmt, \"mode\");\n\t\tconst cfg_obj_t *identity = cfg_tuple_get(stmt, \"identity\");\n\t\tconst cfg_obj_t *matchtype = cfg_tuple_get(stmt, \"matchtype\");\n\t\tconst cfg_obj_t *dname = cfg_tuple_get(stmt, \"name\");\n\t\tconst cfg_obj_t *typelist = cfg_tuple_get(stmt, \"types\");\n\t\tconst char *str;\n\t\tbool grant = false;\n\t\tbool usezone = false;\n\t\tdns_ssumatchtype_t mtype = DNS_SSUMATCHTYPE_NAME;\n\t\tdns_fixedname_t fname, fident;\n\t\tisc_buffer_t b;\n\t\tdns_rdatatype_t *types;\n\t\tunsigned int i, n;",
+      "explanation": "Iterates each rule statement in the update-policy list. For each statement it extracts the five tuple members defined by the config grammar: `mode` (grant/deny), `identity` (the principal name the rule authorizes), `matchtype` (how identity/name are matched: name, subdomain, wildcard, self, zonesub, etc.), `name` (`dname`, the target name), and `types` (the record types the rule covers). Per-iteration locals: `grant`/`usezone` flags, `mtype` defaulting to DNS_SSUMATCHTYPE_NAME, two fixed-name buffers (`fident`, `fname`) plus an isc_buffer `b` used to feed dns_name_fromtext, and the heap `types` array with its element count `n` and fill index `i`. Because these are re-declared each iteration, `types` is an indeterminate pointer until assigned at line 103/105."
+    },
+    {
+      "file": "corpus/eval/eval_0044_cwe269.c",
+      "lines": "48-56",
+      "code": "\t\tstr = cfg_obj_asstring(mode);\n\t\tif (strcasecmp(str, \"grant\") == 0) {\n\t\t\tgrant = true;\n\t\t} else if (strcasecmp(str, \"deny\") == 0) {\n\t\t\tgrant = false;\n\t\t} else {\n\t\t\tINSIST(0);\n\t\t\tISC_UNREACHABLE();\n\t\t}",
+      "explanation": "Decodes the rule's sense. The `mode` string is compared case-insensitively: \"grant\" sets the boolean `grant = true`; \"deny\" leaves it false. Any other value is treated as a can't-happen and trips INSIST(0) followed by ISC_UNREACHABLE(). The config grammar restricts `mode` to exactly grant|deny, so the else branch is defensive; it is a hard-assert (process abort) rather than a graceful config error. The grant/deny boolean is the single bit that determines whether a matched request is authorized or refused, so its correctness is security-critical."
+    },
+    {
+      "file": "corpus/eval/eval_0044_cwe269.c",
+      "lines": "58-63",
+      "code": "\t\tstr = cfg_obj_asstring(matchtype);\n\t\tCHECK(dns_ssu_mtypefromstring(str, &mtype));\n\t\tif (mtype == dns_ssumatchtype_subdomain &&\n\t\t    strcasecmp(str, \"zonesub\") == 0) {\n\t\t\tusezone = true;\n\t\t}",
+      "explanation": "Converts the `matchtype` keyword to the internal enum `mtype` via dns_ssu_mtypefromstring; the CHECK() macro sets `result` and jumps to cleanup on failure. It then special-cases \"zonesub\": both \"subdomain\" and \"zonesub\" decode to dns_ssumatchtype_subdomain, but only the literal \"zonesub\" sets `usezone = true`. That flag (used at lines 78-99) makes the rule's bound name be the ZONE ORIGIN rather than a name taken from the config, which is precisely the semantic distinction between \"subdomain <name>\" (matches within an admin-chosen name) and \"zonesub\" (matches within the zone apex). Getting this discrimination right is what keeps a zonesub rule scoped to the zone and a subdomain rule scoped to its stated name."
+    },
+    {
+      "file": "corpus/eval/eval_0044_cwe269.c",
+      "lines": "65-75",
+      "code": "\t\tdns_fixedname_init(&fident);\n\t\tstr = cfg_obj_asstring(identity);\n\t\tisc_buffer_constinit(&b, str, strlen(str));\n\t\tisc_buffer_add(&b, strlen(str));\n\t\tresult = dns_name_fromtext(dns_fixedname_name(&fident), &b,\n\t\t\t\t\t   dns_rootname, 0, NULL);\n\t\tif (result != ISC_R_SUCCESS) {\n\t\t\tcfg_obj_log(identity, ns_g_lctx, ISC_LOG_ERROR,\n\t\t\t\t    \"'%s' is not a valid name\", str);\n\t\t\tgoto cleanup;\n\t\t}",
+      "explanation": "Parses the rule's `identity` string into the fixed-name buffer `fident`. It wraps the config string in an isc_buffer via isc_buffer_constinit + isc_buffer_add(strlen), then calls dns_name_fromtext relative to dns_rootname (so the identity is interpreted as a fully-qualified DNS name). A parse failure is logged and jumps to cleanup. The identity is the authenticated principal the rule refers to (e.g. a TSIG key name); it is the subject side of the authorization decision."
+    },
+    {
+      "file": "corpus/eval/eval_0044_cwe269.c",
+      "lines": "77-99",
+      "code": "\t\tdns_fixedname_init(&fname);\n\t\tif (usezone) {\n\t\t\tresult = dns_name_copy(dns_zone_getorigin(zone),\n\t\t\t\t\t       dns_fixedname_name(&fname),\n\t\t\t\t\t       NULL);\n\t\t\tif (result != ISC_R_SUCCESS) {\n\t\t\t\tcfg_obj_log(identity, ns_g_lctx, ISC_LOG_ERROR,\n\t\t\t\t\t    \"error copying origin: %s\",\n\t\t\t\t\t    isc_result_totext(result));\n\t\t\t\tgoto cleanup;\n\t\t\t}\n\t\t} else {\n\t\t\tstr = cfg_obj_asstring(dname);\n\t\t\tisc_buffer_constinit(&b, str, strlen(str));\n\t\t\tisc_buffer_add(&b, strlen(str));\n\t\t\tresult = dns_name_fromtext(dns_fixedname_name(&fname),\n\t\t\t\t\t\t   &b, dns_rootname, 0, NULL);\n\t\t\tif (result != ISC_R_SUCCESS) {\n\t\t\t\tcfg_obj_log(identity, ns_g_lctx, ISC_LOG_ERROR,\n\t\t\t\t\t    \"'%s' is not a valid name\", str);\n\t\t\t\tgoto cleanup;\n\t\t\t}\n\t\t}",
+      "explanation": "Determines the rule's bound name `fname`, the object side of the authorization decision. When `usezone` (the \"zonesub\" case) is set, `fname` is a copy of the zone origin obtained via dns_zone_getorigin — the rule is anchored to the zone apex. Otherwise the configured `name` string (`dname`) is parsed as a DNS name exactly like the identity was. Both branches log and cleanup on error. This is the fix-relevant branch: it ensures a zonesub rule cannot be redirected to an attacker- or misconfig-chosen name and always tracks the actual zone."
+    },
+    {
+      "file": "corpus/eval/eval_0044_cwe269.c",
+      "lines": "101-110",
+      "code": "\t\tn = ns_config_listcount(typelist);\n\t\tif (n == 0)\n\t\t\ttypes = NULL;\n\t\telse {\n\t\t\ttypes = isc_mem_get(mctx, n * sizeof(dns_rdatatype_t));\n\t\t\tif (types == NULL) {\n\t\t\t\tresult = ISC_R_NOMEMORY;\n\t\t\t\tgoto cleanup;\n\t\t\t}\n\t\t}",
+      "explanation": "Counts the record types in the rule's `types` list (`n`) and, if non-zero, allocates a temporary array of `n` dns_rdatatype_t (a 16-bit type) from the memory context. When `n == 0` (meaning `types` covers all types, e.g. `any`), `types` is left NULL and the fill loop below is a no-op. The allocation size `n * sizeof(dns_rdatatype_t)` is the array that dns_ssutable_addrule will copy from; `n` is the trusted contract that the fill loop and addrule must both honor exactly."
+    },
+    {
+      "file": "corpus/eval/eval_0044_cwe269.c",
+      "lines": "112-136",
+      "code": "\t\ti = 0;\n\t\tfor (element2 = cfg_list_first(typelist);\n\t\t     element2 != NULL;\n\t\t     element2 = cfg_list_next(element2))\n\t\t{\n\t\t\tconst cfg_obj_t *typeobj;\n\t\t\tisc_textregion_t r;\n\n\t\t\tINSIST(i < n);\n\n\t\t\ttypeobj = cfg_listelt_value(element2);\n\t\t\tstr = cfg_obj_asstring(typeobj);\n\t\t\tDE_CONST(str, r.base);\n\t\t\tr.length = strlen(str);\n\n\t\t\tresult = dns_rdatatype_fromtext(&types[i++], &r);\n\t\t\tif (result != ISC_R_SUCCESS) {\n\t\t\t\tcfg_obj_log(identity, ns_g_lctx, ISC_LOG_ERROR,\n\t\t\t\t\t    \"'%s' is not a valid type\", str);\n\t\t\t\tisc_mem_put(mctx, types,\n\t\t\t\t\t    n * sizeof(dns_rdatatype_t));\n\t\t\t\tgoto cleanup;\n\t\t\t}\n\t\t}\n\t\tINSIST(i == n);",
+      "explanation": "Fills the `types` array. It walks the same `typelist`, and before each store asserts INSIST(i < n) to guarantee it never writes past the `n`-element allocation. Each element string is wrapped in an isc_textregion_t (DE_CONST strips const so r.base can point at the config string; r.length = strlen) and decoded by dns_rdatatype_fromtext directly into types[i++]. On a bad type keyword it logs, frees `types` with the exact same size passed to isc_mem_get, and jumps to cleanup. After the loop INSIST(i == n) confirms the produced count matches the pre-counted `n`, i.e. the fill loop and ns_config_listcount agreed on the element count. Both INSISTs are the memory-safety guard for this array."
+    },
+    {
+      "file": "corpus/eval/eval_0044_cwe269.c",
+      "lines": "138-147",
+      "code": "\t\tresult = dns_ssutable_addrule(table, grant,\n\t\t\t\t\t      dns_fixedname_name(&fident),\n\t\t\t\t\t      mtype,\n\t\t\t\t\t      dns_fixedname_name(&fname),\n\t\t\t\t\t      n, types);\n\t\tif (types != NULL)\n\t\t\tisc_mem_put(mctx, types, n * sizeof(dns_rdatatype_t));\n\t\tif (result != ISC_R_SUCCESS) {\n\t\t\tgoto cleanup;\n\t\t}",
+      "explanation": "Installs the fully-decoded rule into the SSU table: sense (`grant`), authorized identity (`fident`), match semantics (`mtype`), bound name (`fname`), and the `n`-entry type array (`types`). dns_ssutable_addrule copies what it needs, so the temporary `types` buffer is freed immediately afterward with the matching size (guarded by the `types != NULL` check for the n==0 case). A failure to add is propagated to cleanup. This call is the actual privilege grant — the single place where administrator intent becomes an enforceable network authorization rule."
+    },
+    {
+      "file": "corpus/eval/eval_0044_cwe269.c",
+      "lines": "150-176",
+      "code": "\t/*\n\t * If \"update-policy local;\" and a session key exists,\n\t * then use the default policy, which is equivalent to:\n\t * update-policy { grant <session-keyname> zonesub any; };\n\t */\n\tif (autoddns) {\n\t\tdns_rdatatype_t any = dns_rdatatype_any;\n\n\t\tif (ns_g_server->session_keyname == NULL) {\n\t\t\tisc_log_write(ns_g_lctx, NS_LOGCATEGORY_GENERAL,\n\t\t\t\t      NS_LOGMODULE_SERVER, ISC_LOG_ERROR,\n\t\t\t\t      \"failed to enable auto DDNS policy \"\n\t\t\t\t      \"for zone %s: session key not found\",\n\t\t\t\t      zname);\n\t\t\tresult = ISC_R_NOTFOUND;\n\t\t\tgoto cleanup;\n\t\t}\n\n\t\tresult = dns_ssutable_addrule(table, true,\n\t\t\t\t\t      ns_g_server->session_keyname,\n\t\t\t\t\t      DNS_SSUMATCHTYPE_LOCAL,\n\t\t\t\t\t      dns_zone_getorigin(zone),\n\t\t\t\t\t      1, &any);\n\n\t\tif (result != ISC_R_SUCCESS)\n\t\t\tgoto cleanup;\n\t}",
+      "explanation": "Implements the `update-policy local;` default. If autoddns was set (line 21) it synthesizes a single rule equivalent to `grant <session-keyname> zonesub any`: grant=true, identity = the server's generated session key (ns_g_server->session_keyname), matchtype = DNS_SSUMATCHTYPE_LOCAL, name = the zone origin, and a one-element type list of dns_rdatatype_any. If no session key exists it refuses to enable the policy (ISC_R_NOTFOUND) — importantly it does NOT silently fall through to an unrestricted grant. The DNS_SSUMATCHTYPE_LOCAL match ties updates to a key only reachable via the local session, which is the privilege-limiting intent of the feature."
+    },
+    {
+      "file": "corpus/eval/eval_0044_cwe269.c",
+      "lines": "178-184",
+      "code": "\tresult = ISC_R_SUCCESS;\n\tdns_zone_setssutable(zone, table);\n\n cleanup:\n\tdns_ssutable_detach(&table);\n\treturn (result);\n}",
+      "explanation": "Success path: sets `result` to success and attaches the completed table to the zone with dns_zone_setssutable (which takes its own reference). The shared `cleanup:` label then calls dns_ssutable_detach(&table), dropping this function's reference. On the success path the zone still holds its reference so the table survives; on every error path (table only locally referenced) the detach frees it. `result` is returned to the caller. This detach-after-set pattern is the standard ISC reference-counting cleanup and avoids both leak and premature free."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/eval/eval_0044_cwe269.c",
+      "lines": "138-142",
+      "code": "\t\tresult = dns_ssutable_addrule(table, grant,\n\t\t\t\t\t      dns_fixedname_name(&fident),\n\t\t\t\t\t      mtype,\n\t\t\t\t\t      dns_fixedname_name(&fname),\n\t\t\t\t\t      n, types);",
+      "explanation": "This is the CWE-269 privilege-management surface (matching the sample's cwe269 tag). Everything upstream — grant/deny sense (line 49-52), matchtype decode and the zonesub/usezone discrimination (lines 58-63), the identity name (65-70), and the bound name being either the zone origin or the configured name (78-99) — is fused here into an enforceable DNS UPDATE authorization rule. A defect in ANY of those decodes does not crash; it silently produces a rule that authorizes the wrong principal, the wrong name scope, or the wrong sense, letting a remote client with a matching TSIG/SIG(0) identity rewrite zone records it should not be able to. The invariant the implementation must uphold: mode maps grant<->true / deny<->false exactly; matchtype maps to the enum with zonesub bound to the zone origin (not an arbitrary name); identity and name parse to the intended DNS names; and addrule preserves all of these without widening scope. This is a LATENT contract — the shown code appears to honor it — but it is the reason this function is security-relevant despite parsing admin config."
+    },
+    {
+      "file": "corpus/eval/eval_0044_cwe269.c",
+      "lines": "58-63",
+      "code": "\t\tstr = cfg_obj_asstring(matchtype);\n\t\tCHECK(dns_ssu_mtypefromstring(str, &mtype));\n\t\tif (mtype == dns_ssumatchtype_subdomain &&\n\t\t    strcasecmp(str, \"zonesub\") == 0) {\n\t\t\tusezone = true;\n\t\t}",
+      "explanation": "The zonesub/subdomain discrimination is the specific privilege-scoping decision most likely to be gotten wrong (and is a plausible before/after point for a cwe269 fix). Because \"subdomain\" and \"zonesub\" collapse to the same enum value dns_ssumatchtype_subdomain, the ONLY thing that keeps a `zonesub` rule anchored to the zone apex (line 79 origin copy) rather than to an admin-supplied `name` is this exact string compare setting `usezone`. If the guard were dropped or inverted, a `zonesub` rule would take its bound name from `dname` (which may be absent/empty for zonesub) or, conversely, a `subdomain <name>` rule could be re-anchored to the zone origin — either way broadening or misdirecting who may update which subtree. The implementation must keep usezone true iff the keyword is literally zonesub, and dns_ssu_mtypefromstring must not alias other keywords onto dns_ssumatchtype_subdomain."
+    },
+    {
+      "file": "corpus/eval/eval_0044_cwe269.c",
+      "lines": "105",
+      "code": "\t\t\ttypes = isc_mem_get(mctx, n * sizeof(dns_rdatatype_t));",
+      "explanation": "Integer-overflow-in-allocation hazard (CWE-190). `n` is an unsigned int returned by ns_config_listcount(typelist) and is multiplied by sizeof(dns_rdatatype_t) (2 bytes) with no explicit cap. If a configuration could make `n` approach or exceed SIZE_MAX/2, the product would wrap to a small value, isc_mem_get would return an undersized buffer, and the fill loop at line 127 would write past it (heap overflow) — though the INSIST(i < n) at line 120 uses the same wrapped `n` and would generally abort first. In practice `n` is bounded by the number of type tokens an administrator writes in one rule, so this is not remotely reachable and is low severity; the invariant is simply that `n * sizeof(dns_rdatatype_t)` cannot overflow size_t (or that `n` is bounded well below that), which holds for realistic configs."
+    },
+    {
+      "file": "corpus/eval/eval_0044_cwe269.c",
+      "lines": "120",
+      "code": "\t\t\tINSIST(i < n);",
+      "explanation": "Reachable-assertion / abort-on-mismatch (CWE-617), together with INSIST(i == n) at line 136 and INSIST(0) at line 54. These are hard asserts that terminate named if their condition fails. They are memory-safety guards (INSIST(i<n) is exactly what prevents types[i++] from overrunning the `n`-element buffer), and they are safe as long as ns_config_listcount(typelist) returns the same element count that cfg_list_first/cfg_list_next iterate. If those two ever diverged (e.g. count logic and iteration disagreeing on how list elements are enumerated), the process would abort rather than corrupt memory — a denial of service, not a write primitive. Because both the count and the iteration derive from the same admin-authored config list, divergence is not attacker-reachable; the invariant is that ns_config_listcount and the cfg_list iteration are consistent for any parseable typelist."
+    },
+    {
+      "file": "corpus/eval/eval_0044_cwe269.c",
+      "lines": "155-172",
+      "code": "\tif (autoddns) {\n\t\tdns_rdatatype_t any = dns_rdatatype_any;\n\n\t\tif (ns_g_server->session_keyname == NULL) {\n\t\t\tisc_log_write(ns_g_lctx, NS_LOGCATEGORY_GENERAL,\n\t\t\t\t      NS_LOGMODULE_SERVER, ISC_LOG_ERROR,\n\t\t\t\t      \"failed to enable auto DDNS policy \"\n\t\t\t\t      \"for zone %s: session key not found\",\n\t\t\t\t      zname);\n\t\t\tresult = ISC_R_NOTFOUND;\n\t\t\tgoto cleanup;\n\t\t}\n\n\t\tresult = dns_ssutable_addrule(table, true,\n\t\t\t\t\t      ns_g_server->session_keyname,\n\t\t\t\t\t      DNS_SSUMATCHTYPE_LOCAL,\n\t\t\t\t\t      dns_zone_getorigin(zone),\n\t\t\t\t\t      1, &any);",
+      "explanation": "The `update-policy local` auto-DDNS path grants a blanket `grant <session-key> zonesub any` rule (CWE-269, by design). Two contracts must hold. First, the NULL-session-key guard must precede the addrule and must fail closed: if it were skipped or ns_g_server->session_keyname were NULL when passed to addrule, either a NULL identity is installed (dereference / undefined rule) or, worse in a hypothetical variant, an unauthenticated grant is created — the code here correctly errors out with ISC_R_NOTFOUND, so it fails closed. Second, DNS_SSUMATCHTYPE_LOCAL must genuinely restrict matching to the locally-generated session key channel; if that match type were treated permissively, this rule would let any principal update any name of any type in the zone. The implementation must ensure DNS_SSUMATCHTYPE_LOCAL is honored strictly and that ns_g_server / session_keyname are validly initialized before this runs."
+    },
+    {
+      "file": "corpus/eval/eval_0044_cwe269.c",
+      "lines": "12",
+      "code": "\t(void)cfg_map_get(zconfig, \"update-policy\", &updatepolicy);",
+      "explanation": "The return value of cfg_map_get is intentionally discarded (CWE-252, informational). This is safe here because `updatepolicy` is pre-initialized to NULL (line 5) and the immediate NULL check at line 14 handles both the not-present and lookup-error cases identically (no policy installed). The invariant to preserve is that cfg_map_get never writes a non-NULL, invalid pointer into `updatepolicy` on a failure return; standard ISC semantics leave the out-param untouched on miss, so ignoring the status is acceptable. Flagged only so the student model learns to notice and correctly dismiss an ignored-return-value pattern rather than assume a bug."
+    }
+  ],
+  "summary": "BIND9 config parser (configure_zone_ssutable) that compiles a zone's named.conf update-policy clause into a dynamic-update SSU authorization table. Its input is administrator-controlled configuration, not network wire data, so there is no remote memory-corruption surface and no memory-safety bug is evident in the shown (fixed) code — the array fill is bounded by INSIST guards and the types buffer is freed on every path. Its real security weight is CWE-269 improper privilege management: this routine is the sole translator of admin intent into who may perform remote DNS UPDATEs, so the grant/deny sense, matchtype decode (notably the zonesub-vs-subdomain / usezone discrimination), bound name, and the fail-closed session-key check are the contracts that matter. All shown findings are low-severity or latent-contract.",
+  "reviewed_anchors": [
+    {"anchor": "configure_zone_ssutable(const cfg_obj_t *zconfig, dns_zone_t *zone, const char *zname) (lines 2-3)", "disposition": "finding", "reason": "Entry point that builds the DNS UPDATE authorization policy; the whole privilege-management contract lives here (CWE-269)."},
+    {"anchor": "isc_mem_t *mctx = dns_zone_getmctx(zone) (line 8)", "disposition": "dismissed", "reason": "Memory context handle from the zone; standard allocator source, no attacker-controlled contract."},
+    {"anchor": "(void)cfg_map_get(zconfig, \"update-policy\", &updatepolicy) (line 12)", "disposition": "finding", "reason": "Ignored return value; safe due to NULL pre-init + line-14 check, flagged and dismissed as CWE-252 info."},
+    {"anchor": "if (updatepolicy == NULL) ... dns_zone_setssutable(zone, NULL) (lines 14-17)", "disposition": "dismissed", "reason": "No-policy fast path; clears table and returns success, no unsafe behavior."},
+    {"anchor": "strcmp(\"local\", cfg_obj_asstring(updatepolicy)) -> autoddns (lines 19-23)", "disposition": "finding", "reason": "Triggers the auto-DDNS blanket grant path; privilege-relevant (folded into the autoddns finding)."},
+    {"anchor": "dns_ssutable_create(mctx, &table) (line 25)", "disposition": "dismissed", "reason": "Table allocation with failure check; table still NULL on failure so early return is safe."},
+    {"anchor": "cfg_tuple_get mode/identity/matchtype/name/types (lines 34-38)", "disposition": "finding", "reason": "The five inputs that compose each authorization rule; correctness feeds the CWE-269 addrule finding."},
+    {"anchor": "dns_ssumatchtype_t mtype = DNS_SSUMATCHTYPE_NAME (line 42)", "disposition": "dismissed", "reason": "Safe default match type; overwritten by dns_ssu_mtypefromstring before use."},
+    {"anchor": "dns_rdatatype_t *types; unsigned int i, n (lines 45-46)", "disposition": "finding", "reason": "Heap array pointer plus its count/index; sizes the allocation and is the memory-safety focus (alloc/fill/free)."},
+    {"anchor": "mode grant/deny with INSIST(0)/ISC_UNREACHABLE() (lines 48-56)", "disposition": "finding", "reason": "Grant/deny sense bit (privilege) plus a defensive reachable-assert; both security-relevant."},
+    {"anchor": "dns_ssu_mtypefromstring + zonesub->usezone (lines 58-63)", "disposition": "finding", "reason": "The scoping discrimination that keeps zonesub anchored to the zone origin; central CWE-269 decode."},
+    {"anchor": "dns_name_fromtext for identity (lines 65-70)", "disposition": "dismissed", "reason": "Parses the principal name with error check; no buffer sizing issue (dns_fixedname owns storage)."},
+    {"anchor": "usezone ? dns_name_copy(origin) : dns_name_fromtext(dname) (lines 78-99)", "disposition": "finding", "reason": "Chooses the rule's bound name (origin vs configured); mis-selection widens/misdirects privilege (part of CWE-269)."},
+    {"anchor": "n = ns_config_listcount(typelist) (line 101)", "disposition": "finding", "reason": "Attacker/config-supplied count that sizes the allocation and bounds the fill loop; drives the CWE-190/CWE-617 findings."},
+    {"anchor": "types = isc_mem_get(mctx, n * sizeof(dns_rdatatype_t)) (line 105)", "disposition": "finding", "reason": "Unsigned size multiplication; theoretical CWE-190 overflow (low, config-bounded)."},
+    {"anchor": "INSIST(i < n) (line 120) and INSIST(i == n) (line 136)", "disposition": "finding", "reason": "Reachable assertions that also serve as the array-bound guard; CWE-617 abort if count/iteration diverge."},
+    {"anchor": "dns_rdatatype_fromtext(&types[i++], &r) with DE_CONST (lines 122-127)", "disposition": "dismissed", "reason": "Bounded write into types[] guarded by INSIST(i<n); DE_CONST only strips const for the read-only region, no overrun."},
+    {"anchor": "isc_mem_put(mctx, types, n * sizeof(dns_rdatatype_t)) error/normal free (lines 131-132, 143-144)", "disposition": "dismissed", "reason": "Frees with the exact size passed to isc_mem_get; error path frees then goto skips the second free, so no double-free/leak."},
+    {"anchor": "dns_ssutable_addrule(table, grant, fident, mtype, fname, n, types) (lines 138-142)", "disposition": "finding", "reason": "The actual privilege grant; the CWE-269 contract culminates here."},
+    {"anchor": "autoddns block: session_keyname NULL check + addrule(...DNS_SSUMATCHTYPE_LOCAL...) (lines 155-172)", "disposition": "finding", "reason": "Auto-DDNS blanket grant; must fail closed on missing session key and rely on LOCAL match to limit privilege (CWE-269)."},
+    {"anchor": "dns_zone_setssutable(zone, table) + cleanup: dns_ssutable_detach(&table) (lines 179-182)", "disposition": "dismissed", "reason": "Standard set-then-detach reference-count cleanup; zone holds its own ref on success, detach frees on error — no UAF/leak."}
+  ],
+  "findings": [
+    {
+      "title": "Update-policy compiler is the DNS UPDATE authorization gate (privilege management)",
+      "anchor": "dns_ssutable_addrule(table, grant, dns_fixedname_name(&fident), mtype, dns_fixedname_name(&fname), n, types)",
+      "file": "corpus/eval/eval_0044_cwe269.c",
+      "line": "138-142",
+      "code": "result = dns_ssutable_addrule(table, grant,\n\t\t\t\t      dns_fixedname_name(&fident),\n\t\t\t\t      mtype,\n\t\t\t\t      dns_fixedname_name(&fname),\n\t\t\t\t      n, types);",
+      "bug_class": "Improper privilege management (authorization policy compiled from config)",
+      "cwe": "CWE-269",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided) — dns_ssutable_addrule and the SSU match logic in libdns",
+      "invariant": "The compiled rule must exactly reflect administrator intent: grant maps to true / deny to false; mtype reflects the stated match type with zonesub anchored to the zone origin; identity and name parse to the intended DNS names; and addrule must not widen the rule's scope. No decode step may alias one keyword onto a broader match.",
+      "failure_mode": "If any upstream decode is wrong (inverted grant/deny, a matchtype aliased to a broader class, or a zonesub rule taking its name from config instead of the origin), the SSU table silently authorizes the wrong principal or name scope. A remote client presenting a matching TSIG/SIG(0) identity could then perform DNS UPDATEs on records outside the intended scope — a network-reachable privilege escalation, with no crash or log to signal it. This is a latent contract: the shown (fixed) code appears to honor it.",
+      "cve_analog": "",
+      "what_to_confirm": "That dns_ssutable_addrule copies (not aliases) identity/name/types and stores grant/mtype without transformation, and that the SSU match evaluator treats each matchtype (especially subdomain vs zonesub vs local) with exactly the scope the config keyword implies."
+    },
+    {
+      "title": "zonesub vs subdomain discrimination is the only guard scoping the rule to the zone origin",
+      "anchor": "if (mtype == dns_ssumatchtype_subdomain && strcasecmp(str, \"zonesub\") == 0) usezone = true;",
+      "file": "corpus/eval/eval_0044_cwe269.c",
+      "line": "60-63",
+      "code": "if (mtype == dns_ssumatchtype_subdomain &&\n\t\t    strcasecmp(str, \"zonesub\") == 0) {\n\t\t\tusezone = true;\n\t\t}",
+      "bug_class": "Improper privilege management (match-scope selection)",
+      "cwe": "CWE-269",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0044_cwe269.c (this function) plus dns_ssu_mtypefromstring in libdns",
+      "invariant": "usezone must be true if and only if the keyword is literally \"zonesub\", so that a zonesub rule is bound to dns_zone_getorigin(zone) (lines 78-81) and a subdomain rule is bound to the configured name (lines 89-93). dns_ssu_mtypefromstring must not map any other keyword onto dns_ssumatchtype_subdomain.",
+      "failure_mode": "Since \"subdomain\" and \"zonesub\" both decode to dns_ssumatchtype_subdomain, dropping or inverting this string compare would make a zonesub rule read its bound name from the (possibly empty) config `name`, or re-anchor a subdomain rule to the zone origin — broadening or misdirecting which subtree the identity may update. Config-controlled, so not remotely triggerable, but it is the exact scoping decision a privilege-management regression would live in.",
+      "cve_analog": "",
+      "what_to_confirm": "That dns_ssu_mtypefromstring maps only \"subdomain\" and \"zonesub\" to dns_ssumatchtype_subdomain, and that no path can leave usezone true for a plain subdomain rule or false for a zonesub rule."
+    },
+    {
+      "title": "Auto-DDNS \"update-policy local\" installs a blanket grant; must fail closed on missing session key",
+      "anchor": "dns_ssutable_addrule(table, true, ns_g_server->session_keyname, DNS_SSUMATCHTYPE_LOCAL, dns_zone_getorigin(zone), 1, &any)",
+      "file": "corpus/eval/eval_0044_cwe269.c",
+      "line": "158-172",
+      "code": "if (ns_g_server->session_keyname == NULL) {\n\t\t\tisc_log_write(ns_g_lctx, NS_LOGCATEGORY_GENERAL,\n\t\t\t\t      NS_LOGMODULE_SERVER, ISC_LOG_ERROR,\n\t\t\t\t      \"failed to enable auto DDNS policy \"\n\t\t\t\t      \"for zone %s: session key not found\",\n\t\t\t\t      zname);\n\t\t\tresult = ISC_R_NOTFOUND;\n\t\t\tgoto cleanup;\n\t\t}\n\n\t\tresult = dns_ssutable_addrule(table, true,\n\t\t\t\t\t      ns_g_server->session_keyname,\n\t\t\t\t\t      DNS_SSUMATCHTYPE_LOCAL,\n\t\t\t\t\t      dns_zone_getorigin(zone),\n\t\t\t\t\t      1, &any);",
+      "bug_class": "Improper privilege management (default policy grant)",
+      "cwe": "CWE-269",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0044_cwe269.c (this function); enforcement in dns_ssutable match logic (DNS_SSUMATCHTYPE_LOCAL)",
+      "invariant": "The NULL session-key check must run BEFORE addrule and must fail closed (it does: ISC_R_NOTFOUND + goto cleanup, no rule installed). DNS_SSUMATCHTYPE_LOCAL must restrict matching to the locally-generated session key so the `grant <session-key> zonesub any` rule cannot be satisfied by an arbitrary remote principal.",
+      "failure_mode": "This path grants update rights to all types over the whole zone for the session key. If the NULL guard were removed, addrule would receive a NULL identity (undefined/over-broad rule); if DNS_SSUMATCHTYPE_LOCAL were treated permissively downstream, the blanket grant would apply to any matching request. As written it fails closed, so this is a by-design grant flagged for its privilege weight, not a live bug.",
+      "cve_analog": "",
+      "what_to_confirm": "That DNS_SSUMATCHTYPE_LOCAL is enforced strictly against the session key at update time, and that ns_g_server and session_keyname are always initialized before configure_zone_ssutable runs."
+    },
+    {
+      "title": "Reachable assertions on type-list count/index (abort-based DoS if count and iteration diverge)",
+      "anchor": "INSIST(i < n); ... INSIST(i == n);",
+      "file": "corpus/eval/eval_0044_cwe269.c",
+      "line": "120",
+      "code": "INSIST(i < n);",
+      "bug_class": "Reachable assertion / process abort",
+      "cwe": "CWE-617",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0044_cwe269.c (this function); ns_config_listcount and cfg_list_* in the config parser",
+      "invariant": "ns_config_listcount(typelist) must return exactly the number of elements that cfg_list_first/cfg_list_next enumerate for the same list, so that INSIST(i < n) (line 120) and INSIST(i == n) (line 136) never fail and the types[i++] writes stay within the n-element allocation.",
+      "failure_mode": "If the pre-count and the iteration ever disagreed, INSIST would abort named (denial of service) rather than corrupt memory — the assertion is precisely the guard that stops types[i++] overrunning the buffer. Both derive from the same admin-authored config list, so divergence is not attacker-reachable; this is defensive hardening whose only downside is an abort on an impossible state.",
+      "cve_analog": "",
+      "what_to_confirm": "That ns_config_listcount and the cfg_list iteration are guaranteed consistent for any typelist the grammar accepts (including empty and single-element lists)."
+    },
+    {
+      "title": "Unsigned size multiplication in type-array allocation (theoretical integer overflow)",
+      "anchor": "types = isc_mem_get(mctx, n * sizeof(dns_rdatatype_t))",
+      "file": "corpus/eval/eval_0044_cwe269.c",
+      "line": "105",
+      "code": "types = isc_mem_get(mctx, n * sizeof(dns_rdatatype_t));",
+      "bug_class": "Integer overflow in allocation size",
+      "cwe": "CWE-190",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0044_cwe269.c (this function)",
+      "invariant": "n * sizeof(dns_rdatatype_t) must not exceed SIZE_MAX (n must be bounded well below SIZE_MAX / sizeof(dns_rdatatype_t)) so the allocation is large enough for the subsequent fill loop.",
+      "failure_mode": "n is an unsigned int from ns_config_listcount with no explicit cap; if a config could drive n high enough for the product to wrap, isc_mem_get would return an undersized buffer and the loop at line 127 could overflow it (though the INSIST(i < n) at line 120 uses the same wrapped n and would typically abort first). n is bounded by the type tokens an admin writes in one rule, so this is not realistically reachable — reported for completeness at low severity.",
+      "cve_analog": "",
+      "what_to_confirm": "That ns_config_listcount cannot return a value large enough for n * sizeof(dns_rdatatype_t) to overflow size_t, or add an explicit upper bound before the multiply."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm dns_ssutable_addrule copies identity/name/types into the table and does not retain the caller's dns_fixedname/types storage (which are stack/temporary and freed after the call).",
+    "Verify dns_ssu_mtypefromstring maps ONLY the intended keywords, and in particular that only \"subdomain\" and \"zonesub\" reach dns_ssumatchtype_subdomain, so the usezone discrimination at lines 60-63 fully scopes the rule.",
+    "Confirm DNS_SSUMATCHTYPE_LOCAL is enforced strictly at UPDATE time so the auto-DDNS `grant <session-key> zonesub any` rule cannot be satisfied by a remote principal.",
+    "Check that grant/deny is applied with the same polarity the SSU evaluator expects (grant==true authorizes, deny==false refuses) end-to-end.",
+    "Confirm ns_config_listcount(typelist) always equals the cfg_list iteration count so the INSIST guards at lines 120 and 136 cannot abort named on a valid config.",
+    "Bound or overflow-check n before `n * sizeof(dns_rdatatype_t)` at line 105 (or confirm the config layer caps list length).",
+    "Verify the error paths free types exactly once (lines 131-132 vs 143-144) and that dns_zone_setssutable/dns_ssutable_detach reference counting leaves the table live on success and freed on every error path (no UAF, no leak).",
+    "Confirm ns_g_server and ns_g_server->session_keyname are initialized before configure_zone_ssutable can run, so the autoddns NULL check reflects real state."
+  ]
+}

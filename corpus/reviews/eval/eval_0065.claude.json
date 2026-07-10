@@ -1,0 +1,150 @@
+{
+  "subsystem": "GLib GIO socket-client asynchronous connection machinery. This is the completion callback g_socket_client_connected_callback() that fires when one of the parallel (\"happy eyeballs\") TCP connection attempts started by g_socket_client_connect_async() finishes. It decides whether the attempt succeeded, tears down the losing attempts, then either completes the connection, starts a TLS handshake, or begins proxy negotiation. It is a state-machine / object-lifetime callback, not a wire-format parser.",
+  "provenance": "Identified by the GLib/GObject naming conventions and API surface: g_socket_client_*, g_socket_connection_connect_finish, g_task_return_error_if_cancelled, g_steal_pointer, g_clear_pointer, GSList/g_slist_*, GProxy/g_proxy_connect_async, and the internal types ConnectionAttempt and GSocketClientAsyncConnectData. This is the body of g_socket_client_connected_callback from GLib's gio/gsocketclient.c. The eval banner (corpus/eval/eval_0065_cwe754.c, sample primevul_c_test_0379_vuln) tags it CWE-754 (improper check for an exceptional/unusual condition).",
+  "trust_boundary": "This callback is invoked by the GLib main-loop async dispatch when a socket connect operation completes. Attacker influence is indirect but real: a remote/malicious server (and general network conditions) controls whether and when each parallel connection attempt succeeds, fails, resets, or times out, and therefore the ORDER in which these callbacks run relative to the winner cancelling and NULL-ing the siblings. The hostile condition here is not a byte in a packet but the exceptional state 'this attempt's owning data has already been torn down (attempt->data == NULL) / the task is already completed' arriving in a code path that dereferences data anyway. The connect result (error vs success) and the timing are the untrusted inputs that steer which branch runs.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/eval/eval_0065_cwe754.c",
+      "lines": "2-11",
+      "code": "g_socket_client_connected_callback (GObject      *source,\n                                    GAsyncResult *result,\n                                    gpointer      user_data)\n{\n  ConnectionAttempt *attempt = user_data;\n  GSocketClientAsyncConnectData *data = attempt->data;\n  GSList *l;\n  GError *error = NULL;\n  GProxy *proxy;\n  const gchar *protocol;",
+      "explanation": "This is a GAsyncReadyCallback: source is the GSocketConnection whose connect operation just finished, result is the GAsyncResult (a GTask) carrying success/failure, and user_data is the per-attempt ConnectionAttempt object. Line 6 recovers that attempt. Line 7 caches attempt->data, a pointer to the shared GSocketClientAsyncConnectData that coordinates ALL of the parallel attempts for a single g_socket_client_connect_async() call. Crucially, data is a back-pointer that can legitimately be NULL: when one attempt wins, it sets every other attempt's ->data to NULL (see lines 52-58) and the outer task can be completed, at which point data no longer exists. The remaining locals are scratch: l for iterating the attempt list, error for the connect result, proxy/protocol for the proxy-dispatch tail. Everything downstream hinges on whether data is still valid."
+    },
+    {
+      "file": "corpus/eval/eval_0065_cwe754.c",
+      "lines": "13-19",
+      "code": "/* data is NULL once the task is completed */\n  if (data && g_task_return_error_if_cancelled (data->task))\n    {\n      g_object_unref (data->task);\n      connection_attempt_unref (attempt);\n      return;\n    }",
+      "explanation": "The comment on line 13 states the invariant explicitly: data is NULL once the task is completed. Line 14 therefore guards the dereference with a short-circuit: only if data is non-NULL is data->task read and passed to g_task_return_error_if_cancelled, which returns TRUE (and finishes the task with a cancelled error) if the overall operation was cancelled by the caller. On that path it unrefs the task, unrefs this attempt, and returns. This line is the first of THREE places (14, 38) where the author correctly treats data as possibly-NULL, establishing that NULL is an expected, handled state for data throughout this function."
+    },
+    {
+      "file": "corpus/eval/eval_0065_cwe754.c",
+      "lines": "21-25",
+      "code": "if (attempt->timeout_source)\n    {\n      g_source_destroy (attempt->timeout_source);\n      g_clear_pointer (&attempt->timeout_source, g_source_unref);\n    }",
+      "explanation": "If this attempt had an associated timeout GSource (the happy-eyeballs delay timer that staggers parallel connects), it is destroyed and cleared now that the connect has completed. Note this dereferences attempt (not data), which is always valid because it came from user_data, so there is no NULL concern here. g_clear_pointer NULLs the field after unref to prevent reuse."
+    },
+    {
+      "file": "corpus/eval/eval_0065_cwe754.c",
+      "lines": "27-47",
+      "code": "if (!g_socket_connection_connect_finish (G_SOCKET_CONNECTION (source),\n\t\t\t\t\t   result, &error))\n    {\n      if (!g_cancellable_is_cancelled (attempt->cancellable))\n        {\n          clarify_connect_error (error, data->connectable, attempt->address);\n          set_last_error (data, error);\n        }\n      else\n        g_clear_error (&error);\n\n      if (data)\n        {\n          connection_attempt_remove (attempt);\n          enumerator_next_async (data);\n        }\n      else\n        connection_attempt_unref (attempt);\n\n      return;\n    }",
+      "explanation": "Line 27-28 finishes the connect; if it returns FALSE the connection failed and error is populated. Inside the failure block, line 30 checks whether THIS attempt's private cancellable was cancelled. If it was NOT cancelled (a genuine failure), lines 32-33 enrich the error via clarify_connect_error, reading data->connectable, and record it via set_last_error(data, error). If it WAS cancelled, line 36 just clears the error. Then lines 38-44 branch on data: if data still exists, remove this attempt and advance the enumerator to try the next address (enumerator_next_async); otherwise (data already torn down) simply unref the attempt. Line 46 returns. This block contains the security-relevant asymmetry: lines 32-33 dereference data->connectable and pass data onward WITHOUT the NULL check that line 38 applies just a few lines later."
+    },
+    {
+      "file": "corpus/eval/eval_0065_cwe754.c",
+      "lines": "49-61",
+      "code": "data->socket = g_steal_pointer (&attempt->socket);\n  data->connection = g_steal_pointer (&attempt->connection);\n\n  for (l = data->connection_attempts; l; l = g_slist_next (l))\n    {\n      ConnectionAttempt *attempt_entry = l->data;\n      g_cancellable_cancel (attempt_entry->cancellable);\n      attempt_entry->data = NULL;\n      connection_attempt_unref (attempt_entry);\n    }\n  g_slist_free (data->connection_attempts);\n  data->connection_attempts = NULL;\n  connection_attempt_unref (attempt);",
+      "explanation": "This is the success path (connect_finish returned TRUE). Lines 49-50 move the winning socket and connection out of the attempt into the shared data via g_steal_pointer. Lines 52-58 then iterate every other outstanding attempt: cancel its cancellable (line 55), set attempt_entry->data = NULL (line 56) — this is exactly what makes a sibling's later callback see data == NULL — and drop a reference (line 57). Line 59-60 frees and NULLs the list; line 61 unrefs the winning attempt. This block is the ORIGIN of the NULL-data condition that the failure path (lines 32-33) fails to guard: the winner nulls the losers' data here, so a loser's already-queued callback can subsequently run with data == NULL. Note the winner dereferences data (49-50) unconditionally, which is safe only if a successful attempt can never itself already have been NULL-ed by a concurrent winner."
+    },
+    {
+      "file": "corpus/eval/eval_0065_cwe754.c",
+      "lines": "63-73",
+      "code": "g_socket_connection_set_cached_remote_address ((GSocketConnection*)data->connection, NULL);\n  g_socket_client_emit_event (data->client, G_SOCKET_CLIENT_CONNECTED, data->connectable, data->connection);\n\n  /* wrong, but backward compatible */\n  g_socket_set_blocking (data->socket, TRUE);\n\n  if (!data->proxy_addr)\n    {\n      g_socket_client_tls_handshake (data);\n      return;\n    }",
+      "explanation": "Post-success bookkeeping, all through data: line 63 clears the cached remote address, line 64 emits the G_SOCKET_CLIENT_CONNECTED signal to observers, and line 67 forces the socket back to blocking mode (the comment concedes this is semantically wrong but kept for backward compatibility). Line 69 checks whether a proxy address was configured; if not, it hands off to the TLS handshake path (line 71) and returns. Every access here assumes data is non-NULL, which is the normal contract for a genuinely-winning attempt."
+    },
+    {
+      "file": "corpus/eval/eval_0065_cwe754.c",
+      "lines": "75-90",
+      "code": "protocol = g_proxy_address_get_protocol (data->proxy_addr);\n\n  /* The connection should not be anything other than TCP,\n   * but let's put a safety guard in case\n   */\n  if (!G_IS_TCP_CONNECTION (data->connection))\n    {\n      g_critical (\"Trying to proxy over non-TCP connection, this is \"\n          \"most likely a bug in GLib IO library.\");\n\n      g_set_error_literal (&data->last_error,\n          G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,\n          _(\"Proxying over a non-TCP connection is not supported.\"));\n\n      enumerator_next_async (data);\n    }",
+      "explanation": "A proxy was configured. Line 75 reads the proxy protocol string. Lines 80-90 are a defensive guard: proxying is only defined over TCP, so if the established connection is not a GTcpConnection the code logs a g_critical, records G_IO_ERROR_NOT_SUPPORTED in data->last_error, and advances to the next candidate via enumerator_next_async. This is a good example of the file's own habit of adding 'safety guards for cases that should not happen' — the same defensive discipline that is missing at lines 32-33."
+    },
+    {
+      "file": "corpus/eval/eval_0065_cwe754.c",
+      "lines": "91-118",
+      "code": "else if (g_hash_table_contains (data->client->priv->app_proxies, protocol))\n    {\n      /* Simply complete the connection, we don't want to do TLS handshake\n       * as the application proxy handling may need proxy handshake first */\n      g_socket_client_async_connect_complete (data);\n    }\n  else if ((proxy = g_proxy_get_default_for_protocol (protocol)))\n    {\n      g_socket_client_emit_event (data->client, G_SOCKET_CLIENT_PROXY_NEGOTIATING, data->connectable, data->connection);\n      g_proxy_connect_async (proxy,\n                             data->connection,\n                             data->proxy_addr,\n                             g_task_get_cancellable (data->task),\n                             g_socket_client_proxy_connect_callback,\n                             data);\n      g_object_unref (proxy);\n    }\n  else\n    {\n      g_clear_error (&data->last_error);\n\n      g_set_error (&data->last_error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,\n          _(\"Proxy protocol “%s” is not supported.\"),\n          protocol);\n\n      enumerator_next_async (data);\n    }\n}",
+      "explanation": "The proxy-dispatch cascade. Lines 91-95: if the protocol is an application-registered proxy, just complete the connection without a TLS handshake. Lines 97-107: if a default GProxy handler exists for the protocol, emit PROXY_NEGOTIATING and kick off g_proxy_connect_async, passing data as the callback user_data so g_socket_client_proxy_connect_callback continues the chain, then unref the proxy. Lines 108-117: otherwise record 'proxy protocol not supported' in data->last_error and advance to the next candidate. All branches assume data (and data->client, data->task, data->connectable) are valid — again the success-path contract that data is non-NULL."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/eval/eval_0065_cwe754.c",
+      "lines": "30-33",
+      "code": "if (!g_cancellable_is_cancelled (attempt->cancellable))\n        {\n          clarify_connect_error (error, data->connectable, attempt->address);\n          set_last_error (data, error);\n        }",
+      "explanation": "This is the core CWE-754 defect. The function everywhere else treats data as possibly-NULL: the comment on line 13 says so, line 14 uses `data &&` before touching data->task, and line 38 gates cleanup on `if (data)`. But inside this not-cancelled failure branch, line 32 dereferences data->connectable and line 33 passes data to set_last_error WITHOUT any NULL check. An attacker/network condition that produces a connect FAILURE (connect_finish returns FALSE) on an attempt whose data has already been NULL-ed by a concurrent winner (lines 52-58) reaches line 32 and dereferences a NULL pointer -> immediate crash (denial of service) in the process using GLib networking. The invariant the implementation must uphold is: never read through data unless data != NULL. Today the only thing preventing the crash is the implicit, non-local coupling that lines 55-56 always set the cancellable AND null data together, so line 30 happens to catch the NULL-data siblings; that coupling is fragile and the guard belongs directly on lines 32-33 (upstream GLib later wraps them in `if (data)`)."
+    },
+    {
+      "file": "corpus/eval/eval_0065_cwe754.c",
+      "lines": "13-19",
+      "code": "/* data is NULL once the task is completed */\n  if (data && g_task_return_error_if_cancelled (data->task))",
+      "explanation": "This line documents and enforces the exact invariant that lines 32-33 violate: it demonstrates the author KNOWS data can be NULL here and must be checked before dereference. The presence of this guard (and the matching `if (data)` at line 38) is direct evidence that the missing check at lines 32-33 is an oversight, not an intentional 'data is guaranteed non-NULL here' assumption. Any static or manual audit should treat the three sites as one contract: data must be NULL-checked at every dereference, and one of the three (32-33) is missing it."
+    },
+    {
+      "file": "corpus/eval/eval_0065_cwe754.c",
+      "lines": "52-58",
+      "code": "for (l = data->connection_attempts; l; l = g_slist_next (l))\n    {\n      ConnectionAttempt *attempt_entry = l->data;\n      g_cancellable_cancel (attempt_entry->cancellable);\n      attempt_entry->data = NULL;\n      connection_attempt_unref (attempt_entry);\n    }",
+      "explanation": "This block is what makes the NULL-data condition reachable. When one parallel attempt wins, it walks every sibling and, on line 56, sets attempt_entry->data = NULL. If a sibling's connect callback has already been queued to the main context and runs afterwards, that callback observes attempt->data == NULL. The pairing with g_cancellable_cancel on line 55 is the ONLY reason the failure path at line 30 currently dodges the NULL deref — the code relies on 'cancelled implies data==NULL' being always true, an emergent property of these two adjacent statements rather than an enforced local check. Because cancellation is observed asynchronously and connect results are attacker/network-timed, an auditor must confirm no ordering exists where data is NULL while attempt->cancellable reports not-cancelled."
+    },
+    {
+      "file": "corpus/eval/eval_0065_cwe754.c",
+      "lines": "49-50",
+      "code": "data->socket = g_steal_pointer (&attempt->socket);\n  data->connection = g_steal_pointer (&attempt->connection);",
+      "explanation": "The success path also dereferences data unconditionally, with no cancellation guard at all (unlike the failure path's line 30). In a happy-eyeballs race, two parallel TCP connects can both succeed almost simultaneously: the first winner runs the loop at 52-58 and NULLs the siblings' data, then the second attempt's already-queued success callback runs, connect_finish still returns TRUE (its socket did connect), the failure block is skipped entirely, and line 49 executes `data->socket = ...` with data == NULL -> NULL pointer dereference. This is the same missing-check class as lines 32-33 but at a distinct, arguably more reachable site because the success branch has no NULL/cancellation gate whatsoever. The implementation must confirm that a successful attempt can never have been NULL-ed by a concurrent winner, or add an `if (data)` guard here too."
+    },
+    {
+      "file": "corpus/eval/eval_0065_cwe754.c",
+      "lines": "32-33",
+      "code": "clarify_connect_error (error, data->connectable, attempt->address);\n          set_last_error (data, error);",
+      "explanation": "Secondary consequence beyond the raw NULL deref: set_last_error(data, error) is presumably responsible for taking ownership of / storing error. On the NULL-data path the else branch at line 36 (g_clear_error) is skipped, so if control ever reached line 33 with data==NULL and set_last_error early-returned on NULL without consuming error, the GError would be leaked. This is a lower-severity corollary; the dominant impact is the crash from line 32's data->connectable read, which occurs before set_last_error is even called."
+    }
+  ],
+  "summary": "A GLib GIO happy-eyeballs connect-completion callback that consistently treats its shared `data` pointer as possibly-NULL (comment line 13, guards at lines 14 and 38) but then dereferences it without that check on the connect-failure path (data->connectable at line 32, set_last_error(data,...) at line 33) and on the success path (lines 49-50). This is a CWE-754 / CWE-476 NULL pointer dereference (client-side crash / DoS) reachable when a parallel attempt is torn down by a concurrent winner; currently only an implicit, non-local coupling between cancellation and data-nulling prevents it. No memory-safety write primitive is present; risk is a crash, not code execution.",
+  "reviewed_anchors": [
+    {"anchor": "g_socket_client_connected_callback(GObject *source, GAsyncResult *result, gpointer user_data) [lines 2-4]", "disposition": "dismissed", "reason": "GAsyncReadyCallback signature; parameters are supplied by trusted GLib dispatch, not the direct vector — the vector is the state carried in user_data."},
+    {"anchor": "ConnectionAttempt *attempt = user_data; [line 6]", "disposition": "dismissed", "reason": "attempt comes from user_data and is always valid for the life of the callback; never NULL-checked because it is never nulled."},
+    {"anchor": "GSocketClientAsyncConnectData *data = attempt->data; [line 7]", "disposition": "finding", "reason": "data is documented (line 13) as possibly-NULL and is nulled for siblings at line 56; unchecked dereferences of it are the central defect."},
+    {"anchor": "if (data && g_task_return_error_if_cancelled (data->task)) [line 14]", "disposition": "dismissed", "reason": "Correctly guards data before dereference; this is the model the rest of the function should follow."},
+    {"anchor": "attempt->timeout_source teardown [lines 21-25]", "disposition": "dismissed", "reason": "Operates on always-valid attempt; g_clear_pointer nulls the field safely; no untrusted-length or NULL contract."},
+    {"anchor": "g_socket_connection_connect_finish(...) [lines 27-28]", "disposition": "dismissed", "reason": "Result-checking gate; correctly branches on FALSE. Its own arguments are trusted; it only sets error."},
+    {"anchor": "if (!g_cancellable_is_cancelled (attempt->cancellable)) [line 30]", "disposition": "dismissed", "reason": "Guards the not-cancelled branch; not itself buggy, but it is the fragile implicit gate that currently masks the line 32-33 NULL deref."},
+    {"anchor": "clarify_connect_error (error, data->connectable, attempt->address); [line 32]", "disposition": "finding", "reason": "Dereferences data->connectable with no NULL check while data can be NULL here — primary NULL-pointer-dereference site."},
+    {"anchor": "set_last_error (data, error); [line 33]", "disposition": "finding", "reason": "Passes possibly-NULL data onward without a guard; part of the same missing-check defect and a potential GError-leak corollary."},
+    {"anchor": "if (data) { connection_attempt_remove/enumerator_next_async } else connection_attempt_unref [lines 38-44]", "disposition": "dismissed", "reason": "Correctly NULL-guards data; demonstrates the intended contract that lines 32-33 fail to honor."},
+    {"anchor": "data->socket / data->connection = g_steal_pointer(...) [lines 49-50]", "disposition": "finding", "reason": "Success path dereferences data with no NULL/cancellation guard; reachable via concurrent double-success race — distinct site of the same NULL-deref class."},
+    {"anchor": "connection_attempts cancel/null/unref loop [lines 52-58]", "disposition": "finding", "reason": "Sets attempt_entry->data = NULL (line 56) — the origin of the NULL-data condition; establishes reachability of the unguarded dereferences."},
+    {"anchor": "g_slist_free(data->connection_attempts); data->connection_attempts = NULL; [lines 59-60]", "disposition": "dismissed", "reason": "List teardown after the loop; no untrusted contract, pointer is nulled to avoid reuse."},
+    {"anchor": "connection_attempt_unref(attempt) success path [line 61]", "disposition": "dismissed", "reason": "Balances the reference taken for this attempt; single unref per success path, no double-free evident in shown code."},
+    {"anchor": "g_socket_client_emit_event / set_cached_remote_address [lines 63-64]", "disposition": "dismissed", "reason": "Signal emission through data on the success path; inherits the success-path assumption that data is non-NULL (covered by the lines 49-50 finding)."},
+    {"anchor": "g_socket_set_blocking (data->socket, TRUE); [line 67]", "disposition": "dismissed", "reason": "Behavioral quirk acknowledged by the 'wrong, but backward compatible' comment; not a security contract."},
+    {"anchor": "if (!data->proxy_addr) g_socket_client_tls_handshake(data) [lines 69-73]", "disposition": "dismissed", "reason": "Success-path branch; dereference of data covered by the success-path NULL finding, no additional distinct contract."},
+    {"anchor": "protocol = g_proxy_address_get_protocol(data->proxy_addr) [line 75]", "disposition": "dismissed", "reason": "Reads proxy protocol string on success path; string is used only for hash lookup/handler dispatch, not as a length or copied into a fixed buffer."},
+    {"anchor": "if (!G_IS_TCP_CONNECTION (data->connection)) safety guard [lines 80-90]", "disposition": "dismissed", "reason": "A correct defensive guard for a 'should not happen' condition; illustrates the discipline missing at lines 32-33."},
+    {"anchor": "proxy dispatch cascade: app_proxies / g_proxy_get_default_for_protocol / unsupported [lines 91-117]", "disposition": "dismissed", "reason": "Routing logic on the success path; forwards data to further async callbacks. No fixed buffer, length field, or new untrusted-parse surface; protocol string is treated as an opaque key."}
+  ],
+  "findings": [
+    {
+      "title": "NULL pointer dereference of `data` on the connect-failure path (missing check for the documented data==NULL state)",
+      "anchor": "clarify_connect_error (error, data->connectable, attempt->address); / set_last_error (data, error);",
+      "file": "corpus/eval/eval_0065_cwe754.c",
+      "line": "30-33",
+      "code": "if (!g_cancellable_is_cancelled (attempt->cancellable))\n        {\n          clarify_connect_error (error, data->connectable, attempt->address);\n          set_last_error (data, error);\n        }",
+      "bug_class": "NULL pointer dereference due to improper check for an exceptional condition",
+      "cwe": "CWE-476",
+      "severity": "medium",
+      "where_it_lives": "corpus/eval/eval_0065_cwe754.c (this function; the referenced clarify_connect_error/set_last_error are in the implementation, file not provided)",
+      "invariant": "`data` must be verified non-NULL before any dereference; specifically lines 32-33 must be gated by `if (data)` exactly as lines 14 and 38 already are, because the function's own comment (line 13) and guards establish that attempt->data can be NULL once a sibling wins / the task completes.",
+      "failure_mode": "When a parallel connection attempt fails (g_socket_connection_connect_finish returns FALSE) after a concurrent winner has already NULL-ed this attempt's data via line 56, and attempt->cancellable is observed as not-cancelled at line 30, control enters lines 32-33 and evaluates data->connectable on a NULL pointer -> segmentation fault, crashing any process using GLib client networking (denial of service). Reachability is currently gated only by the implicit, non-local coupling that lines 55-56 always cancel AND null together, so line 30 tends to divert NULL-data siblings to the else branch; that coupling is not enforced locally and is fragile to the asynchronous ordering of connect completion vs. cancellation, which a remote peer's connect timing influences.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm whether any code path (or async cancellation race) can leave attempt->data == NULL while g_cancellable_is_cancelled(attempt->cancellable) returns FALSE; and confirm that clarify_connect_error/set_last_error do not internally NULL-check data. The correct fix is to wrap lines 32-33 in `if (data)` (as upstream GLib does)."
+    },
+    {
+      "title": "Success path dereferences `data` with no NULL/cancellation guard (concurrent double-success race)",
+      "anchor": "data->socket = g_steal_pointer (&attempt->socket); data->connection = g_steal_pointer (&attempt->connection);",
+      "file": "corpus/eval/eval_0065_cwe754.c",
+      "line": "49-50",
+      "code": "data->socket = g_steal_pointer (&attempt->socket);\n  data->connection = g_steal_pointer (&attempt->connection);",
+      "bug_class": "NULL pointer dereference on the un-gated success branch (improper check for exceptional condition)",
+      "cwe": "CWE-476",
+      "severity": "medium",
+      "where_it_lives": "corpus/eval/eval_0065_cwe754.c (this function)",
+      "invariant": "A connect that reports success must still verify `data != NULL` before storing results into it, because in a happy-eyeballs race a concurrent winner may already have set this attempt's data to NULL (line 56) before this attempt's own success callback runs.",
+      "failure_mode": "Two parallel TCP connects both succeed nearly simultaneously. The first winner executes the loop at lines 52-58, setting the second attempt's data = NULL. The second attempt's already-queued success callback then runs; g_socket_connection_connect_finish still returns TRUE (its socket did connect), so the failure block (and its line-30 cancellation check) is skipped entirely, and line 49 executes `data->socket = ...` with data == NULL -> NULL pointer dereference / crash. Unlike the failure path, this branch has no cancellation gate at all, so it is not even incidentally protected.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm whether the state machine can deliver a successful connect_finish for an attempt whose data was already NULL-ed by a concurrent winner (i.e. two attempts succeeding before the winner's teardown removes them). If so, the success path needs an early `if (!data) { connection_attempt_unref (attempt); return; }` style guard mirroring the failure path's line 38 handling."
+    }
+  ],
+  "audit_checklist": [
+    "Wrap the connect-failure dereferences at lines 32-33 (clarify_connect_error(error, data->connectable, ...) and set_last_error(data, error)) in an `if (data)` check, matching the guards already present at lines 14 and 38.",
+    "Prove or add a guard for the invariant 'attempt->data == NULL implies attempt->cancellable is cancelled'; if it cannot be proven under async cancellation ordering, the line-30 gate does not protect lines 32-33.",
+    "Add a NULL/teardown guard on the success path (lines 49-50 and the subsequent data->connection/data->client/data->task uses through line 117) to survive a concurrent double-success where this attempt's data was already NULL-ed by the winner.",
+    "Verify set_last_error() and clarify_connect_error() behavior when passed a NULL data — do they crash, and do they still consume/free the GError (leak check on line 33's error if the branch is entered with data==NULL)?",
+    "Audit the reference-count balance of the winning `attempt`: it is unref'd once at line 61, but if the winner is still a member of data->connection_attempts it is also unref'd inside the loop at line 57 — confirm this does not double-unref (potential use-after-free/CWE-416).",
+    "Confirm attempt->cancellable and attempt (from user_data) are guaranteed valid for the whole callback, since they are dereferenced (lines 21-24, 30, 32) without any NULL check."
+  ]
+}

@@ -1,0 +1,187 @@
+{
+  "subsystem": "Ceph messenger v2 (msgr2) connection-authentication entry point. This is MonClient::handle_auth_request, the server/peer-side handler that is invoked when a not-yet-authenticated Connection presents an authorizer during the msgr2 auth handshake. It selects an AuthAuthorizeHandler for the negotiated auth method, runs the authorizer verification (cephx or none), and drives the authorizer-challenge (nonce) state machine that is meant to prevent replay of captured authorizers.",
+  "provenance": "Identified as Ceph (RADOS) source: the MonClient class, the ceph::bufferlist type, AuthConnectionMeta / AuthAuthorizeHandler, rotating_secrets, the lderr(cct)/ldout(cct,10)/dendl logging macros, __func__, ms_handle_authentication, Connection::get_peer_type(), and the -EACCES/-EOPNOTSUPP errno returns are all distinctive of src/mon/MonClient.cc in the Ceph tree. The sample banner 'primevul_train_3216_fixed' and the file name '...cwe294.cpp' further tag it as the fixed revision of a capture-replay (CWE-294) case; the shown code is judged blind on its merits regardless of that label.",
+  "trust_boundary": "This runs BEFORE the peer is authenticated, so the peer and everything it sends are fully hostile. Attacker-controlled inputs: the 'more' flag (protocol continuation state), 'auth_method' (uint32_t taken from the wire during method negotiation), and above all the 'payload' bufferlist, which is the raw authorizer blob the peer chose to send. con->peer_* and auth_meta out-fields (peer_name, peer_global_id, peer_caps_info, session_key, connection_secret) are written as a RESULT of verification and become the connection's authenticated identity and capabilities, so their correctness gates all later authorization. Only cct, rotating_secrets, and the handler registry are server-side trusted state.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0064_cwe294.cpp",
+      "lines": "2-9",
+      "code": "int MonClient::handle_auth_request(\n  Connection *con,\n  AuthConnectionMeta *auth_meta,\n  bool more,\n  uint32_t auth_method,\n  const bufferlist& payload,\n  bufferlist *reply)\n{",
+      "explanation": "The function is the msgr2 auth-request callback. 'con' is the Connection presenting credentials (still unauthenticated). 'auth_meta' is the per-connection AuthConnectionMeta scratch structure that carries auth_mode, the authorizer_challenge, the skip_authorizer_challenge flag, the negotiated connection-secret length, and the output session_key/connection_secret. 'more' distinguishes a fresh authorizer from a continuation of an in-progress handshake (e.g. a client re-submitting an authorizer that now incorporates the server's challenge). 'auth_method' is the negotiated auth method id chosen over the wire. 'payload' is the const authorizer bytes the peer sent; 'reply' is an output bufferlist the handler fills with data to send back. The int return encodes the state-machine result: 1 = authenticated, 0 = need another round (challenge issued), negative errno = reject."
+    },
+    {
+      "file": "corpus/train/train_0064_cwe294.cpp",
+      "lines": "10",
+      "code": "  auth_meta->auth_mode = payload[0];",
+      "explanation": "The very first byte of the attacker-supplied payload is read via bufferlist::operator[](0) and stored as the connection's auth_mode. This byte selects the sub-protocol (authorizer mode) the peer wants. Note there is NO check that payload is non-empty before indexing element 0 — the length of payload is never consulted here."
+    },
+    {
+      "file": "corpus/train/train_0064_cwe294.cpp",
+      "lines": "11-14",
+      "code": "  if (auth_meta->auth_mode < AUTH_MODE_AUTHORIZER ||\n      auth_meta->auth_mode > AUTH_MODE_AUTHORIZER_MAX) {\n    return -EACCES;\n  }",
+      "explanation": "The auth_mode byte is range-validated against the closed interval [AUTH_MODE_AUTHORIZER, AUTH_MODE_AUTHORIZER_MAX]. Any value outside that band is rejected with -EACCES (permission denied). This is the one input-validation gate on the mode selector: it constrains which authorizer sub-protocols a peer may request and prevents the peer from steering into an unexpected mode. Both bounds are inclusive and the constants are compile-time enum values, so the gate itself is well-formed."
+    },
+    {
+      "file": "corpus/train/train_0064_cwe294.cpp",
+      "lines": "15-21",
+      "code": "  AuthAuthorizeHandler *ah = get_auth_authorize_handler(con->get_peer_type(),\n\t\t\t\t\t\t\tauth_method);\n  if (!ah) {\n    lderr(cct) << __func__ << \" no AuthAuthorizeHandler found for auth method \"\n\t       << auth_method << dendl;\n    return -EOPNOTSUPP;\n  }",
+      "explanation": "The code looks up the concrete verification handler for this peer type (con->get_peer_type(), e.g. OSD/MON/CLIENT) and the negotiated auth_method. If the registry has no handler for that combination, it logs the unsupported method at error level and returns -EOPNOTSUPP. Crucially the returned pointer 'ah' is NULL-checked before any dereference, so an attacker choosing an unregistered auth_method cannot cause a NULL call here — it is safely rejected."
+    },
+    {
+      "file": "corpus/train/train_0064_cwe294.cpp",
+      "lines": "23-27",
+      "code": "  auto ac = &auth_meta->authorizer_challenge;\n  if (auth_meta->skip_authorizer_challenge) {\n    ldout(cct, 10) << __func__ << \" skipping challenge on \" << con << dendl;\n    ac = nullptr;\n  }",
+      "explanation": "'ac' is a pointer to the connection's authorizer_challenge slot. By default it points at auth_meta->authorizer_challenge, which lets verify_authorizer READ any challenge already stored and WRITE a freshly generated challenge into it. If the connection has skip_authorizer_challenge set, the code logs and nulls 'ac', signalling verify_authorizer to neither require nor generate a challenge. This flag is the on/off switch for the anti-replay nonce: with it set, authorizer verification proceeds without any freshness challenge."
+    },
+    {
+      "file": "corpus/train/train_0064_cwe294.cpp",
+      "lines": "29",
+      "code": "  bool was_challenge = (bool)auth_meta->authorizer_challenge;",
+      "explanation": "A snapshot is taken of whether a challenge already existed BEFORE calling verify_authorizer. authorizer_challenge is a smart/optional-like object whose bool conversion is true when a challenge is populated. 'was_challenge' therefore records 'did this connection already have a pending challenge on entry', which the state machine below uses to decide whether the verify call has just NEWLY generated a challenge versus reusing a pre-existing one — the guard that stops the handshake from looping and re-issuing challenges forever."
+    },
+    {
+      "file": "corpus/train/train_0064_cwe294.cpp",
+      "lines": "30-41",
+      "code": "  bool isvalid = ah->verify_authorizer(\n    cct,\n    rotating_secrets.get(),\n    payload,\n    auth_meta->get_connection_secret_length(),\n    reply,\n    &con->peer_name,\n    &con->peer_global_id,\n    &con->peer_caps_info,\n    &auth_meta->session_key,\n    &auth_meta->connection_secret,\n    ac);",
+      "explanation": "The heart of the routine: the selected handler verifies the authorizer. Inputs are cct, the current rotating service secrets (rotating_secrets.get()), the raw peer payload, and the requested connection-secret length (get_connection_secret_length()). Outputs written on success are 'reply' (bytes to send back), the peer identity (peer_name, peer_global_id), the peer's capability set (peer_caps_info), and the negotiated crypto material (session_key, connection_secret). 'ac' passes the challenge slot (or nullptr if skipped). The bool result 'isvalid' is the sole authentication verdict; every out-param it fills becomes the trusted, authenticated identity/authorization of the connection."
+    },
+    {
+      "file": "corpus/train/train_0064_cwe294.cpp",
+      "lines": "42-45",
+      "code": "  if (isvalid) {\n    handle_authentication_dispatcher->ms_handle_authentication(con);\n    return 1;\n  }",
+      "explanation": "On a valid authorizer the code notifies the dispatcher via ms_handle_authentication(con) — the upcall that promotes the connection to authenticated and applies its caps — and returns 1 to tell the messenger the handshake succeeded. From this point the peer is treated as the identity/caps that verify_authorizer wrote into con->peer_name/peer_global_id/peer_caps_info."
+    },
+    {
+      "file": "corpus/train/train_0064_cwe294.cpp",
+      "lines": "46-49",
+      "code": "  if (!more && !was_challenge && auth_meta->authorizer_challenge) {\n    ldout(cct,10) << __func__ << \" added challenge on \" << con << dendl;\n    return 0;\n  }",
+      "explanation": "The anti-replay branch. It fires only when this was a fresh authorizer (!more), no challenge existed on entry (!was_challenge), yet verify_authorizer has now POPULATED authorizer_challenge. That combination means the server just minted a nonce that must be echoed back: it logs 'added challenge' and returns 0, instructing the messenger to send the challenge (in 'reply') and await a continuation. The triple guard is what prevents a captured/replayed authorizer from ever succeeding on the first round and prevents endless re-challenging: a legitimate client must re-present an authorizer bound to this fresh nonce."
+    },
+    {
+      "file": "corpus/train/train_0064_cwe294.cpp",
+      "lines": "50-51",
+      "code": "  ldout(cct,10) << __func__ << \" bad authorizer on \" << con << dendl;\n  return -EACCES;",
+      "explanation": "The terminal reject: if the authorizer was not valid and no fresh challenge was issued (e.g. this was a continuation with a wrong/stale authorizer, or challenges are disabled), the connection is denied with -EACCES. This is the default-deny fall-through that closes the state machine."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0064_cwe294.cpp",
+      "lines": "23-49",
+      "code": "  auto ac = &auth_meta->authorizer_challenge;\n  if (auth_meta->skip_authorizer_challenge) {\n    ldout(cct, 10) << __func__ << \" skipping challenge on \" << con << dendl;\n    ac = nullptr;\n  }\n\n  bool was_challenge = (bool)auth_meta->authorizer_challenge;\n  bool isvalid = ah->verify_authorizer(",
+      "explanation": "This is the capture-replay (CWE-294) surface. The ONLY defense against an attacker sniffing a valid authorizer off the wire and re-presenting it later is the server-generated challenge nonce that verify_authorizer binds into the accepted authorizer. Two contracts must hold and neither is enforceable in this file: (1) verify_authorizer must cryptographically require that a non-skipped authorizer incorporate the exact challenge stored in *ac — if it accepts an authorizer that lacks or mismatches the nonce, any captured authorizer replays into isvalid==true and return 1, fully authenticating the attacker as the original peer's identity/caps; (2) skip_authorizer_challenge (line 24) must be true ONLY for trust paths that are otherwise protected, because when it is set 'ac' becomes nullptr, no nonce is required, and the first-round anti-replay branch at line 46 can never fire (authorizer_challenge stays empty), so a replayed authorizer is accepted immediately. An attacker who can reach a connection with skip set, or a verify_authorizer that ignores the challenge, defeats replay protection entirely. This is the exact class fixed in the cephx replay CVEs."
+    },
+    {
+      "file": "corpus/train/train_0064_cwe294.cpp",
+      "lines": "10",
+      "code": "  auth_meta->auth_mode = payload[0];",
+      "explanation": "payload[0] is dereferenced with no prior check that payload.length() >= 1. An attacker can present an empty authorizer bufferlist during the msgr2 handshake. bufferlist::operator[] on an out-of-range index does not silently return 0 — it walks the buffer segments and, finding none, throws ceph::buffer::end_of_buffer (an out-of-bounds condition). Depending on the caller's exception handling in the messenger, this is at best an aborted connection and at worst an unhandled-exception crash of the daemon, i.e. a pre-authentication remote DoS reachable by any peer that can open a connection. The invariant is: reject (or default) before indexing — 'if (payload.length() < 1) return -EACCES;' must precede the read of byte 0."
+    },
+    {
+      "file": "corpus/train/train_0064_cwe294.cpp",
+      "lines": "30-41",
+      "code": "  bool isvalid = ah->verify_authorizer(\n    cct,\n    rotating_secrets.get(),\n    payload,\n    auth_meta->get_connection_secret_length(),\n    reply,\n    &con->peer_name,\n    &con->peer_global_id,\n    &con->peer_caps_info,\n    &auth_meta->session_key,\n    &auth_meta->connection_secret,\n    ac);",
+      "explanation": "Latent contract in the implementation this call reaches. get_connection_secret_length() supplies the size that verify_authorizer uses to derive/copy connection_secret; if that length is attacker-influenced upstream and the implementation copies into a fixed-size connection_secret container without bounding to the container size, it is a classic length-vs-buffer overflow (CWE-120/CWE-787). Independently, every out-param here (peer_name, peer_global_id, peer_caps_info) becomes the connection's authenticated identity and capability set: if verify_authorizer can return isvalid==true while leaving these partially/incorrectly populated (e.g. defaulting global_id or caps), the peer is authorized as the wrong principal. None of this is visible in the header/callsite; the invariant is that verify_authorizer sets ALL identity/caps outputs atomically and only on genuine success, and never writes connection_secret beyond its allocated length."
+    },
+    {
+      "file": "corpus/train/train_0064_cwe294.cpp",
+      "lines": "43",
+      "code": "    handle_authentication_dispatcher->ms_handle_authentication(con);",
+      "explanation": "handle_authentication_dispatcher is dereferenced unconditionally on the success path with no NULL guard. If a connection can reach handle_auth_request before this dispatcher is wired up (initialization ordering, or a code path that leaves it null), a valid authorizer triggers a NULL pointer dereference and crash (CWE-476). This is a lower-severity latent robustness issue rather than an attacker-chosen primitive, but it is worth confirming the dispatcher is guaranteed non-null for every path that can invoke this handler."
+    },
+    {
+      "file": "corpus/train/train_0064_cwe294.cpp",
+      "lines": "15-16",
+      "code": "  AuthAuthorizeHandler *ah = get_auth_authorize_handler(con->get_peer_type(),\n\t\t\t\t\t\t\tauth_method);",
+      "explanation": "auth_method is an attacker-chosen uint32_t fed straight into the handler-registry lookup. This is safely NULL-checked at line 17, so an unknown method is rejected rather than dispatched — no bug here. The only residual concern is that the SET of handlers reachable this way must not include a permissive/none handler for peer types that require strong auth; that is a policy question about the registry, not a memory-safety flaw in this function. Called out for completeness and dismissed as validated at the callsite."
+    }
+  ],
+  "summary": "Ceph msgr2 authorizer-request handler. The dominant risk is capture-replay (CWE-294): security rests entirely on verify_authorizer binding the server-generated authorizer_challenge nonce and on skip_authorizer_challenge being set only for trusted paths — both live in code not shown here (the historical cephx replay CVEs are the analog). A concrete local defect is the unchecked payload[0] read at line 10, a pre-auth remote DoS on an empty payload. Remaining items (connection_secret length/out-param contract in verify_authorizer, and the unguarded dispatcher deref) are latent.",
+  "reviewed_anchors": [
+    {"anchor": "handle_auth_request(Connection*, AuthConnectionMeta*, bool more, uint32_t auth_method, const bufferlist& payload, bufferlist* reply)", "disposition": "finding", "reason": "Pre-authentication entry point; payload/auth_method/more are fully attacker-controlled."},
+    {"anchor": "payload[0] (line 10)", "disposition": "finding", "reason": "bufferlist indexed at 0 with no length check — OOB read / throw on empty payload."},
+    {"anchor": "auth_meta->auth_mode range check vs AUTH_MODE_AUTHORIZER / AUTH_MODE_AUTHORIZER_MAX (lines 11-14)", "disposition": "dismissed", "reason": "Inclusive-bounds validation gate is present and well-formed; rejects out-of-band modes with -EACCES."},
+    {"anchor": "auth_method (uint32_t) -> get_auth_authorize_handler (lines 6,15-16)", "disposition": "dismissed", "reason": "Return pointer is NULL-checked at line 17 before use; unknown method safely returns -EOPNOTSUPP."},
+    {"anchor": "AuthAuthorizeHandler *ah null check (lines 17-21)", "disposition": "dismissed", "reason": "Explicit NULL guard prevents dereference of an unresolved handler."},
+    {"anchor": "auth_meta->authorizer_challenge / ac pointer (lines 23,29,46)", "disposition": "finding", "reason": "The anti-replay nonce; whole CWE-294 defense depends on it being generated and bound correctly."},
+    {"anchor": "auth_meta->skip_authorizer_challenge (line 24)", "disposition": "finding", "reason": "Struct flag that disables the challenge (ac=nullptr) — if set on an untrusted path, replay protection is bypassed."},
+    {"anchor": "was_challenge snapshot (line 29)", "disposition": "dismissed", "reason": "Correctly captures prior challenge state; part of the guard that prevents challenge loops and premature success."},
+    {"anchor": "verify_authorizer(...) signature and out-params session_key/connection_secret/peer_name/peer_global_id/peer_caps_info (lines 30-41)", "disposition": "finding", "reason": "Latent: identity/caps/secret are written by the implementation; connection-secret length and atomic identity population are unverifiable here."},
+    {"anchor": "auth_meta->get_connection_secret_length() (line 34)", "disposition": "finding", "reason": "Length driving connection_secret derivation inside verify_authorizer — latent length-vs-buffer contract (folded into the verify_authorizer finding)."},
+    {"anchor": "rotating_secrets.get() (line 32)", "disposition": "dismissed", "reason": "Server-side trusted secret material, not attacker-controlled."},
+    {"anchor": "isvalid -> handle_authentication_dispatcher->ms_handle_authentication(con) (lines 42-43)", "disposition": "finding", "reason": "Dispatcher pointer dereferenced with no NULL guard on the success path (CWE-476, latent)."},
+    {"anchor": "!more && !was_challenge && authorizer_challenge branch, return 0 (lines 46-49)", "disposition": "dismissed", "reason": "Triple-guarded challenge issuance is the correct anti-replay/anti-loop state transition."},
+    {"anchor": "return values 1 / 0 / -EACCES / -EOPNOTSUPP (lines 13,20,44,48,51)", "disposition": "dismissed", "reason": "Encode authenticated / need-more / deny; semantics are consistent and default-deny."}
+  ],
+  "findings": [
+    {
+      "title": "Authorizer replay depends on unverifiable challenge binding; skip flag disables it",
+      "anchor": "auth_meta->authorizer_challenge / ac and auth_meta->skip_authorizer_challenge",
+      "file": "corpus/train/train_0064_cwe294.cpp",
+      "line": "23-49",
+      "code": "  auto ac = &auth_meta->authorizer_challenge;\n  if (auth_meta->skip_authorizer_challenge) {\n    ldout(cct, 10) << __func__ << \" skipping challenge on \" << con << dendl;\n    ac = nullptr;\n  }\n\n  bool was_challenge = (bool)auth_meta->authorizer_challenge;\n  bool isvalid = ah->verify_authorizer(",
+      "bug_class": "Authentication bypass by capture-replay (challenge-nonce not enforced / disabled)",
+      "cwe": "CWE-294",
+      "severity": "high",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "verify_authorizer MUST cryptographically require the caller-supplied authorizer to embed the exact server-generated nonce stored in *ac before returning isvalid==true, and skip_authorizer_challenge must be true ONLY for paths not exposed to replay; a captured authorizer must never authenticate.",
+      "failure_mode": "An attacker sniffs a valid authorizer from the wire. If verify_authorizer accepts an authorizer that omits or mismatches the challenge, or if the connection has skip_authorizer_challenge set (ac becomes nullptr and the line 46 challenge branch can never fire), the replayed authorizer yields isvalid==true and return 1, authenticating the attacker as the original peer with its full peer_caps_info. Impact: full impersonation / authentication bypass on the RADOS control plane.",
+      "cve_analog": "CVE-2018-1128",
+      "what_to_confirm": "In the verify_authorizer implementation for each auth method, confirm the stored challenge is required and compared against the presented authorizer before success, and audit every site that sets skip_authorizer_challenge to ensure it is limited to trusted/loopback contexts."
+    },
+    {
+      "title": "Out-of-bounds read of payload[0] with no length check (empty payload)",
+      "anchor": "auth_meta->auth_mode = payload[0];",
+      "file": "corpus/train/train_0064_cwe294.cpp",
+      "line": "10",
+      "code": "  auth_meta->auth_mode = payload[0];",
+      "bug_class": "Out-of-bounds read / unhandled exception on empty attacker input",
+      "cwe": "CWE-125",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0064_cwe294.cpp",
+      "invariant": "payload.length() must be verified >= 1 before indexing element 0; a zero-length authorizer must be rejected, not indexed.",
+      "failure_mode": "A peer sends an empty authorizer bufferlist. bufferlist::operator[](0) finds no backing segment and throws ceph::buffer::end_of_buffer (an out-of-range access). Depending on the messenger's exception handling this aborts the connection or crashes the daemon — a pre-authentication remote denial of service triggerable by any peer able to open a connection.",
+      "cve_analog": "",
+      "what_to_confirm": "Add/verify a 'if (payload.length() < 1) return -EACCES;' (or equivalent) guard before line 10, and confirm the msgr2 call site does not treat a thrown buffer error as fatal to the process."
+    },
+    {
+      "title": "verify_authorizer connection-secret length and identity out-params are an unbounded trust sink",
+      "anchor": "ah->verify_authorizer(..., get_connection_secret_length(), ..., &connection_secret, ac)",
+      "file": "corpus/train/train_0064_cwe294.cpp",
+      "line": "30-41",
+      "code": "  bool isvalid = ah->verify_authorizer(\n    cct,\n    rotating_secrets.get(),\n    payload,\n    auth_meta->get_connection_secret_length(),\n    reply,\n    &con->peer_name,\n    &con->peer_global_id,\n    &con->peer_caps_info,\n    &auth_meta->session_key,\n    &auth_meta->connection_secret,\n    ac);",
+      "bug_class": "Length-vs-buffer copy and incomplete identity population (latent)",
+      "cwe": "CWE-120",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "verify_authorizer must bound any write into connection_secret to get_connection_secret_length() AND to the container's real capacity, and must populate peer_name/peer_global_id/peer_caps_info fully and only on genuine success.",
+      "failure_mode": "If the connection-secret length is attacker-influenced and the implementation copies into a fixed-size connection_secret without bounding, an out-of-bounds write results (CWE-787). Separately, if verify_authorizer can return valid while leaving global_id or caps at a permissive default, the peer is authorized as the wrong/over-privileged principal. Neither is visible at this call site.",
+      "cve_analog": "",
+      "what_to_confirm": "Inspect verify_authorizer: confirm connection_secret writes are bounded, and that all identity/caps out-params are set atomically before returning true."
+    },
+    {
+      "title": "Unguarded dispatcher dereference on success path",
+      "anchor": "handle_authentication_dispatcher->ms_handle_authentication(con)",
+      "file": "corpus/train/train_0064_cwe294.cpp",
+      "line": "43",
+      "code": "    handle_authentication_dispatcher->ms_handle_authentication(con);",
+      "bug_class": "NULL pointer dereference",
+      "cwe": "CWE-476",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "handle_authentication_dispatcher must be guaranteed non-null for every path that can reach a successful verify_authorizer.",
+      "failure_mode": "If a connection can present a valid authorizer before the dispatcher is initialized (or on a path that leaves it null), the success branch dereferences a null pointer and crashes the daemon. Robustness/DoS rather than an attacker-chosen memory primitive.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify handle_authentication_dispatcher is always set before handle_auth_request can be invoked, or add a null guard before the call."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm every auth-method verify_authorizer requires the stored authorizer_challenge nonce and rejects authorizers that omit/mismatch it (anti-replay, CWE-294).",
+    "Audit all sites that set AuthConnectionMeta::skip_authorizer_challenge; ensure it is only true for trusted/loopback connections that cannot be replayed.",
+    "Add a payload.length() >= 1 guard before reading payload[0] at line 10 and confirm the msgr2 caller survives a thrown buffer::end_of_buffer without crashing.",
+    "Verify verify_authorizer bounds writes into connection_secret by both get_connection_secret_length() and the container capacity (no OOB write).",
+    "Confirm verify_authorizer sets peer_name, peer_global_id and peer_caps_info completely and only on genuine success so no connection is authorized with default/over-broad identity or caps.",
+    "Ensure handle_authentication_dispatcher is non-null on every path that can reach line 43.",
+    "Re-check that the auth_mode bounds [AUTH_MODE_AUTHORIZER, AUTH_MODE_AUTHORIZER_MAX] match the modes the handlers actually support so no accepted mode is left unhandled."
+  ]
+}

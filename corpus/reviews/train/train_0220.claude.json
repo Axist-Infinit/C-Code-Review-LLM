@@ -1,0 +1,257 @@
+{
+  "subsystem": "Linux kernel process-creation core: this is copy_process() from kernel/fork.c, the function that clone()/fork()/vfork() and kernel_thread() funnel into to allocate and populate a new struct task_struct. It duplicates the caller's task, copies (or shares, per clone_flags) every subsystem's per-task state (creds, files, fs, sighand, signal, mm, namespaces, io, thread/TLS), allocates a pid, and finally links the child into the task list, pid hashes, thread group and cgroup under tasklist_lock/siglock.",
+  "provenance": "Identified by symbol and structure: the signature 'static __latent_entropy struct task_struct *copy_process(unsigned long clone_flags, ...)' with parameters child_tidptr/pid/trace/tls/node, the CLONE_* flag vocabulary, the bad_fork_* goto ladder, dup_task_struct(), copy_creds/copy_files/copy_fs/copy_sighand/copy_signal/copy_mm/copy_namespaces, alloc_pid(), tasklist_lock and current->sighand->siglock are all verbatim kernel/fork.c constructs. The __latent_entropy attribute is the kernel gcc-plugin marker. The sample banner (corpus/train/train_0220_cwe362.c, 'primevul_c_train_2848_vuln') marks it as a PrimeVul CWE-362 (race condition) sample.",
+  "trust_boundary": "This runs in ring 0 on behalf of an unprivileged local caller of the clone(2)/fork(2)/clone3(2) syscall. The attacker fully controls clone_flags (arbitrary combination of CLONE_* bits), stack_start, stack_size, tls, node, and child_tidptr (a raw __user pointer). The threat model is a local user issuing many concurrent clone() calls with adversarial flag combinations; the relevant hostile surface is (a) flag combinations that steer control flow and (b) concurrency: copy_process runs largely without global serialization until it takes tasklist_lock near the end, so global accounting state (nr_threads, max_threads, per-user process counts, cgroup membership) is read outside that lock and mutated inside it, creating time-of-check/time-of-use windows. child_tidptr is an untrusted userspace address stored into the task for later use.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0220_cwe362.c",
+      "lines": "2-11",
+      "code": "static __latent_entropy struct task_struct *copy_process(\n\t\t\t\t\tunsigned long clone_flags,\n\t\t\t\t\tunsigned long stack_start,\n\t\t\t\t\tunsigned long stack_size,\n\t\t\t\t\tint __user *child_tidptr,\n\t\t\t\t\tstruct pid *pid,\n\t\t\t\t\tint trace,\n\t\t\t\t\tunsigned long tls,\n\t\t\t\t\tint node)\n{",
+      "explanation": "The entry point. clone_flags is the caller-chosen bitmask of CLONE_* options that decide what is shared vs copied. stack_start/stack_size describe the child stack, child_tidptr is a userspace pointer used for CLONE_CHILD_SETTID/CLONE_CHILD_CLEARTID, pid is either &init_struct_pid or NULL-ish sentinel meaning 'allocate one', trace carries ptrace intent, tls is the new thread-local-storage value, node is the NUMA node hint. It returns a task_struct* on success or an ERR_PTR() encoded errno. __latent_entropy is a hardening plugin annotation and has no bearing on the logic."
+    },
+    {
+      "file": "corpus/train/train_0220_cwe362.c",
+      "lines": "12-14",
+      "code": "\tint retval;\n\tstruct task_struct *p;\n\tstruct multiprocess_signals delayed;",
+      "explanation": "retval accumulates the error code that the goto ladder will return. p is the child task being built. delayed is a stack-allocated node used to collect signals that are delivered to a whole process group while the fork is mid-flight, so they can be applied to the child atomically once it becomes visible."
+    },
+    {
+      "file": "corpus/train/train_0220_cwe362.c",
+      "lines": "20-24",
+      "code": "\tif ((clone_flags & (CLONE_NEWNS|CLONE_FS)) == (CLONE_NEWNS|CLONE_FS))\n\t\treturn ERR_PTR(-EINVAL);\n\n\tif ((clone_flags & (CLONE_NEWUSER|CLONE_FS)) == (CLONE_NEWUSER|CLONE_FS))\n\t\treturn ERR_PTR(-EINVAL);",
+      "explanation": "First flag-consistency gates. You may not simultaneously create a new mount namespace (CLONE_NEWNS) or a new user namespace (CLONE_NEWUSER) and share the fs_struct (CLONE_FS), because sharing the root directory across a namespace boundary is nonsensical/unsafe. Rejected early with -EINVAL before any allocation, so no cleanup is needed."
+    },
+    {
+      "file": "corpus/train/train_0220_cwe362.c",
+      "lines": "30-39",
+      "code": "\tif ((clone_flags & CLONE_THREAD) && !(clone_flags & CLONE_SIGHAND))\n\t\treturn ERR_PTR(-EINVAL);\n\n\t/*\n\t * Shared signal handlers imply shared VM. By way of the above,\n\t * thread groups also imply shared VM. Blocking this case allows\n\t * for various simplifications in other code.\n\t */\n\tif ((clone_flags & CLONE_SIGHAND) && !(clone_flags & CLONE_VM))\n\t\treturn ERR_PTR(-EINVAL);",
+      "explanation": "Two more invariants: a thread (CLONE_THREAD) must share signal handlers (CLONE_SIGHAND), and sharing signal handlers requires sharing the address space (CLONE_VM). These reduce the space of legal states so downstream copy_* routines can assume consistent sharing. Again a pure early reject."
+    },
+    {
+      "file": "corpus/train/train_0220_cwe362.c",
+      "lines": "47-60",
+      "code": "\tif ((clone_flags & CLONE_PARENT) &&\n\t\t\t\tcurrent->signal->flags & SIGNAL_UNKILLABLE)\n\t\treturn ERR_PTR(-EINVAL);\n\n\t/*\n\t * If the new process will be in a different pid or user namespace\n\t * do not allow it to share a thread group with the forking task.\n\t */\n\tif (clone_flags & CLONE_THREAD) {\n\t\tif ((clone_flags & (CLONE_NEWUSER | CLONE_NEWPID)) ||\n\t\t    (task_active_pid_ns(current) !=\n\t\t\t\tcurrent->nsproxy->pid_ns_for_children))\n\t\t\treturn ERR_PTR(-EINVAL);\n\t}",
+      "explanation": "Prevents an init-like (SIGNAL_UNKILLABLE) task from using CLONE_PARENT to spawn siblings that would become unreaped zombies, and forbids a thread from being created into a different pid/user namespace than the forking task's active pid namespace. These protect the integrity of the process-tree/namespace model."
+    },
+    {
+      "file": "corpus/train/train_0220_cwe362.c",
+      "lines": "68-78",
+      "code": "\tsigemptyset(&delayed.signal);\n\tINIT_HLIST_NODE(&delayed.node);\n\n\tspin_lock_irq(&current->sighand->siglock);\n\tif (!(clone_flags & CLONE_THREAD))\n\t\thlist_add_head(&delayed.node, &current->signal->multiprocess);\n\trecalc_sigpending();\n\tspin_unlock_irq(&current->sighand->siglock);\n\tretval = -ERESTARTNOINTR;\n\tif (signal_pending(current))\n\t\tgoto fork_out;",
+      "explanation": "Under the parent's siglock the delayed node is registered onto current->signal->multiprocess (only for a real fork, not a thread) so that any signal sent to the whole process group during the fork is captured into delayed.signal. recalc_sigpending() refreshes the pending state, and if a signal is now pending the fork is aborted with -ERESTARTNOINTR by jumping to fork_out (which unlinks the delayed node). This is the machinery that makes concurrently-arriving multiprocess signals appear to happen strictly before or after the fork."
+    },
+    {
+      "file": "corpus/train/train_0220_cwe362.c",
+      "lines": "80-95",
+      "code": "\tretval = -ENOMEM;\n\tp = dup_task_struct(current, node);\n\tif (!p)\n\t\tgoto fork_out;\n\n\t/*\n\t * This _must_ happen before we call free_task(), i.e. before we jump\n\t * to any of the bad_fork_* labels. This is to avoid freeing\n\t * p->set_child_tid which is (ab)used as a kthread's data pointer for\n\t * kernel threads (PF_KTHREAD).\n\t */\n\tp->set_child_tid = (clone_flags & CLONE_CHILD_SETTID) ? child_tidptr : NULL;\n\t/*\n\t * Clear TID on mm_release()?\n\t */\n\tp->clear_child_tid = (clone_flags & CLONE_CHILD_CLEARTID) ? child_tidptr : NULL;",
+      "explanation": "dup_task_struct allocates the new task and its kernel stack as a shallow copy of current. From here on, error handling must go through the bad_fork_* labels to free_task(p). The untrusted userspace pointer child_tidptr is stored verbatim into p->set_child_tid and p->clear_child_tid depending on the CLONE_CHILD_SETTID/CLEARTID flags; set_child_tid is written by the kernel after the child starts and clear_child_tid drives the futex clear at task exit (mm_release)."
+    },
+    {
+      "file": "corpus/train/train_0220_cwe362.c",
+      "lines": "105-116",
+      "code": "\tretval = -EAGAIN;\n\tif (atomic_read(&p->real_cred->user->processes) >=\n\t\t\ttask_rlimit(p, RLIMIT_NPROC)) {\n\t\tif (p->real_cred->user != INIT_USER &&\n\t\t    !capable(CAP_SYS_RESOURCE) && !capable(CAP_SYS_ADMIN))\n\t\t\tgoto bad_fork_free;\n\t}\n\tcurrent->flags &= ~PF_NPROC_EXCEEDED;\n\n\tretval = copy_creds(p, clone_flags);\n\tif (retval < 0)\n\t\tgoto bad_fork_free;",
+      "explanation": "Enforces RLIMIT_NPROC: if the owning user already has at least as many processes as the soft limit, and the user is not INIT_USER and lacks CAP_SYS_RESOURCE/CAP_SYS_ADMIN, the fork is rejected with -EAGAIN. The per-user process counter is read with a plain atomic_read of p->real_cred->user->processes, i.e. a snapshot. copy_creds then attaches/copies credentials for the child (which is where the user's process count is actually incremented)."
+    },
+    {
+      "file": "corpus/train/train_0220_cwe362.c",
+      "lines": "118-125",
+      "code": "\t/*\n\t * If multiple threads are within copy_process(), then this check\n\t * triggers too late. This doesn't hurt, the check is only there\n\t * to stop root fork bombs.\n\t */\n\tretval = -EAGAIN;\n\tif (nr_threads >= max_threads)\n\t\tgoto bad_fork_cleanup_count;",
+      "explanation": "A global cap on the total number of tasks. nr_threads is a global counter read here without holding tasklist_lock; the increment happens much later at line 412 under write_lock_irq(&tasklist_lock). The comment itself acknowledges that concurrent copy_process() callers race this check. If it fails, control jumps to bad_fork_cleanup_count to undo the credential/user-count changes."
+    },
+    {
+      "file": "corpus/train/train_0220_cwe362.c",
+      "lines": "127-214",
+      "code": "\tdelayacct_tsk_init(p);\t/* Must remain after dup_task_struct() */\n\tp->flags &= ~(PF_SUPERPRIV | PF_WQ_WORKER | PF_IDLE);\n\tp->flags |= PF_FORKNOEXEC;\n\tINIT_LIST_HEAD(&p->children);\n\tINIT_LIST_HEAD(&p->sibling);\n\trcu_copy_process(p);\n\tp->vfork_done = NULL;\n\tspin_lock_init(&p->alloc_lock);\n\n\tinit_sigpending(&p->pending);",
+      "explanation": "The large per-field initialization block (only the head is quoted; it continues through line 214 zeroing cputime, vtime, rss_stat, timer slack, psi, io accounting, IRQ-flags tracing state, lockdep, mutex-debug and bcache fields under their respective CONFIG_* guards). This is pure state setup on the freshly duplicated task with no external input; it establishes the child's clean initial accounting and debugging state before subsystem copies begin. All of it precedes the point where p becomes visible to other CPUs."
+    },
+    {
+      "file": "corpus/train/train_0220_cwe362.c",
+      "lines": "216-258",
+      "code": "\tretval = sched_fork(clone_flags, p);\n\tif (retval)\n\t\tgoto bad_fork_cleanup_policy;\n\n\tretval = perf_event_init_task(p);\n\tif (retval)\n\t\tgoto bad_fork_cleanup_policy;\n\tretval = audit_alloc(p);\n\tif (retval)\n\t\tgoto bad_fork_cleanup_perf;\n\t/* copy all the process information */\n\tshm_init_task(p);\n\tretval = security_task_alloc(p, clone_flags);\n\tif (retval)\n\t\tgoto bad_fork_cleanup_audit;\n\tretval = copy_semundo(clone_flags, p);\n\tif (retval)\n\t\tgoto bad_fork_cleanup_security;\n\tretval = copy_files(clone_flags, p);\n\tif (retval)\n\t\tgoto bad_fork_cleanup_semundo;\n\tretval = copy_fs(clone_flags, p);\n\tif (retval)\n\t\tgoto bad_fork_cleanup_files;\n\tretval = copy_sighand(clone_flags, p);\n\tif (retval)\n\t\tgoto bad_fork_cleanup_fs;\n\tretval = copy_signal(clone_flags, p);\n\tif (retval)\n\t\tgoto bad_fork_cleanup_signal;\n\tretval = copy_mm(clone_flags, p);\n\tif (retval)\n\t\tgoto bad_fork_cleanup_signal;\n\tretval = copy_namespaces(clone_flags, p);\n\tif (retval)\n\t\tgoto bad_fork_cleanup_mm;\n\tretval = copy_io(clone_flags, p);\n\tif (retval)\n\t\tgoto bad_fork_cleanup_namespaces;\n\tretval = copy_thread_tls(clone_flags, stack_start, stack_size, p, tls);\n\tif (retval)\n\t\tgoto bad_fork_cleanup_io;",
+      "explanation": "The heart of the copy: scheduler setup, perf/audit/LSM allocation, and then the ordered ladder that copies-or-shares each subsystem's per-task state according to clone_flags. Each step checks retval and, on failure, jumps to the precise bad_fork label that unwinds exactly the resources acquired so far and no more. The ordering of the labels mirrors the acquisition order, which is what makes the cleanup correct. copy_thread_tls consumes the attacker-supplied stack_start/stack_size/tls to build the child's register/stack image."
+    },
+    {
+      "file": "corpus/train/train_0220_cwe362.c",
+      "lines": "260-268",
+      "code": "\tstackleak_task_init(p);\n\n\tif (pid != &init_struct_pid) {\n\t\tpid = alloc_pid(p->nsproxy->pid_ns_for_children);\n\t\tif (IS_ERR(pid)) {\n\t\t\tretval = PTR_ERR(pid);\n\t\t\tgoto bad_fork_cleanup_thread;\n\t\t}\n\t}",
+      "explanation": "Unless the caller passed the pre-existing init_struct_pid, a fresh struct pid is allocated in the child's target pid namespace. Failure unwinds via bad_fork_cleanup_thread. The allocated pid is what later ties the task into the pid hash tables and namespaces."
+    },
+    {
+      "file": "corpus/train/train_0220_cwe362.c",
+      "lines": "298-311",
+      "code": "\t/* ok, now we should be set up.. */\n\tp->pid = pid_nr(pid);\n\tif (clone_flags & CLONE_THREAD) {\n\t\tp->exit_signal = -1;\n\t\tp->group_leader = current->group_leader;\n\t\tp->tgid = current->tgid;\n\t} else {\n\t\tif (clone_flags & CLONE_PARENT)\n\t\t\tp->exit_signal = current->group_leader->exit_signal;\n\t\telse\n\t\t\tp->exit_signal = (clone_flags & CSIGNAL);\n\t\tp->group_leader = p;\n\t\tp->tgid = p->pid;\n\t}",
+      "explanation": "Sets the numeric pid and the thread-group identity. For CLONE_THREAD the child joins the caller's thread group (same group_leader/tgid, exit_signal disabled). Otherwise it becomes its own group leader with tgid == pid, and its exit_signal is either inherited (CLONE_PARENT) or taken from the low CSIGNAL bits of clone_flags — i.e. the exit signal delivered to the parent is attacker-selected within the CSIGNAL mask."
+    },
+    {
+      "file": "corpus/train/train_0220_cwe362.c",
+      "lines": "321-345",
+      "code": "\tcgroup_threadgroup_change_begin(current);\n\t/*\n\t * Ensure that the cgroup subsystem policies allow the new process to be\n\t * forked. It should be noted the the new process's css_set can be changed\n\t * between here and cgroup_post_fork() if an organisation operation is in\n\t * progress.\n\t */\n\tretval = cgroup_can_fork(p);\n\tif (retval)\n\t\tgoto bad_fork_free_pid;\n\n\t/*\n\t * Make it visible to the rest of the system, but dont wake it up yet.\n\t * Need tasklist lock for parent etc handling!\n\t */\n\twrite_lock_irq(&tasklist_lock);\n\n\t/* CLONE_PARENT re-uses the old parent */\n\tif (clone_flags & (CLONE_PARENT|CLONE_THREAD)) {\n\t\tp->real_parent = current->real_parent;\n\t\tp->parent_exec_id = current->parent_exec_id;\n\t} else {\n\t\tp->real_parent = current;\n\t\tp->parent_exec_id = current->self_exec_id;\n\t}",
+      "explanation": "cgroup_can_fork asks the cgroup controllers whether the fork is allowed (e.g. pids controller limit); the comment warns that the child's css_set may still be migrated between this check and cgroup_post_fork if a concurrent cgroup organisation operation runs. Then the global tasklist_lock is taken for write — this is the first point of true global serialization for the linkage phase — and the child's real_parent/parent_exec_id are set according to CLONE_PARENT/CLONE_THREAD."
+    },
+    {
+      "file": "corpus/train/train_0220_cwe362.c",
+      "lines": "349-369",
+      "code": "\tspin_lock(&current->sighand->siglock);\n\n\t/*\n\t * Copy seccomp details explicitly here, in case they were changed\n\t * before holding sighand lock.\n\t */\n\tcopy_seccomp(p);\n\n\trseq_fork(p, clone_flags);\n\n\t/* Don't start children in a dying pid namespace */\n\tif (unlikely(!(ns_of_pid(pid)->pid_allocated & PIDNS_ADDING))) {\n\t\tretval = -ENOMEM;\n\t\tgoto bad_fork_cancel_cgroup;\n\t}\n\n\t/* Let kill terminate clone/fork in the middle */\n\tif (fatal_signal_pending(current)) {\n\t\tretval = -EINTR;\n\t\tgoto bad_fork_cancel_cgroup;\n\t}",
+      "explanation": "With siglock now held, seccomp filters are copied under the lock (so a concurrent seccomp change is captured consistently), rseq state is set up, and two last-chance aborts fire: refuse to attach the child if its pid namespace is being torn down (PIDNS_ADDING clear) and refuse if the caller has a pending fatal signal. Both jump to bad_fork_cancel_cgroup, which drops the two locks and cancels the cgroup fork."
+    },
+    {
+      "file": "corpus/train/train_0220_cwe362.c",
+      "lines": "372-413",
+      "code": "\tinit_task_pid_links(p);\n\tif (likely(p->pid)) {\n\t\tptrace_init_task(p, (clone_flags & CLONE_PTRACE) || trace);\n\n\t\tinit_task_pid(p, PIDTYPE_PID, pid);\n\t\tif (thread_group_leader(p)) {\n\t\t\tinit_task_pid(p, PIDTYPE_TGID, pid);\n\t\t\tinit_task_pid(p, PIDTYPE_PGID, task_pgrp(current));\n\t\t\tinit_task_pid(p, PIDTYPE_SID, task_session(current));\n\n\t\t\tif (is_child_reaper(pid)) {\n\t\t\t\tns_of_pid(pid)->child_reaper = p;\n\t\t\t\tp->signal->flags |= SIGNAL_UNKILLABLE;\n\t\t\t}\n\t\t\tp->signal->shared_pending.signal = delayed.signal;\n\t\t\tp->signal->tty = tty_kref_get(current->signal->tty);\n\t\t\tp->signal->has_child_subreaper = p->real_parent->signal->has_child_subreaper ||\n\t\t\t\t\t\t\t p->real_parent->signal->is_child_subreaper;\n\t\t\tlist_add_tail(&p->sibling, &p->real_parent->children);\n\t\t\tlist_add_tail_rcu(&p->tasks, &init_task.tasks);\n\t\t\tattach_pid(p, PIDTYPE_TGID);\n\t\t\tattach_pid(p, PIDTYPE_PGID);\n\t\t\tattach_pid(p, PIDTYPE_SID);\n\t\t\t__this_cpu_inc(process_counts);\n\t\t} else {\n\t\t\tcurrent->signal->nr_threads++;\n\t\t\tatomic_inc(&current->signal->live);\n\t\t\tatomic_inc(&current->signal->sigcnt);\n\t\t\ttask_join_group_stop(p);\n\t\t\tlist_add_tail_rcu(&p->thread_group,\n\t\t\t\t\t  &p->group_leader->thread_group);\n\t\t\tlist_add_tail_rcu(&p->thread_node,\n\t\t\t\t\t  &p->signal->thread_head);\n\t\t}\n\t\tattach_pid(p, PIDTYPE_PID);\n\t\tnr_threads++;\n\t}",
+      "explanation": "The linkage phase under tasklist_lock+siglock. The pid links are initialised, ptrace inheritance is set, and depending on whether the child is a thread-group leader it is either wired into the process tree (sibling/children lists, PGID/SID pid types, tty inheritance, has_child_subreaper propagation, and the delayed multiprocess signals folded into shared_pending) or into the existing thread group (nr_threads/live/sigcnt bumped, thread_group/thread_node lists). Finally attach_pid(PIDTYPE_PID) publishes it and the global nr_threads is incremented — this is the increment that the earlier line-124 check raced against."
+    },
+    {
+      "file": "corpus/train/train_0220_cwe362.c",
+      "lines": "414-428",
+      "code": "\ttotal_forks++;\n\thlist_del_init(&delayed.node);\n\tspin_unlock(&current->sighand->siglock);\n\tsyscall_tracepoint_update(p);\n\twrite_unlock_irq(&tasklist_lock);\n\n\tproc_fork_connector(p);\n\tcgroup_post_fork(p);\n\tcgroup_threadgroup_change_end(current);\n\tperf_event_fork(p);\n\n\ttrace_task_newtask(p, clone_flags);\n\tuprobe_copy_process(p, clone_flags);\n\n\treturn p;",
+      "explanation": "Success path: the global total_forks is bumped, the delayed node is unlinked from the parent's multiprocess list (so no further group signals are folded in), the locks are released, and the post-visibility hooks run (proc connector notification, cgroup_post_fork to finalize cgroup membership — the counterpart to the earlier cgroup_can_fork window, perf/trace/uprobe fork events). The fully-formed task is returned to the caller (_do_fork), which will wake it."
+    },
+    {
+      "file": "corpus/train/train_0220_cwe362.c",
+      "lines": "430-483",
+      "code": "bad_fork_cancel_cgroup:\n\tspin_unlock(&current->sighand->siglock);\n\twrite_unlock_irq(&tasklist_lock);\n\tcgroup_cancel_fork(p);\nbad_fork_free_pid:\n\tcgroup_threadgroup_change_end(current);\n\tif (pid != &init_struct_pid)\n\t\tfree_pid(pid);\nbad_fork_cleanup_thread:\n\texit_thread(p);\nbad_fork_cleanup_io:\n\tif (p->io_context)\n\t\texit_io_context(p);\nbad_fork_cleanup_namespaces:\n\texit_task_namespaces(p);\nbad_fork_cleanup_mm:\n\tif (p->mm)\n\t\tmmput(p->mm);\nbad_fork_cleanup_signal:\n\tif (!(clone_flags & CLONE_THREAD))\n\t\tfree_signal_struct(p->signal);\nbad_fork_cleanup_sighand:\n\t__cleanup_sighand(p->sighand);\nbad_fork_cleanup_fs:\n\texit_fs(p); /* blocking */\nbad_fork_cleanup_files:\n\texit_files(p); /* blocking */\nbad_fork_cleanup_semundo:\n\texit_sem(p);\nbad_fork_cleanup_security:\n\tsecurity_task_free(p);\nbad_fork_cleanup_audit:\n\taudit_free(p);\nbad_fork_cleanup_perf:\n\tperf_event_free_task(p);\nbad_fork_cleanup_policy:\n\tlockdep_free_task(p);\n#ifdef CONFIG_NUMA\n\tmpol_put(p->mempolicy);\nbad_fork_cleanup_threadgroup_lock:\n#endif\n\tdelayacct_tsk_free(p);\nbad_fork_cleanup_count:\n\tatomic_dec(&p->cred->user->processes);\n\texit_creds(p);\nbad_fork_free:\n\tp->state = TASK_DEAD;\n\tput_task_stack(p);\n\tfree_task(p);\nfork_out:\n\tspin_lock_irq(&current->sighand->siglock);\n\thlist_del_init(&delayed.node);\n\tspin_unlock_irq(&current->sighand->siglock);\n\treturn ERR_PTR(retval);",
+      "explanation": "The fall-through cleanup ladder: each label undoes exactly one acquisition step and then falls into the next, so entering at the correct label unwinds precisely the resources held. bad_fork_free sets TASK_DEAD, releases the kernel stack and frees the task. Every error path ultimately reaches fork_out, which re-acquires siglock to unlink the delayed multiprocess node (idempotent — hlist_del_init is safe even if it was never added, e.g. the CLONE_THREAD case) and returns the encoded errno. The correctness of this whole function's safety hinges on the label order matching the acquisition order."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0220_cwe362.c",
+      "lines": "105-111",
+      "code": "\tretval = -EAGAIN;\n\tif (atomic_read(&p->real_cred->user->processes) >=\n\t\t\ttask_rlimit(p, RLIMIT_NPROC)) {\n\t\tif (p->real_cred->user != INIT_USER &&\n\t\t    !capable(CAP_SYS_RESOURCE) && !capable(CAP_SYS_ADMIN))\n\t\t\tgoto bad_fork_free;\n\t}",
+      "explanation": "Time-of-check/time-of-use race on the per-user process count. The limit is evaluated with a lone atomic_read snapshot at line 106, but the actual increment of user->processes happens later inside copy_creds (line 114) and, symmetrically, the decrement is on the cleanup path. Two or more threads of the same uid calling clone() in parallel can each read a count below RLIMIT_NPROC and each proceed, so the aggregate number of processes transiently overshoots the limit by up to the number of concurrent forkers. Impact is a soft resource-limit bypass / local DoS pressure (fork-bomb throttling weakened), not memory corruption. The invariant the implementation must uphold is that the check-and-increment be atomic with respect to concurrent forks; here they are decoupled."
+    },
+    {
+      "file": "corpus/train/train_0220_cwe362.c",
+      "lines": "123-125",
+      "code": "\tretval = -EAGAIN;\n\tif (nr_threads >= max_threads)\n\t\tgoto bad_fork_cleanup_count;",
+      "explanation": "The same TOCTOU pattern on the global task cap, and the code comment at lines 119-122 admits it. nr_threads is read here with no lock, while the matching nr_threads++ (line 412) executes far downstream under write_lock_irq(&tasklist_lock). N concurrent copy_process() callers can all observe nr_threads < max_threads and all subsequently increment it, letting the live task count exceed max_threads by up to N. Because the whole prologue between this check and line 412 (all the copy_* work) is unserialized, the window is large. Upstream treats this as an acceptable soft cap, but it is a genuine CWE-362 race: the guard is advisory, not enforcing. To be strictly safe the compare-and-increment would have to occur under tasklist_lock."
+    },
+    {
+      "file": "corpus/train/train_0220_cwe362.c",
+      "lines": "321-330",
+      "code": "\tcgroup_threadgroup_change_begin(current);\n\t/*\n\t * Ensure that the cgroup subsystem policies allow the new process to be\n\t * forked. It should be noted the the new process's css_set can be changed\n\t * between here and cgroup_post_fork() if an organisation operation is in\n\t * progress.\n\t */\n\tretval = cgroup_can_fork(p);\n\tif (retval)\n\t\tgoto bad_fork_free_pid;",
+      "explanation": "A documented race window between cgroup_can_fork() here and cgroup_post_fork() at line 421: a concurrent cgroup migration ('organisation operation') can change the child's css_set in between. If the enforcement decision (e.g. the pids controller admission) is made against one css_set but the task is ultimately committed into a different one, the policy check can be stale — an attacker racing clone() against cgroup moves could momentarily land a task under a controller state that did not admit it. The invariant is that admission and commitment observe the same css_set; the code relies on cgroup_post_fork re-taking the css_set_lock to reconcile, so this is a narrow, largely-mitigated window rather than a hard bypass, but it is a real concurrency contract to verify."
+    },
+    {
+      "file": "corpus/train/train_0220_cwe362.c",
+      "lines": "355-363",
+      "code": "\tcopy_seccomp(p);\n\n\trseq_fork(p, clone_flags);\n\n\t/* Don't start children in a dying pid namespace */\n\tif (unlikely(!(ns_of_pid(pid)->pid_allocated & PIDNS_ADDING))) {\n\t\tretval = -ENOMEM;\n\t\tgoto bad_fork_cancel_cgroup;\n\t}",
+      "explanation": "The child must not be attached into a pid namespace that is concurrently being disabled/reaped. This PIDNS_ADDING test is the guard against that race, and it is deliberately performed while holding both tasklist_lock and siglock so it is atomic with the subsequent attach_pid() linkage. The failure mode if this ordering were wrong (check outside the lock, or attach before the check) would be a use-after-free/zombie in a dying pid namespace. The invariant to confirm is that PIDNS_ADDING is tested and the task linked under the same lock hold — as written it is, so this is the correctly-placed defense; the review point is that any refactor that moves the attach or drops the lock reintroduces a CWE-362 UAF."
+    },
+    {
+      "file": "corpus/train/train_0220_cwe362.c",
+      "lines": "68-73",
+      "code": "\tsigemptyset(&delayed.signal);\n\tINIT_HLIST_NODE(&delayed.node);\n\n\tspin_lock_irq(&current->sighand->siglock);\n\tif (!(clone_flags & CLONE_THREAD))\n\t\thlist_add_head(&delayed.node, &current->signal->multiprocess);",
+      "explanation": "delayed is a stack object linked into current->signal->multiprocess, a list walked by concurrent signal senders (under siglock) to record group-directed signals arriving during the fork. Correctness depends on two things holding on every path: (1) the node is only ever traversed while siglock is held — true here, add at line 73 and both removals (line 415 success, line 481 fork_out) are under siglock; and (2) the node is removed before copy_process returns and its stack frame dies. Every error path falls through to fork_out which unlinks it, so there is no use-after-free of the stack node. The hazard to verify is that no early return or future goto bypasses fork_out, which would leave a dangling stack address on a live list — a CWE-416 waiting to happen."
+    },
+    {
+      "file": "corpus/train/train_0220_cwe362.c",
+      "lines": "91-95",
+      "code": "\tp->set_child_tid = (clone_flags & CLONE_CHILD_SETTID) ? child_tidptr : NULL;\n\t/*\n\t * Clear TID on mm_release()?\n\t */\n\tp->clear_child_tid = (clone_flags & CLONE_CHILD_CLEARTID) ? child_tidptr : NULL;",
+      "explanation": "child_tidptr is an unvalidated userspace pointer that is stored directly into the task and used later: set_child_tid is written after the child starts and clear_child_tid drives a put_user(0) plus futex wake in mm_release() at task exit. No access_ok() is done here, which is fine only because the later accesses go through the put_user()/get_user() user-access helpers that themselves validate the address. The contract to uphold is that every dereference of these fields uses the user-access API and never a raw kernel dereference; if any consumer treated child_tidptr as a trusted kernel address it would be an arbitrary-write primitive (CWE-20/CWE-787). This is why the comment at lines 85-90 stresses that set_child_tid is also (ab)used as the kthread data pointer — mixing those semantics is the latent risk."
+    },
+    {
+      "file": "corpus/train/train_0220_cwe362.c",
+      "lines": "430-478",
+      "code": "bad_fork_cancel_cgroup:\n\tspin_unlock(&current->sighand->siglock);\n\twrite_unlock_irq(&tasklist_lock);\n\tcgroup_cancel_fork(p);\nbad_fork_free_pid:\n\tcgroup_threadgroup_change_end(current);\n\tif (pid != &init_struct_pid)\n\t\tfree_pid(pid);\nbad_fork_cleanup_thread:\n\texit_thread(p);",
+      "explanation": "The fall-through goto ladder is correct only as long as the entry label for each failure exactly matches the set of resources acquired at that point. This is fragile by construction: if a future edit adds a resource acquisition (a new copy_*), or reorders acquisitions, without inserting/moving the matching cleanup label, the wrong amount of unwinding runs — either a leak (CWE-772) of the un-freed resource or a double-free/use-after-free (CWE-415/CWE-416) of something freed at a label that shouldn't run. As shown the ordering is consistent, so this is a maintenance-hazard / latent finding rather than an active bug; the thing to confirm is that each goto target throughout the function still corresponds to its acquisition depth."
+    }
+  ],
+  "summary": "This is Linux kernel copy_process() (kernel/fork.c). Its dominant risk class is CWE-362 concurrency: several pieces of global admission state — the per-user RLIMIT_NPROC count (line 106) and the global nr_threads/max_threads cap (line 124) — are checked with lockless snapshots but only mutated later under tasklist_lock (line 412), so concurrent clone() callers can overshoot both limits (a soft resource-limit / fork-bomb-throttle bypass, acknowledged in-code). A second documented window exists between cgroup_can_fork() and cgroup_post_fork(). The safety-critical linkage (PIDNS_ADDING check + attach_pid) is correctly serialized under tasklist_lock/siglock, and the delayed-signal stack node and the bad_fork_* cleanup ladder are correct as written; those are latent hazards to guard on future edits, not active memory-corruption bugs in the shown code.",
+  "reviewed_anchors": [
+    {"anchor": "copy_process() signature (clone_flags, stack_start, stack_size, child_tidptr, pid, trace, tls, node)", "disposition": "finding", "reason": "All parameters are attacker-controlled via the clone() syscall; child_tidptr is an untrusted __user pointer, clone_flags steers all control flow."},
+    {"anchor": "__latent_entropy attribute (line 2)", "disposition": "dismissed", "reason": "gcc hardening-plugin marker, no runtime security contract."},
+    {"anchor": "struct multiprocess_signals delayed (line 14)", "disposition": "finding", "reason": "Stack object linked onto a globally-walked signal list; lifetime/lock discipline must be verified against every exit path (potential CWE-416 if bypassed)."},
+    {"anchor": "CLONE_NEWNS/CLONE_FS and CLONE_NEWUSER/CLONE_FS gates (lines 20-24)", "disposition": "dismissed", "reason": "Pure early-reject flag-consistency checks with no allocation; correctly return -EINVAL."},
+    {"anchor": "CLONE_THREAD/SIGHAND and SIGHAND/VM gates (lines 30-39)", "disposition": "dismissed", "reason": "State-space-reduction invariants, early reject only."},
+    {"anchor": "CLONE_PARENT + SIGNAL_UNKILLABLE / CLONE_THREAD pid-ns gate (lines 47-60)", "disposition": "dismissed", "reason": "Namespace/reaper integrity checks; reject-only, no memory operation."},
+    {"anchor": "delayed multiprocess signal registration + recalc_sigpending (lines 68-78)", "disposition": "finding", "reason": "Cross-thread list under siglock; correctness depends on removal on all paths."},
+    {"anchor": "dup_task_struct(current, node) (line 81)", "disposition": "dismissed", "reason": "Allocation with NULL check and correct goto fork_out; node is only a NUMA hint."},
+    {"anchor": "p->set_child_tid / p->clear_child_tid = child_tidptr (lines 91,95)", "disposition": "finding", "reason": "Untrusted userspace pointer stored for deferred use; safe only if all consumers use user-access helpers (latent CWE-20/787)."},
+    {"anchor": "RLIMIT_NPROC check on real_cred->user->processes (lines 105-111)", "disposition": "finding", "reason": "Lockless check-then-increment TOCTOU across concurrent forks (CWE-362/367)."},
+    {"anchor": "copy_creds(p, clone_flags) (line 114)", "disposition": "dismissed", "reason": "Return checked, unwinds to bad_fork_free; internal logic not shown."},
+    {"anchor": "nr_threads >= max_threads global cap (lines 123-125)", "disposition": "finding", "reason": "Lockless read vs later locked nr_threads++ (line 412): global task-cap TOCTOU, admitted by the comment (CWE-362)."},
+    {"anchor": "Per-field init block (lines 127-214)", "disposition": "dismissed", "reason": "Deterministic state initialization on the private, not-yet-visible task; no external input."},
+    {"anchor": "copy_* subsystem ladder (lines 227-258)", "disposition": "dismissed", "reason": "Each return value checked and routed to a matching bad_fork label; correct as shown, internals not provided."},
+    {"anchor": "alloc_pid(p->nsproxy->pid_ns_for_children) (lines 262-268)", "disposition": "dismissed", "reason": "IS_ERR-checked with correct cleanup goto."},
+    {"anchor": "p->exit_signal = (clone_flags & CSIGNAL) (line 308)", "disposition": "dismissed", "reason": "Masked to CSIGNAL bits; attacker choice is bounded to a valid signal-number field, no overflow."},
+    {"anchor": "cgroup_can_fork(p) vs cgroup_post_fork(p) (lines 321-330, 421)", "disposition": "finding", "reason": "Documented css_set-migration race window between admission and commitment (CWE-362)."},
+    {"anchor": "write_lock_irq(&tasklist_lock) linkage section (lines 336-345)", "disposition": "dismissed", "reason": "Global serialization point; parent assignment is correct under the lock."},
+    {"anchor": "copy_seccomp(p) under siglock (lines 349-355)", "disposition": "dismissed", "reason": "Explicitly taken under siglock to avoid a seccomp-change race; correctly placed."},
+    {"anchor": "PIDNS_ADDING dying-namespace check (lines 359-363)", "disposition": "finding", "reason": "Race-critical guard; correctly under tasklist_lock/siglock here, but the contract must hold on any refactor (latent CWE-362/416)."},
+    {"anchor": "fatal_signal_pending abort (lines 366-369)", "disposition": "dismissed", "reason": "Correct mid-fork cancellation under lock, routes to bad_fork_cancel_cgroup."},
+    {"anchor": "attach block: list_add_tail_rcu/attach_pid/nr_threads++ (lines 372-413)", "disposition": "dismissed", "reason": "Publication happens only after full init and only under tasklist_lock+siglock; the nr_threads++ here is the locked counterpart flagged in the line-124 finding."},
+    {"anchor": "total_forks++ / delayed removal / unlock (lines 414-418)", "disposition": "dismissed", "reason": "total_forks is a statistic; delayed node removed under siglock as required."},
+    {"anchor": "bad_fork_* fall-through cleanup ladder (lines 430-483)", "disposition": "finding", "reason": "Correct as written but structurally fragile; label-vs-acquisition ordering is the safety invariant (latent CWE-772/416)."}
+  ],
+  "findings": [
+    {
+      "title": "TOCTOU on RLIMIT_NPROC per-user process count",
+      "anchor": "if (atomic_read(&p->real_cred->user->processes) >= task_rlimit(p, RLIMIT_NPROC))",
+      "file": "corpus/train/train_0220_cwe362.c",
+      "line": "105-111",
+      "code": "\tretval = -EAGAIN;\n\tif (atomic_read(&p->real_cred->user->processes) >=\n\t\t\ttask_rlimit(p, RLIMIT_NPROC)) {\n\t\tif (p->real_cred->user != INIT_USER &&\n\t\t    !capable(CAP_SYS_RESOURCE) && !capable(CAP_SYS_ADMIN))\n\t\t\tgoto bad_fork_free;\n\t}",
+      "bug_class": "Race condition / time-of-check-to-time-of-use on resource accounting",
+      "cwe": "CWE-362",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0220_cwe362.c",
+      "invariant": "The per-user process-count check and the increment performed by copy_creds() must be atomic with respect to concurrent copy_process() invocations for the same uid, so the RLIMIT_NPROC ceiling cannot be exceeded.",
+      "failure_mode": "The count is read as a lockless snapshot (line 106) while the increment occurs later in copy_creds() (line 114). Multiple same-uid threads calling clone() concurrently each see a below-limit value and all proceed, transiently exceeding RLIMIT_NPROC by up to the number of concurrent forkers. Result: soft process-limit bypass / weakened fork-bomb throttling; local resource-exhaustion DoS pressure, not memory corruption.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether user->processes is incremented under the same synchronization as the check (it is not here), and whether any code relies on RLIMIT_NPROC being a hard bound rather than advisory."
+    },
+    {
+      "title": "TOCTOU on global nr_threads/max_threads cap (acknowledged in-code)",
+      "anchor": "if (nr_threads >= max_threads) goto bad_fork_cleanup_count;",
+      "file": "corpus/train/train_0220_cwe362.c",
+      "line": "123-125",
+      "code": "\tretval = -EAGAIN;\n\tif (nr_threads >= max_threads)\n\t\tgoto bad_fork_cleanup_count;",
+      "bug_class": "Race condition / TOCTOU on global counter (unlocked read vs locked write)",
+      "cwe": "CWE-362",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0220_cwe362.c",
+      "invariant": "The comparison of nr_threads against max_threads and the nr_threads++ at line 412 must be serialized so the total live-task count never exceeds max_threads.",
+      "failure_mode": "nr_threads is read here without tasklist_lock, but incremented at line 412 under write_lock_irq(&tasklist_lock). N concurrent copy_process() callers can all pass the check and all increment, overshooting max_threads by up to N; the large unserialized copy_* prologue between check and increment widens the window. The in-code comment (lines 119-122) admits the check 'triggers too late'. Impact: system-wide task-cap overshoot / DoS pressure.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether the compare-and-increment of nr_threads is intended to be advisory; if a hard cap is required it must be evaluated under tasklist_lock adjacent to the increment."
+    },
+    {
+      "title": "cgroup admission vs commitment race window (css_set migration)",
+      "anchor": "retval = cgroup_can_fork(p);",
+      "file": "corpus/train/train_0220_cwe362.c",
+      "line": "321-330",
+      "code": "\tcgroup_threadgroup_change_begin(current);\n\t/*\n\t * Ensure that the cgroup subsystem policies allow the new process to be\n\t * forked. It should be noted the the new process's css_set can be changed\n\t * between here and cgroup_post_fork() if an organisation operation is in\n\t * progress.\n\t */\n\tretval = cgroup_can_fork(p);\n\tif (retval)\n\t\tgoto bad_fork_free_pid;",
+      "bug_class": "Race condition between admission check and final commitment",
+      "cwe": "CWE-362",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "The cgroup controller admission decision made in cgroup_can_fork() must apply to the same css_set the child is ultimately committed into by cgroup_post_fork() (line 421).",
+      "failure_mode": "As the in-code comment states, a concurrent cgroup organisation operation can change the child's css_set between cgroup_can_fork() and cgroup_post_fork(). An attacker racing clone() against cgroup moves could have the admission evaluated against one controller state while the task lands in another, momentarily evading a controller limit (e.g. pids). The reconciliation relies on cgroup_post_fork re-taking css_set_lock, so the window is narrow, but the contract must be verified.",
+      "cve_analog": "",
+      "what_to_confirm": "That cgroup_post_fork()/cgroup_cancel_fork() correctly re-validate under css_set_lock and reject/charge against the final css_set, closing the window opened at line 328."
+    },
+    {
+      "title": "Untrusted userspace child_tidptr stored for deferred dereference",
+      "anchor": "p->clear_child_tid = (clone_flags & CLONE_CHILD_CLEARTID) ? child_tidptr : NULL;",
+      "file": "corpus/train/train_0220_cwe362.c",
+      "line": "91-95",
+      "code": "\tp->set_child_tid = (clone_flags & CLONE_CHILD_SETTID) ? child_tidptr : NULL;\n\t/*\n\t * Clear TID on mm_release()?\n\t */\n\tp->clear_child_tid = (clone_flags & CLONE_CHILD_CLEARTID) ? child_tidptr : NULL;",
+      "bug_class": "Deferred use of unvalidated user-supplied pointer",
+      "cwe": "CWE-20",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "Every later access to p->set_child_tid / p->clear_child_tid must go through the user-access API (put_user/get_user, which enforce access_ok), never a raw kernel dereference, since child_tidptr is an arbitrary userspace address.",
+      "failure_mode": "child_tidptr is stored verbatim with no validation here. It is later written (put_user(0) at task exit via mm_release for clear_child_tid) and futex-woken. If any consumer dereferenced it as a trusted kernel pointer, an unprivileged caller could turn it into an arbitrary kernel write. The comment further notes set_child_tid doubles as a kthread data pointer (PF_KTHREAD), so conflating the two semantics is the latent hazard.",
+      "cve_analog": "",
+      "what_to_confirm": "That mm_release() and any other reader of set_child_tid/clear_child_tid use put_user/get_user (never a direct dereference), and that the PF_KTHREAD data-pointer overload can never reach the user-copy path."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm whether RLIMIT_NPROC (line 106) and nr_threads/max_threads (line 124) are intended as hard or advisory limits; if hard, the check must be co-located with the increment under tasklist_lock.",
+    "Verify user->processes is incremented in copy_creds() and decremented on every bad_fork path exactly once (line 473 uses p->cred->user; ensure p->cred and p->real_cred coincide after copy_creds so the accounting is symmetric).",
+    "Trace every exit path to ensure the delayed multiprocess node (line 73) is unlinked before the stack frame dies — success (line 415), fork_out (line 481), and all fall-through bad_fork_* paths — with no early return bypassing it.",
+    "Confirm the PIDNS_ADDING check (line 360) and attach_pid() linkage (lines 397-411) execute under the same tasklist_lock/siglock hold so a dying pid namespace cannot be raced.",
+    "Verify cgroup_post_fork()/cgroup_cancel_fork() reconcile the child's final css_set under css_set_lock, closing the cgroup_can_fork window (line 328).",
+    "Ensure all dereferences of set_child_tid/clear_child_tid use put_user/get_user and that the PF_KTHREAD data-pointer overload never reaches a user-copy.",
+    "Re-verify that each bad_fork_* label unwinds exactly the resources acquired up to its point (label order vs acquisition order) so no leak, double-free, or use-after-free is introduced."
+  ]
+}

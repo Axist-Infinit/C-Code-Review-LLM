@@ -1,0 +1,162 @@
+{
+  "subsystem": "GnuPG / Libgcrypt CSPRNG entropy-pool mixing. mix_pool() is the core stirring function of the RAND (random.c) subsystem: it takes the raw entropy pool and runs it through RIPEMD-160 in overlapping blocks so that every byte of freshly-added entropy is diffused across the whole pool before bytes are handed out as random output. It is not a parser; it is the mixing primitive that underpins key generation, nonces, and IVs.",
+  "provenance": "Identified from the RIPEMD-160 idiom (RMD160_CONTEXT md, rmd160_init, rmd160_mixblock, the DIGESTLEN==20 compile-time guard for 'ripe-md-160'), the pool/hashbuf/POOLSIZE/BLOCKLEN/POOLBLOCKS naming, and the trailing burn_stack(384) call to scrub secret material off the stack. This exact code is the mix_pool() routine from GnuPG 1.x / Libgcrypt random/random.c (byte *pool signature, hashbuf = pool + POOLSIZE scratch region). The banner comment 'primevul_c_train_2725_vuln' and file name '_cwe200' further mark it as a labelled sample, but the review is performed blind on the code's merits.",
+  "trust_boundary": "Unusual boundary for this corpus: mix_pool() does NOT consume attacker-supplied wire data, so the classic overflow-from-hostile-length framing does not apply. The pool buffer is internal CSPRNG state. The adversary here is a cryptographic observer who can see some random-generator OUTPUT (nonces, IVs, session material) and who wins if the mixing is incomplete enough that unseen pool bytes become predictable or that internal state can be reconstructed. Therefore the hostile surface is the QUALITY and COMPLETENESS of the transform (does every pool byte actually get stirred into every output block?), plus the memory-safety contract of the scratch region hashbuf that lives past the end of the pool.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0244_cwe200.c",
+      "lines": "1-7",
+      "code": "/* sample: primevul_c_train_2725_vuln */\nmix_pool(byte *pool)\n{\n    char *hashbuf = pool + POOLSIZE;\n    char *p, *pend;\n    int i, n;\n    RMD160_CONTEXT md;",
+      "explanation": "mix_pool(byte *pool) receives a pointer to the entropy pool, a fixed-size byte array of POOLSIZE bytes that holds the CSPRNG's accumulated state. hashbuf is aliased to pool + POOLSIZE, i.e. it points at the memory IMMEDIATELY AFTER the logical pool; this is a BLOCKLEN-byte scratch buffer that the caller is expected to have over-allocated (the pool object must be POOLSIZE+BLOCKLEN bytes long). p and pend are cursors walking the pool; i and n are loop counters. md is the RIPEMD-160 hashing context used to compress each block. Note the function has no explicit return type in the shown slice (K&R-style / macro'd), and no bounds arguments — all sizing is by compile-time macros POOLSIZE, BLOCKLEN, DIGESTLEN, POOLBLOCKS."
+    },
+    {
+      "file": "corpus/train/train_0244_cwe200.c",
+      "lines": "9-12",
+      "code": "rmd160_init( &md );\n#if DIGESTLEN != 20\n#error must have a digest length of 20 for ripe-md-160\n#endif",
+      "explanation": "rmd160_init(&md) resets the RIPEMD-160 context to its initial state. The #if/#error is a compile-time assertion that DIGESTLEN is exactly 20, matching the 160-bit (20-byte) RIPEMD-160 output. This guard confirms the algorithm identity and that all the DIGESTLEN-stride arithmetic below assumes a 20-byte digest; it prevents the code from being built with a mismatched digest macro that would silently corrupt the block layout."
+    },
+    {
+      "file": "corpus/train/train_0244_cwe200.c",
+      "lines": "13-18",
+      "code": "/* loop over the pool */\n    pend = pool + POOLSIZE;\n    memcpy(hashbuf, pend - DIGESTLEN, DIGESTLEN );\n    memcpy(hashbuf+DIGESTLEN, pool, BLOCKLEN-DIGESTLEN);\n    rmd160_mixblock( &md, hashbuf);\n    memcpy(pool, hashbuf, DIGESTLEN);",
+      "explanation": "pend is set to the end of the logical pool (pool + POOLSIZE). This block builds the FIRST mixing block, which deliberately wraps the pool: hashbuf[0..DIGESTLEN) is filled from the LAST DIGESTLEN bytes of the pool (pend - DIGESTLEN), and hashbuf[DIGESTLEN..BLOCKLEN) is filled from the FIRST BLOCKLEN-DIGESTLEN bytes of the pool (starting at pool). So this block feeds RIPEMD-160 the tail of the pool concatenated with the head, giving a wrap-around chaining so the first and last regions influence each other. rmd160_mixblock(&md, hashbuf) compresses the assembled BLOCKLEN-byte block, and the resulting DIGESTLEN-byte digest is written back over the first DIGESTLEN bytes of the pool (memcpy(pool, hashbuf, DIGESTLEN)). Intent: each 20-byte slot of the pool is replaced by a hash that depends on that slot plus the following block of pool bytes."
+    },
+    {
+      "file": "corpus/train/train_0244_cwe200.c",
+      "lines": "20-24",
+      "code": "p = pool;\n    for( n=1; n < POOLBLOCKS; n++ ) {\n\tmemcpy(hashbuf, p, DIGESTLEN );\n\n\tp += DIGESTLEN;",
+      "explanation": "The main loop starts p at the pool base and iterates POOLBLOCKS-1 times (n from 1 to POOLBLOCKS-1). Each iteration first copies the current DIGESTLEN (20) bytes at p into the front of hashbuf (memcpy(hashbuf, p, DIGESTLEN)). Then it advances p by DIGESTLEN. The critical thing to track is that AFTER this p += DIGESTLEN, p now points 20 bytes PAST the slot whose contents were just placed in hashbuf[0..DIGESTLEN). The design intent is that hashbuf should end up holding one contiguous BLOCKLEN window of the pool starting at the slot that was copied — i.e. hashbuf[DIGESTLEN..BLOCKLEN) should be filled from the bytes immediately following that slot, which after the advance is exactly the location p now points to."
+    },
+    {
+      "file": "corpus/train/train_0244_cwe200.c",
+      "lines": "25-26",
+      "code": "if( p+DIGESTLEN+BLOCKLEN < pend )\n\t    memcpy(hashbuf+DIGESTLEN, p+DIGESTLEN, BLOCKLEN-DIGESTLEN);",
+      "explanation": "The fast path: when there is comfortably enough pool ahead (p+DIGESTLEN+BLOCKLEN < pend), the tail of the block hashbuf[DIGESTLEN..BLOCKLEN) is filled with BLOCKLEN-DIGESTLEN (44) bytes copied from p+DIGESTLEN. But p was already advanced by DIGESTLEN at line 24, so the source is DIGESTLEN bytes beyond where the contiguous window should begin. The window actually assembled is pool_slot[0..20) followed by pool bytes at offset 40..84 relative to the original slot — the 20 bytes at offset 20..40 are SKIPPED and never enter this block. The block is then compressed and written back (see below). This off-by-one-slot in the source pointer is the substantive defect."
+    },
+    {
+      "file": "corpus/train/train_0244_cwe200.c",
+      "lines": "27-34",
+      "code": "else {\n\t    char *pp = p+DIGESTLEN;\n\t    for(i=DIGESTLEN; i < BLOCKLEN; i++ ) {\n\t\tif( pp >= pend )\n\t\t    pp = pool;\n\t\thashbuf[i] = *pp++;\n\t    }\n\t}",
+      "explanation": "The wrap-around path, taken near the end of the pool where a straight 44-byte copy would run off pend. It fills hashbuf[DIGESTLEN..BLOCKLEN) one byte at a time from pp, and when pp reaches pend it wraps back to pool, so the block is completed with bytes from the start of the pool. Crucially pp is initialised to p+DIGESTLEN, the SAME shifted source as the fast path, so this branch reproduces the identical 20-byte gap: the bytes at offset 20..40 after the original slot are skipped here too. Functionally the two branches are equivalent except for the wrap; both should have started the tail source at p (post-advance), not p+DIGESTLEN."
+    },
+    {
+      "file": "corpus/train/train_0244_cwe200.c",
+      "lines": "36-38",
+      "code": "rmd160_mixblock( &md, hashbuf);\n\tmemcpy(p, hashbuf, DIGESTLEN);\n    }",
+      "explanation": "After the block is assembled, rmd160_mixblock(&md, hashbuf) compresses the BLOCKLEN-byte hashbuf and leaves a fresh DIGESTLEN-byte digest at the front of hashbuf, which is written back over the pool at p (memcpy(p, hashbuf, DIGESTLEN)). Because p was advanced by DIGESTLEN before this, each iteration replaces the NEXT 20-byte slot with a hash that (in the intended design) depends on that slot and the BLOCKLEN window following it. The loop thus rolls a 20-byte-stride hashing window across the whole pool, chaining each digest into the RIPEMD-160 state md so later slots depend on earlier ones."
+    },
+    {
+      "file": "corpus/train/train_0244_cwe200.c",
+      "lines": "39-40",
+      "code": "burn_stack (384); /* for the rmd160_mixblock() */\n}",
+      "explanation": "burn_stack(384) overwrites 384 bytes of the stack below the current frame to scrub any residual secret material (RIPEMD-160 intermediate state, copies of pool bytes) that rmd160_mixblock() and the local buffers may have left there, reducing the window in which a later stack disclosure could leak entropy-pool contents. The 384 is a hand-computed estimate of the deepest stack the mixing used. The function then returns."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0244_cwe200.c",
+      "lines": "22-26",
+      "code": "memcpy(hashbuf, p, DIGESTLEN );\n\n\tp += DIGESTLEN;\n\tif( p+DIGESTLEN+BLOCKLEN < pend )\n\t    memcpy(hashbuf+DIGESTLEN, p+DIGESTLEN, BLOCKLEN-DIGESTLEN);",
+      "explanation": "Incomplete mixing / predictable RNG output (CVE-2016-6313). The first memcpy places the 20-byte slot at p into hashbuf[0..DIGESTLEN); line 24 then advances p by DIGESTLEN. The tail copy at line 26 reads from p+DIGESTLEN, i.e. TWO digest-lengths past the original slot, so the 20 pool bytes lying between the copied slot and the copied tail are never fed into this RIPEMD-160 block. To assemble one contiguous BLOCKLEN window the source should have been p (the post-advance pointer), not p+DIGESTLEN. The correct code is 'if (p+BLOCKLEN < pend) memcpy(hashbuf+DIGESTLEN, p, BLOCKLEN-DIGESTLEN)'. Consequence: a fixed 20-byte stripe of every mixing window is skipped, so the diffusion the pool relies on is weaker than intended — freshly added entropy is not spread across all of the pool, and an observer of some generator output can predict/reconstruct pool bytes that should have been mixed in (the published analysis showed the first bytes of output after a mix were derivable from prior output). This is a cryptographic-strength/information-exposure defect, not a memory-safety crash: the invariant the implementation must uphold is that every byte of the pool is stirred into the hash state on each pass, with no gaps in the sliding window."
+    },
+    {
+      "file": "corpus/train/train_0244_cwe200.c",
+      "lines": "28-33",
+      "code": "char *pp = p+DIGESTLEN;\n\t    for(i=DIGESTLEN; i < BLOCKLEN; i++ ) {\n\t\tif( pp >= pend )\n\t\t    pp = pool;\n\t\thashbuf[i] = *pp++;\n\t    }",
+      "explanation": "Same root cause in the wrap-around branch. pp is initialised to p+DIGESTLEN, reproducing the identical 20-byte gap in the blocks assembled near the end of the pool; the fix is 'char *pp = p;'. Because the last POOLBLOCKS iterations that touch the pool tail go through this branch, the defect is not confined to the fast path — it degrades mixing across the wrap region too. This is the same finding as above (one logical bug expressed in two places) and must be corrected in both to restore full diffusion."
+    },
+    {
+      "file": "corpus/train/train_0244_cwe200.c",
+      "lines": "4",
+      "code": "char *hashbuf = pool + POOLSIZE;",
+      "explanation": "Scratch region past the pool: hashbuf points BLOCKLEN bytes beyond the logical pool, and the code writes and reads hashbuf[0..BLOCKLEN) (memcpy into hashbuf, rmd160_mixblock over it). This only stays in bounds if the caller allocated the pool object as POOLSIZE+BLOCKLEN bytes. Nothing in the shown code enforces or documents that; it is a silent contract. If a maintainer ever allocates exactly POOLSIZE, every mix_pool() call performs an out-of-bounds write of up to BLOCKLEN bytes past the buffer (heap/BSS overflow, CWE-787) and a matching over-read (CWE-125). This is a latent memory-safety contract that lives in the allocation site, not visible here — it must be confirmed against the pool's definition."
+    },
+    {
+      "file": "corpus/train/train_0244_cwe200.c",
+      "lines": "25",
+      "code": "if( p+DIGESTLEN+BLOCKLEN < pend )",
+      "explanation": "The fast-path guard is stricter than the actual read requires. The tail copy at line 26 touches bytes up to (p+DIGESTLEN)+(BLOCKLEN-DIGESTLEN)-1 = p+BLOCKLEN-1, so the memory-safe condition is p+BLOCKLEN <= pend; the guard demands p+DIGESTLEN+BLOCKLEN < pend, an extra DIGESTLEN+1 of slack. This is conservative — it errs toward the else branch — so it is NOT an out-of-bounds read. But it is arithmetically coupled to the shifted p+DIGESTLEN source: once the source is fixed back to p, the guard should become p+BLOCKLEN < pend. Flagged as a correctness note that travels with the primary fix, not as an independent overflow."
+    },
+    {
+      "file": "corpus/train/train_0244_cwe200.c",
+      "lines": "39",
+      "code": "burn_stack (384); /* for the rmd160_mixblock() */",
+      "explanation": "The 384-byte scrub length is a hard-coded magic number estimating the deepest stack used by rmd160_mixblock() and the locals. If the real worst-case stack footprint of rmd160_mixblock() on some platform/compiler exceeds 384 bytes, part of the RIPEMD-160 intermediate state or copied pool bytes remains un-scrubbed on the stack after return, leaving secret entropy-pool material recoverable by a later stack-reading disclosure (information exposure, CWE-226/CWE-200). The invariant: the burn length must cover the maximum stack actually dirtied by the mixing on the target ABI. Low severity but worth confirming against rmd160_mixblock()'s frame size."
+    }
+  ],
+  "summary": "This is GnuPG/Libgcrypt's mix_pool() CSPRNG stirring routine. Its dominant, real defect is a cryptographic one (CVE-2016-6313): the tail-copy source pointer is p+DIGESTLEN when it should be p (in both the fast-path memcpy at line 26 and the wrap loop at line 28), so a fixed 20-byte stripe of every RIPEMD-160 mixing window is skipped and the pool is not fully diffused, weakening the RNG and making some output/pool bytes predictable. Secondary latent concerns are the unenforced POOLSIZE+BLOCKLEN over-allocation contract behind hashbuf = pool + POOLSIZE and the hard-coded burn_stack(384) scrub length.",
+  "reviewed_anchors": [
+    {"anchor": "mix_pool(byte *pool) signature / pool parameter", "disposition": "dismissed", "reason": "Internal CSPRNG state, not attacker-controlled wire input; carries no length field to overflow — its risk is mixing quality, captured in the primary finding."},
+    {"anchor": "char *hashbuf = pool + POOLSIZE; (line 4)", "disposition": "finding", "reason": "Scratch region past the pool; safe only if pool is over-allocated by BLOCKLEN — latent OOB write/read contract."},
+    {"anchor": "char *p, *pend; int i, n; (lines 5-6)", "disposition": "dismissed", "reason": "Ordinary cursors/counters; their misuse is captured in the mixing-gap finding, no independent contract."},
+    {"anchor": "RMD160_CONTEXT md; (line 7)", "disposition": "dismissed", "reason": "Opaque hash context, initialised before use at line 9; no attacker-reachable field here."},
+    {"anchor": "rmd160_init(&md) (line 9)", "disposition": "dismissed", "reason": "State reset with no untrusted input; correct and necessary."},
+    {"anchor": "#if DIGESTLEN != 20 / #error (lines 10-12)", "disposition": "dismissed", "reason": "Compile-time invariant guard; a safety assertion, not a runtime hazard."},
+    {"anchor": "pend = pool + POOLSIZE; (line 14)", "disposition": "dismissed", "reason": "End-of-pool marker; used only as an upper bound in checks, no overflow."},
+    {"anchor": "memcpy(hashbuf, pend - DIGESTLEN, DIGESTLEN) (line 15)", "disposition": "dismissed", "reason": "Reads the last 20 pool bytes into scratch; in bounds given the over-allocation contract."},
+    {"anchor": "memcpy(hashbuf+DIGESTLEN, pool, BLOCKLEN-DIGESTLEN) (line 16)", "disposition": "dismissed", "reason": "First wrap block tail; correct — starts at pool head, no gap in this pre-loop block."},
+    {"anchor": "memcpy(pool, hashbuf, DIGESTLEN) (line 18)", "disposition": "dismissed", "reason": "Writes digest back over first slot; DIGESTLEN <= POOLSIZE, in bounds."},
+    {"anchor": "for(n=1; n < POOLBLOCKS; n++) (line 21)", "disposition": "dismissed", "reason": "Bounded loop over pool blocks; iteration count fixed by macro, not attacker input."},
+    {"anchor": "memcpy(hashbuf, p, DIGESTLEN) + p += DIGESTLEN (lines 22-24)", "disposition": "finding", "reason": "The post-advance of p combined with the p+DIGESTLEN tail source produces the 20-byte mixing gap — the primary defect."},
+    {"anchor": "if( p+DIGESTLEN+BLOCKLEN < pend ) then memcpy(hashbuf+DIGESTLEN, p+DIGESTLEN, BLOCKLEN-DIGESTLEN) (lines 25-26)", "disposition": "finding", "reason": "Shifted source pointer skips DIGESTLEN pool bytes per window (fast path of the CVE-2016-6313 bug); guard also over-strict."},
+    {"anchor": "else wrap loop, char *pp = p+DIGESTLEN (lines 28-33)", "disposition": "finding", "reason": "Same shifted source in the wrap branch — same mixing gap; part of the primary finding."},
+    {"anchor": "rmd160_mixblock(&md, hashbuf) + memcpy(p, hashbuf, DIGESTLEN) (lines 36-37)", "disposition": "dismissed", "reason": "Compresses assembled block and writes digest back in bounds; correct given a correctly-assembled block."},
+    {"anchor": "burn_stack(384) (line 39)", "disposition": "finding", "reason": "Hard-coded scrub length; residual secret pool/hash bytes may survive on stack if rmd160_mixblock's frame exceeds 384."},
+    {"anchor": "POOLSIZE / BLOCKLEN / DIGESTLEN / POOLBLOCKS macros", "disposition": "dismissed", "reason": "External compile-time constants (not defined in this file); their values fix the layout but carry no runtime input — relevant only as they parameterise the findings above."}
+  ],
+  "findings": [
+    {
+      "title": "Incomplete entropy-pool mixing: 20-byte gap makes RNG output predictable",
+      "anchor": "memcpy(hashbuf+DIGESTLEN, p+DIGESTLEN, BLOCKLEN-DIGESTLEN) after p += DIGESTLEN; also char *pp = p+DIGESTLEN",
+      "file": "corpus/train/train_0244_cwe200.c",
+      "line": "24-33",
+      "code": "p += DIGESTLEN;\n\tif( p+DIGESTLEN+BLOCKLEN < pend )\n\t    memcpy(hashbuf+DIGESTLEN, p+DIGESTLEN, BLOCKLEN-DIGESTLEN);\n\telse {\n\t    char *pp = p+DIGESTLEN;",
+      "bug_class": "Insufficient CSPRNG mixing / predictable output (skipped pool bytes)",
+      "cwe": "CWE-330",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0244_cwe200.c",
+      "invariant": "Each mixing window must be a CONTIGUOUS BLOCKLEN run of the pool starting at the slot just copied; after p += DIGESTLEN the tail source must be p (and pp = p), so that every pool byte — with no DIGESTLEN-sized gap — is stirred into the RIPEMD-160 state on each pass.",
+      "failure_mode": "Because p is advanced by DIGESTLEN before the tail copy, and the tail is read from p+DIGESTLEN (and the wrap loop from pp = p+DIGESTLEN), the 20 pool bytes between the copied slot and the copied tail are never fed into that RIPEMD-160 block. A fixed stripe of the pool escapes mixing on each window, so freshly added entropy is not fully diffused and an attacker who observes some generator output can predict or reconstruct pool bytes that should have been mixed (information exposure of internal RNG state, CWE-200, via weakened randomness CWE-330). Fix: use p (and pp = p) as the tail source and adjust the guard to p+BLOCKLEN < pend.",
+      "cve_analog": "CVE-2016-6313",
+      "what_to_confirm": "Confirm the intended contiguous window and that the tail source should be p, not p+DIGESTLEN, in both the fast-path memcpy (line 26) and the wrap loop initialiser (line 28); verify against the upstream Libgcrypt/GnuPG fix that removed the +DIGESTLEN offset."
+    },
+    {
+      "title": "hashbuf scratch region assumes pool is over-allocated by BLOCKLEN",
+      "anchor": "char *hashbuf = pool + POOLSIZE;",
+      "file": "corpus/train/train_0244_cwe200.c",
+      "line": "4",
+      "code": "char *hashbuf = pool + POOLSIZE;",
+      "bug_class": "Out-of-bounds write/read (unchecked allocation contract)",
+      "cwe": "CWE-787",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "The pool object must be allocated with at least POOLSIZE + BLOCKLEN bytes, because mix_pool() writes and reads hashbuf[0..BLOCKLEN) at offset POOLSIZE.",
+      "failure_mode": "If the pool is ever allocated as exactly POOLSIZE bytes, the memcpy into hashbuf and rmd160_mixblock over it write/read up to BLOCKLEN bytes past the buffer end — a heap/BSS overflow (CWE-787) and over-read (CWE-125) on every mix. The defect is not visible in this file; it is a silent contract enforced only at the allocation site.",
+      "cve_analog": "",
+      "what_to_confirm": "Locate the pool/rndpool allocation and confirm it reserves POOLSIZE + BLOCKLEN bytes; ensure no refactor shrinks it to POOLSIZE."
+    },
+    {
+      "title": "Hard-coded burn_stack length may leave secret pool bytes on the stack",
+      "anchor": "burn_stack (384); /* for the rmd160_mixblock() */",
+      "file": "corpus/train/train_0244_cwe200.c",
+      "line": "39",
+      "code": "burn_stack (384); /* for the rmd160_mixblock() */",
+      "bug_class": "Sensitive information left in memory (under-scrubbed stack)",
+      "cwe": "CWE-226",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "The burn length must be >= the maximum stack footprint actually dirtied by rmd160_mixblock() and the mixing locals on the target ABI, so no RIPEMD-160 intermediate state or copied pool bytes survive after return.",
+      "failure_mode": "If rmd160_mixblock()'s real worst-case frame exceeds 384 bytes on some compiler/platform, residual secret entropy material remains un-scrubbed on the stack and could be recovered via a later stack-disclosure bug (information exposure, CWE-200). Magic-number scrubbing lengths are brittle across compilers and optimisation levels.",
+      "cve_analog": "",
+      "what_to_confirm": "Measure the actual maximum stack used by rmd160_mixblock() plus locals and verify 384 covers it on all supported targets."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm the tail-copy source is p (not p+DIGESTLEN) at line 26 and pp = p (not p+DIGESTLEN) at line 28 so each mixing window is a contiguous BLOCKLEN run with no skipped 20-byte stripe (CVE-2016-6313).",
+    "After fixing the source pointer, confirm the fast-path guard is p+BLOCKLEN < pend so the else wrap branch is entered exactly when needed and never reads past pend.",
+    "Verify the pool object is allocated as POOLSIZE + BLOCKLEN bytes so hashbuf = pool + POOLSIZE and the BLOCKLEN scratch stay in bounds.",
+    "Confirm burn_stack(384) covers the true maximum stack footprint of rmd160_mixblock() and the mixing locals on every supported ABI.",
+    "Validate that DIGESTLEN, BLOCKLEN, POOLSIZE, POOLBLOCKS are mutually consistent (POOLSIZE a multiple of the stride, BLOCKLEN > DIGESTLEN) so the sliding-window arithmetic tiles the pool exactly.",
+    "Check callers cannot invoke mix_pool() concurrently on the same pool without a lock (the in-place rewrite of pool + shared hashbuf is not re-entrant)."
+  ]
+}

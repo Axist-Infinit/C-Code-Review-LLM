@@ -1,0 +1,198 @@
+{
+  "subsystem": "SDDM (Simple Desktop Display Manager) greeter/daemon authentication path. This is the Display::startAuth() method, which is invoked when a user at the login greeter submits a username, password, and a chosen desktop Session. It validates the selected session, optionally locates an existing logind session for the same user to reuse (session unlock), builds the child process environment, and kicks off PAM authentication via the Auth helper (m_auth). It processes greeter-supplied credentials and interacts with systemd-logind over D-Bus to enumerate, unlock, and activate login sessions.",
+  "provenance": "Identified by the SDDM-specific type and symbol names: the Display class with startAuth(user, password, Session), the Auth helper (m_auth->setUser/setSession/insertEnvironment/start and the Auth::authentication signal), the Logind wrapper (Logind::isAvailable/serviceName/managerPath), the generated logind D-Bus proxies OrgFreedesktopLogin1ManagerInterface / OrgFreedesktopLogin1SessionInterface (ListSessions/UnlockSession/ActivateSession), Session/SessionInfo objects, mainConfig.Users.ReuseSession/DefaultPath, daemonApp->displayManager(), VirtualTerminal::setUpNewVt(), and Qt idioms (QString, QStringLiteral, qCritical/qDebug, foreach). The header comment `/* sample: primevul_train_2537_vuln */` marks it as a PrimeVul sample. This is C++/Qt, GPL-2.0 upstream. File under review: corpus/train/train_0248_cwe284.cpp.",
+  "trust_boundary": "The user and password arguments originate from the unauthenticated person sitting at the login greeter and are fully attacker-controlled; the Session object (session type, exec, desktop names, file name) is also selected by that untrusted user from the greeter. systemd-logind over the system D-Bus bus (ListSessions, session paths, UnlockSession, ActivateSession) is a privileged system service and its data (SessionInfo.userName, sessionId, sessionPath) is comparatively trusted, but the daemon runs privileged and any decision it makes on behalf of the untrusted greeter input crosses a privilege boundary. The critical boundary is the authentication gate: nothing an attacker at the greeter supplies should cause an existing desktop session to be unlocked or activated unless PAM has actually confirmed the supplied password for that user.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0248_cwe284.cpp",
+      "lines": "2-3",
+      "code": "void Display::startAuth(const QString &user, const QString &password, const Session &session) {\n        m_passPhrase = password;",
+      "explanation": "The entry point of the authentication flow. It receives three inputs: `user` (the login name typed at the greeter), `password` (the cleartext secret typed at the greeter), and `session` (a Session value object describing the desktop session the user picked). The very first action, before any validation, is to copy the plaintext password into the member variable `m_passPhrase`, persisting the secret on the Display object for the lifetime of the auth attempt so it can be handed to the PAM conversation later."
+    },
+    {
+      "file": "corpus/train/train_0248_cwe284.cpp",
+      "lines": "5-17",
+      "code": "// sanity check\n        if (!session.isValid()) {\n            qCritical() << \"Invalid session\" << session.fileName();\n            return;\n        }\n        if (session.xdgSessionType().isEmpty()) {\n            qCritical() << \"Failed to find XDG session type for session\" << session.fileName();\n            return;\n        }\n        if (session.exec().isEmpty()) {\n            qCritical() << \"Failed to find command for session\" << session.fileName();\n            return;\n        }",
+      "explanation": "Three defensive guards on the chosen Session before proceeding. First, `session.isValid()` rejects a malformed/unknown session descriptor. Second, an empty `session.xdgSessionType()` (the XDG_SESSION_TYPE, e.g. \"x11\" or \"wayland\") is rejected because later logic branches on it. Third, an empty `session.exec()` (the command that launches the desktop) is rejected because there would be nothing to run. Each failure logs via qCritical and returns early without starting auth. These guards concern session well-formedness, not the identity or authorization of the requester."
+    },
+    {
+      "file": "corpus/train/train_0248_cwe284.cpp",
+      "lines": "19-35",
+      "code": "QString existingSessionId;\n\n        if (Logind::isAvailable() && mainConfig.Users.ReuseSession.get()) {\n            OrgFreedesktopLogin1ManagerInterface manager(Logind::serviceName(), Logind::managerPath(), QDBusConnection::systemBus());\n            auto reply = manager.ListSessions();\n            reply.waitForFinished();\n\n            foreach(const SessionInfo &s, reply.value()) {\n                if (s.userName == user) {\n                    OrgFreedesktopLogin1SessionInterface session(Logind::serviceName(), s.sessionPath.path(), QDBusConnection::systemBus());\n                    if (session.service() == QLatin1String(\"sddm\")) {\n                        existingSessionId =  s.sessionId;\n                        break;\n                    }\n                }\n            }\n        }",
+      "explanation": "The session-reuse lookup. When logind is available and the ReuseSession configuration option is enabled, the code constructs a logind Manager D-Bus proxy and synchronously calls ListSessions(), blocking on waitForFinished(). It then iterates every SessionInfo `s` returned by logind and selects the first whose `s.userName` equals the greeter-supplied `user` AND whose per-session logind service string equals \"sddm\" (i.e. a session that SDDM itself created). Note the inner variable is also named `session` (an OrgFreedesktopLogin1SessionInterface), shadowing the Session parameter within this block. When a match is found its `s.sessionId` is stored in `existingSessionId` and the loop breaks. `existingSessionId` being non-null is the signal, later, that we should unlock/reactivate an already-running session for this user rather than start a fresh one."
+    },
+    {
+      "file": "corpus/train/train_0248_cwe284.cpp",
+      "lines": "37-45",
+      "code": "// cache last session\n        m_lastSession = session;\n\n        // save session desktop file name, we'll use it to set the\n        // last session later, in slotAuthenticationFinished()\n        m_sessionName = session.fileName();\n\n        // some information\n        qDebug() << \"Session\" << m_sessionName << \"selected, command:\" << session.exec();",
+      "explanation": "Bookkeeping. The chosen Session is cached in `m_lastSession` and its descriptor file name in `m_sessionName`, so that after authentication completes (in slotAuthenticationFinished) SDDM can record the user's last-used session. A qDebug line logs the selected session name and its exec command for diagnostics; because the command comes from a session desktop file it is generally not the attacker's free-form input, but it is logged verbatim."
+    },
+    {
+      "file": "corpus/train/train_0248_cwe284.cpp",
+      "lines": "47-51",
+      "code": "// create new VT for Wayland sessions otherwise use greeter vt\n        int vt = terminalId();\n        if (session.xdgSessionType() == QLatin1String(\"wayland\"))\n            vt = VirtualTerminal::setUpNewVt();\n        m_lastSession.setVt(vt);",
+      "explanation": "Virtual terminal allocation. It starts with the greeter's current VT (`terminalId()`), and for Wayland sessions it allocates a brand-new VT via VirtualTerminal::setUpNewVt() (X11 reuses the greeter VT). The resulting VT number is stored on the cached session so the launched session lands on the right console. This is privileged VT management done on behalf of the untrusted session-type choice."
+    },
+    {
+      "file": "corpus/train/train_0248_cwe284.cpp",
+      "lines": "53-68",
+      "code": "QProcessEnvironment env;\n        env.insert(QStringLiteral(\"PATH\"), mainConfig.Users.DefaultPath.get());\n        if (session.xdgSessionType() == QLatin1String(\"x11\"))\n            env.insert(QStringLiteral(\"DISPLAY\"), name());\n        env.insert(QStringLiteral(\"XDG_SEAT_PATH\"), daemonApp->displayManager()->seatPath(seat()->name()));\n        env.insert(QStringLiteral(\"XDG_SESSION_PATH\"), daemonApp->displayManager()->sessionPath(QStringLiteral(\"Session%1\").arg(daemonApp->newSessionId())));\n        env.insert(QStringLiteral(\"DESKTOP_SESSION\"), session.desktopSession());\n        env.insert(QStringLiteral(\"XDG_CURRENT_DESKTOP\"), session.desktopNames());\n        env.insert(QStringLiteral(\"XDG_SESSION_CLASS\"), QStringLiteral(\"user\"));\n        env.insert(QStringLiteral(\"XDG_SESSION_TYPE\"), session.xdgSessionType());\n        env.insert(QStringLiteral(\"XDG_SEAT\"), seat()->name());\n\n        env.insert(QStringLiteral(\"XDG_SESSION_DESKTOP\"), session.desktopNames());\n        if (seat()->name() == QLatin1String(\"seat0\")) {\n            env.insert(QStringLiteral(\"XDG_VTNR\"), QString::number(vt));\n        }",
+      "explanation": "Constructs the QProcessEnvironment that will be handed to the authenticated child process. PATH is taken from configuration; DISPLAY is set for X11 sessions from the display name; XDG_SEAT_PATH / XDG_SESSION_PATH are computed from the daemon's display-manager objects and a freshly minted session id; DESKTOP_SESSION, XDG_CURRENT_DESKTOP, XDG_SESSION_DESKTOP, and XDG_SESSION_TYPE are populated from the chosen Session's fields (some of which trace back to session .desktop files); XDG_SESSION_CLASS is hardcoded \"user\"; XDG_SEAT and (on seat0) XDG_VTNR describe the seat and VT number. This env dictionary defines part of the runtime context of the launched user session."
+    },
+    {
+      "file": "corpus/train/train_0248_cwe284.cpp",
+      "lines": "70-72",
+      "code": "m_auth->insertEnvironment(env);\n\n        m_auth->setUser(user);",
+      "explanation": "Hands the constructed environment to the Auth helper and sets the target username on it. m_auth is the object that performs the actual PAM conversation (out of process, in the SDDM auth helper). setUser(user) establishes which account PAM will authenticate against, using the greeter-supplied `user` string."
+    },
+    {
+      "file": "corpus/train/train_0248_cwe284.cpp",
+      "lines": "73-85",
+      "code": "if (existingSessionId.isNull()) {\n            m_auth->setSession(session.exec());\n        } else {\n            //we only want to unlock the session if we can lock in, so we want to go via PAM auth, but not start a new session\n            //by not setting the session and the helper will emit authentication and then quit\n            connect(m_auth, &Auth::authentication, this, [=](){\n                qDebug() << \"activating existing seat\";\n                OrgFreedesktopLogin1ManagerInterface manager(Logind::serviceName(), Logind::managerPath(), QDBusConnection::systemBus());\n                manager.UnlockSession(existingSessionId);\n                manager.ActivateSession(existingSessionId);\n            });\n        }\n        m_auth->start();",
+      "explanation": "The branch that decides between starting a new session and reusing an existing one. If no existing session was found (`existingSessionId.isNull()`), it calls m_auth->setSession(session.exec()), meaning PAM auth will proceed and then spawn the chosen desktop command as a new session. Otherwise (an existing SDDM session for this user was located earlier) it deliberately does NOT set a session command; instead it connects a lambda to the Auth::authentication signal. Per the comment, the intent is: run PAM only to prove the user \"can log in,\" then, rather than starting a new session, unlock and activate the already-running one. The lambda captures by value (`[=]`, which includes `this` and `existingSessionId`), builds a logind Manager proxy, and calls UnlockSession(existingSessionId) followed by ActivateSession(existingSessionId). Finally m_auth->start() launches the PAM conversation. The security of the whole reuse path therefore rests entirely on that lambda firing only when authentication genuinely succeeded."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0248_cwe284.cpp",
+      "lines": "78-83",
+      "code": "connect(m_auth, &Auth::authentication, this, [=](){\n                qDebug() << \"activating existing seat\";\n                OrgFreedesktopLogin1ManagerInterface manager(Logind::serviceName(), Logind::managerPath(), QDBusConnection::systemBus());\n                manager.UnlockSession(existingSessionId);\n                manager.ActivateSession(existingSessionId);\n            });",
+      "explanation": "Authentication bypass / improper access control. The SDDM Auth::authentication signal is emitted for BOTH successful and failed PAM authentication and carries a success flag (upstream signature is authentication(const QString &user, bool success)). This lambda takes no parameters and therefore IGNORES the success flag: it unconditionally calls UnlockSession and ActivateSession whenever the signal fires. The stated intent in the comment (\"we only want to unlock the session if we can lock in\") is not enforced. Concretely, an unauthenticated local attacker at the greeter selects a user who has a locked, still-running SDDM session (very common: a user who locked their screen), types the correct username and ANY password, and submits. PAM fails, but Auth::authentication is still emitted, the lambda runs, and the victim's session is unlocked and activated on the console — full takeover of a logged-in desktop without knowing the password. The invariant the implementation MUST uphold is: unlock/activate must be gated on a verified success flag (e.g. the lambda must accept the bool and early-return when it is false); firing on the bare signal makes the reuse feature an authentication bypass. This is the central, critical defect."
+    },
+    {
+      "file": "corpus/train/train_0248_cwe284.cpp",
+      "lines": "78-84",
+      "code": "connect(m_auth, &Auth::authentication, this, [=](){\n                qDebug() << \"activating existing seat\";\n                OrgFreedesktopLogin1ManagerInterface manager(Logind::serviceName(), Logind::managerPath(), QDBusConnection::systemBus());\n                manager.UnlockSession(existingSessionId);\n                manager.ActivateSession(existingSessionId);\n            });\n        }",
+      "explanation": "Signal-connection lifetime / accumulation. The connection to Auth::authentication is created every time startAuth() takes the reuse branch and is never disconnected. Because greeter authentication is retried (wrong password, then another attempt), multiple lambdas — each capturing a possibly-different `existingSessionId` from a prior attempt — can be connected to the same m_auth object simultaneously. When authentication finally fires, ALL accumulated slots run, so a stale existingSessionId captured in an earlier attempt can be unlocked/activated alongside the current one, and the same connection persists across the object's lifetime. The implementation must use a single-shot connection (Qt::SingleShotConnection or an explicit disconnect) and must not let captured session ids from abandoned attempts survive. Combined with the missing success check above, this widens the window in which the wrong session is acted on."
+    },
+    {
+      "file": "corpus/train/train_0248_cwe284.cpp",
+      "lines": "27-29",
+      "code": "if (s.userName == user) {\n                    OrgFreedesktopLogin1SessionInterface session(Logind::serviceName(), s.sessionPath.path(), QDBusConnection::systemBus());\n                    if (session.service() == QLatin1String(\"sddm\")) {",
+      "explanation": "Session-selection is keyed only on the greeter-supplied username string and the logind service name \"sddm\". The greeter attacker fully controls `user`, so they choose which victim's existing session becomes the unlock target. This selection is not itself an authorization decision — it is only meant to identify a candidate — but it means the target of the later UnlockSession/ActivateSession is entirely attacker-directed, so it must be paired with a genuine per-user authentication gate (see the finding above). Also note the inner variable is named `session`, shadowing the Session parameter within the loop body; while `session.service()` here correctly refers to the D-Bus proxy, the shadowing is a maintenance hazard that can lead a future edit to touch the wrong object. The implementation must ensure the matched session truly belongs to the account that PAM verified, not merely to a name string an attacker typed."
+    },
+    {
+      "file": "corpus/train/train_0248_cwe284.cpp",
+      "lines": "3",
+      "code": "m_passPhrase = password;",
+      "explanation": "Cleartext credential retained in process memory. The plaintext password is copied into the member `m_passPhrase` at the top of the function, before any of the early-return sanity checks, and (as a QString member) is not zeroed or wiped after use. If startAuth returns early at lines 8/12/16 the secret still lingers in the Display object. Long-lived plaintext credentials in a privileged process increase exposure via core dumps, swap, or memory disclosure. The implementation should minimize the lifetime of the plaintext secret and clear it once handed to the auth helper; storing it unconditionally up front is the weakest form."
+    },
+    {
+      "file": "corpus/train/train_0248_cwe284.cpp",
+      "lines": "23-26",
+      "code": "auto reply = manager.ListSessions();\n            reply.waitForFinished();\n\n            foreach(const SessionInfo &s, reply.value()) {",
+      "explanation": "Unchecked D-Bus reply. After waitForFinished() the code calls reply.value() without checking reply.isValid()/reply.isError(). If the ListSessions call errored (logind unavailable mid-call, bus timeout), value() yields a default-constructed/empty list; here that fails safe (no reuse candidate found, existingSessionId stays null). The concern is lower severity but the implementation should still verify the reply succeeded before trusting its contents, and must not treat an errored reply's contents as authoritative. Additionally, waitForFinished() is a synchronous blocking call on the system bus that can stall the privileged daemon if logind is slow, a minor availability consideration."
+    }
+  ],
+  "summary": "This is SDDM's Display::startAuth() authentication entry point. Its dominant risk is a critical authentication bypass in the session-reuse path: the lambda connected to Auth::authentication (lines 78-83) unconditionally unlocks and activates an existing user session and never checks the authentication success flag, so a local attacker at the greeter can unlock a victim's locked session with a wrong password. Secondary issues are the never-disconnected accumulating signal connection, attacker-directed session selection keyed only on the typed username, and a plaintext password retained in a member before validation.",
+  "reviewed_anchors": [
+    {"anchor": "startAuth(const QString &user, const QString &password, const Session &session) signature (line 2)", "disposition": "finding", "reason": "user and password are the untrusted greeter inputs that drive the whole auth decision; session is attacker-selected."},
+    {"anchor": "m_passPhrase = password; (line 3)", "disposition": "finding", "reason": "plaintext credential stored on the object before validation and not wiped (CWE-316)."},
+    {"anchor": "session.isValid() guard (lines 6-9)", "disposition": "dismissed", "reason": "well-formedness check that fails closed with early return; no security contract violated."},
+    {"anchor": "session.xdgSessionType().isEmpty() guard (lines 10-13)", "disposition": "dismissed", "reason": "input-shape guard, fails closed."},
+    {"anchor": "session.exec().isEmpty() guard (lines 14-17)", "disposition": "dismissed", "reason": "input-shape guard, fails closed."},
+    {"anchor": "existingSessionId (lines 19, 30, 73)", "disposition": "finding", "reason": "its non-null state is the trigger for the unlock/activate path; captured by value into the lambda."},
+    {"anchor": "Logind::isAvailable() && mainConfig.Users.ReuseSession.get() (line 21)", "disposition": "dismissed", "reason": "feature gate; the reuse behavior it enables is analyzed under the lambda finding."},
+    {"anchor": "OrgFreedesktopLogin1ManagerInterface manager + ListSessions()/waitForFinished() (lines 22-24)", "disposition": "finding", "reason": "reply.value() consumed without checking reply validity; synchronous blocking call on privileged daemon (CWE-252/availability)."},
+    {"anchor": "foreach SessionInfo s : reply.value() (line 26)", "disposition": "dismissed", "reason": "iteration over trusted logind data; covered by the reply-validation and selection findings."},
+    {"anchor": "s.userName == user match (line 27)", "disposition": "finding", "reason": "candidate selection keyed on attacker-controlled username; must be paired with a real auth gate (CWE-284)."},
+    {"anchor": "OrgFreedesktopLogin1SessionInterface session(...) inner variable (line 28)", "disposition": "finding", "reason": "shadows the Session parameter within the loop; maintenance hazard flagged alongside the selection finding."},
+    {"anchor": "session.service() == \"sddm\" (line 29)", "disposition": "dismissed", "reason": "narrows candidates to SDDM-created sessions; not itself a control decision."},
+    {"anchor": "existingSessionId = s.sessionId (line 30)", "disposition": "dismissed", "reason": "assignment of the trusted logind session id; captured into lambda (covered elsewhere)."},
+    {"anchor": "m_lastSession = session / m_sessionName = session.fileName() (lines 38-42)", "disposition": "dismissed", "reason": "bookkeeping caches; no untrusted-length or control contract."},
+    {"anchor": "qDebug session/exec logging (line 45)", "disposition": "dismissed", "reason": "diagnostic logging of session-file-derived strings; no format-string or injection sink."},
+    {"anchor": "vt = terminalId(); VirtualTerminal::setUpNewVt(); setVt(vt) (lines 48-51)", "disposition": "dismissed", "reason": "VT allocation branch on session type; no attacker-controlled buffer or count."},
+    {"anchor": "QProcessEnvironment env inserts (lines 53-68)", "disposition": "dismissed", "reason": "environment values come from config and session .desktop metadata inserted as discrete QString keys/values; no shell interpolation or length primitive here."},
+    {"anchor": "m_auth->insertEnvironment(env); m_auth->setUser(user) (lines 70-72)", "disposition": "dismissed", "reason": "passes prepared env and username to PAM helper; the auth decision itself is analyzed in the lambda finding."},
+    {"anchor": "if (existingSessionId.isNull()) setSession(session.exec()) else connect(...) (lines 73-84)", "disposition": "finding", "reason": "the else branch installs the unlock lambda; both the missing success check and the accumulating connection are defects."},
+    {"anchor": "connect(m_auth, &Auth::authentication, this, [=](){ ... UnlockSession/ActivateSession }) (lines 78-83)", "disposition": "finding", "reason": "unconditional unlock/activate ignoring the success flag = authentication bypass (CWE-287/CWE-284); never disconnected."},
+    {"anchor": "manager.UnlockSession/ActivateSession(existingSessionId) (lines 81-82)", "disposition": "finding", "reason": "privileged action executed on attacker-directed session id whenever the signal fires; core of the bypass."},
+    {"anchor": "m_auth->start() (line 85)", "disposition": "dismissed", "reason": "starts the PAM conversation; no direct contract beyond triggering the already-flagged flow."}
+  ],
+  "findings": [
+    {
+      "title": "Authentication bypass: existing session unlocked/activated without checking the PAM success flag",
+      "anchor": "connect(m_auth, &Auth::authentication, this, [=](){ ... manager.UnlockSession(existingSessionId); manager.ActivateSession(existingSessionId); })",
+      "file": "corpus/train/train_0248_cwe284.cpp",
+      "line": "78-83",
+      "code": "connect(m_auth, &Auth::authentication, this, [=](){\n                qDebug() << \"activating existing seat\";\n                OrgFreedesktopLogin1ManagerInterface manager(Logind::serviceName(), Logind::managerPath(), QDBusConnection::systemBus());\n                manager.UnlockSession(existingSessionId);\n                manager.ActivateSession(existingSessionId);\n            });",
+      "bug_class": "Authentication bypass / improper access control (success flag ignored)",
+      "cwe": "CWE-287",
+      "severity": "critical",
+      "where_it_lives": "corpus/train/train_0248_cwe284.cpp (and the Auth helper implementation, file not provided)",
+      "invariant": "UnlockSession/ActivateSession for an existing session must execute ONLY when PAM authentication actually succeeded; the slot must inspect the Auth::authentication success argument and do nothing on failure.",
+      "failure_mode": "Auth::authentication is emitted on both success and failure (signature authentication(user, bool success)); this zero-argument lambda ignores the flag and always unlocks/activates. A local attacker at the greeter selects a user with a locked, still-running SDDM session, enters any password; PAM fails but the signal still fires, so UnlockSession(existingSessionId)+ActivateSession(existingSessionId) run and the victim's desktop is unlocked and brought to the foreground — full account/session takeover without valid credentials.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the Auth::authentication signal signature includes a success/error indicator and that this slot fires on failed attempts; verify no success check exists before UnlockSession/ActivateSession."
+    },
+    {
+      "title": "Auth::authentication connection never disconnected; stale session-ids accumulate across retries",
+      "anchor": "connect(m_auth, &Auth::authentication, this, [=](){ ... })",
+      "file": "corpus/train/train_0248_cwe284.cpp",
+      "line": "78-84",
+      "code": "connect(m_auth, &Auth::authentication, this, [=](){\n                qDebug() << \"activating existing seat\";\n                OrgFreedesktopLogin1ManagerInterface manager(Logind::serviceName(), Logind::managerPath(), QDBusConnection::systemBus());\n                manager.UnlockSession(existingSessionId);\n                manager.ActivateSession(existingSessionId);\n            });\n        }",
+      "bug_class": "Signal-slot lifetime / repeated side effect (no single-shot, no disconnect)",
+      "cwe": "CWE-459",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0248_cwe284.cpp",
+      "invariant": "Each authentication attempt must install at most one unlock handler bound to the current session id, and it must be removed after firing (single-shot / explicit disconnect).",
+      "failure_mode": "startAuth() re-runs on every greeter retry and connects a new lambda each time without disconnecting prior ones, each capturing a possibly-different existingSessionId by value. When authentication eventually fires, all accumulated slots execute, so a session id captured in an earlier abandoned attempt can be unlocked/activated together with the current one; the connections also persist for the object's lifetime.",
+      "cve_analog": "",
+      "what_to_confirm": "Check whether the connection uses Qt::SingleShotConnection or is disconnected after handling, and whether multiple startAuth calls can leave several live connections on m_auth."
+    },
+    {
+      "title": "Reuse target session chosen solely from attacker-typed username",
+      "anchor": "if (s.userName == user) { ... if (session.service() == QLatin1String(\"sddm\")) {",
+      "file": "corpus/train/train_0248_cwe284.cpp",
+      "line": "27-29",
+      "code": "if (s.userName == user) {\n                    OrgFreedesktopLogin1SessionInterface session(Logind::serviceName(), s.sessionPath.path(), QDBusConnection::systemBus());\n                    if (session.service() == QLatin1String(\"sddm\")) {",
+      "bug_class": "Improper access control (target selected from untrusted input)",
+      "cwe": "CWE-284",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0248_cwe284.cpp",
+      "invariant": "The session that gets unlocked must be one whose owning account PAM has actually verified for the current attempt; candidate selection by the raw greeter-supplied username is not authorization by itself and must be gated by a real success check.",
+      "failure_mode": "The greeter attacker fully controls `user`, so they choose whose existing SDDM session becomes existingSessionId. With the missing success-flag check (finding 1) this directly translates typed-username control into unlock/activate of an arbitrary victim's session. Even with a correct gate, matching only on a name string (no uid/session-owner cross-check) is fragile. The inner `session` variable also shadows the Session parameter, a maintenance hazard.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify that the account PAM authenticates equals the owner of the selected logind session (uid match), and that username comparison cannot select a session the authenticated user does not own."
+    },
+    {
+      "title": "Plaintext password stored in member before validation and not wiped",
+      "anchor": "m_passPhrase = password;",
+      "file": "corpus/train/train_0248_cwe284.cpp",
+      "line": "3",
+      "code": "m_passPhrase = password;",
+      "bug_class": "Cleartext storage of sensitive information in memory",
+      "cwe": "CWE-316",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0248_cwe284.cpp",
+      "invariant": "The plaintext password should exist for the minimum time necessary and be cleared after it is delivered to the auth helper; it should not be persisted on a long-lived object ahead of any checks.",
+      "failure_mode": "The secret is copied into the QString member m_passPhrase at function entry, before the early-return guards, and is never zeroed. It lingers in the privileged process (and any core dump / swap) for the object's lifetime, widening exposure of user credentials.",
+      "cve_analog": "",
+      "what_to_confirm": "Check where m_passPhrase is consumed and whether it is cleared afterward, and whether an early return leaves it populated."
+    },
+    {
+      "title": "logind ListSessions reply consumed without validity check",
+      "anchor": "auto reply = manager.ListSessions(); reply.waitForFinished(); foreach(... reply.value())",
+      "file": "corpus/train/train_0248_cwe284.cpp",
+      "line": "23-26",
+      "code": "auto reply = manager.ListSessions();\n            reply.waitForFinished();\n\n            foreach(const SessionInfo &s, reply.value()) {",
+      "bug_class": "Unchecked return / blocking privileged call",
+      "cwe": "CWE-252",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0248_cwe284.cpp",
+      "invariant": "A D-Bus reply must be checked for error/validity before its value is trusted, and synchronous waits on the system bus in a privileged daemon should be bounded.",
+      "failure_mode": "reply.value() is used without reply.isValid()/isError(); on a bus error it yields an empty list (here failing safe by finding no reuse candidate), but errored replies should not be treated as authoritative. waitForFinished() also blocks the privileged daemon on the system bus, a minor availability/DoS consideration if logind is slow or hung.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the reply's error state is handled and that a slow/failed logind call cannot stall the daemon."
+    }
+  ],
+  "audit_checklist": [
+    "Verify the Auth::authentication signal signature and confirm the reuse lambda is changed to accept and honor the success flag (do nothing on failed PAM auth).",
+    "Confirm UnlockSession/ActivateSession cannot run for any attempt where PAM authentication did not succeed for the exact account being unlocked.",
+    "Make the Auth::authentication connection single-shot (or disconnect after firing) so retries do not accumulate handlers or act on stale existingSessionId values.",
+    "Cross-check that the selected logind session's owning uid matches the authenticated account, not just the typed username string.",
+    "Minimize and wipe m_passPhrase after it is handed to the auth helper; avoid storing it before the early-return guards.",
+    "Validate the ListSessions D-Bus reply (isValid/isError) before iterating and bound the synchronous wait.",
+    "Rename the inner OrgFreedesktopLogin1SessionInterface variable so it no longer shadows the Session parameter."
+  ]
+}

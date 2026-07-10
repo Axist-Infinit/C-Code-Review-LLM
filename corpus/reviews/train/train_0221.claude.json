@@ -1,0 +1,172 @@
+{
+  "subsystem": "UserTerminalRouter::getInfoForId — a lookup method on the terminal-routing table of Eternal Terminal (ET). The router maps a client/session id string to a TerminalUserInfo record (the per-terminal user/session metadata); this method returns the record for a given id under a mutex. It sits on the connection-handling path where a client presents an id to be routed to its terminal.",
+  "provenance": "Identified by the ET-specific symbol vocabulary: the class UserTerminalRouter, the value type TerminalUserInfo, the member idInfoMap, the routerMutex member, and the STFATAL logging macro are all from MisterTea/EternalTerminal (src/terminal/UserTerminalRouter.*). STFATAL is ET's easylogging++-backed fatal-severity macro. The sample banner 'primevul_test_0271_fixed' and the file name suffix cwe362 indicate this is the PrimeVul 'fixed' variant of a race-condition (CWE-362) sample; the fix is the addition of the lock_guard.",
+  "trust_boundary": "The parameter `const string &id` is the untrusted input. In ET a connecting client presents its terminal id over the network during routing; getInfoForId is invoked with that client-supplied id. An attacker can therefore choose an id that is not present in idInfoMap (never registered, already torn down, or races a removal). The returned TerminalUserInfo carries session-sensitive routing/user data, so both the crash path and the return value are security-relevant. Concurrent mutators of idInfoMap (registration/teardown on other threads) are the second hostile axis this code must be safe against.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0221_cwe362.cpp",
+      "lines": "2",
+      "code": "TerminalUserInfo UserTerminalRouter::getInfoForId(const string &id) {",
+      "explanation": "The member function of UserTerminalRouter takes a single argument `id` by const reference and returns a TerminalUserInfo BY VALUE (a copy). The by-value return means whatever is read from the map is copied into a temporary handed back to the caller; the caller does not observe a reference into the map. `id` is the routing key the caller wants to resolve. Because the caller of this router on the connection path supplies the id from client input, `id` is the attack-surface entry point for this function."
+    },
+    {
+      "file": "corpus/train/train_0221_cwe362.cpp",
+      "lines": "3",
+      "code": "  lock_guard<recursive_mutex> guard(routerMutex);",
+      "explanation": "A scoped lock is taken on routerMutex for the whole function body; the guard is released when the function returns (RAII). routerMutex is a recursive_mutex, meaning the same thread may re-acquire it while already holding it — this is used so that this method can safely be called from another router method that already holds the lock. This lock is the CWE-362 FIX: it makes the subsequent find() and the read of it->second atomic with respect to any other thread that ALSO locks routerMutex before mutating idInfoMap, closing the check-then-use (TOCTOU) window that would otherwise exist between locating the entry and dereferencing it."
+    },
+    {
+      "file": "corpus/train/train_0221_cwe362.cpp",
+      "lines": "4",
+      "code": "  auto it = idInfoMap.find(id);",
+      "explanation": "Looks up `id` in idInfoMap (a std::map/unordered_map from id string to TerminalUserInfo). `find` returns an iterator that is either positioned at the matching element or equal to idInfoMap.end() when no element matches. The result `it` is the sole handle used for the rest of the function; its validity for dereference depends entirely on the end() check that follows."
+    },
+    {
+      "file": "corpus/train/train_0221_cwe362.cpp",
+      "lines": "5-7",
+      "code": "  if (it == idInfoMap.end()) {\n    STFATAL << \" Tried to read from an id that no longer exists\";\n  }",
+      "explanation": "The presence check: if find() returned the end sentinel (the id is absent), the code emits STFATAL, ET's FATAL-severity log macro. By easylogging++ default semantics a FATAL log writes the message and then aborts the process (unless the LoggingFlag::DisableApplicationAbortOnFatalLog flag has been set). Crucially, the if-block contains ONLY the log statement — there is no `return`, `throw`, or other control-flow diversion inside the braces. The code therefore RELIES on STFATAL terminating the process to prevent execution from continuing past this block when the id is missing."
+    },
+    {
+      "file": "corpus/train/train_0221_cwe362.cpp",
+      "lines": "8",
+      "code": "  return it->second;",
+      "explanation": "Returns a copy of the mapped value (the TerminalUserInfo) by dereferencing the iterator and reading `.second`. This line executes unconditionally after the if-block. When the id WAS found this is correct: it copies the record and releases the lock as the function returns. When the id was NOT found, this line is only skipped if STFATAL aborted first; otherwise `it` equals idInfoMap.end() and `it->second` dereferences a non-dereferenceable iterator, which is undefined behavior."
+    },
+    {
+      "file": "corpus/train/train_0221_cwe362.cpp",
+      "lines": "9",
+      "code": "}",
+      "explanation": "End of function; the lock_guard destructor runs here on every return path, releasing routerMutex. There is no explicit unlock elsewhere, so lock scope correctly spans the entire body including the find and the dereference."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0221_cwe362.cpp",
+      "lines": "5-6",
+      "code": "  if (it == idInfoMap.end()) {\n    STFATAL << \" Tried to read from an id that no longer exists\";",
+      "explanation": "Because `id` is client-supplied, an attacker can request routing for an id that is not (or is no longer) in idInfoMap — e.g. a fabricated id, an id whose terminal has already been torn down, or one whose registration is racing. That drives execution into the STFATAL branch, and STFATAL at FATAL severity aborts the entire ET server process by default. A single unauthenticated/low-effort request with a bogus id thus terminates the daemon and every other user's session with it: a remotely reachable denial of service (reachable fatal/assert). The invariant the implementation must uphold is that a missing id is a NORMAL, recoverable condition on an attacker-reachable path (return an error / empty optional / throw a catchable exception), not a process-fatal event."
+    },
+    {
+      "file": "corpus/train/train_0221_cwe362.cpp",
+      "lines": "6-8",
+      "code": "    STFATAL << \" Tried to read from an id that no longer exists\";\n  }\n  return it->second;",
+      "explanation": "The error branch has no `return`/`throw`, so control flow falls through to `return it->second`. This is only prevented by STFATAL actually aborting. If the deployment has set LoggingFlag::DisableApplicationAbortOnFatalLog (a supported easylogging++ configuration that downgrades FATAL to non-terminating), or if STFATAL is ever reconfigured, then on a missing id `it == idInfoMap.end()` and `it->second` dereferences the end() iterator — undefined behavior. Reading `.second` off the map's end sentinel copies whatever memory lies at that offset into the returned TerminalUserInfo, so beyond a likely crash this can silently return a garbage/attacker-influenced record (session/user info disclosure or downstream misrouting). The invariant: the missing-id path must divert control BEFORE the dereference; safety must not depend on a log macro's abort side effect."
+    },
+    {
+      "file": "corpus/train/train_0221_cwe362.cpp",
+      "lines": "3",
+      "code": "  lock_guard<recursive_mutex> guard(routerMutex);",
+      "explanation": "The lock closes the TOCTOU race (CWE-362) ONLY if every code path that inserts into or erases from idInfoMap also acquires routerMutex first. This file shows the reader but not the writers; if any registration/teardown path mutates idInfoMap without holding routerMutex, the find()/it->second pair still races an erase and can dereference an invalidated iterator (use-after-free of the node). Additionally, the mutex is recursive: recursion is invisible to reasoning, so if getInfoForId is re-entered while a partially-mutated map state is held on the same thread, the 'no longer exists' branch can fire on internally consistent-but-transient state. The invariant to confirm: all idInfoMap mutators lock routerMutex, and no mutator holds the recursive lock across a call back into getInfoForId mid-modification."
+    },
+    {
+      "file": "corpus/train/train_0221_cwe362.cpp",
+      "lines": "2",
+      "code": "TerminalUserInfo UserTerminalRouter::getInfoForId(const string &id) {",
+      "explanation": "The by-value return of TerminalUserInfo means the function copies a session record out of the router keyed purely on an attacker-chosen string, with no authorization check that the caller is entitled to THIS id's info. If callers do not enforce that the requesting connection owns `id`, an attacker who can enumerate or guess ids obtains another session's TerminalUserInfo (information disclosure / session confusion). The invariant: the caller must authorize the id-to-connection binding before trusting the returned record; getInfoForId itself performs no such check."
+    }
+  ],
+  "summary": "A router lookup that resolves an attacker-supplied terminal id. The added recursive_mutex lock_guard fixes the original check-then-use race (CWE-362), but two hazards remain: a missing/expired id — which a client controls — hits STFATAL and aborts the whole ET process (remote DoS), and the missing-id branch lacks a return/throw so it falls through to `return it->second`, dereferencing the end() iterator (undefined behavior, potential info disclosure) if fatal-abort is ever disabled. Both stem from treating an attacker-reachable 'not found' as a fatal programming error.",
+  "reviewed_anchors": [
+    {
+      "anchor": "UserTerminalRouter::getInfoForId(const string &id) — signature",
+      "disposition": "finding",
+      "reason": "Attack-surface entry: resolves an attacker-supplied id and returns a session record by value with no in-function authorization; unknown-id handling is unsafe."
+    },
+    {
+      "anchor": "const string &id — parameter",
+      "disposition": "finding",
+      "reason": "Client-controlled routing key; the attacker chooses whether it hits or misses the map, controlling which branch executes."
+    },
+    {
+      "anchor": "lock_guard<recursive_mutex> guard(routerMutex)",
+      "disposition": "finding",
+      "reason": "This is the CWE-362 mitigation but only sound if all idInfoMap mutators also lock routerMutex; latent race contract to verify."
+    },
+    {
+      "anchor": "routerMutex (recursive_mutex)",
+      "disposition": "finding",
+      "reason": "Recursive type permits re-entrant acquisition; folded into the concurrency finding as a reentrancy hazard to confirm."
+    },
+    {
+      "anchor": "idInfoMap.find(id)",
+      "disposition": "dismissed",
+      "reason": "Standard associative lookup; safe in isolation — the risk is in how its end() result is handled, tracked under the deref/DoS findings."
+    },
+    {
+      "anchor": "if (it == idInfoMap.end()) { ... }",
+      "disposition": "finding",
+      "reason": "Error branch performs only a fatal log with no control-flow diversion; both the DoS and the fall-through deref stem from this block."
+    },
+    {
+      "anchor": "STFATAL << \" Tried to read from an id that no longer exists\"",
+      "disposition": "finding",
+      "reason": "FATAL log on an attacker-reachable path aborts the process (DoS) and is the sole guard preventing the invalid dereference below it."
+    },
+    {
+      "anchor": "return it->second",
+      "disposition": "finding",
+      "reason": "Executes unconditionally after the error block; dereferences end() iterator when the id is absent and abort is not enforced — undefined behavior."
+    },
+    {
+      "anchor": "TerminalUserInfo return-by-value",
+      "disposition": "finding",
+      "reason": "Copies a session record keyed on attacker input without authorization; disclosure/misrouting risk if callers do not authorize the id."
+    }
+  ],
+  "findings": [
+    {
+      "title": "Attacker-supplied unknown/expired id triggers STFATAL, aborting the whole ET process (remote DoS)",
+      "anchor": "if (it == idInfoMap.end()) { STFATAL << ... }",
+      "file": "corpus/train/train_0221_cwe362.cpp",
+      "line": "5-6",
+      "code": "  if (it == idInfoMap.end()) {\n    STFATAL << \" Tried to read from an id that no longer exists\";\n  }",
+      "bug_class": "Reachable fatal log / uncontrolled process abort on untrusted input (denial of service)",
+      "cwe": "CWE-617",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0221_cwe362.cpp (and implementation of STFATAL abort semantics, file not provided)",
+      "invariant": "A missing/expired id arriving from a client MUST be handled as a normal recoverable error (return empty/optional/error or throw a catchable exception), never as a FATAL/aborting event, because the id is attacker-controlled.",
+      "failure_mode": "A client requests routing with an id that is absent from idInfoMap (fabricated, already-torn-down, or racing registration). find() returns end(), the branch fires STFATAL, and easylogging++ FATAL severity aborts the daemon by default, killing every concurrent session. One cheap request yields a full-service DoS.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm STFATAL maps to a FATAL-severity log that aborts (default easylogging++ behavior) and that getInfoForId is reachable with a client-controlled id that need not exist in idInfoMap; check whether any caller pre-validates id membership."
+    },
+    {
+      "title": "Missing-id branch lacks return/throw; falls through to dereference of end() iterator",
+      "anchor": "return it->second",
+      "file": "corpus/train/train_0221_cwe362.cpp",
+      "line": "6-8",
+      "code": "    STFATAL << \" Tried to read from an id that no longer exists\";\n  }\n  return it->second;",
+      "bug_class": "Invalid (non-dereferenceable) iterator dereference — undefined behavior / potential info disclosure",
+      "cwe": "CWE-825",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0221_cwe362.cpp",
+      "invariant": "The not-found path must divert control (return/throw) BEFORE `return it->second`; memory safety must not depend on the side effect of a logging macro terminating the process.",
+      "failure_mode": "The if-block contains only STFATAL with no return/throw, so control reaches `return it->second` unconditionally. If LoggingFlag::DisableApplicationAbortOnFatalLog is set (or STFATAL is reconfigured to non-terminating), then for an absent id `it == idInfoMap.end()` and `it->second` dereferences the map end sentinel — undefined behavior that typically crashes, or copies arbitrary adjacent memory into the returned TerminalUserInfo (session/user info disclosure or misrouting).",
+      "cve_analog": "",
+      "what_to_confirm": "Verify whether the process is ever run with fatal-abort disabled; add an explicit return/throw inside the end() branch so correctness does not hinge on STFATAL aborting."
+    },
+    {
+      "title": "Race safety depends on all idInfoMap mutators also locking routerMutex (recursive-mutex reentrancy)",
+      "anchor": "lock_guard<recursive_mutex> guard(routerMutex)",
+      "file": "corpus/train/train_0221_cwe362.cpp",
+      "line": "3",
+      "code": "  lock_guard<recursive_mutex> guard(routerMutex);",
+      "bug_class": "Concurrent access / TOCTOU (residual race if lock discipline is incomplete)",
+      "cwe": "CWE-362",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "Every path that inserts into or erases from idInfoMap must acquire routerMutex first, and no thread may hold the recursive lock across a re-entrant call into getInfoForId while the map is in a partially-mutated state.",
+      "failure_mode": "This lock closes the read-side race, but if a registration/teardown path mutates idInfoMap without holding routerMutex, find()/it->second still races an erase and can dereference an invalidated node (use-after-free) or observe torn map state. The recursive_mutex allows the same thread to re-enter mid-modification, which can surface the map in a transient 'not found' state and trip the fatal branch above.",
+      "cve_analog": "",
+      "what_to_confirm": "Audit all idInfoMap insert/erase sites for consistent routerMutex locking and check for any recursive re-entry into getInfoForId while a mutation is in progress on the same thread."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm STFATAL is FATAL severity that aborts by default and that getInfoForId is reachable with a client-controlled id — this is a remote DoS on any unknown/expired id.",
+    "Add an explicit return/throw inside the `it == idInfoMap.end()` branch so `return it->second` can never run on an end() iterator regardless of STFATAL's abort behavior.",
+    "Grep every idInfoMap insert/erase for a preceding routerMutex lock; any unlocked mutator reintroduces the CWE-362 race and a possible use-after-free of the map node.",
+    "Verify no caller relies on getInfoForId to authorize the id-to-connection binding; the function returns a full TerminalUserInfo keyed solely on attacker input.",
+    "Check deployment logging configuration for LoggingFlag::DisableApplicationAbortOnFatalLog, which converts the DoS into a silent invalid-iterator dereference / info-disclosure path.",
+    "Confirm whether the recursive_mutex is ever held across a re-entrant call back into getInfoForId while idInfoMap is mid-mutation."
+  ]
+}

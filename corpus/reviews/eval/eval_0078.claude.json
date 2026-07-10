@@ -1,0 +1,243 @@
+{
+  "subsystem": "GLib/GIO generic file-copy fallback. This is file_copy_fallback(), the portable copy path used by g_file_copy() when no backend-specific fast copy is available. It queries the source's type/attributes, handles symlinks and special files, opens the source, creates the destination output stream (with private permissions), then copies the bytes via btrfs reflink, splice, or a plain read/write loop, and finally propagates the source's metadata (mode, timestamps) to the destination.",
+  "provenance": "Identified by the GLib/GIO API surface: GFile/GFileCopyFlags/GCancellable/GFileProgressCallback/GError types, the g_file_* and g_file_info_* functions, G_IO_ERROR_* error domain, the gettext _() macro, and internal GIO symbols _g_local_file_output_stream_replace/_g_local_file_get_filename/G_LOCAL_FILE plus the file-local helpers btrfs_reflink_with_progress and splice_stream_with_progress. This is glib gio/gfile.c file_copy_fallback(). The sample banner 'primevul_c_train_2907_fixed' and the corpus filename (cwe362) indicate this is the FIXED variant of a race-condition (TOCTOU) sample.",
+  "trust_boundary": "The attacker-controllable inputs are the SOURCE and DESTINATION paths and, crucially, the on-disk objects they name and the directories that contain them. If the source (or its parent directory) is writable by, or shared with, an attacker, the object a path resolves to can be swapped between the moment the code inspects it (lstat/query_info) and the moment it opens/writes it — the classic time-of-check/time-of-use window. The symlink TARGET string, the file's type, and its unix::mode/ownership are all data that a hostile filesystem participant controls. Everything derived from a PATH-based query is therefore hostile until the code has an open file descriptor pinned to a specific inode.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/eval/eval_0078_cwe362.c",
+      "lines": "2-9",
+      "code": "file_copy_fallback (GFile                  *source,\n                    GFile                  *destination,\n                    GFileCopyFlags          flags,\n                    GCancellable           *cancellable,\n                    GFileProgressCallback   progress_callback,\n                    gpointer                progress_callback_data,\n                    GError                **error)\n{",
+      "explanation": "The entry point of the portable copy fallback. `source` and `destination` are the two GFile objects (thin wrappers over paths/URIs). `flags` is a bitmask of GFileCopyFlags controlling behavior such as G_FILE_COPY_OVERWRITE, G_FILE_COPY_BACKUP, and G_FILE_COPY_NOFOLLOW_SYMLINKS. `cancellable` allows the operation to be aborted from another thread. `progress_callback`/`progress_callback_data` are an application-supplied callback fired during the byte copy. `error` is the out-parameter GError chain. The security-relevant parameters are `source`/`destination` (they name filesystem objects an attacker may control) and `flags` (which decides whether symlinks are followed)."
+    },
+    {
+      "file": "corpus/eval/eval_0078_cwe362.c",
+      "lines": "10-17",
+      "code": "gboolean ret = FALSE;\n  GFileInputStream *file_in = NULL;\n  GInputStream *in = NULL;\n  GOutputStream *out = NULL;\n  GFileInfo *info = NULL;\n  const char *target;\n  char *attrs_to_read;\n  gboolean do_set_attributes = FALSE;",
+      "explanation": "Local state, all initialized so the single `out:` cleanup label can run safely regardless of where an early error jumps from. `ret` is the success flag. `file_in`/`in` hold the source input stream; `out` holds the destination output stream. `info` is the GFileInfo describing the source (its type and attributes). `target` will hold a symlink's target string. `attrs_to_read` is a heap string listing attributes to gather. `do_set_attributes` records whether metadata should be re-applied to the destination at the end. Note that `attrs_to_read` is NOT initialized to NULL here — it is only read after build_attribute_list_for_copy() (line 59) has set it, and only on the success branch, so this is safe but tight."
+    },
+    {
+      "file": "corpus/eval/eval_0078_cwe362.c",
+      "lines": "19-26",
+      "code": "/* need to know the file type */\n  info = g_file_query_info (source,\n                            G_FILE_ATTRIBUTE_STANDARD_TYPE \",\" G_FILE_ATTRIBUTE_STANDARD_SYMLINK_TARGET,\n                            G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS,\n                            cancellable,\n                            error);\n  if (!info)\n    goto out;",
+      "explanation": "The first inspection of the source, done BY PATH. It asks only for the standard file type and (if it is a symlink) the symlink target. The critical flag is G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, which on Unix makes the backend lstat() rather than stat(): a symlink is reported as a symlink instead of being silently dereferenced. The result feeds the branching below. Because this query resolves the path (not a held descriptor), the inode it describes can differ from the one later opened — this is the check side of a potential time-of-check/time-of-use race."
+    },
+    {
+      "file": "corpus/eval/eval_0078_cwe362.c",
+      "lines": "28-42",
+      "code": "/* Maybe copy the symlink? */\n  if ((flags & G_FILE_COPY_NOFOLLOW_SYMLINKS) &&\n      g_file_info_get_file_type (info) == G_FILE_TYPE_SYMBOLIC_LINK)\n    {\n      target = g_file_info_get_symlink_target (info);\n      if (target)\n        {\n          if (!copy_symlink (destination, flags, cancellable, target, error))\n            goto out;\n\n          ret = TRUE;\n          goto out;\n        }\n        /* ... else fall back on a regular file copy */\n    }",
+      "explanation": "If the caller asked not to follow symlinks AND the source is itself a symbolic link, the code recreates the link rather than copying its contents. `target` is read out of the GFileInfo (the raw bytes the symlink points at, fully attacker-controlled if the source is hostile). copy_symlink() is expected to create a symlink at `destination` pointing at `target` (an operation that writes the link, not through it). On success the function returns TRUE early. If the target string is somehow NULL, it falls through to the regular content copy."
+    },
+    {
+      "file": "corpus/eval/eval_0078_cwe362.c",
+      "lines": "43-50",
+      "code": "/* Handle \"special\" files (pipes, device nodes, ...)? */\n  else if (g_file_info_get_file_type (info) == G_FILE_TYPE_SPECIAL)\n    {\n      /* FIXME: could try to recreate device nodes and others? */\n      g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,\n                           _(\"Can’t copy special file\"));\n      goto out;\n    }",
+      "explanation": "If the source's type (as seen by the earlier path query) is G_FILE_TYPE_SPECIAL — a FIFO, socket, block/character device, etc. — copying is refused with G_IO_ERROR_NOT_SUPPORTED. This is a deliberate safety refusal: blindly opening and read-looping a device node or FIFO could block forever or read attacker-supplied device data. The type used for this decision, however, is the PATH-based one from line 20, not a type confirmed on an open descriptor."
+    },
+    {
+      "file": "corpus/eval/eval_0078_cwe362.c",
+      "lines": "52-57",
+      "code": "/* Everything else should just fall back on a regular copy. */\n\n  file_in = open_source_for_copy (source, destination, flags, cancellable, error);\n  if (!file_in)\n    goto out;\n  in = G_INPUT_STREAM (file_in);",
+      "explanation": "For an ordinary file, the source is actually OPENED here, yielding a GFileInputStream. open_source_for_copy() is the use side of the earlier check: it resolves the path again and opens it. The safety of the whole routine hinges on this helper opening with O_NOFOLLOW-equivalent semantics and, ideally, confirming the opened object is a regular file — because between line 20 and here the path could have been repointed at a symlink, device, or a different regular file. `in` is the generic-stream view used by the copy engines."
+    },
+    {
+      "file": "corpus/eval/eval_0078_cwe362.c",
+      "lines": "59-61",
+      "code": "if (!build_attribute_list_for_copy (destination, flags, &attrs_to_read,\n                                      cancellable, error))\n    goto out;",
+      "explanation": "Builds, into the heap string `attrs_to_read`, the set of source attributes that should be gathered and later replicated onto the destination (this depends on what the destination filesystem can store and on the copy flags). A failure aborts. On success `attrs_to_read` is either a non-NULL attribute list or NULL (meaning nothing to copy)."
+    },
+    {
+      "file": "corpus/eval/eval_0078_cwe362.c",
+      "lines": "63-99",
+      "code": "if (attrs_to_read != NULL)\n    {\n      GError *tmp_error = NULL;\n\n      /* Ok, ditch the previous lightweight info (on Unix we just\n       * called lstat()); at this point we gather all the information\n       * we need about the source from the opened file descriptor.\n       */\n      g_object_unref (info);\n\n      info = g_file_input_stream_query_info (file_in, attrs_to_read,\n                                             cancellable, &tmp_error);\n      if (!info)\n        {\n          /* Not all gvfs backends implement query_info_on_read(), we\n           * can just fall back to the pathname again.\n           * https://bugzilla.gnome.org/706254\n           */\n          if (g_error_matches (tmp_error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED))\n            {\n              g_clear_error (&tmp_error);\n              info = g_file_query_info (source, attrs_to_read, G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS,\n                                        cancellable, error);\n            }\n          else\n            {\n              g_free (attrs_to_read);\n              g_propagate_error (error, tmp_error);\n              goto out;\n            }\n        }\n      g_free (attrs_to_read);\n      if (!info)\n        goto out;\n\n      do_set_attributes = TRUE;\n    }",
+      "explanation": "This is the heart of the TOCTOU FIX. The lightweight path-based `info` from line 20 is dropped (g_object_unref) and replaced by g_file_input_stream_query_info(), which re-reads the metadata FROM THE ALREADY-OPEN DESCRIPTOR (`file_in`). Metadata pinned to the open FD cannot be swapped out from under the copy, so the mode/ownership later applied to the destination reflects the exact inode being copied. The comment explicitly notes it is intentionally discarding the earlier lstat result. The IMPORTANT residual: if the stream backend does not implement query-on-read (returns G_IO_ERROR_NOT_SUPPORTED), it falls back to g_file_query_info() BY PATH again (line 84) — reintroducing a path resolution that is no longer tied to `file_in`. `attrs_to_read` is freed on all paths; `do_set_attributes` is set so the metadata is applied at cleanup."
+    },
+    {
+      "file": "corpus/eval/eval_0078_cwe362.c",
+      "lines": "101-137",
+      "code": "if (G_IS_LOCAL_FILE (destination))\n    {\n      if (flags & G_FILE_COPY_OVERWRITE)\n        out = (GOutputStream*)_g_local_file_output_stream_replace (_g_local_file_get_filename (G_LOCAL_FILE (destination)),\n                                                                   FALSE, NULL,\n                                                                   flags & G_FILE_COPY_BACKUP,\n                                                                   G_FILE_CREATE_REPLACE_DESTINATION |\n                                                                   G_FILE_CREATE_PRIVATE, info,\n                                                                   cancellable, error);\n      else\n        out = (GOutputStream*)_g_local_file_output_stream_create (_g_local_file_get_filename (G_LOCAL_FILE (destination)),\n                                                                  FALSE, G_FILE_CREATE_PRIVATE, info,\n                                                                  cancellable, error);\n    }\n  else if (flags & G_FILE_COPY_OVERWRITE)\n    {\n      out = (GOutputStream *)g_file_replace (destination,\n                                             NULL,\n                                             flags & G_FILE_COPY_BACKUP,\n                                             G_FILE_CREATE_REPLACE_DESTINATION |\n                                             G_FILE_CREATE_PRIVATE,\n                                             cancellable, error);\n    }\n  else\n    {\n      out = (GOutputStream *)g_file_create (destination, G_FILE_CREATE_PRIVATE, cancellable, error);\n    }\n\n  if (!out)\n    goto out;",
+      "explanation": "Creates the destination output stream. There are three cases: a local destination (fast internal path that also passes the source `info` down so the file is created with the source's unix::mode instead of default permissions), a remote destination with overwrite, and a remote destination create. Every branch passes G_FILE_CREATE_PRIVATE. That flag is a real security control: it makes the new file initially accessible only to the owner, so its bytes are not briefly world-readable during the copy before the final mode is applied. Overwrite paths also request G_FILE_CREATE_REPLACE_DESTINATION (atomic replace) and honor G_FILE_COPY_BACKUP. A NULL result aborts."
+    },
+    {
+      "file": "corpus/eval/eval_0078_cwe362.c",
+      "lines": "139-164",
+      "code": "#ifdef __linux__\n  if (G_IS_FILE_DESCRIPTOR_BASED (in) && G_IS_FILE_DESCRIPTOR_BASED (out))\n    {\n      GError *reflink_err = NULL;\n\n      if (!btrfs_reflink_with_progress (in, out, info, cancellable,\n                                        progress_callback, progress_callback_data,\n                                        &reflink_err))\n        {\n          if (g_error_matches (reflink_err, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED))\n            {\n              g_clear_error (&reflink_err);\n            }\n          else\n            {\n              g_propagate_error (error, reflink_err);\n              goto out;\n            }\n        }\n      else\n        {\n          ret = TRUE;\n          goto out;\n        }\n    }\n#endif",
+      "explanation": "On Linux, if both ends are backed by real file descriptors, it first attempts a btrfs reflink (copy-on-write clone) via the FICLONE ioctl. A NOT_SUPPORTED error (e.g. non-btrfs, cross-filesystem) is swallowed so the code can fall through to the next strategy; any other error aborts. Success returns TRUE early. `info` is passed so the clone helper can size/attribute the copy."
+    },
+    {
+      "file": "corpus/eval/eval_0078_cwe362.c",
+      "lines": "166-192",
+      "code": "#ifdef HAVE_SPLICE\n  if (G_IS_FILE_DESCRIPTOR_BASED (in) && G_IS_FILE_DESCRIPTOR_BASED (out))\n    {\n      GError *splice_err = NULL;\n\n      if (!splice_stream_with_progress (in, out, cancellable,\n                                        progress_callback, progress_callback_data,\n                                        &splice_err))\n        {\n          if (g_error_matches (splice_err, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED))\n            {\n              g_clear_error (&splice_err);\n            }\n          else\n            {\n              g_propagate_error (error, splice_err);\n              goto out;\n            }\n        }\n      else\n        {\n          ret = TRUE;\n          goto out;\n        }\n    }\n\n#endif",
+      "explanation": "The second fast strategy: an in-kernel splice() copy that avoids bouncing data through user space, again only when both endpoints are FD-based. Same error discipline — NOT_SUPPORTED falls through, other errors abort, success returns early. splice_stream_with_progress() also drives the progress callback."
+    },
+    {
+      "file": "corpus/eval/eval_0078_cwe362.c",
+      "lines": "194-200",
+      "code": "/* A plain read/write loop */\n  if (!copy_stream_with_progress (in, out, source, cancellable,\n                                  progress_callback, progress_callback_data,\n                                  error))\n    goto out;\n\n  ret = TRUE;",
+      "explanation": "The universal fallback: a portable read/write loop that works for any stream pair (including remote/gvfs). It also receives `source` (used for progress size hints) and the progress callback. On success `ret` is set TRUE and control drops into cleanup."
+    },
+    {
+      "file": "corpus/eval/eval_0078_cwe362.c",
+      "lines": "201-215",
+      "code": " out:\n  if (in)\n    {\n      /* Don't care about errors in source here */\n      (void) g_input_stream_close (in, cancellable, NULL);\n      g_object_unref (in);\n    }\n\n  if (out)\n    {\n      /* But write errors on close are bad! */\n      if (!g_output_stream_close (out, cancellable, ret ? error : NULL))\n        ret = FALSE;\n      g_object_unref (out);\n    }",
+      "explanation": "The single cleanup path. The input stream is closed with errors ignored (a read-side close failure does not invalidate a successful copy) and unref'd. The output stream close is treated as significant: a failure to flush/close the destination downgrades `ret` to FALSE (an incomplete write must be reported as failure). The error is only captured into `error` when the copy had otherwise succeeded (`ret ? error : NULL`) so an earlier, more specific error is not overwritten."
+    },
+    {
+      "file": "corpus/eval/eval_0078_cwe362.c",
+      "lines": "217-231",
+      "code": "/* Ignore errors here. Failure to copy metadata is not a hard error */\n  /* TODO: set these attributes /before/ we do the rename() on Unix */\n  if (ret && do_set_attributes)\n    {\n      g_file_set_attributes_from_info (destination,\n                                       info,\n                                       G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS,\n                                       cancellable,\n                                       NULL);\n    }\n\n  g_clear_object (&info);\n\n  return ret;\n}",
+      "explanation": "If the copy succeeded and attributes were gathered, the source's metadata (`info`, ideally the FD-sourced one) is applied to the destination, with errors deliberately ignored (metadata loss is soft-fail). The NOFOLLOW flag is passed so attributes are set on the destination file itself, not a symlink it might resolve to. The in-code TODO acknowledges a design wrinkle: on Unix the attributes are applied AFTER the atomic rename that publishes the file, so there is a brief window in which the destination exists with default (private) rather than final permissions. Finally `info` is released and `ret` returned."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/eval/eval_0078_cwe362.c",
+      "lines": "81-85",
+      "code": "if (g_error_matches (tmp_error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED))\n            {\n              g_clear_error (&tmp_error);\n              info = g_file_query_info (source, attrs_to_read, G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS,\n                                        cancellable, error);",
+      "explanation": "This is the residual race INSIDE the fix. The whole point of lines 71-73 is to stop using path-based metadata and instead read attributes from the pinned descriptor `file_in`. But when the stream backend lacks query-on-read, the code re-queries BY PATH (`source`) rather than by the open FD. The `info` obtained here is then handed to the destination-creation call (line 115) and re-applied via g_file_set_attributes_from_info (line 221). An attacker who can swap the object at `source` between the open (line 54) and this re-stat can make the destination be created and/or chmod'd with an inode's mode/ownership that is NOT the data actually copied — e.g. inducing a more permissive mode, or setuid/setgid bits, on a file whose contents came from the originally-opened inode. Invariant: post-open metadata must come from the descriptor, never a fresh path lookup; the path fallback should at minimum re-verify identity (dev/ino) against `file_in`."
+    },
+    {
+      "file": "corpus/eval/eval_0078_cwe362.c",
+      "lines": "20-24",
+      "code": "info = g_file_query_info (source,\n                            G_FILE_ATTRIBUTE_STANDARD_TYPE \",\" G_FILE_ATTRIBUTE_STANDARD_SYMLINK_TARGET,\n                            G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS,\n                            cancellable,\n                            error);",
+      "explanation": "Time-of-check for file TYPE. The symlink decision (line 29-30) and the special-file refusal (line 44) are both made against this path-based lstat, but the actual open happens later at line 54. If `source` lives in an attacker-influenced directory, the object can be swapped between this query and the open: a regular file at check time can become a symlink or a device/FIFO at open time. The type-based safety checks are only as strong as open_source_for_copy()'s use of O_NOFOLLOW and its confirmation that the opened FD is really a regular file. This is a LATENT CWE-362: the guard here does not by itself prevent following a maliciously-substituted symlink or blocking on a substituted FIFO. Invariant: the open must be atomic-with-check (O_NOFOLLOW / fstat-after-open identity check), not merely trust the earlier path query."
+    },
+    {
+      "file": "corpus/eval/eval_0078_cwe362.c",
+      "lines": "218-225",
+      "code": "/* TODO: set these attributes /before/ we do the rename() on Unix */\n  if (ret && do_set_attributes)\n    {\n      g_file_set_attributes_from_info (destination,\n                                       info,\n                                       G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS,\n                                       cancellable,\n                                       NULL);",
+      "explanation": "Two concerns converge here. (1) Ordering window (the code's own TODO): attributes — including unix::mode — are applied AFTER the destination has been published (renamed into place on the overwrite path). Until this runs the file carries the private-create mode, which is safe-by-default, but if the source mode carries setuid/setgid/world bits they are copied onto the destination without any policy check; copying setuid bits during a privileged copy can create a privilege-escalation artifact. (2) It re-applies whatever `info` currently holds — which, on the fallback branch (line 84), is path-sourced and potentially attacker-influenced (see the first risk). Invariant: privileged/security-sensitive mode bits should be filtered or applied before publish, and `info` must be the descriptor-sourced metadata."
+    },
+    {
+      "file": "corpus/eval/eval_0078_cwe362.c",
+      "lines": "32-36",
+      "code": "target = g_file_info_get_symlink_target (info);\n      if (target)\n        {\n          if (!copy_symlink (destination, flags, cancellable, target, error))\n            goto out;",
+      "explanation": "The symlink target string is entirely attacker-controlled content of a hostile source symlink. It is passed straight into copy_symlink() to be recreated at `destination`. Recreating a symlink is normally safe (it writes the link, not through it), but the contract that must hold is that copy_symlink() creates the destination as a symlink WITHOUT following any existing symlink at the destination path (O_NOFOLLOW / symlinkat semantics) and without letting an absolute/`..`-laden target cause a later dereference to escape an intended directory. If the destination side follows an existing symlink, an attacker who controls the source symlink target plus a destination-side symlink can redirect a subsequent write. This is a LATENT concern in copy_symlink() (not shown). CWE-59/CWE-362."
+    },
+    {
+      "file": "corpus/eval/eval_0078_cwe362.c",
+      "lines": "44-49",
+      "code": "else if (g_file_info_get_file_type (info) == G_FILE_TYPE_SPECIAL)\n    {\n      /* FIXME: could try to recreate device nodes and others? */\n      g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,\n                           _(\"Can’t copy special file\"));",
+      "explanation": "The refusal to copy special files is decided on the path-based type from line 20. If the source is swapped from a regular file to a FIFO/device AFTER this check but BEFORE open_source_for_copy() at line 54, the refusal is bypassed and the copy loop may open and read a device node or block indefinitely on a FIFO. This is the same TOCTOU root cause as the type-check risk above and again depends entirely on the open helper (O_NONBLOCK/O_NOFOLLOW and post-open S_ISREG verification). Invariant: reject non-regular sources based on the OPEN descriptor's fstat, not the pre-open path query."
+    },
+    {
+      "file": "corpus/eval/eval_0078_cwe362.c",
+      "lines": "110-116",
+      "code": "if (flags & G_FILE_COPY_OVERWRITE)\n        out = (GOutputStream*)_g_local_file_output_stream_replace (_g_local_file_get_filename (G_LOCAL_FILE (destination)),\n                                                                   FALSE, NULL,\n                                                                   flags & G_FILE_COPY_BACKUP,\n                                                                   G_FILE_CREATE_REPLACE_DESTINATION |\n                                                                   G_FILE_CREATE_PRIVATE, info,\n                                                                   cancellable, error);",
+      "explanation": "This branch is the positive security control worth confirming rather than a bug: G_FILE_CREATE_PRIVATE is present on every destination-creation path (lines 115, 119, 128, 133), which prevents the copied bytes from being momentarily exposed with permissive default mode before the final chmod. The failure mode to guard against is a future refactor DROPPING this flag on any one branch — that would reintroduce an information-disclosure window (CWE-732/CWE-200) where a partially- or fully-written copy of sensitive source data is world-readable. Invariant: all creation paths must keep G_FILE_CREATE_PRIVATE."
+    },
+    {
+      "file": "corpus/eval/eval_0078_cwe362.c",
+      "lines": "144-146",
+      "code": "if (!btrfs_reflink_with_progress (in, out, info, cancellable,\n                                        progress_callback, progress_callback_data,\n                                        &reflink_err))",
+      "explanation": "The application-supplied progress_callback is invoked from deep inside the copy engines (reflink/splice/plain loop) while `in`, `out`, and `info` are live and the destination is mid-write. A re-entrant or malicious callback could call back into GIO on the same objects, or block, or trigger cancellation, during an unfinished write. This is a lower-severity object-lifetime/re-entrancy concern (CWE-362/CWE-663): the callback must be treated as untrusted control flow that runs while internal state is inconsistent, and the engines must not assume the callback leaves their streams untouched. Not demonstrably exploitable from the shown code, but a contract the implementations must respect."
+    }
+  ],
+  "summary": "This is the FIXED variant of GLib GIO's file_copy_fallback(). It correctly hardens the central TOCTOU hazard by discarding the initial path-based lstat and re-reading source metadata from the already-open descriptor (lines 71-73), and it creates every destination with G_FILE_CREATE_PRIVATE. The residual, LATENT risks are all race-condition (CWE-362) in nature and live in code not shown: a path-based re-stat fallback when query-on-read is unsupported (line 84), reliance on open_source_for_copy()/copy_symlink() to enforce O_NOFOLLOW and post-open regular-file verification, and an attribute-application step that runs after publish and copies mode bits verbatim. No memory-safety bug is present in the shown function; the code is defensively written.",
+  "reviewed_anchors": [
+    { "anchor": "file_copy_fallback() signature (source, destination, flags, cancellable, progress_callback, progress_callback_data, error), lines 2-8", "disposition": "finding", "reason": "source/destination name attacker-influenceable filesystem objects; the whole TOCTOU surface hangs off these parameters" },
+    { "anchor": "GFileCopyFlags flags parameter (G_FILE_COPY_NOFOLLOW_SYMLINKS / OVERWRITE / BACKUP), line 4", "disposition": "finding", "reason": "controls whether symlinks are followed and whether overwrite/backup semantics apply — security-relevant behavior selector" },
+    { "anchor": "GFileProgressCallback progress_callback / progress_callback_data, lines 6-7", "disposition": "finding", "reason": "untrusted callback executed mid-write inside the copy engines — re-entrancy/lifetime contract" },
+    { "anchor": "local var initializations, lines 10-17", "disposition": "dismissed", "reason": "all pointers NULL-initialized for the single cleanup label; attrs_to_read is only read after being assigned — no uninitialized-use bug" },
+    { "anchor": "g_file_query_info(... NOFOLLOW ...) initial type check, lines 20-24", "disposition": "finding", "reason": "time-of-check by path; the checked inode can be swapped before the open at line 54 (CWE-362)" },
+    { "anchor": "symlink branch + g_file_info_get_symlink_target + copy_symlink(target), lines 28-40", "disposition": "finding", "reason": "attacker-controlled symlink target recreated at destination; destination-side symlink-follow/traversal contract lives in copy_symlink()" },
+    { "anchor": "G_FILE_TYPE_SPECIAL refusal, lines 43-50", "disposition": "finding", "reason": "refusal based on pre-open path type; a swapped-in FIFO/device can bypass it at open time (CWE-362)" },
+    { "anchor": "open_source_for_copy(source, destination, flags, ...), line 54", "disposition": "finding", "reason": "the time-of-use open; safety depends on unshown O_NOFOLLOW and post-open S_ISREG verification" },
+    { "anchor": "build_attribute_list_for_copy(destination, flags, &attrs_to_read, ...), line 59", "disposition": "dismissed", "reason": "constructs the attribute list; no direct attacker-controlled buffer/length here" },
+    { "anchor": "g_object_unref(info) + g_file_input_stream_query_info(file_in, ...), lines 71-74", "disposition": "finding", "reason": "the TOCTOU FIX — metadata re-read from the pinned FD; central positive control to confirm" },
+    { "anchor": "path-based fallback g_file_query_info(source, ...), line 84", "disposition": "finding", "reason": "re-introduces a path resolution not tied to file_in when query-on-read is unsupported — residual race (CWE-362)" },
+    { "anchor": "error/free handling in the query block (g_free attrs_to_read, g_propagate_error, goto out), lines 88-96", "disposition": "dismissed", "reason": "attrs_to_read freed on every branch; info reassigned or NULL then NULL-checked — no leak/double-free/use-after-free" },
+    { "anchor": "destination creation with G_FILE_CREATE_PRIVATE (all branches), lines 108-134", "disposition": "finding", "reason": "private-create flag is a real info-disclosure control; must be preserved on every branch" },
+    { "anchor": "btrfs_reflink_with_progress(in, out, info, ...), lines 144-146", "disposition": "finding", "reason": "runs the untrusted progress callback while destination is mid-write; NOT_SUPPORTED-swallow error discipline to confirm" },
+    { "anchor": "splice_stream_with_progress(in, out, ...), lines 171-173", "disposition": "dismissed", "reason": "same callback/error pattern as the reflink engine; no distinct new contract beyond the callback re-entrancy finding" },
+    { "anchor": "copy_stream_with_progress(in, out, source, ...), lines 195-197", "disposition": "dismissed", "reason": "portable read/write loop; the buffer bounds live in the helper, no anchor exposes a length/size here" },
+    { "anchor": "out: cleanup — g_input_stream_close / g_output_stream_close(ret ? error : NULL), lines 201-215", "disposition": "dismissed", "reason": "correct: source close errors ignored, destination close failure downgrades ret, error not clobbered — sound cleanup" },
+    { "anchor": "g_file_set_attributes_from_info(destination, info, NOFOLLOW, ...) after publish, lines 219-226", "disposition": "finding", "reason": "applies mode/ownership after the file is published and copies mode bits verbatim (setuid/setgid); TODO acknowledges the ordering window" },
+    { "anchor": "g_clear_object(&info) + return ret, lines 228-230", "disposition": "dismissed", "reason": "single-point release of the last info reference; no double-free or leak" }
+  ],
+  "findings": [
+    {
+      "title": "Path-based metadata fallback reintroduces a TOCTOU race in the fix itself",
+      "anchor": "info = g_file_query_info (source, attrs_to_read, G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, cancellable, error);",
+      "file": "corpus/eval/eval_0078_cwe362.c",
+      "line": "84-85",
+      "code": "info = g_file_query_info (source, attrs_to_read, G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS,\n                                        cancellable, error);",
+      "bug_class": "Time-of-check/time-of-use race (path re-stat after open)",
+      "cwe": "CWE-362",
+      "severity": "medium",
+      "where_it_lives": "corpus/eval/eval_0078_cwe362.c (and the query-on-read backends it falls back from)",
+      "invariant": "Once the source is open (file_in), all metadata used to shape the destination must come from that descriptor (fstat/query-on-read); a path re-lookup must at minimum re-verify device/inode identity against file_in before its info is trusted.",
+      "failure_mode": "When a stream backend does not implement query-on-read, the code re-queries the source BY PATH. If the source path is in an attacker-controllable directory, the object can be swapped between open (line 54) and this re-stat, so the mode/ownership subsequently used to create (line 115) and chmod (line 221) the destination reflects a different inode than the bytes copied — enabling attacker-chosen (e.g. more permissive or setuid) permissions on the output.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether the query-on-read fallback path can be reached for local files, and whether any caller/downstream re-verifies that the path-queried inode matches file_in before applying its attributes."
+    },
+    {
+      "title": "Source file-type checks decided on pre-open path query, not the open descriptor",
+      "anchor": "file_in = open_source_for_copy (source, destination, flags, cancellable, error);",
+      "file": "corpus/eval/eval_0078_cwe362.c",
+      "line": "20-54",
+      "code": "file_in = open_source_for_copy (source, destination, flags, cancellable, error);",
+      "bug_class": "TOCTOU file-type substitution (symlink/special-file)",
+      "cwe": "CWE-362",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided) — open_source_for_copy() in gio/gfile.c",
+      "invariant": "open_source_for_copy() must open with O_NOFOLLOW-equivalent semantics and confirm via fstat on the returned descriptor that the object is a regular file; the copy must not proceed on a descriptor whose type differs from the type checked at line 20.",
+      "failure_mode": "The symlink decision (line 29) and special-file refusal (line 44) are made against the path-based lstat at line 20, but the open happens later at line 54. A regular file checked here can be replaced by a symlink (causing an unintended dereference/target write) or a FIFO/device (causing an indefinite block or reading attacker device data) before the open, bypassing both guards.",
+      "cve_analog": "",
+      "what_to_confirm": "That open_source_for_copy() uses O_NOFOLLOW and rejects non-regular files after opening, rather than trusting the earlier path query."
+    },
+    {
+      "title": "Source attributes (incl. setuid/mode) applied to destination after publish, verbatim",
+      "anchor": "g_file_set_attributes_from_info (destination, info, G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, cancellable, NULL);",
+      "file": "corpus/eval/eval_0078_cwe362.c",
+      "line": "219-226",
+      "code": "g_file_set_attributes_from_info (destination,\n                                       info,\n                                       G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS,\n                                       cancellable,\n                                       NULL);",
+      "bug_class": "Post-publish attribute application / verbatim privilege-bit copy",
+      "cwe": "CWE-362",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0078_cwe362.c",
+      "invariant": "Security-sensitive mode bits (setuid/setgid/sticky and group/other permissions) copied from a possibly-hostile source should be applied before the file is published (as the in-code TODO states) and, for privileged copies, filtered rather than replicated blindly; `info` here must be the descriptor-sourced metadata.",
+      "failure_mode": "The metadata copy runs after the destination has been renamed into place, and it replicates the source's mode verbatim. If `info` came from the path fallback (line 84) it may describe an attacker-substituted inode, and copying setuid/setgid bits can yield a destination with unintended privilege in a directory the attacker can then leverage.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether g_file_set_attributes_from_info() filters privilege bits, and whether the ordering window between rename and chmod is observable to other users."
+    },
+    {
+      "title": "Attacker-controlled symlink target recreated at destination (symlink-follow contract)",
+      "anchor": "if (!copy_symlink (destination, flags, cancellable, target, error))",
+      "file": "corpus/eval/eval_0078_cwe362.c",
+      "line": "35",
+      "code": "if (!copy_symlink (destination, flags, cancellable, target, error))",
+      "bug_class": "Symlink handling / link-following at destination",
+      "cwe": "CWE-59",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided) — copy_symlink() in gio/gfile.c",
+      "invariant": "copy_symlink() must create the destination as a symbolic link without following any pre-existing symlink at the destination path (symlinkat/O_NOFOLLOW), so that a hostile source symlink target cannot be combined with a destination-side symlink to redirect later operations.",
+      "failure_mode": "`target` is the raw, fully attacker-controlled contents of a hostile source symlink. If copy_symlink() follows an existing symlink at the destination when creating the link, an attacker who controls both the source target and a destination-side link can cause writes to be redirected outside the intended location.",
+      "cve_analog": "",
+      "what_to_confirm": "That copy_symlink() creates the link atomically with O_NOFOLLOW/symlinkat and does not traverse an existing destination symlink."
+    },
+    {
+      "title": "Untrusted progress callback invoked while destination is mid-write",
+      "anchor": "btrfs_reflink_with_progress (in, out, info, cancellable, progress_callback, progress_callback_data, &reflink_err)",
+      "file": "corpus/eval/eval_0078_cwe362.c",
+      "line": "144-146",
+      "code": "if (!btrfs_reflink_with_progress (in, out, info, cancellable,\n                                        progress_callback, progress_callback_data,\n                                        &reflink_err))",
+      "bug_class": "Callback re-entrancy / object lifetime during active copy",
+      "cwe": "CWE-663",
+      "severity": "info",
+      "where_it_lives": "implementation (file not provided) — the *_with_progress copy engines",
+      "invariant": "The copy engines must treat progress_callback as untrusted control flow that runs while in/out/info are live and the destination is inconsistent: they must not assume the callback leaves their streams untouched and must handle callback-triggered cancellation safely.",
+      "failure_mode": "progress_callback is application code executed from inside reflink/splice/plain-loop while the write is unfinished. A re-entrant callback that manipulates the same GFile/streams, blocks, or forces cancellation can corrupt engine state or leave a partial destination; the impact depends entirely on the (unshown) engine internals.",
+      "cve_analog": "",
+      "what_to_confirm": "That the *_with_progress helpers do not hold state across the callback that the callback could invalidate, and that cancellation during the callback unwinds cleanly."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm open_source_for_copy() opens with O_NOFOLLOW and fstat-verifies the descriptor is a regular file, so the line-20 type checks cannot be defeated by a post-check swap.",
+    "Trace whether the query-on-read NOT_SUPPORTED fallback (line 84) is reachable for local files and whether the path-queried info is identity-checked (dev/ino) against file_in before use.",
+    "Verify g_file_set_attributes_from_info() (line 221) filters setuid/setgid/sticky and permission bits rather than copying them verbatim, and assess the rename-then-chmod ordering window called out by the TODO.",
+    "Confirm copy_symlink() creates the destination link with symlinkat/O_NOFOLLOW and never follows an existing destination symlink when writing the target.",
+    "Confirm G_FILE_CREATE_PRIVATE is present on ALL destination-creation branches (lines 115, 119, 128, 133) so partial copies are never world-readable.",
+    "Review the *_with_progress engines for safe handling of a re-entrant or cancelling progress callback fired mid-write.",
+    "Confirm the destination-side create/replace also resists symlink attacks on the destination path (O_NOFOLLOW / O_EXCL as appropriate)."
+  ]
+}

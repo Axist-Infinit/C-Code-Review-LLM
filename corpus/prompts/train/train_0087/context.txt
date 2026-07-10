@@ -1,0 +1,131 @@
+Files under review: corpus/train/train_0087_cwe665.cpp
+
+<<<BEGIN_UNTRUSTED_CODE>>>
+/* ===== FILE: corpus/train/train_0087_cwe665.cpp ===== */
+   1| /* sample: primevul_train_2108_vuln */
+   2|   void Compute(OpKernelContext* ctx) override {
+   3|     const Tensor* inputs;
+   4|     const Tensor* labels_indices;
+   5|     const Tensor* labels_values;
+   6|     const Tensor* seq_len;
+   7|     OP_REQUIRES_OK(ctx, ctx->input("inputs", &inputs));
+   8|     OP_REQUIRES_OK(ctx, ctx->input("labels_indices", &labels_indices));
+   9|     OP_REQUIRES_OK(ctx, ctx->input("labels_values", &labels_values));
+  10|     OP_REQUIRES_OK(ctx, ctx->input("sequence_length", &seq_len));
+  11| 
+  12|     OP_REQUIRES(ctx, inputs->shape().dims() == 3,
+  13|                 errors::InvalidArgument("inputs is not a 3-Tensor"));
+  14|     OP_REQUIRES(ctx, TensorShapeUtils::IsVector(seq_len->shape()),
+  15|                 errors::InvalidArgument("sequence_length is not a vector"));
+  16|     OP_REQUIRES(ctx, TensorShapeUtils::IsMatrix(labels_indices->shape()),
+  17|                 errors::InvalidArgument("labels_indices is not a matrix"));
+  18|     OP_REQUIRES(ctx, labels_indices->dim_size(1) > 1,
+  19|                 errors::InvalidArgument(
+  20|                     "labels_indices second dimension must be >= 1. Received ",
+  21|                     labels_indices->dim_size(1)));
+  22|     OP_REQUIRES(ctx, TensorShapeUtils::IsVector(labels_values->shape()),
+  23|                 errors::InvalidArgument("labels_values is not a vector"));
+  24| 
+  25|     const TensorShape& inputs_shape = inputs->shape();
+  26|     const int64 max_time = inputs_shape.dim_size(0);
+  27|     const int64 batch_size = inputs_shape.dim_size(1);
+  28|     const int64 num_classes_raw = inputs_shape.dim_size(2);
+  29|     OP_REQUIRES(
+  30|         ctx, FastBoundsCheck(num_classes_raw, std::numeric_limits<int>::max()),
+  31|         errors::InvalidArgument("num_classes cannot exceed max int"));
+  32|     const int num_classes = static_cast<const int>(num_classes_raw);
+  33| 
+  34|     OP_REQUIRES(
+  35|         ctx, batch_size == seq_len->dim_size(0),
+  36|         errors::InvalidArgument("len(sequence_length) != batch_size.  ",
+  37|                                 "len(sequence_length):  ", seq_len->dim_size(0),
+  38|                                 " batch_size: ", batch_size));
+  39|     auto seq_len_t = seq_len->vec<int32>();
+  40| 
+  41|     OP_REQUIRES(ctx, labels_indices->dim_size(0) == labels_values->dim_size(0),
+  42|                 errors::InvalidArgument(
+  43|                     "labels_indices and labels_values must contain the "
+  44|                     "same number of rows, but saw shapes: ",
+  45|                     labels_indices->shape().DebugString(), " vs. ",
+  46|                     labels_values->shape().DebugString()));
+  47| 
+  48|     OP_REQUIRES(ctx, batch_size != 0,
+  49|                 errors::InvalidArgument("batch_size must not be 0"));
+  50| 
+  51|     // Figure out the maximum label length to use as sparse tensor dimension.
+  52|     auto labels_indices_t = labels_indices->matrix<int64>();
+  53|     int64 max_label_len = 0;
+  54|     for (int i = 0; i < labels_indices->dim_size(0); i++) {
+  55|       max_label_len = std::max(max_label_len, labels_indices_t(i, 1) + 1);
+  56|     }
+  57| 
+  58|     TensorShape labels_shape({batch_size, max_label_len});
+  59|     std::vector<int64> order{0, 1};
+  60|     sparse::SparseTensor labels_sp;
+  61|     OP_REQUIRES_OK(
+  62|         ctx, sparse::SparseTensor::Create(*labels_indices, *labels_values,
+  63|                                           labels_shape, order, &labels_sp));
+  64| 
+  65|     Status labels_sp_valid = labels_sp.IndicesValid();
+  66|     OP_REQUIRES(ctx, labels_sp_valid.ok(),
+  67|                 errors::InvalidArgument("label SparseTensor is not valid: ",
+  68|                                         labels_sp_valid.error_message()));
+  69| 
+  70|     typename ctc::CTCLossCalculator<T>::LabelSequences labels_t(batch_size);
+  71|     for (const auto& g : labels_sp.group({0})) {  // iterate by batch
+  72|       const int64 batch_indices = g.group()[0];
+  73|       OP_REQUIRES(ctx, FastBoundsCheck(batch_indices, batch_size),
+  74|                   errors::InvalidArgument("labels batch index must be between ",
+  75|                                           0, " and ", batch_size,
+  76|                                           " but saw: ", batch_indices));
+  77| 
+  78|       auto values = g.values<int32>();
+  79|       std::vector<int>* b_values = &labels_t[batch_indices];
+  80|       b_values->resize(values.size());
+  81|       for (int i = 0; i < values.size(); ++i) (*b_values)[i] = values(i);
+  82|     }
+  83| 
+  84|     OP_REQUIRES(ctx, static_cast<size_t>(batch_size) == labels_t.size(),
+  85|                 errors::InvalidArgument("len(labels) != batch_size.  ",
+  86|                                         "len(labels):  ", labels_t.size(),
+  87|                                         " batch_size: ", batch_size));
+  88| 
+  89|     for (int64 b = 0; b < batch_size; ++b) {
+  90|       OP_REQUIRES(
+  91|           ctx, seq_len_t(b) <= max_time,
+  92|           errors::InvalidArgument("sequence_length(", b, ") <= ", max_time));
+  93|     }
+  94| 
+  95|     Tensor* loss = nullptr;
+  96|     OP_REQUIRES_OK(ctx, ctx->allocate_output("loss", seq_len->shape(), &loss));
+  97|     auto loss_t = loss->vec<T>();
+  98| 
+  99|     Tensor* gradient;
+ 100|     OP_REQUIRES_OK(ctx,
+ 101|                    ctx->allocate_output("gradient", inputs_shape, &gradient));
+ 102|     auto gradient_t = gradient->tensor<T, 3>();
+ 103|     auto inputs_t = inputs->tensor<T, 3>();
+ 104|     std::vector<OutputMap> gradient_list_t;
+ 105|     std::vector<InputMap> input_list_t;
+ 106| 
+ 107|     for (std::size_t t = 0; t < max_time; ++t) {
+ 108|       input_list_t.emplace_back(inputs_t.data() + t * batch_size * num_classes,
+ 109|                                 batch_size, num_classes);
+ 110|       gradient_list_t.emplace_back(
+ 111|           gradient_t.data() + t * batch_size * num_classes, batch_size,
+ 112|           num_classes);
+ 113|     }
+ 114| 
+ 115|     gradient_t.setZero();
+ 116| 
+ 117|     // Assumption: the blank index is num_classes - 1
+ 118|     ctc::CTCLossCalculator<T> ctc_loss_calculator(num_classes - 1, 0);
+ 119|     DeviceBase::CpuWorkerThreads workers =
+ 120|         *ctx->device()->tensorflow_cpu_worker_threads();
+ 121|     OP_REQUIRES_OK(ctx, ctc_loss_calculator.CalculateLoss(
+ 122|                             seq_len_t, labels_t, input_list_t,
+ 123|                             preprocess_collapse_repeated_, ctc_merge_repeated_,
+ 124|                             ignore_longer_outputs_than_inputs_, &loss_t,
+ 125|                             &gradient_list_t, &workers));
+ 126|   }
+<<<END_UNTRUSTED_CODE>>>

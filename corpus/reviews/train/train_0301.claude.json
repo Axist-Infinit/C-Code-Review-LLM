@@ -1,0 +1,276 @@
+{
+  "subsystem": "Linux kernel DSA (Distributed Switch Architecture) driver for the NXP SJA1105 automotive Ethernet switch. This is the sja1105_static_config_upload() routine that serializes the driver's in-memory static configuration into a byte buffer and pushes it to the switch over SPI, then polls the device's status word to confirm the upload took (device-id match, local/global CRC OK, config valid), retrying a cold-reset + upload cycle up to RETRIES times.",
+  "provenance": "Identified from the function name sja1105_static_config_upload and the pervasive sja1105_* symbol namespace (sja1105_private, sja1105_static_config, sja1105_regs, sja1105_status, sja1105_cold_reset, sja1105_spi_send_long_packed_buf, sja1105_ptp_reset), which are the NXP SJA1105 DSA driver in drivers/net/dsa/sja1105/ of the mainline Linux kernel. Kernel idioms confirm it: kcalloc/kfree with GFP_KERNEL, GENMASK_ULL, usleep_range, dev_err/dev_info, negative-errno returns (-ENOMEM, -EINVAL, -ENXIO, -EIO), and u8 typedef. The in-file banner comment 'primevul_c_train_2370_fixed' and the filename train_0301_cwe401.c indicate this is the fixed revision of a sample whose original defect class was CWE-401 (memory leak).",
+  "trust_boundary": "This is in-kernel driver control-plane code, not a network wire-format parser. The `priv` handle, the static_config it serializes, and the register map all originate inside the trusted kernel/DSA subsystem; they are not attacker-supplied packet data. The one datum that crosses a hardware trust boundary is `status`, read back from the SJA1105 over SPI in sja1105_status_get(): its bitfields (ids, crcchkl, crcchkg, configs) come from the peripheral, but the switch is a soldered, trusted device and the code only branches on those bits (retry/abort), never using them as sizes or indices. The attack surface here is therefore minimal; the security-relevant contracts are internal memory-safety invariants around buf_len/config_buf rather than remote input handling.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0301_cwe401.c",
+      "lines": "2-11",
+      "code": "int sja1105_static_config_upload(struct sja1105_private *priv)\n{\n\tunsigned long port_bitmap = GENMASK_ULL(SJA1105_NUM_PORTS - 1, 0);\n\tstruct sja1105_static_config *config = &priv->static_config;\n\tconst struct sja1105_regs *regs = priv->info->regs;\n\tstruct device *dev = &priv->spidev->dev;\n\tstruct sja1105_status status;\n\tint rc, retries = RETRIES;\n\tu8 *config_buf;\n\tint buf_len;",
+      "explanation": "Function prologue and locals. It takes a single `priv` pointer to the driver's per-switch private state and returns an int errno-style code. `port_bitmap` is built with GENMASK_ULL(SJA1105_NUM_PORTS - 1, 0), a bitmask with one bit set per switch port (bits [SJA1105_NUM_PORTS-1 : 0]); it is later used to inhibit Tx on every port. `config` aliases priv->static_config, the in-memory representation of the whole static configuration to be uploaded. `regs` caches the per-variant register-address map (priv->info->regs) so the SPI target address regs->config is available. `dev` is the SPI device's struct device, used only for dev_err/dev_info logging. `status` is a stack struct that will receive the switch's post-upload status word. `rc` holds intermediate return codes; `retries` is initialized to the RETRIES macro and drives the upload retry loop. `config_buf` is the heap byte buffer that will hold the serialized config, and `buf_len` its length. Note buf_len is a signed int and config_buf is not yet allocated."
+    },
+    {
+      "file": "corpus/train/train_0301_cwe401.c",
+      "lines": "13-16",
+      "code": "\tbuf_len = sja1105_static_config_get_length(config);\n\tconfig_buf = kcalloc(buf_len, sizeof(char), GFP_KERNEL);\n\tif (!config_buf)\n\t\treturn -ENOMEM;",
+      "explanation": "The serialized size of the static configuration is computed by sja1105_static_config_get_length(config) and stored in buf_len. A zeroed heap buffer of that many bytes is then allocated with kcalloc(buf_len, sizeof(char), GFP_KERNEL) — count=buf_len, element size=1. The allocation is immediately NULL-checked: on failure the function returns -ENOMEM directly. Crucially, this is the ONE early return that happens before config_buf is a live allocation, so returning here leaks nothing. Every later exit routes through the `out:` label instead. sizeof(char) is 1, so kcalloc effectively requests buf_len bytes and zero-fills them."
+    },
+    {
+      "file": "corpus/train/train_0301_cwe401.c",
+      "lines": "18-23",
+      "code": "\trc = static_config_buf_prepare_for_upload(priv, config_buf, buf_len);\n\tif (rc < 0) {\n\t\tdev_err(dev, \"Invalid config, cannot upload\\n\");\n\t\trc = -EINVAL;\n\t\tgoto out;\n\t}",
+      "explanation": "The freshly allocated config_buf is handed to static_config_buf_prepare_for_upload(priv, config_buf, buf_len), which serializes/packs the static_config into the buffer (and typically appends CRCs). buf_len is passed as the buffer's capacity so the packer knows its bound. If preparation fails (rc < 0), the code logs 'Invalid config, cannot upload', normalizes rc to -EINVAL, and jumps to `out:` — which frees config_buf. This is the first of several error paths that correctly funnel through the single cleanup label."
+    },
+    {
+      "file": "corpus/train/train_0301_cwe401.c",
+      "lines": "28-33",
+      "code": "\trc = sja1105_inhibit_tx(priv, port_bitmap, true);\n\tif (rc < 0) {\n\t\tdev_err(dev, \"Failed to inhibit Tx on ports\\n\");\n\t\trc = -ENXIO;\n\t\tgoto out;\n\t}",
+      "explanation": "Before resetting the switch, the driver inhibits transmission on all ports (port_bitmap, true) so the PHY does not emit a half-formed/unterminated Ethernet frame during the reset — as the preceding comment explains, this prevents PHY jabbering. On failure it logs, sets rc to -ENXIO, and goes to out (freeing config_buf). Another correctly-cleaned error path."
+    },
+    {
+      "file": "corpus/train/train_0301_cwe401.c",
+      "lines": "38-51",
+      "code": "\tusleep_range(500, 1000);\n\tdo {\n\t\t/* Put the SJA1105 in programming mode */\n\t\trc = sja1105_cold_reset(priv);\n\t\tif (rc < 0) {\n\t\t\tdev_err(dev, \"Failed to reset switch, retrying...\\n\");\n\t\t\tcontinue;\n\t\t}\n\t\t/* Wait for the switch to come out of reset */\n\t\tusleep_range(1000, 5000);\n\t\t/* Upload the static config to the device */\n\t\trc = sja1105_spi_send_long_packed_buf(priv, SPI_WRITE,\n\t\t\t\t\t\t      regs->config,\n\t\t\t\t\t\t      config_buf, buf_len);",
+      "explanation": "After a short drain delay (usleep_range(500,1000)), the retry loop begins. Each iteration cold-resets the switch into programming mode via sja1105_cold_reset(priv); on failure it logs and `continue`s. Because this is a do/while loop, `continue` transfers control to the loop's condition expression `--retries`, so each continue decrements the retry counter — the loop cannot spin forever. On successful reset it waits for the switch to come up (usleep_range(1000,5000)) and then uploads the serialized configuration with sja1105_spi_send_long_packed_buf(priv, SPI_WRITE, regs->config, config_buf, buf_len): a long packed SPI write of buf_len bytes from config_buf to register address regs->config."
+    },
+    {
+      "file": "corpus/train/train_0301_cwe401.c",
+      "lines": "52-59",
+      "code": "\t\tif (rc < 0) {\n\t\t\tdev_err(dev, \"Failed to upload config, retrying...\\n\");\n\t\t\tcontinue;\n\t\t}\n\t\t/* Check that SJA1105 responded well to the config upload */\n\t\trc = sja1105_status_get(priv, &status);\n\t\tif (rc < 0)\n\t\t\tcontinue;",
+      "explanation": "If the SPI upload itself failed, log and continue (retry). Otherwise read the switch's status word into the stack `status` struct via sja1105_status_get(priv, &status). A read failure also just continues to the next retry. Note that all in-loop failure handling uses `continue`, never `goto out`, so config_buf is intentionally kept alive across retries and only freed once, after the loop."
+    },
+    {
+      "file": "corpus/train/train_0301_cwe401.c",
+      "lines": "61-84",
+      "code": "\t\tif (status.ids == 1) {\n\t\t\tdev_err(dev, \"Mismatch between hardware and static config \"\n\t\t\t\t\"device id. Wrote 0x%llx, wants 0x%llx\\n\",\n\t\t\t\tconfig->device_id, priv->info->device_id);\n\t\t\tcontinue;\n\t\t}\n\t\tif (status.crcchkl == 1) {\n\t\t\tdev_err(dev, \"Switch reported invalid local CRC on \"\n\t\t\t\t\"the uploaded config, retrying...\\n\");\n\t\t\tcontinue;\n\t\t}\n\t\tif (status.crcchkg == 1) {\n\t\t\tdev_err(dev, \"Switch reported invalid global CRC on \"\n\t\t\t\t\"the uploaded config, retrying...\\n\");\n\t\t\tcontinue;\n\t\t}\n\t\tif (status.configs == 0) {\n\t\t\tdev_err(dev, \"Switch reported that configuration is \"\n\t\t\t\t\"invalid, retrying...\\n\");\n\t\t\tcontinue;\n\t\t}\n\t\t/* Success! */\n\t\tbreak;\n\t} while (--retries);",
+      "explanation": "This block validates the hardware's response bits, each failure retrying: status.ids==1 means the device-id the driver wrote does not match the actual silicon (config->device_id vs priv->info->device_id) — a wrong config binary; status.crcchkl==1 / status.crcchkg==1 mean the switch computed a bad local/global CRC over the uploaded bytes; status.configs==0 means the switch deems the configuration invalid. Any of these `continue` to retry. Only when all four indicators are healthy does `break` exit the loop with success. The loop condition `--retries` decrements the counter on each fall-through/continue and stops when it reaches zero. Because `break` skips the condition, a successful exit leaves retries > 0."
+    },
+    {
+      "file": "corpus/train/train_0301_cwe401.c",
+      "lines": "86-92",
+      "code": "\tif (!retries) {\n\t\trc = -EIO;\n\t\tdev_err(dev, \"Failed to upload config to device, giving up\\n\");\n\t\tgoto out;\n\t} else if (retries != RETRIES) {\n\t\tdev_info(dev, \"Succeeded after %d tried\\n\", RETRIES - retries);\n\t}",
+      "explanation": "After the loop, retries==0 distinguishes exhaustion (all attempts failed) from success: on exhaustion it sets rc=-EIO, logs 'giving up', and goes to out (freeing config_buf). Otherwise, if retries != RETRIES, at least one attempt was consumed before success, so it logs how many tries it took (RETRIES - retries). This is the only place retries is used to reconstruct the attempt count, and it relies on `break` having preserved a non-zero retries on success."
+    },
+    {
+      "file": "corpus/train/train_0301_cwe401.c",
+      "lines": "94-103",
+      "code": "\trc = sja1105_ptp_reset(priv);\n\tif (rc < 0)\n\t\tdev_err(dev, \"Failed to reset PTP clock: %d\\n\", rc);\n\n\tdev_info(dev, \"Reset switch and programmed static config\\n\");\n\nout:\n\tkfree(config_buf);\n\treturn rc;",
+      "explanation": "On success the PTP (IEEE-1588 timestamp) clock is re-reset because the switch cold reset wiped it; a failure here is logged but non-fatal (rc from ptp_reset is left in rc and returned, though the success-path info log still prints). Control then falls into the shared `out:` cleanup label, which kfree(config_buf) frees the heap buffer exactly once and returns rc. Every non-trivial exit from the function reaches this kfree, and the only path that bypasses it (the -ENOMEM return at line 16) does so before the allocation exists — so config_buf is neither leaked nor double-freed."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0301_cwe401.c",
+      "lines": "13-14",
+      "code": "\tbuf_len = sja1105_static_config_get_length(config);\n\tconfig_buf = kcalloc(buf_len, sizeof(char), GFP_KERNEL);",
+      "explanation": "buf_len is a signed int received from sja1105_static_config_get_length() and is used unchecked as the kcalloc element count (a size_t) AND as the capacity bound passed to static_config_buf_prepare_for_upload() and sja1105_spi_send_long_packed_buf(). Two latent failure modes depend on the implementation of get_length: (1) If the length accumulation overflows or returns a negative int, the value sign-extends to an enormous size_t in kcalloc — which will practically fail and be caught by the NULL check, but if get_length instead returns 0, kcalloc(0, 1, ...) returns ZERO_SIZE_PTR (a non-NULL sentinel) that passes the `if (!config_buf)` check, after which prepare_for_upload writes serialized bytes into a zero-capacity buffer (out-of-bounds heap write, CWE-787). (2) More generally, if get_length under-counts the number of bytes the packer will actually write for this config, prepare_for_upload overflows config_buf. The invariant the implementation must uphold is that sja1105_static_config_get_length() returns a positive value that is exactly >= the number of bytes static_config_buf_prepare_for_upload() writes, and that the length cannot overflow int. Neither the size validation nor the count*size overflow guard is visible in this function."
+    },
+    {
+      "file": "corpus/train/train_0301_cwe401.c",
+      "lines": "18-18",
+      "code": "\trc = static_config_buf_prepare_for_upload(priv, config_buf, buf_len);",
+      "explanation": "This is the write side of the buffer contract. The packer serializes an arbitrary-sized static configuration (tables, entries, per-table CRCs) into config_buf using buf_len as the declared bound. If the packer's own length arithmetic disagrees with get_length's — e.g. a table whose entry count changed between the sizing pass and the packing pass, or a CRC/trailer the size pass forgot — it writes past the buf_len-byte allocation, a heap overflow (CWE-787) fully within the driver (no remote attacker, but a memory-safety defect). This is latent in static_config_buf_prepare_for_upload (implementation not provided); the header-level contract to confirm is that the sizing and packing passes are driven by the same table metadata and can never diverge."
+    },
+    {
+      "file": "corpus/train/train_0301_cwe401.c",
+      "lines": "100-102",
+      "code": "out:\n\tkfree(config_buf);\n\treturn rc;",
+      "explanation": "This is the memory-management focus implied by the CWE-401 sample label, and here it is CORRECT — worth stating explicitly as a non-finding so the pattern is learned. config_buf is allocated once at line 14; the only exit that skips this kfree is the -ENOMEM return at line 16, which fires before the pointer is valid. Every other error path uses `goto out` (lines 22, 32, 89) and the success path falls through, so the buffer is freed exactly once on all live-allocation paths. There is no leak and no double-free. The invariant to preserve on future edits: any new early `return` added after line 14 must `goto out` instead, or the CWE-401 leak that this revision fixed will regress."
+    },
+    {
+      "file": "corpus/train/train_0301_cwe401.c",
+      "lines": "57-59",
+      "code": "\t\trc = sja1105_status_get(priv, &status);\n\t\tif (rc < 0)\n\t\t\tcontinue;",
+      "explanation": "`status` is uninitialized stack memory that is only populated on a successful sja1105_status_get(). The code guards this correctly by `continue`-ing when rc < 0, so the subsequent status.ids/crcchkl/crcchkg/configs reads only happen after a good read — no use of uninitialized data here. The residual, low-severity concern is that status.* bits are the sole hardware trust boundary in this function: a malicious or faulty switch could always report healthy bits to make the driver accept a config it did not actually store, but since the driver never uses these bits as sizes/indices/pointers (only to decide retry vs accept), the worst case is a logically-wrong-but-accepted upload, not memory corruption. The invariant: status fields must never be promoted into buffer sizes or array indices downstream."
+    },
+    {
+      "file": "corpus/train/train_0301_cwe401.c",
+      "lines": "39-84",
+      "code": "\tdo {\n\t\t/* Put the SJA1105 in programming mode */\n\t\trc = sja1105_cold_reset(priv);\n\t\tif (rc < 0) {\n\t\t\tdev_err(dev, \"Failed to reset switch, retrying...\\n\");\n\t\t\tcontinue;\n\t\t}",
+      "explanation": "Control-flow correctness of the retry loop. Because this is a do/while, each `continue` (lines 44, 54, 59, 65, 70, 75, 80) jumps to the `--retries` condition and decrements the counter, so the loop is bounded and cannot livelock — this is correct. The subtle contract is that success uses `break` (line 83), which bypasses `--retries`, and the post-loop code at line 86 relies on retries being non-zero to distinguish success (`if (!retries)`), and at line 90 computes RETRIES - retries. If a future refactor changed the loop to `while` or moved the decrement, the success/failure discrimination and the 'Succeeded after N tried' accounting would silently break. No memory-safety impact; noted as a correctness invariant only."
+    }
+  ],
+  "summary": "This is the FIXED revision of an SJA1105 DSA-driver static-config upload routine, and it is low risk. The CWE-401 memory-leak class it addresses is resolved: config_buf is freed exactly once via a single `out:` label reached by every live-allocation exit, with the only bypassing return occurring before allocation. There is no genuine remote attack surface (the serialized config and priv state are kernel-internal; the only hardware-sourced data, the SPI status bits, is used solely for retry decisions). The remaining concerns are latent and internal: buf_len is an unchecked signed int used both as the kcalloc count and as the write bound for a not-shown serializer, so memory safety hinges on sja1105_static_config_get_length() returning a correct, non-negative, non-overflowing length that matches what static_config_buf_prepare_for_upload() writes.",
+  "reviewed_anchors": [
+    {
+      "anchor": "int sja1105_static_config_upload(struct sja1105_private *priv) — signature",
+      "disposition": "dismissed",
+      "reason": "Single trusted in-kernel pointer parameter; returns errno int. Not attacker-reachable input."
+    },
+    {
+      "anchor": "port_bitmap = GENMASK_ULL(SJA1105_NUM_PORTS - 1, 0) (line 4)",
+      "disposition": "dismissed",
+      "reason": "Compile-time port mask from a fixed constant; only passed to inhibit_tx as a bitmap, no size/index misuse."
+    },
+    {
+      "anchor": "config = &priv->static_config (line 5)",
+      "disposition": "dismissed",
+      "reason": "Alias of a trusted embedded struct; feeds get_length/prepare — its size correctness is captured by the buf_len finding."
+    },
+    {
+      "anchor": "regs = priv->info->regs (line 6)",
+      "disposition": "dismissed",
+      "reason": "Trusted per-variant register map; used only as an SPI target address, not a buffer."
+    },
+    {
+      "anchor": "dev = &priv->spidev->dev (line 7)",
+      "disposition": "dismissed",
+      "reason": "Only used for dev_err/dev_info logging; priv is trusted and non-NULL by caller contract."
+    },
+    {
+      "anchor": "struct sja1105_status status (line 8)",
+      "disposition": "finding",
+      "reason": "Hardware-sourced bitfields (ids/crcchkl/crcchkg/configs) read over SPI — the only trust boundary; guarded and used only for retry logic (low severity)."
+    },
+    {
+      "anchor": "int rc, retries = RETRIES (line 9) and do/while(--retries)",
+      "disposition": "finding",
+      "reason": "Bounded-loop / success-vs-exhaustion discrimination contract; correct as written but fragile — noted as a correctness invariant."
+    },
+    {
+      "anchor": "u8 *config_buf (line 10) and kfree(config_buf) (line 101)",
+      "disposition": "finding",
+      "reason": "The heap buffer at the center of the CWE-401 sample; memory management verified correct (freed once on all live paths) — reported as a resolved/non-defect anchor."
+    },
+    {
+      "anchor": "int buf_len (line 11)",
+      "disposition": "finding",
+      "reason": "Signed length used as kcalloc count and as serializer write bound; unchecked for zero/negative/overflow — latent CWE-787/CWE-190."
+    },
+    {
+      "anchor": "buf_len = sja1105_static_config_get_length(config) (line 13)",
+      "disposition": "finding",
+      "reason": "Sizing signature whose correctness the whole buffer safety depends on; latent, implementation not shown."
+    },
+    {
+      "anchor": "kcalloc(buf_len, sizeof(char), GFP_KERNEL) + NULL check (lines 14-16)",
+      "disposition": "dismissed",
+      "reason": "Allocation is NULL-checked and returns -ENOMEM before config_buf is live; the count-value risk is captured under the buf_len finding."
+    },
+    {
+      "anchor": "static_config_buf_prepare_for_upload(priv, config_buf, buf_len) (line 18)",
+      "disposition": "finding",
+      "reason": "Write side of the buffer contract; overflows config_buf if it writes more than buf_len — latent CWE-787."
+    },
+    {
+      "anchor": "sja1105_inhibit_tx(priv, port_bitmap, true) (line 28)",
+      "disposition": "dismissed",
+      "reason": "Boolean/bitmap args, return-checked with clean goto out; no buffer or untrusted size."
+    },
+    {
+      "anchor": "sja1105_cold_reset(priv) (line 41)",
+      "disposition": "dismissed",
+      "reason": "No buffer arguments; failure handled by bounded retry."
+    },
+    {
+      "anchor": "sja1105_spi_send_long_packed_buf(priv, SPI_WRITE, regs->config, config_buf, buf_len) (lines 49-51)",
+      "disposition": "dismissed",
+      "reason": "Reads buf_len bytes from a buffer sized to buf_len; safe as long as buf_len is the true allocation size — covered by the buf_len finding, not a distinct defect."
+    },
+    {
+      "anchor": "sja1105_status_get(priv, &status) (line 57)",
+      "disposition": "dismissed",
+      "reason": "Return-checked; populates status only on success, guarding the later reads. Captured by the status anchor."
+    },
+    {
+      "anchor": "status.ids / crcchkl / crcchkg / configs reads (lines 61,67,72,77)",
+      "disposition": "dismissed",
+      "reason": "Used only as branch predicates for retry/accept; never as sizes or indices, so no memory-safety contract."
+    },
+    {
+      "anchor": "config->device_id / priv->info->device_id log args (line 64)",
+      "disposition": "dismissed",
+      "reason": "Scalar values printed with %llx for diagnostics; no security contract."
+    },
+    {
+      "anchor": "sja1105_ptp_reset(priv) (line 94)",
+      "disposition": "dismissed",
+      "reason": "No buffers; failure is logged-and-continued, non-fatal by design."
+    }
+  ],
+  "findings": [
+    {
+      "title": "buf_len is an unchecked signed int used as both allocation size and serializer write bound",
+      "anchor": "buf_len = sja1105_static_config_get_length(config); config_buf = kcalloc(buf_len, sizeof(char), GFP_KERNEL);",
+      "file": "corpus/train/train_0301_cwe401.c",
+      "line": "13-18",
+      "code": "\tbuf_len = sja1105_static_config_get_length(config);\n\tconfig_buf = kcalloc(buf_len, sizeof(char), GFP_KERNEL);\n\tif (!config_buf)\n\t\treturn -ENOMEM;\n\n\trc = static_config_buf_prepare_for_upload(priv, config_buf, buf_len);",
+      "bug_class": "Out-of-bounds heap write via bad/zero/overflowing length (latent)",
+      "cwe": "CWE-787",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided) — sja1105_static_config_get_length() and static_config_buf_prepare_for_upload()",
+      "invariant": "sja1105_static_config_get_length() must return a positive, non-overflowing byte count that is exactly >= the number of bytes static_config_buf_prepare_for_upload() will write into config_buf; buf_len must never be 0 or negative when passed to kcalloc.",
+      "failure_mode": "If get_length returns 0, kcalloc(0,1,...) yields the non-NULL ZERO_SIZE_PTR sentinel that passes the `if (!config_buf)` check, and the subsequent packer write goes out of bounds. If get_length returns a negative int (arithmetic overflow while summing table sizes), it sign-extends to a huge size_t so the allocation fails and is caught — but if it merely under-counts the true serialized size, prepare_for_upload overflows the allocation. No zero/negative/overflow guard is present in this function; safety is delegated entirely to the sizing routine.",
+      "cve_analog": "",
+      "what_to_confirm": "That sja1105_static_config_get_length() cannot return 0 or a negative/overflowed int for any reachable static_config, and that its byte count is derived from the same table metadata that static_config_buf_prepare_for_upload() iterates, so the two can never diverge."
+    },
+    {
+      "title": "Serializer must not write past buf_len (packer/sizer divergence)",
+      "anchor": "static_config_buf_prepare_for_upload(priv, config_buf, buf_len)",
+      "file": "corpus/train/train_0301_cwe401.c",
+      "line": "18",
+      "code": "\trc = static_config_buf_prepare_for_upload(priv, config_buf, buf_len);",
+      "bug_class": "Heap buffer overflow if packed size exceeds sized length (latent)",
+      "cwe": "CWE-787",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided) — static_config_buf_prepare_for_upload()",
+      "invariant": "The number of bytes static_config_buf_prepare_for_upload() writes (all table entries plus any per-table/global CRC trailers) must be <= buf_len for every configuration it accepts.",
+      "failure_mode": "config_buf is a buf_len-byte kcalloc allocation. If the packing pass emits more bytes than the sizing pass counted — e.g. an entry-count or CRC-trailer mismatch between get_length and prepare_for_upload — the packer writes past the end of config_buf, corrupting the kernel heap. This is a driver-internal memory-safety defect (no remote attacker), latent because the packer body is not shown.",
+      "cve_analog": "",
+      "what_to_confirm": "That prepare_for_upload bounds every write against buf_len (or is provably byte-for-byte consistent with get_length), including CRC/trailer bytes."
+    },
+    {
+      "title": "config_buf lifetime — CWE-401 leak class is correctly resolved (regression guard)",
+      "anchor": "out: kfree(config_buf);",
+      "file": "corpus/train/train_0301_cwe401.c",
+      "line": "100-101",
+      "code": "out:\n\tkfree(config_buf);",
+      "bug_class": "Memory leak on error path (resolved; regression risk)",
+      "cwe": "CWE-401",
+      "severity": "info",
+      "where_it_lives": "corpus/train/train_0301_cwe401.c",
+      "invariant": "Every exit after the successful kcalloc at line 14 must reach the single kfree(config_buf) at out:; the only permitted early return before that point is the -ENOMEM return at line 16, which precedes a live allocation.",
+      "failure_mode": "In this revision there is no leak: all error paths (lines 22, 32, 89) use `goto out` and the success path falls through, so config_buf is freed exactly once and never double-freed. The risk is regression — adding a bare `return` after line 14 (as the original vulnerable revision presumably had) would reintroduce the CWE-401 leak. Reported as info to lock in the invariant, not as an active defect.",
+      "cve_analog": "",
+      "what_to_confirm": "That no future code path returns between line 14 and the out: label without going through kfree, and that config_buf is not freed anywhere else (no double free)."
+    },
+    {
+      "title": "Switch-reported SPI status bits are the sole hardware trust boundary",
+      "anchor": "rc = sja1105_status_get(priv, &status); ... if (status.ids == 1) / crcchkl / crcchkg / configs",
+      "file": "corpus/train/train_0301_cwe401.c",
+      "line": "57-81",
+      "code": "\t\trc = sja1105_status_get(priv, &status);\n\t\tif (rc < 0)\n\t\t\tcontinue;\n\n\t\tif (status.ids == 1) {",
+      "bug_class": "Trust of peripheral-supplied data (low; guarded)",
+      "cwe": "CWE-20",
+      "severity": "info",
+      "where_it_lives": "corpus/train/train_0301_cwe401.c",
+      "invariant": "Hardware-sourced status bitfields must be consumed only as retry/accept predicates and never promoted into buffer sizes, loop bounds, or array indices; status must be read (rc>=0) before its fields are inspected.",
+      "failure_mode": "status is uninitialized stack memory populated only on a successful sja1105_status_get(); the `if (rc < 0) continue;` guard correctly prevents reading stale/uninitialized fields. A faulty or malicious switch could always report healthy bits and cause the driver to accept a config it did not truly store, but because the bits only steer control flow (retry vs break) and are never used as sizes/indices, the worst outcome is a logically-wrong accepted upload, not memory corruption. Low/info severity.",
+      "cve_analog": "",
+      "what_to_confirm": "That no downstream code path uses any status.* field as a length, offset, or index, and that status is never read on the rc<0 path."
+    },
+    {
+      "title": "Retry-loop success/exhaustion discrimination depends on break bypassing --retries",
+      "anchor": "do { ... break; } while (--retries); if (!retries) ... else if (retries != RETRIES)",
+      "file": "corpus/train/train_0301_cwe401.c",
+      "line": "84-90",
+      "code": "\t} while (--retries);\n\n\tif (!retries) {\n\t\trc = -EIO;\n\t\tdev_err(dev, \"Failed to upload config to device, giving up\\n\");\n\t\tgoto out;\n\t} else if (retries != RETRIES) {",
+      "bug_class": "Fragile control-flow invariant (correctness, not memory safety)",
+      "cwe": "CWE-691",
+      "severity": "info",
+      "where_it_lives": "corpus/train/train_0301_cwe401.c",
+      "invariant": "Success must exit via `break` (leaving retries > 0) and every failure must `continue` (decrementing retries via --retries), so that `if (!retries)` uniquely identifies exhaustion and RETRIES - retries yields the attempt count.",
+      "failure_mode": "As written the do/while is correct and bounded: each continue decrements retries and success breaks with retries>0. The fragility is that a refactor to a `while` loop, or moving/duplicating the decrement, would break the exhaustion test and the 'Succeeded after N tried' accounting, and could in principle misreport failure as success (returning a stale rc). No memory-safety impact. Info-level, noted to protect the invariant.",
+      "cve_analog": "",
+      "what_to_confirm": "That RETRIES > 0 (so the do/while runs at least once and retries never wraps), and that no path decrements retries other than the loop condition."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm sja1105_static_config_get_length() cannot return 0, a negative value, or an int-overflowed value for any reachable static_config; add an explicit `buf_len <= 0` guard before kcalloc if not provably impossible.",
+    "Prove static_config_buf_prepare_for_upload() writes at most buf_len bytes (including all per-table and global CRC trailers) — ideally by driving the sizing and packing passes from the same table metadata.",
+    "Verify no `return` exists between the successful kcalloc (line 14) and the out: label without going through kfree(config_buf), and that config_buf is freed nowhere else (no double free).",
+    "Check that RETRIES is a positive compile-time constant so the do/while runs at least once and `--retries` cannot underflow.",
+    "Confirm no downstream consumer uses status.ids/crcchkl/crcchkg/configs (or any SPI-read value) as a buffer size, offset, or array index.",
+    "Ensure sja1105_spi_send_long_packed_buf() treats buf_len as the exact valid length of config_buf and reads no bytes beyond it."
+  ]
+}

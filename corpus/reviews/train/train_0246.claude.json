@@ -1,0 +1,218 @@
+{
+  "subsystem": "ZNC IRC-bouncer DCC module. This is the CTCP DCC handler (an OnPrivCTCP module hook) that intercepts DCC CHAT/SEND/RESUME/ACCEPT negotiation messages received from a remote IRC peer and sets up / rewrites a DCC \"bounce\" so that file transfers and chats between two IRC clients are relayed through the ZNC process. It parses the attacker-supplied CTCP payload, allocates local bounce listeners via CDCCBounce::DCCRequest, and forwards rewritten DCC handshake lines to the locally attached user.",
+  "provenance": "Identified by the ZNC-specific API surface: the module hook signature EModRet OnPrivCTCP(CNick&, CString&) with return values HALTCORE/CONTINUE, ZNC string type CString with .Token()/.Equals()/.ToULong()/.ToUShort() helpers, the CNick/CDCCBounce/CSocket classes, the m_pUser/m_pClient CUser/CClient members, PutUser(), BeginSockets()/EndSockets(), and CUtils::GetIP/GetLongIP. The header comment '/* sample: primevul_train_3545_vuln */' and the file name train_0246_cwe399.cpp mark it as a PrimeVul training sample tagged CWE-399 (resource management). This is the DCC bounce logic from ZNC's modules/dcc.cpp.",
+  "trust_boundary": "The trust boundary is the IRC network. OnPrivCTCP is invoked with Nick (the remote sender) and sMessage (the raw CTCP payload) both sourced directly from a private CTCP message sent by ANOTHER IRC user to the ZNC-hosted user. Every token in sMessage is fully attacker-controlled: the DCC sub-command (Token(1)), the file name (Token(2)), the peer IP as a packed unsigned long (Token(3)), the peer port (Token(4)), the file size (Token(5)). Nick.GetNickMask()/GetNick() are also attacker-influenced and spoofable. Nothing here is authenticated; the sender need not be on the user's contact list. The parsed IP/port are later used to open outbound connections, and the raw file name / trailing tokens are echoed back into the user's IRC stream.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0246_cwe399.cpp",
+      "lines": "2",
+      "code": "\tvirtual EModRet OnPrivCTCP(CNick& Nick, CString& sMessage) {",
+      "explanation": "This is a ZNC module callback. OnPrivCTCP is fired by the core whenever the attached user receives a private (non-channel) CTCP message. Nick is the remote sender's identity object and sMessage is the decoded CTCP payload (the bytes between the \\001 delimiters). Returning EModRet HALTCORE tells the core to swallow the message (the module has handled it) while CONTINUE lets normal processing proceed. Both parameters are non-const references originating from the wire, so this method is a raw parser of untrusted remote input."
+    },
+    {
+      "file": "corpus/train/train_0246_cwe399.cpp",
+      "lines": "3",
+      "code": "\t\tif (sMessage.Equals(\"DCC \", false, 4) && m_pUser->IsUserAttached()) {",
+      "explanation": "The single gate before any DCC handling. sMessage.Equals(\"DCC \", false, 4) does a case-insensitive (false = not case-sensitive) comparison of the first 4 characters against the literal 'DCC '. m_pUser->IsUserAttached() requires that the ZNC user currently has an IRC client connected (otherwise there is nobody to bounce to). If either is false the method falls through to the CONTINUE at line 52. Note this only checks the prefix; the remainder of the payload is unvalidated at this point."
+    },
+    {
+      "file": "corpus/train/train_0246_cwe399.cpp",
+      "lines": "5-9",
+      "code": "\t\t\tCString sType = sMessage.Token(1);\n\t\t\tCString sFile = sMessage.Token(2);\n\t\t\tunsigned long uLongIP = sMessage.Token(3).ToULong();\n\t\t\tunsigned short uPort = sMessage.Token(4).ToUShort();\n\t\t\tunsigned long uFileSize = sMessage.Token(5).ToULong();",
+      "explanation": "The payload is split on spaces into tokens. Token(0) is 'DCC'; Token(1) is the DCC sub-command (CHAT/SEND/RESUME/ACCEPT); Token(2) is the file name; Token(3) is the peer's IPv4 address encoded as a 32-bit decimal integer (classic DCC on-wire IP form) converted with ToULong(); Token(4) is the peer's TCP port converted with ToUShort(); Token(5) is the advertised file size. ToULong()/ToUShort() are ZNC helpers that parse a numeric string and silently yield 0 on failure or on empty tokens, so every one of these five values is attacker-chosen and none is range-validated here. sFile in particular is retained verbatim for later re-emission."
+    },
+    {
+      "file": "corpus/train/train_0246_cwe399.cpp",
+      "lines": "11-13",
+      "code": "\t\t\tif (sType.Equals(\"CHAT\")) {\n\t\t\t\tCNick FromNick(Nick.GetNickMask());\n\t\t\t\tunsigned short uBNCPort = CDCCBounce::DCCRequest(FromNick.GetNick(), uLongIP, uPort, \"\", true, this, CUtils::GetIP(uLongIP));",
+      "explanation": "The CHAT branch. It constructs a fresh CNick from the sender's full nick!user@host mask, then calls the static CDCCBounce::DCCRequest to allocate a bounce endpoint. The arguments are the sender nick, the attacker-supplied uLongIP and uPort (the remote peer the bounce will ultimately talk to), an empty file name, a boolean true (this is a chat, not a file send), 'this' module pointer, and a human-readable IP string derived from uLongIP via CUtils::GetIP. DCCRequest opens a local listening socket (a CDCCBounce) and returns the local port it bound to (0 on failure). Every DCC CHAT thus causes a new socket/port to be allocated on the ZNC host."
+    },
+    {
+      "file": "corpus/train/train_0246_cwe399.cpp",
+      "lines": "14-17",
+      "code": "\t\t\t\tif (uBNCPort) {\n\t\t\t\t\tCString sIP = GetLocalDCCIP();\n\t\t\t\t\tm_pUser->PutUser(\":\" + Nick.GetNickMask() + \" PRIVMSG \" + m_pUser->GetNick() + \" :\\001DCC CHAT chat \" + CString(CUtils::GetLongIP(sIP)) + \" \" + CString(uBNCPort) + \"\\001\");\n\t\t\t\t}",
+      "explanation": "If a bounce port was successfully allocated, the module fabricates a DCC CHAT handshake line pointing at ZNC's own local DCC IP (GetLocalDCCIP, packed via CUtils::GetLongIP) and the freshly bound bounce port, and pushes it to the attached user's client with PutUser. The line is constructed to look like it came from the original sender (':' + Nick.GetNickMask() + ' PRIVMSG ...'). The effect is that the user's client is told to connect to ZNC instead of directly to the remote peer, completing the bounce. \\001 is the CTCP framing byte."
+    },
+    {
+      "file": "corpus/train/train_0246_cwe399.cpp",
+      "lines": "18-24",
+      "code": "\t\t\t} else if (sType.Equals(\"SEND\")) {\n\t\t\t\t// DCC SEND readme.txt 403120438 5550 1104\n\t\t\t\tunsigned short uBNCPort = CDCCBounce::DCCRequest(Nick.GetNick(), uLongIP, uPort, sFile, false, this, CUtils::GetIP(uLongIP));\n\t\t\t\tif (uBNCPort) {\n\t\t\t\t\tCString sIP = GetLocalDCCIP();\n\t\t\t\t\tm_pUser->PutUser(\":\" + Nick.GetNickMask() + \" PRIVMSG \" + m_pUser->GetNick() + \" :\\001DCC SEND \" + sFile + \" \" + CString(CUtils::GetLongIP(sIP)) + \" \" + CString(uBNCPort) + \" \" + CString(uFileSize) + \"\\001\");\n\t\t\t\t}",
+      "explanation": "The SEND branch mirrors CHAT but for a file transfer. DCCRequest is called with the attacker's file name sFile and false (this is a send). On success a rewritten 'DCC SEND <file> <znc-ip> <bnc-port> <filesize>' line is pushed to the user, again spoofed to appear to come from Nick. Critically, sFile (Token(2), attacker-chosen) and uFileSize (Token(5)) are re-emitted verbatim into the outbound IRC line with no sanitisation or bounding beyond the space-tokenisation that produced them."
+    },
+    {
+      "file": "corpus/train/train_0246_cwe399.cpp",
+      "lines": "25-36",
+      "code": "\t\t\t} else if (sType.Equals(\"RESUME\")) {\n\t\t\t\t// Need to lookup the connection by port, filter the port, and forward to the user\n\t\t\t\tunsigned short uResumePort = sMessage.Token(3).ToUShort();\n\n\t\t\t\tset<CSocket*>::const_iterator it;\n\t\t\t\tfor (it = BeginSockets(); it != EndSockets(); ++it) {\n\t\t\t\t\tCDCCBounce* pSock = (CDCCBounce*) *it;\n\n\t\t\t\t\tif (pSock->GetLocalPort() == uResumePort) {\n\t\t\t\t\t\tm_pUser->PutUser(\":\" + Nick.GetNickMask() + \" PRIVMSG \" + m_pClient->GetNick() + \" :\\001DCC \" + sType + \" \" + sFile + \" \" + CString(pSock->GetUserPort()) + \" \" + sMessage.Token(4) + \"\\001\");\n\t\t\t\t\t}\n\t\t\t\t}",
+      "explanation": "The RESUME branch handles a partially-transferred file being resumed. For RESUME the port to match is taken from Token(3) (not Token(4) as elsewhere) into uResumePort. It then walks the module's entire socket set via BeginSockets()/EndSockets(), C-style casts each CSocket* to CDCCBounce* (line 31), and compares that bounce's local (ZNC-side) port to the requested resume port. On a match it forwards a rewritten DCC RESUME line to the user, substituting the matched bounce's real user-side port (pSock->GetUserPort()) so the resume offset lines up with the correct relayed connection. sFile and Token(4) are echoed through unchanged."
+    },
+    {
+      "file": "corpus/train/train_0246_cwe399.cpp",
+      "lines": "37-46",
+      "code": "\t\t\t} else if (sType.Equals(\"ACCEPT\")) {\n\t\t\t\t// Need to lookup the connection by port, filter the port, and forward to the user\n\t\t\t\tset<CSocket*>::const_iterator it;\n\t\t\t\tfor (it = BeginSockets(); it != EndSockets(); ++it) {\n\t\t\t\t\tCDCCBounce* pSock = (CDCCBounce*) *it;\n\n\t\t\t\t\tif (pSock->GetUserPort() == sMessage.Token(3).ToUShort()) {\n\t\t\t\t\t\tm_pUser->PutUser(\":\" + Nick.GetNickMask() + \" PRIVMSG \" + m_pClient->GetNick() + \" :\\001DCC \" + sType + \" \" + sFile + \" \" + CString(pSock->GetLocalPort()) + \" \" + sMessage.Token(4) + \"\\001\");\n\t\t\t\t\t}\n\t\t\t\t}",
+      "explanation": "The ACCEPT branch is the counterpart to RESUME: the sender acknowledges a resume. It again iterates the socket set, C-style casts each entry to CDCCBounce*, and this time matches on the user-side port GetUserPort() against Token(3). On a match it echoes back a DCC ACCEPT line but with the bounce's local (ZNC-side) port substituted, so the mapping between the two halves of the bounce is preserved. As in RESUME, the loop trusts that every socket in the set really is a CDCCBounce and re-emits attacker-controlled sFile / Token(4)."
+    },
+    {
+      "file": "corpus/train/train_0246_cwe399.cpp",
+      "lines": "49-53",
+      "code": "\t\t\treturn HALTCORE;\n\t\t}\n\n\t\treturn CONTINUE;\n\t}",
+      "explanation": "If the 'DCC ' prefix matched (regardless of whether the sub-command was recognised or any bounce was created), the method returns HALTCORE so the original CTCP is not delivered to the client — the module has claimed the message. Any payload that did not begin with 'DCC ' (or arrived while no client was attached) falls through to CONTINUE for normal handling. Note that an unrecognised sType still hits HALTCORE, silently dropping the message."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0246_cwe399.cpp",
+      "lines": "31",
+      "code": "\t\t\t\t\tCDCCBounce* pSock = (CDCCBounce*) *it;",
+      "explanation": "Unchecked C-style downcast / type confusion (also at line 41). BeginSockets()/EndSockets() enumerate every socket registered to this module, but the loop blindly reinterpret-casts each CSocket* to CDCCBounce* and immediately dereferences it via pSock->GetLocalPort()/GetUserPort(). The safety of every ACCEPT/RESUME message therefore rests on the unstated invariant that the module's socket set contains ONLY CDCCBounce objects. If the module ever holds a socket of a different concrete type (a listener, a differently-typed helper socket, or a future addition), reading GetLocalPort/GetUserPort dereferences fields at CDCCBounce offsets inside an object of the wrong layout — an out-of-bounds/garbage read that can leak memory into the forwarded PRIVMSG or crash the process. This is the resource/type-management hazard the sample is tagged for (CWE-843/CWE-399); the fix is a checked dynamic_cast or a type tag before use."
+    },
+    {
+      "file": "corpus/train/train_0246_cwe399.cpp",
+      "lines": "13",
+      "code": "\t\t\t\tunsigned short uBNCPort = CDCCBounce::DCCRequest(FromNick.GetNick(), uLongIP, uPort, \"\", true, this, CUtils::GetIP(uLongIP));",
+      "explanation": "Unbounded resource allocation (also line 20). Each DCC CHAT or SEND received from ANY remote IRC user causes DCCRequest to allocate a new local listening socket / TCP port on the ZNC host, with no per-sender rate limit, no cap on the number of simultaneous bounces, and no timeout visible here. A hostile peer (or many) can flood the user with DCC CHAT/SEND CTCPs and force ZNC to exhaust file descriptors, ephemeral ports, and memory (each pending bounce holds a socket until it times out or the user connects). This denial-of-service via unbounded object creation is the core CWE-399/CWE-400 concern: the implementation must bound the number and lifetime of outstanding bounce listeners."
+    },
+    {
+      "file": "corpus/train/train_0246_cwe399.cpp",
+      "lines": "7-8",
+      "code": "\t\t\tunsigned long uLongIP = sMessage.Token(3).ToULong();\n\t\t\tunsigned short uPort = sMessage.Token(4).ToUShort();",
+      "explanation": "Attacker-directed outbound connection (SSRF / open relay). uLongIP and uPort come straight from the remote peer's CTCP tokens and are handed to DCCRequest as the destination the bounce will ultimately connect to. The remote peer can therefore point the bounce at any address, including loopback (127.0.0.1) or an RFC1918 host reachable from the ZNC machine and any port (e.g. an internal SSH/HTTP/admin service). Combined with the fact that the sender is unauthenticated, ZNC becomes a relay to internal services once the user's client connects to the bounce. The implementation should refuse non-routable / internal destinations and validate that the advertised IP matches the sender before opening the outbound leg (CWE-918)."
+    },
+    {
+      "file": "corpus/train/train_0246_cwe399.cpp",
+      "lines": "23",
+      "code": "\t\t\t\t\tm_pUser->PutUser(\":\" + Nick.GetNickMask() + \" PRIVMSG \" + m_pUser->GetNick() + \" :\\001DCC SEND \" + sFile + \" \" + CString(CUtils::GetLongIP(sIP)) + \" \" + CString(uBNCPort) + \" \" + CString(uFileSize) + \"\\001\");",
+      "explanation": "Unsanitised reflection of attacker data into the user's IRC stream (also lines 16, 34, 44). sFile (Token(2)) and the raw echoed tokens are concatenated straight into a PRIVMSG that PutUser writes to the attached client. Although space-tokenisation prevents embedded spaces, the file name can still contain a stray \\001 that prematurely closes / re-opens the CTCP frame, letting the peer inject an extra CTCP or spoof additional DCC parameters interpreted by the victim's client. The Nick.GetNickMask() prefix is likewise attacker-influenced and spoofable, so the forwarded line can impersonate arbitrary senders to the client. The implementation must strip control bytes (\\001, and defensively CR/LF) from sFile and the echoed tokens before re-emission (CWE-150 / CWE-93)."
+    },
+    {
+      "file": "corpus/train/train_0246_cwe399.cpp",
+      "lines": "33",
+      "code": "\t\t\t\t\tif (pSock->GetLocalPort() == uResumePort) {",
+      "explanation": "Weak connection lookup keyed only on an attacker-supplied port. RESUME/ACCEPT match a bounce purely by a 16-bit port number taken from the peer's own token (uResumePort / Token(3)), with no check that the matched CDCCBounce actually belongs to a transfer with THIS sender. A malicious peer who can guess or brute-force the small port space (at most 65535 values, realistically a handful of active bounces) can address another user's in-flight transfer, causing RESUME/ACCEPT rewrites to be forwarded for a connection they do not own — a cross-session confusion/information-disclosure of the other transfer's GetUserPort()/GetLocalPort(). The implementation should scope the socket search to bounces owned by the requesting nick."
+    },
+    {
+      "file": "corpus/train/train_0246_cwe399.cpp",
+      "lines": "3",
+      "code": "\t\t\tif (sMessage.Equals(\"DCC \", false, 4) && m_pUser->IsUserAttached()) {",
+      "explanation": "Insufficient input validation of the payload shape. The only gate is the 4-char 'DCC ' prefix; the code then assumes well-formed tokens. Missing tokens make ToULong/ToUShort return 0, so a bare 'DCC SEND' with no IP/port still drives DCCRequest with uLongIP=0/uPort=0 (allocating a bounce toward 0.0.0.0:0), and an unrecognised sub-command still returns HALTCORE, silently discarding what the user might have needed to see. Robust handling requires validating token count and numeric ranges before acting (CWE-20)."
+    }
+  ],
+  "summary": "This is ZNC's DCC-bounce CTCP handler, a raw parser of unauthenticated remote IRC CTCP payloads. The tagged resource-management issue is real: RESUME/ACCEPT blindly C-style-cast every module socket to CDCCBounce* (type confusion, CWE-843) and every CHAT/SEND allocates an unbounded, unthrottled bounce listener (DoS, CWE-400/399). Beyond that, attacker-supplied IP/port drive outbound connections (SSRF), and attacker file names are reflected unsanitised into the user's IRC stream (CTCP injection). All findings are latent in the shown handler but their full impact depends on CDCCBounce::DCCRequest and the socket-set contents, which are not provided.",
+  "reviewed_anchors": [
+    {"anchor": "virtual EModRet OnPrivCTCP(CNick& Nick, CString& sMessage) (line 2)", "disposition": "finding", "reason": "Entry point taking fully attacker-controlled remote CTCP payload; root of the untrusted data flow."},
+    {"anchor": "sMessage.Equals(\"DCC \", false, 4) && m_pUser->IsUserAttached() (line 3)", "disposition": "finding", "reason": "Only validation gate; a 4-char prefix check that admits malformed/short payloads."},
+    {"anchor": "sType = sMessage.Token(1) (line 5)", "disposition": "dismissed", "reason": "Sub-command selector compared against fixed literals; no buffer or arithmetic contract of its own."},
+    {"anchor": "sFile = sMessage.Token(2) (line 6)", "disposition": "finding", "reason": "Attacker file name reflected verbatim into outbound IRC/CTCP lines without sanitisation."},
+    {"anchor": "uLongIP = sMessage.Token(3).ToULong() (line 7)", "disposition": "finding", "reason": "Attacker-controlled destination IP passed to DCCRequest (SSRF)."},
+    {"anchor": "uPort = sMessage.Token(4).ToUShort() (line 8)", "disposition": "finding", "reason": "Attacker-controlled destination port paired with uLongIP for the outbound bounce leg (SSRF)."},
+    {"anchor": "uFileSize = sMessage.Token(5).ToULong() (line 9)", "disposition": "dismissed", "reason": "Only echoed back to the user as a size field; no buffer sizing or allocation is driven by it here."},
+    {"anchor": "CDCCBounce::DCCRequest(...) CHAT (line 13)", "disposition": "finding", "reason": "Allocates an unbounded bounce listener per request and initiates an attacker-directed connection."},
+    {"anchor": "CDCCBounce::DCCRequest(...) SEND (line 20)", "disposition": "finding", "reason": "Same unbounded-allocation / SSRF contract as the CHAT variant; covered by the same findings."},
+    {"anchor": "m_pUser->PutUser(...) (lines 16, 23, 34, 44)", "disposition": "finding", "reason": "Reflects attacker-controlled sFile/tokens and spoofable nick mask into the client's IRC stream with \\001 framing (CTCP injection)."},
+    {"anchor": "uResumePort = sMessage.Token(3).ToUShort() (line 27)", "disposition": "finding", "reason": "Attacker-chosen 16-bit key used as the sole selector for another connection in the RESUME lookup."},
+    {"anchor": "for (it = BeginSockets(); it != EndSockets(); ++it) (lines 30, 40)", "disposition": "finding", "reason": "Iterates the entire module socket set feeding the unchecked downcast; scope not restricted to the sender's own bounces."},
+    {"anchor": "CDCCBounce* pSock = (CDCCBounce*) *it (lines 31, 41)", "disposition": "finding", "reason": "Unchecked C-style downcast then dereference — type confusion if the set holds any non-CDCCBounce socket."},
+    {"anchor": "pSock->GetLocalPort()/GetUserPort() comparisons (lines 33, 43)", "disposition": "finding", "reason": "Reads through the mis-cast pointer and matches on an attacker-supplied port; part of the type-confusion and weak-lookup findings."},
+    {"anchor": "return HALTCORE (line 49)", "disposition": "dismissed", "reason": "Control-flow result; swallowing the CTCP after a prefix match is a minor UX/logic concern, not a memory-safety contract."},
+    {"anchor": "return CONTINUE (line 52)", "disposition": "dismissed", "reason": "Default pass-through when the DCC prefix does not match; no security contract."}
+  ],
+  "findings": [
+    {
+      "title": "Unchecked downcast of arbitrary CSocket* to CDCCBounce* (type confusion)",
+      "anchor": "CDCCBounce* pSock = (CDCCBounce*) *it;",
+      "file": "corpus/train/train_0246_cwe399.cpp",
+      "line": "31",
+      "code": "\t\t\t\t\tCDCCBounce* pSock = (CDCCBounce*) *it;",
+      "bug_class": "Type confusion via unchecked C-style downcast (out-of-bounds read through mis-typed pointer)",
+      "cwe": "CWE-843",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0246_cwe399.cpp (RESUME line 31 and ACCEPT line 41); depends on the socket set populated by CDCCBounce/DCCRequest in implementation (file not provided)",
+      "invariant": "Every socket returned by BeginSockets()/EndSockets() for this module must actually be a CDCCBounce; otherwise the pointer must be type-checked (dynamic_cast / type tag) before GetLocalPort()/GetUserPort() are called.",
+      "failure_mode": "When a remote peer sends 'DCC RESUME'/'DCC ACCEPT', the loop reinterpret-casts each enumerated socket to CDCCBounce* and dereferences it. If the module's socket set ever contains a socket of a different concrete type (a listener or any non-bounce helper), GetLocalPort()/GetUserPort() read fields at wrong offsets, yielding a garbage/out-of-bounds value that is either leaked back into the forwarded PRIVMSG or dereferenced into a crash. Attacker triggers it merely by sending the CTCP; no memory grooming required.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether BeginSockets()/EndSockets() for this module can ever yield a non-CDCCBounce socket, and whether the codebase elsewhere uses a checked cast for the same set."
+    },
+    {
+      "title": "Unbounded DCC bounce allocation (resource exhaustion DoS)",
+      "anchor": "CDCCBounce::DCCRequest(...)",
+      "file": "corpus/train/train_0246_cwe399.cpp",
+      "line": "13",
+      "code": "\t\t\t\tunsigned short uBNCPort = CDCCBounce::DCCRequest(FromNick.GetNick(), uLongIP, uPort, \"\", true, this, CUtils::GetIP(uLongIP));",
+      "bug_class": "Uncontrolled resource consumption (unbounded socket/port allocation)",
+      "cwe": "CWE-400",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0246_cwe399.cpp (CHAT line 13, SEND line 20); actual allocation logic in CDCCBounce::DCCRequest — implementation (file not provided)",
+      "invariant": "The number and lifetime of outstanding bounce listeners must be bounded (per sender and globally) with idle timeouts, so a flood of DCC CTCPs cannot exhaust file descriptors, ports, or memory.",
+      "failure_mode": "Each DCC CHAT/SEND from any unauthenticated remote user allocates a new listening socket/port via DCCRequest with no rate limit, cap, or visible timeout here. A peer that sprays DCC CTCPs forces ZNC to hold many sockets/ports open until they time out or the user connects, exhausting host resources and denying service. This is the CWE-399/400 resource-management issue the sample is tagged for.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether DCCRequest imposes a maximum concurrent bounce count / per-nick limit and reaps idle listeners on a timer."
+    },
+    {
+      "title": "Attacker-controlled outbound destination (SSRF / open relay)",
+      "anchor": "uLongIP / uPort passed to CDCCBounce::DCCRequest",
+      "file": "corpus/train/train_0246_cwe399.cpp",
+      "line": "7-8",
+      "code": "\t\t\tunsigned long uLongIP = sMessage.Token(3).ToULong();\n\t\t\tunsigned short uPort = sMessage.Token(4).ToUShort();",
+      "bug_class": "Server-side request forgery via attacker-supplied connection target",
+      "cwe": "CWE-918",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0246_cwe399.cpp (parsed lines 7-8, consumed lines 13/20); outbound connect logic in CDCCBounce — implementation (file not provided)",
+      "invariant": "The advertised peer IP/port used for the outbound bounce leg must be validated (reject loopback, link-local, and RFC1918 targets, and ideally require it to match the sender) before ZNC connects to it.",
+      "failure_mode": "The remote peer fully controls uLongIP/uPort (Token(3)/Token(4)); DCCRequest uses them as the address the bounce connects to. By advertising 127.0.0.1 or an internal address and an internal service port, an unauthenticated sender can make ZNC relay to internal services once the victim's client connects to the bounce, i.e. use ZNC as an SSRF pivot / open relay.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether DCCRequest or the bounce connect path filters non-routable destinations and binds the outbound target to the requesting peer's real address."
+    },
+    {
+      "title": "Unsanitised attacker file name reflected into client CTCP stream (CTCP injection)",
+      "anchor": "m_pUser->PutUser(... + sFile + ...)",
+      "file": "corpus/train/train_0246_cwe399.cpp",
+      "line": "23",
+      "code": "\t\t\t\t\tm_pUser->PutUser(\":\" + Nick.GetNickMask() + \" PRIVMSG \" + m_pUser->GetNick() + \" :\\001DCC SEND \" + sFile + \" \" + CString(CUtils::GetLongIP(sIP)) + \" \" + CString(uBNCPort) + \" \" + CString(uFileSize) + \"\\001\");",
+      "bug_class": "Improper neutralization of control bytes in output (CTCP/message injection)",
+      "cwe": "CWE-150",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0246_cwe399.cpp (lines 16, 23, 34, 44)",
+      "invariant": "Attacker-controlled fields (sFile, echoed tokens) and the spoofable nick mask must be stripped of control characters (\\001, and defensively CR/LF) before being concatenated into a line handed to PutUser.",
+      "failure_mode": "sFile (Token(2)) is re-emitted verbatim inside a \\001-framed CTCP PRIVMSG. A file name containing a stray \\001 closes the CTCP frame early and lets the peer inject an additional CTCP or forge extra DCC parameters that the victim's IRC client will parse, and the ':' + Nick.GetNickMask() prefix can be spoofed to impersonate other senders to the client.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether PutUser or an upstream layer strips \\001/CR/LF from module-supplied lines, and whether sFile is validated before reflection."
+    },
+    {
+      "title": "Bounce lookup keyed solely on attacker-supplied port (cross-session confusion)",
+      "anchor": "if (pSock->GetLocalPort() == uResumePort)",
+      "file": "corpus/train/train_0246_cwe399.cpp",
+      "line": "33",
+      "code": "\t\t\t\t\tif (pSock->GetLocalPort() == uResumePort) {",
+      "bug_class": "Improper authorization of a cross-session lookup (missing owner check)",
+      "cwe": "CWE-639",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0246_cwe399.cpp (RESUME line 33, ACCEPT line 43)",
+      "invariant": "A RESUME/ACCEPT must only match bounce sockets that belong to a transfer with the requesting nick; the lookup must not be a bare port comparison over all bounces.",
+      "failure_mode": "The RESUME/ACCEPT handlers match a CDCCBounce purely by a 16-bit port taken from the peer's own token (uResumePort / Token(3)), with no check that the matched bounce belongs to the sender. Because the active port space is tiny and guessable, a malicious peer can address another user's in-flight transfer and cause RESUME/ACCEPT rewrites (including that connection's GetUserPort()/GetLocalPort()) to be forwarded, disclosing/hijacking a transfer they do not own.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether the socket search is (or should be) scoped to bounces owned by the requesting nick rather than matching any bounce by port."
+    },
+    {
+      "title": "Payload accepted on 4-char prefix only; malformed/short tokens unhandled",
+      "anchor": "sMessage.Equals(\"DCC \", false, 4)",
+      "file": "corpus/train/train_0246_cwe399.cpp",
+      "line": "3",
+      "code": "\t\t\tif (sMessage.Equals(\"DCC \", false, 4) && m_pUser->IsUserAttached()) {",
+      "bug_class": "Improper input validation (insufficient structural checks)",
+      "cwe": "CWE-20",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0246_cwe399.cpp (line 3, consumed at lines 5-9)",
+      "invariant": "Before acting, the handler must verify the DCC message has the required number of tokens and that numeric fields are in range, rejecting malformed payloads.",
+      "failure_mode": "Only the 'DCC ' prefix is checked; missing tokens make ToULong/ToUShort silently yield 0, so a truncated 'DCC SEND' still calls DCCRequest with IP/port 0, and an unrecognised sub-command still returns HALTCORE, silently dropping the message. This is a robustness gap that amplifies the resource and SSRF findings above.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether token count and numeric ranges are validated before DCCRequest is invoked."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm whether BeginSockets()/EndSockets() for this module can ever return a non-CDCCBounce socket; if so, the C-style casts at lines 31/41 are exploitable type confusion — replace with a checked cast.",
+    "Check CDCCBounce::DCCRequest for a maximum concurrent bounce count, per-nick limits, and idle timeouts to bound resource consumption (lines 13/20).",
+    "Verify the outbound connect path validates uLongIP/uPort and rejects loopback/link-local/RFC1918 targets to prevent SSRF (lines 7-8, 13, 20).",
+    "Confirm that sFile and echoed tokens are stripped of \\001/CR/LF before being passed to PutUser, and that the spoofable nick mask cannot forge CTCP frames (lines 16, 23, 34, 44).",
+    "Verify RESUME/ACCEPT scope their socket search to the requesting nick rather than matching any bounce by an attacker-supplied port (lines 33, 43).",
+    "Confirm token count and numeric ranges are validated after the 'DCC ' prefix check so malformed payloads (missing IP/port) are rejected rather than driving DCCRequest with 0 values (line 3)."
+  ]
+}

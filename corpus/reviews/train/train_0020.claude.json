@@ -1,0 +1,202 @@
+{
+  "subsystem": "Linux kernel RDS (Reliable Datagram Sockets) connection layer. This is __rds_conn_create(), the core routine in net/rds/connection.c that looks up an existing rds_connection for a (local addr, foreign addr, transport, tos, dev_if) tuple or allocates and initializes a new one, including its per-path array (conn->c_path) and per-transport connection state. It handles both normal and 'passive' (loopback IB) connections and reconciles races where two threads create the same conn concurrently.",
+  "provenance": "Identified from the function name __rds_conn_create and its RDS-specific types/APIs: struct rds_connection, struct rds_transport, struct rds_conn_path, rds_conn_slab, rds_conn_bucket(), rds_conn_lookup(), rds_trans_get_preferred(), rds_cong_get_maps(), rds_conn_net_set(), __rds_conn_path_init(), rds_destroy_pending(), and rdsdebug(). These are Linux net/rds identifiers. The RDS_MPATH_WORKERS / t_mp_capable multipath idiom, in6_addr/ipv6_addr_* usage, kmem_cache_zalloc/kcalloc/kfree, hlist_add_head_rcu, and rcu_read_lock/spin_lock_irqsave confirm Linux kernel networking code. The sample banner (train_0020_cwe401.c, 'primevul_c_train_2992_vuln') hints at a memory-leak (CWE-401) class.",
+  "trust_boundary": "This runs in kernel context on behalf of RDS socket operations. The laddr/faddr (struct in6_addr), tos, dev_if, is_outgoing, and gfp arguments originate from socket calls (connect/sendmsg/bind) and from incoming-connection handling, so they are reachable by local unprivileged users and, via the is_outgoing=0 incoming path, influenced by the peer/network. The primary risk here is not a wire-format parse overflow but resource management on the many error/rollback paths: an attacker who can repeatedly drive connection creation into a losing-race or failure path can exhaust kernel memory if any allocation is not fully released. The transport (trans) and its callbacks (conn_alloc/conn_free) and the multipath count (npaths) determine how much per-path state must be freed on rollback.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0020_cwe401.c",
+      "lines": "2-9",
+      "code": "static struct rds_connection *__rds_conn_create(struct net *net,\n\t\t\t\t\t\tconst struct in6_addr *laddr,\n\t\t\t\t\t\tconst struct in6_addr *faddr,\n\t\t\t\t\t\tstruct rds_transport *trans,\n\t\t\t\t\t\tgfp_t gfp, u8 tos,\n\t\t\t\t\t\tint is_outgoing,\n\t\t\t\t\t\tint dev_if)\n{",
+      "explanation": "The function signature. It returns a struct rds_connection* (or an ERR_PTR on failure). net is the network namespace; laddr and faddr are the local and foreign IPv6 addresses (IPv4 is carried v4-mapped) identifying the connection endpoints; trans is the chosen RDS transport (e.g. TCP or IB); gfp is the allocation flag context; tos is the type-of-service byte; is_outgoing distinguishes locally-initiated from incoming connections; dev_if is the interface index. The function's job is to return a fully initialized, hash-inserted rds_connection, reusing an existing one if present."
+    },
+    {
+      "file": "corpus/train/train_0020_cwe401.c",
+      "lines": "10-15",
+      "code": "\tstruct rds_connection *conn, *parent = NULL;\n\tstruct hlist_head *head = rds_conn_bucket(laddr, faddr);\n\tstruct rds_transport *loop_trans;\n\tunsigned long flags;\n\tint ret, i;\n\tint npaths = (trans->t_mp_capable ? RDS_MPATH_WORKERS : 1);",
+      "explanation": "Locals. conn is the working connection pointer; parent tracks a pre-existing loopback conn under which a passive conn will be stored. head is the hash bucket for this address pair. loop_trans holds a preferred loopback transport if one exists. The key value here is npaths on line 15: if the transport advertises multipath capability (trans->t_mp_capable) the connection has RDS_MPATH_WORKERS paths; otherwise a single path. npaths therefore governs the size of the c_path array allocated below and how many per-path transport objects must be created and, critically, freed on every rollback path."
+    },
+    {
+      "file": "corpus/train/train_0020_cwe401.c",
+      "lines": "17-33",
+      "code": "\trcu_read_lock();\n\tconn = rds_conn_lookup(net, head, laddr, faddr, trans, tos, dev_if);\n\tif (conn &&\n\t    conn->c_loopback &&\n\t    conn->c_trans != &rds_loop_transport &&\n\t    ipv6_addr_equal(laddr, faddr) &&\n\t    !is_outgoing) {\n\t\t/* This is a looped back IB connection, and we're\n\t\t * called by the code handling the incoming connect.\n\t\t * We need a second connection object into which we\n\t\t * can stick the other QP. */\n\t\tparent = conn;\n\t\tconn = parent->c_passive;\n\t}\n\trcu_read_unlock();\n\tif (conn)\n\t\tgoto out;",
+      "explanation": "Under RCU read lock, it looks up an existing connection for the tuple. If a matching connection exists and is a loopback IB connection reached on the incoming path (c_loopback set, not already the loop transport, laddr==faddr, and !is_outgoing), the found conn is treated as a parent and the code switches to that parent's c_passive slot: a second 'passive' connection object is needed for the other queue pair. After dropping the RCU lock, if conn is non-NULL (either a normal match or an already-existing passive conn) the function jumps to out and returns it, avoiding any allocation."
+    },
+    {
+      "file": "corpus/train/train_0020_cwe401.c",
+      "lines": "35-45",
+      "code": "\tconn = kmem_cache_zalloc(rds_conn_slab, gfp);\n\tif (!conn) {\n\t\tconn = ERR_PTR(-ENOMEM);\n\t\tgoto out;\n\t}\n\tconn->c_path = kcalloc(npaths, sizeof(struct rds_conn_path), gfp);\n\tif (!conn->c_path) {\n\t\tkmem_cache_free(rds_conn_slab, conn);\n\t\tconn = ERR_PTR(-ENOMEM);\n\t\tgoto out;\n\t}",
+      "explanation": "Allocation. The connection object is zero-allocated from the rds_conn_slab cache; the return is NULL-checked and on failure the function returns ERR_PTR(-ENOMEM). Then the per-path array conn->c_path is allocated with kcalloc(npaths, sizeof(struct rds_conn_path)) — kcalloc zeroes the memory and internally guards the npaths*size multiplication against overflow. Its NULL check correctly frees the already-allocated conn back to the slab before returning -ENOMEM. Both allocations are properly checked; this is the clean part of the resource lifecycle. Note that c_path is a heap array of npaths elements, so any later cleanup must account for all npaths entries, not just the first."
+    },
+    {
+      "file": "corpus/train/train_0020_cwe401.c",
+      "lines": "47-64",
+      "code": "\tINIT_HLIST_NODE(&conn->c_hash_node);\n\tconn->c_laddr = *laddr;\n\tconn->c_isv6 = !ipv6_addr_v4mapped(laddr);\n\tconn->c_faddr = *faddr;\n\tconn->c_dev_if = dev_if;\n\tconn->c_tos = tos;\n\n#if IS_ENABLED(CONFIG_IPV6)\n\t/* If the local address is link local, set c_bound_if to be the\n\t * index used for this connection.  Otherwise, set it to 0 as\n\t * the socket is not bound to an interface.  c_bound_if is used\n\t * to look up a socket when a packet is received\n\t */\n\tif (ipv6_addr_type(laddr) & IPV6_ADDR_LINKLOCAL)\n\t\tconn->c_bound_if = dev_if;\n\telse\n#endif\n\t\tconn->c_bound_if = 0;",
+      "explanation": "Field initialization. The hash node is initialized, the local and foreign addresses are copied by value into c_laddr/c_faddr, c_isv6 records whether laddr is a genuine IPv6 (not v4-mapped) address, and dev_if/tos are stored. Under CONFIG_IPV6, if the local address is link-local the bound interface index is recorded (needed to disambiguate scoped addresses on receive), otherwise c_bound_if is 0 meaning not bound to an interface. These are straightforward value copies with no allocation."
+    },
+    {
+      "file": "corpus/train/train_0020_cwe401.c",
+      "lines": "66-74",
+      "code": "\trds_conn_net_set(conn, net);\n\n\tret = rds_cong_get_maps(conn);\n\tif (ret) {\n\t\tkfree(conn->c_path);\n\t\tkmem_cache_free(rds_conn_slab, conn);\n\t\tconn = ERR_PTR(ret);\n\t\tgoto out;\n\t}",
+      "explanation": "The connection's network namespace is set, then rds_cong_get_maps() attaches congestion-map state. On failure this error path correctly releases both heap allocations owned so far — kfree(conn->c_path) and kmem_cache_free the conn — and returns ERR_PTR(ret). At this point no per-path transport state has been allocated yet, so freeing just c_path and conn is complete and correct."
+    },
+    {
+      "file": "corpus/train/train_0020_cwe401.c",
+      "lines": "76-103",
+      "code": "\t/*\n\t * This is where a connection becomes loopback.  If *any* RDS sockets\n\t * can bind to the destination address then we'd rather the messages\n\t * flow through loopback rather than either transport.\n\t */\n\tloop_trans = rds_trans_get_preferred(net, faddr, conn->c_dev_if);\n\tif (loop_trans) {\n\t\trds_trans_put(loop_trans);\n\t\tconn->c_loopback = 1;\n\t\tif (trans->t_prefer_loopback) {\n\t\t\tif (likely(is_outgoing)) {\n\t\t\t\t/* \"outgoing\" connection to local address.\n\t\t\t\t * Protocol says it wants the connection\n\t\t\t\t * handled by the loopback transport.\n\t\t\t\t * This is what TCP does.\n\t\t\t\t */\n\t\t\t\ttrans = &rds_loop_transport;\n\t\t\t} else {\n\t\t\t\t/* No transport currently in use\n\t\t\t\t * should end up here, but if it\n\t\t\t\t * does, reset/destroy the connection.\n\t\t\t\t */\n\t\t\t\tkmem_cache_free(rds_conn_slab, conn);\n\t\t\t\tconn = ERR_PTR(-EOPNOTSUPP);\n\t\t\t\tgoto out;\n\t\t\t}\n\t\t}\n\t}",
+      "explanation": "Loopback resolution. If a preferred loopback transport exists for the destination, the reference is immediately put back (only its existence matters) and the connection is marked c_loopback. For outgoing connections whose transport prefers loopback, trans is switched to rds_loop_transport. The incoming (!is_outgoing) branch is a 'should not happen' case that destroys the connection with -EOPNOTSUPP. Note that this destroy path (line 98) frees the conn to the slab but does NOT kfree(conn->c_path) here — this is a distinct rollback shape from the earlier one and is worth confirming, though at this point c_path is still allocated so failing to free it would leak it. (See risks.)"
+    },
+    {
+      "file": "corpus/train/train_0020_cwe401.c",
+      "lines": "105-112",
+      "code": "\tconn->c_trans = trans;\n\n\tinit_waitqueue_head(&conn->c_hs_waitq);\n\tfor (i = 0; i < npaths; i++) {\n\t\t__rds_conn_path_init(conn, &conn->c_path[i],\n\t\t\t\t     is_outgoing);\n\t\tconn->c_path[i].cp_index = i;\n\t}",
+      "explanation": "The final transport is recorded, the handshake wait queue is initialized, and every one of the npaths path structures is initialized via __rds_conn_path_init() and stamped with its index. This loop confirms that the connection genuinely owns npaths path objects — reinforcing that any cleanup must iterate all npaths, since per-path transport state is about to be created for each of them by conn_alloc."
+    },
+    {
+      "file": "corpus/train/train_0020_cwe401.c",
+      "lines": "113-124",
+      "code": "\trcu_read_lock();\n\tif (rds_destroy_pending(conn))\n\t\tret = -ENETDOWN;\n\telse\n\t\tret = trans->conn_alloc(conn, GFP_ATOMIC);\n\tif (ret) {\n\t\trcu_read_unlock();\n\t\tkfree(conn->c_path);\n\t\tkmem_cache_free(rds_conn_slab, conn);\n\t\tconn = ERR_PTR(ret);\n\t\tgoto out;\n\t}",
+      "explanation": "Per-transport allocation. Under RCU, unless the netns is being torn down (rds_destroy_pending), the transport's conn_alloc callback allocates per-path transport data (cp_transport_data) for the paths. On failure, the error path kfree()s c_path and frees conn. This path assumes conn_alloc fully cleans up its own partial allocations on failure (it does not call conn_free here), which is the transport contract to verify. If conn_alloc succeeds it has populated cp_transport_data for the paths, and from here on any rollback MUST free each path's cp_transport_data via trans->conn_free — this is the crux of the leak analysis below."
+    },
+    {
+      "file": "corpus/train/train_0020_cwe401.c",
+      "lines": "126-129",
+      "code": "\trdsdebug(\"allocated conn %p for %pI6c -> %pI6c over %s %s\\n\",\n\t\t conn, laddr, faddr,\n\t\t strnlen(trans->t_name, sizeof(trans->t_name)) ?\n\t\t trans->t_name : \"[unknown]\", is_outgoing ? \"(outgoing)\" : \"\");",
+      "explanation": "A debug log of the newly allocated connection, printing the endpoints and transport name. strnlen(trans->t_name, sizeof(trans->t_name)) bounds the name read so an unterminated t_name cannot over-read; if empty it prints '[unknown]'. This is benign and does not dereference any possibly-NULL handle."
+    },
+    {
+      "file": "corpus/train/train_0020_cwe401.c",
+      "lines": "138-150",
+      "code": "\tspin_lock_irqsave(&rds_conn_lock, flags);\n\tif (parent) {\n\t\t/* Creating passive conn */\n\t\tif (parent->c_passive) {\n\t\t\ttrans->conn_free(conn->c_path[0].cp_transport_data);\n\t\t\tkfree(conn->c_path);\n\t\t\tkmem_cache_free(rds_conn_slab, conn);\n\t\t\tconn = parent->c_passive;\n\t\t} else {\n\t\t\tparent->c_passive = conn;\n\t\t\trds_cong_add_conn(conn);\n\t\t\trds_conn_count++;\n\t\t}\n\t}",
+      "explanation": "Under rds_conn_lock, the code reconciles races. In the passive case (parent set), if some other thread already installed parent->c_passive in the interim, our freshly built conn is thrown away: it frees the transport data for c_path[0], kfree()s the c_path array, frees the conn to the slab, and returns the other thread's passive conn. Otherwise it installs our conn as the passive one, adds it to the congestion tracking and bumps rds_conn_count. Note the asymmetry: the discard here frees only conn->c_path[0].cp_transport_data, a single path, whereas the normal-conn discard below loops over all npaths."
+    },
+    {
+      "file": "corpus/train/train_0020_cwe401.c",
+      "lines": "151-182",
+      "code": "\t} else {\n\t\t/* Creating normal conn */\n\t\tstruct rds_connection *found;\n\n\t\tfound = rds_conn_lookup(net, head, laddr, faddr, trans,\n\t\t\t\t\ttos, dev_if);\n\t\tif (found) {\n\t\t\tstruct rds_conn_path *cp;\n\t\t\tint i;\n\n\t\t\tfor (i = 0; i < npaths; i++) {\n\t\t\t\tcp = &conn->c_path[i];\n\t\t\t\t/* The ->conn_alloc invocation may have\n\t\t\t\t * allocated resource for all paths, so all\n\t\t\t\t * of them may have to be freed here.\n\t\t\t\t */\n\t\t\t\tif (cp->cp_transport_data)\n\t\t\t\t\ttrans->conn_free(cp->cp_transport_data);\n\t\t\t}\n\t\t\tkfree(conn->c_path);\n\t\t\tkmem_cache_free(rds_conn_slab, conn);\n\t\t\tconn = found;\n\t\t} else {\n\t\t\tconn->c_my_gen_num = rds_gen_num;\n\t\t\tconn->c_peer_gen_num = 0;\n\t\t\thlist_add_head_rcu(&conn->c_hash_node, head);\n\t\t\trds_cong_add_conn(conn);\n\t\t\trds_conn_count++;\n\t\t}\n\t}\n\tspin_unlock_irqrestore(&rds_conn_lock, flags);\n\trcu_read_unlock();",
+      "explanation": "The normal-conn reconciliation. It re-looks-up under the lock; if another thread already created the conn (found), the freshly built conn is discarded. Crucially, its discard loops i over ALL npaths freeing each cp->cp_transport_data (guarded by a NULL check), then kfree()s c_path and frees conn, returning found. The in-code comment even states 'conn_alloc invocation may have allocated resource for all paths, so all of them may have to be freed.' Otherwise (no race) it stamps generation numbers, inserts the conn into the RCU hash, adds congestion tracking, and increments the count. Finally the spinlock and RCU lock are released. This branch is the correct template: it demonstrates that the transport data for every path must be freed on rollback."
+    },
+    {
+      "file": "corpus/train/train_0020_cwe401.c",
+      "lines": "184-186",
+      "code": "out:\n\treturn conn;\n}",
+      "explanation": "Single return point. conn is either a valid, hash-inserted connection, an existing/other-thread connection reused on a race, or an ERR_PTR encoding a negative errno. Callers must use IS_ERR() to distinguish success from failure."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0020_cwe401.c",
+      "lines": "141-145",
+      "code": "\t\tif (parent->c_passive) {\n\t\t\ttrans->conn_free(conn->c_path[0].cp_transport_data);\n\t\t\tkfree(conn->c_path);\n\t\t\tkmem_cache_free(rds_conn_slab, conn);\n\t\t\tconn = parent->c_passive;",
+      "explanation": "MEMORY LEAK (CWE-401), the central bug. This passive-conn rollback frees transport data for exactly ONE path — conn->c_path[0].cp_transport_data — before discarding the whole conn. But when the transport is multipath-capable (trans->t_mp_capable), npaths == RDS_MPATH_WORKERS (> 1, line 15), and trans->conn_alloc() at line 117 allocates cp_transport_data for ALL npaths paths (line 108-112 initialized every path). The sibling normal-conn rollback path at lines 161-169 gets this right — it loops over all npaths and frees each cp->cp_transport_data with the comment 'all of them may have to be freed here' — proving the intended contract. The passive branch violates it: paths 1..npaths-1 transport objects are leaked every time a passive loopback IB connection loses the creation race. An attacker who can repeatedly race incoming loopback connection setup on a multipath transport (RDS IB is mp-capable) can leak kernel memory unboundedly, a denial-of-service. The invariant: every rollback that discards a conn after conn_alloc must free cp_transport_data for all npaths paths, exactly as the normal branch does. This is the injected CWE-401 defect."
+    },
+    {
+      "file": "corpus/train/train_0020_cwe401.c",
+      "lines": "142-142",
+      "code": "\t\t\ttrans->conn_free(conn->c_path[0].cp_transport_data);",
+      "explanation": "Secondary robustness gap on the same line: unlike the normal-conn branch which guards each free with 'if (cp->cp_transport_data)' (line 167), the passive branch calls trans->conn_free(conn->c_path[0].cp_transport_data) unconditionally. If conn_alloc left path 0's cp_transport_data NULL (e.g. partial or transport-specific allocation), this passes NULL into conn_free. Whether that is safe depends on each transport's conn_free tolerating NULL (CWE-476 potential if not). Confirm every RDS transport's conn_free is NULL-safe, or add the same guard used in the normal branch."
+    },
+    {
+      "file": "corpus/train/train_0020_cwe401.c",
+      "lines": "98-100",
+      "code": "\t\t\t\tkmem_cache_free(rds_conn_slab, conn);\n\t\t\t\tconn = ERR_PTR(-EOPNOTSUPP);\n\t\t\t\tgoto out;",
+      "explanation": "Latent leak to confirm: the 'should not happen' incoming-loopback destroy path frees conn to the slab but does NOT kfree(conn->c_path), which was allocated at line 40. At this point conn_alloc has not run (this is before line 117), so no cp_transport_data exists, but the c_path array itself is leaked if this branch is ever taken. Every other rollback (lines 42, 70-71, 120-121, 143-144, 170-171) pairs kfree(conn->c_path) with the slab free; this one omits it. The invariant: releasing a conn must always release its c_path array. Confirm whether this branch is truly unreachable or whether it leaks c_path."
+    },
+    {
+      "file": "corpus/train/train_0020_cwe401.c",
+      "lines": "113-124",
+      "code": "\trcu_read_lock();\n\tif (rds_destroy_pending(conn))\n\t\tret = -ENETDOWN;\n\telse\n\t\tret = trans->conn_alloc(conn, GFP_ATOMIC);\n\tif (ret) {\n\t\trcu_read_unlock();\n\t\tkfree(conn->c_path);\n\t\tkmem_cache_free(rds_conn_slab, conn);\n\t\tconn = ERR_PTR(ret);\n\t\tgoto out;\n\t}",
+      "explanation": "Transport contract dependency (latent, in implementation not shown). The conn_alloc failure path frees c_path and conn but does NOT call trans->conn_free on any per-path transport data. This is only correct if every transport's conn_alloc fully unwinds its own partial allocations before returning an error — i.e. on failure it must leave no cp_transport_data allocated. If any transport allocates path 0's data, then fails allocating path 1's and returns error without freeing path 0, this path leaks it (CWE-401). The invariant to verify per transport: conn_alloc is all-or-nothing on failure."
+    },
+    {
+      "file": "corpus/train/train_0020_cwe401.c",
+      "lines": "17-33",
+      "code": "\trcu_read_lock();\n\tconn = rds_conn_lookup(net, head, laddr, faddr, trans, tos, dev_if);\n\t...\n\trcu_read_unlock();\n\tif (conn)\n\t\tgoto out;",
+      "explanation": "TOCTOU / concurrent-creation race (handled by design, noted for completeness). The initial lookup runs under RCU without the rds_conn_lock, so two threads can both miss and proceed to allocate. This is deliberately reconciled under spin_lock_irqsave(&rds_conn_lock) at lines 138-181 by re-looking-up and discarding the loser. The correctness of that reconciliation is exactly what the leak finding above targets: the loser's cleanup must be complete. No additional race bug beyond the incomplete passive cleanup."
+    }
+  ],
+  "summary": "The allocation and NULL-checking are correct, but the rollback logic is asymmetric: the passive-connection race-loser path (line 142) frees per-path transport data for only conn->c_path[0], while the equivalent normal-connection path (lines 161-169) correctly frees all npaths paths. On a multipath-capable transport (npaths = RDS_MPATH_WORKERS > 1) this leaks the transport data of paths 1..npaths-1 on every lost passive-conn race — a remotely/locally triggerable kernel memory leak (CWE-401, DoS). A secondary suspected c_path leak exists on the -EOPNOTSUPP destroy path (line 98).",
+  "reviewed_anchors": [
+    {"anchor": "__rds_conn_create() signature (net, laddr, faddr, trans, gfp, tos, is_outgoing, dev_if), lines 2-8", "disposition": "dismissed", "reason": "Entry point; args validated/consumed downstream. No buffer or length field in the signature itself."},
+    {"anchor": "int npaths = (trans->t_mp_capable ? RDS_MPATH_WORKERS : 1); line 15", "disposition": "finding", "reason": "Governs how many c_path entries and per-path transport objects exist; the leak finding hinges on npaths > 1 not being honored in the passive rollback."},
+    {"anchor": "conn = kmem_cache_zalloc(rds_conn_slab, gfp); line 35", "disposition": "dismissed", "reason": "Return value NULL-checked at line 36 with correct -ENOMEM cleanup."},
+    {"anchor": "conn->c_path = kcalloc(npaths, sizeof(struct rds_conn_path), gfp); line 40", "disposition": "dismissed", "reason": "NULL-checked at line 41; kcalloc guards the npaths*size multiplication against overflow internally. Allocation itself is safe (its freeing is the issue, covered by other anchors)."},
+    {"anchor": "rds_cong_get_maps() error path, lines 68-74", "disposition": "dismissed", "reason": "Correctly frees c_path and conn before any per-path transport state exists."},
+    {"anchor": "rds_trans_get_preferred()/rds_trans_put() loopback block, lines 81-103", "disposition": "finding", "reason": "The -EOPNOTSUPP destroy branch at lines 98-100 frees conn but omits kfree(conn->c_path); suspected c_path leak."},
+    {"anchor": "path init loop for (i=0; i<npaths; i++) __rds_conn_path_init(...), lines 108-112", "disposition": "dismissed", "reason": "Initializes all npaths paths; establishes that all paths are owned and must be cleaned up, supporting the leak finding but not itself a defect."},
+    {"anchor": "trans->conn_alloc(conn, GFP_ATOMIC) and its error path, lines 113-124", "disposition": "finding", "reason": "Failure path frees c_path/conn but not per-path transport data; correctness depends on the (unshown) transport contract that conn_alloc unwinds its own partial allocations."},
+    {"anchor": "Passive rollback trans->conn_free(conn->c_path[0].cp_transport_data), lines 141-145", "disposition": "finding", "reason": "Frees only path[0] transport data; leaks paths 1..npaths-1 when npaths > 1 — primary CWE-401 defect. Also unconditional (no NULL guard)."},
+    {"anchor": "Normal rollback loop freeing all npaths cp_transport_data, lines 161-169", "disposition": "dismissed", "reason": "Correct reference implementation: loops all npaths with a NULL guard; used as the contract the passive path violates."},
+    {"anchor": "hlist_add_head_rcu + rds_conn_count++ install path, lines 174-178", "disposition": "dismissed", "reason": "Success path under lock; correct RCU insertion, no resource leak."},
+    {"anchor": "rdsdebug(... strnlen(trans->t_name, sizeof(trans->t_name)) ...), lines 126-129", "disposition": "dismissed", "reason": "strnlen bounds the name read; benign debug output, no NULL-handle deref."}
+  ],
+  "findings": [
+    {
+      "title": "Memory leak: passive-conn rollback frees only path[0] transport data, leaks remaining multipath paths",
+      "anchor": "trans->conn_free(conn->c_path[0].cp_transport_data);",
+      "file": "corpus/train/train_0020_cwe401.c",
+      "line": "142",
+      "code": "trans->conn_free(conn->c_path[0].cp_transport_data);",
+      "bug_class": "Memory leak (incomplete resource release on error/rollback path)",
+      "cwe": "CWE-401",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0020_cwe401.c (this function)",
+      "invariant": "Any path that discards a conn after trans->conn_alloc() has run must free cp_transport_data for ALL npaths paths, not just path[0] — exactly as the normal-conn branch (lines 161-169) does.",
+      "failure_mode": "When trans->t_mp_capable is set, npaths = RDS_MPATH_WORKERS > 1 (line 15) and conn_alloc (line 117) allocates cp_transport_data for every path. If a passive loopback connection loses the creation race (parent->c_passive already set), only conn->c_path[0].cp_transport_data is freed; paths 1..npaths-1 are leaked and the whole conn is then freed, dropping the only references. Repeatedly racing incoming loopback IB connection setup leaks kernel memory unboundedly (DoS). The sibling normal-conn path loops all npaths, confirming this is the intended contract the passive path fails to meet.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm that in the passive branch the code should loop 'for (i=0;i<npaths;i++)' freeing each conn->c_path[i].cp_transport_data (with a NULL guard) as the normal branch does, and that RDS IB (the transport that creates passive conns) is multipath-capable so npaths>1 is reachable."
+    },
+    {
+      "title": "Suspected c_path leak on -EOPNOTSUPP loopback destroy path",
+      "anchor": "kmem_cache_free(rds_conn_slab, conn);  (missing preceding kfree(conn->c_path))",
+      "file": "corpus/train/train_0020_cwe401.c",
+      "line": "98-100",
+      "code": "kmem_cache_free(rds_conn_slab, conn);\nconn = ERR_PTR(-EOPNOTSUPP);\ngoto out;",
+      "bug_class": "Memory leak (missing free of heap array on error path)",
+      "cwe": "CWE-401",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0020_cwe401.c (this function)",
+      "invariant": "Every path that releases a conn must also kfree(conn->c_path), which was allocated at line 40.",
+      "failure_mode": "The incoming-loopback 'should not happen' branch frees the conn object to the slab but omits kfree(conn->c_path); if this branch is ever reached the npaths-element c_path array is leaked. Every other rollback pairs the slab free with kfree(conn->c_path). conn_alloc has not run here so no cp_transport_data exists, limiting the leak to the c_path array itself.",
+      "cve_analog": "",
+      "what_to_confirm": "Determine whether this branch is genuinely unreachable (a non-outgoing, t_prefer_loopback transport reaching here) or whether kfree(conn->c_path) must precede the kmem_cache_free."
+    },
+    {
+      "title": "Unconditional conn_free of path[0] transport data (NULL-deref risk)",
+      "anchor": "trans->conn_free(conn->c_path[0].cp_transport_data);",
+      "file": "corpus/train/train_0020_cwe401.c",
+      "line": "142",
+      "code": "trans->conn_free(conn->c_path[0].cp_transport_data);",
+      "bug_class": "Potential NULL pointer dereference (missing guard)",
+      "cwe": "CWE-476",
+      "severity": "low",
+      "where_it_lives": "implementation (per-transport conn_free, file not provided)",
+      "invariant": "Either every transport's conn_free must tolerate a NULL argument, or the free must be guarded by 'if (conn->c_path[0].cp_transport_data)' as the normal-conn branch guards each path (line 167).",
+      "failure_mode": "If conn_alloc left path 0's cp_transport_data NULL (partial/transport-specific allocation), this passes NULL to conn_free unconditionally, unlike the normal branch which checks first. A transport whose conn_free dereferences its argument would fault.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify each RDS transport conn_free (e.g. rds_tcp, rds_ib) is NULL-safe, or add the same NULL guard used at line 167."
+    },
+    {
+      "title": "conn_alloc failure path does not free partial per-path transport allocations",
+      "anchor": "ret = trans->conn_alloc(conn, GFP_ATOMIC); ... kfree(conn->c_path); kmem_cache_free(...)",
+      "file": "corpus/train/train_0020_cwe401.c",
+      "line": "116-124",
+      "code": "\t\tret = trans->conn_alloc(conn, GFP_ATOMIC);\n\tif (ret) {\n\t\trcu_read_unlock();\n\t\tkfree(conn->c_path);\n\t\tkmem_cache_free(rds_conn_slab, conn);\n\t\tconn = ERR_PTR(ret);\n\t\tgoto out;\n\t}",
+      "bug_class": "Memory leak dependent on transport contract (latent, implementation)",
+      "cwe": "CWE-401",
+      "severity": "info",
+      "where_it_lives": "implementation (per-transport conn_alloc, file not provided)",
+      "invariant": "trans->conn_alloc must be all-or-nothing: on failure it must free any cp_transport_data it already allocated for earlier paths before returning an error, because this caller does not call conn_free on failure.",
+      "failure_mode": "If a multipath conn_alloc allocates path 0, then fails on path 1 and returns error without freeing path 0, the caller here frees only c_path and conn, leaking path 0's transport data. Not a defect in the shown code but a contract this rollback path relies on.",
+      "cve_analog": "",
+      "what_to_confirm": "Inspect each transport's conn_alloc to confirm it unwinds partial per-path allocations on failure."
+    }
+  ],
+  "audit_checklist": [
+    "Change the passive-conn rollback (lines 141-145) to loop over all npaths freeing each conn->c_path[i].cp_transport_data with a NULL guard, matching the normal-conn branch (lines 161-169); confirm RDS IB is mp-capable so npaths>1 is reachable.",
+    "Confirm the -EOPNOTSUPP destroy branch (lines 98-100) frees conn->c_path (add kfree before kmem_cache_free) or prove the branch is unreachable.",
+    "Verify every RDS transport's conn_free tolerates a NULL cp_transport_data, or add a NULL guard at line 142.",
+    "Verify every transport's conn_alloc fully unwinds partial per-path allocations on failure, since the conn_alloc error path (lines 118-124) does not call conn_free.",
+    "Audit that all rollback paths consistently pair kfree(conn->c_path) with kmem_cache_free(rds_conn_slab, conn) and free all npaths transport objects when conn_alloc has run.",
+    "Confirm rds_conn_count/rds_cong_add_conn bookkeeping is only performed on the install branches and never on the discard branches, so counts do not drift under races."
+  ]
+}

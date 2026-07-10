@@ -1,0 +1,183 @@
+{
+  "subsystem": "Deepin/DDE file-manager privileged mount helper. Helper::temporaryMountDevice() constructs an on-demand mount point for a block device under a temporary directory and then mounts the device there. In dde-file-manager this Helper class is the backend of a privileged (root/polkit-gated) D-Bus service that performs mount operations on behalf of unprivileged desktop clients.",
+  "provenance": "Identified by the Qt/DDE API surface: QString/QStringList, QStandardPaths::standardLocations(QStandardPaths::TempLocation), qApp->applicationName(), QDir::current().mkpath(), and the dCError() logging macro are all deepin-tool-kit / dde-file-manager idioms. The class name Helper and the method temporaryMountDevice/mountPoint/mountDevice match dde-file-manager's Helper. The sample tag is 'primevul_train_2254_vuln' and the file name is train_0084_cwe61.cpp (CWE-61 = UNIX symbolic link following), consistent with the mount-path construction shown.",
+  "trust_boundary": "temporaryMountDevice runs inside a privileged helper (root). Its arguments device and name arrive from an unprivileged client over IPC/D-Bus and are therefore attacker-controllable. The mount point is built under a world-writable temporary directory (typically /tmp) at a fully predictable path derived from the application name and the caller-supplied 'name'. Any local user on the system shares that directory, so the directory contents (symlinks, pre-created paths) between path construction and the mount are hostile input just as much as the parameters themselves.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0084_cwe61.cpp",
+      "lines": "2-4",
+      "code": "QString Helper::temporaryMountDevice(const QString &device, const QString &name, bool readonly)\n{\n    QString mount_point = mountPoint(device);",
+      "explanation": "This is the entry point. It takes three parameters: 'device' (a block-device identifier such as /dev/sdb1 that the helper will mount), 'name' (a human/label string used to build the mount directory), and 'readonly' (whether to mount read-only). All three come from the calling client. The first action queries mountPoint(device) to discover whether this device is already mounted somewhere; the result is stored in the local mount_point QString."
+    },
+    {
+      "file": "corpus/train/train_0084_cwe61.cpp",
+      "lines": "6-7",
+      "code": "if (!mount_point.isEmpty())\n        return mount_point;",
+      "explanation": "Early-return fast path: if mountPoint(device) returned a non-empty string the device is already mounted, so the existing mount point is returned and no new directory is created. Only when the device is not yet mounted does control fall through to the path-construction and mount logic below."
+    },
+    {
+      "file": "corpus/train/train_0084_cwe61.cpp",
+      "lines": "9-12",
+      "code": "mount_point = \"%1/.%2/mount/%3\";\n    const QStringList &tmp_paths = QStandardPaths::standardLocations(QStandardPaths::TempLocation);\n\n    mount_point = mount_point.arg(tmp_paths.isEmpty() ? \"/tmp\" : tmp_paths.first()).arg(qApp->applicationName()).arg(name);",
+      "explanation": "The target mount directory is assembled from a format template \"%1/.%2/mount/%3\". %1 is the system temporary location: QStandardPaths::standardLocations(TempLocation) is queried, and if empty it falls back to the hard-coded \"/tmp\". %2 is qApp->applicationName(), a constant per application. %3 is the caller-supplied 'name'. The three .arg() substitutions produce a fully deterministic path such as /tmp/.dde-file-manager/mount/<name>. Nothing in this path is randomized or unpredictable, and 'name' is inserted with no sanitization."
+    },
+    {
+      "file": "corpus/train/train_0084_cwe61.cpp",
+      "lines": "14-18",
+      "code": "if (!QDir::current().mkpath(mount_point)) {\n        dCError(\"mkpath \\\"%s\\\" failed\", qPrintable(mount_point));\n\n        return QString();\n    }",
+      "explanation": "QDir::current().mkpath(mount_point) recursively creates the full directory chain (…/.appname, …/mount, …/mount/<name>). mkpath uses ordinary mkdir semantics that traverse and follow any existing directory components, including symbolic links, and it treats an already-existing directory as success. On failure it logs via dCError and returns an empty QString to signal error. There is no check that the created leaf is a real directory owned by the helper rather than a pre-existing attacker-controlled symlink or directory."
+    },
+    {
+      "file": "corpus/train/train_0084_cwe61.cpp",
+      "lines": "20-24",
+      "code": "if (!mountDevice(device, mount_point, readonly)) {\n        dCError(\"Mount the device \\\"%s\\\" to \\\"%s\\\" failed\", qPrintable(device), qPrintable(mount_point));\n\n        return QString();\n    }",
+      "explanation": "mountDevice(device, mount_point, readonly) performs the actual mount(2) of 'device' onto the just-created mount_point path, honoring the readonly flag. This is the privileged operation. On failure it logs the device and mount_point and returns an empty QString. Crucially, mount_point is whatever path the directory-creation step landed on, which may have been redirected by a symlink placed by another user."
+    },
+    {
+      "file": "corpus/train/train_0084_cwe61.cpp",
+      "lines": "26-27",
+      "code": "return mount_point;\n}",
+      "explanation": "On success the function returns the mount point path string to the caller so the client can access the mounted device's contents there. The returned path is the same predictable /tmp-based path constructed above."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0084_cwe61.cpp",
+      "lines": "12-20",
+      "code": "mount_point = mount_point.arg(tmp_paths.isEmpty() ? \"/tmp\" : tmp_paths.first()).arg(qApp->applicationName()).arg(name);\n\n    if (!QDir::current().mkpath(mount_point)) {\n        dCError(\"mkpath \\\"%s\\\" failed\", qPrintable(mount_point));\n\n        return QString();\n    }\n\n    if (!mountDevice(device, mount_point, readonly)) {",
+      "explanation": "PRIMARY ISSUE (CWE-61 symlink following). The mount point is a fully predictable path in a world-writable directory: /tmp/.<appname>/mount/<name>. Because /tmp is shared and the path contains no random component, an unprivileged local attacker can pre-create the parent chain and plant a symbolic link at (or along) that path pointing to a sensitive directory — e.g. make /tmp/.dde-file-manager/mount/foo a symlink to /etc, /root/.ssh, or a system config directory. mkpath follows existing symlinks in the path and treats the existing target as an already-created directory (success), so mountDevice then mounts the attacker-supplied 'device' filesystem ONTO the symlink target while running as root. Mounting an attacker-controlled filesystem over /etc, ~/.ssh, or a binary directory (with device content the attacker crafted) yields local privilege escalation or complete file shadowing. The implementation MUST create the mount directory with O_NOFOLLOW / lstat semantics, refuse to reuse an existing path it did not just create, verify the leaf is a real directory owned by root, and prefer a per-invocation unpredictable (mkdtemp-style) component rather than a caller-derived name."
+    },
+    {
+      "file": "corpus/train/train_0084_cwe61.cpp",
+      "lines": "12",
+      "code": "mount_point = mount_point.arg(tmp_paths.isEmpty() ? \"/tmp\" : tmp_paths.first()).arg(qApp->applicationName()).arg(name);",
+      "explanation": "PATH TRAVERSAL via 'name' (CWE-22). The caller-controlled 'name' is substituted into %3 with no validation. If 'name' contains path separators or traversal sequences such as \"../../../root/.ssh\" or an absolute-looking payload, the constructed mount_point escapes the intended /tmp/.appname/mount/ subtree entirely, letting the client direct the privileged mount to an arbitrary directory of its choosing without even needing a symlink race. The implementation MUST reject or sanitize 'name' (no '/', no '..', bounded length, whitelist characters) before it becomes part of a filesystem path used for a root mount."
+    },
+    {
+      "file": "corpus/train/train_0084_cwe61.cpp",
+      "lines": "14-20",
+      "code": "if (!QDir::current().mkpath(mount_point)) {\n        dCError(\"mkpath \\\"%s\\\" failed\", qPrintable(mount_point));\n\n        return QString();\n    }\n\n    if (!mountDevice(device, mount_point, readonly)) {",
+      "explanation": "TIME-OF-CHECK/TIME-OF-USE race (CWE-367). Even absent a pre-existing symlink, there is a window between mkpath creating the leaf directory (line 14) and mountDevice consuming that same path (line 20). Between those two calls another local user can delete the just-created directory and replace it with a symlink to a target of their choosing; mount(2) then resolves the swapped path and mounts onto the attacker's target. Directory creation and the subsequent mount must be bound to the same file object (e.g. open the directory once with O_NOFOLLOW and mount via /proc/self/fd, or use a private/unpredictable path) so the path cannot be substituted mid-operation."
+    },
+    {
+      "file": "corpus/train/train_0084_cwe61.cpp",
+      "lines": "9-12",
+      "code": "mount_point = \"%1/.%2/mount/%3\";\n    const QStringList &tmp_paths = QStandardPaths::standardLocations(QStandardPaths::TempLocation);\n\n    mount_point = mount_point.arg(tmp_paths.isEmpty() ? \"/tmp\" : tmp_paths.first()).arg(qApp->applicationName()).arg(name);",
+      "explanation": "PREDICTABLE TEMPORARY LOCATION (CWE-377). The path is deterministic and derived only from the app name and a caller string, with no random component and a fallback to a hard-coded shared \"/tmp\". Predictability is the precondition that makes the symlink and TOCTOU attacks above practical, and it also enables denial-of-service: a local user can pre-create /tmp/.appname/mount/<name> as a non-directory or a directory with hostile permissions to make the helper fail or to squat the mount target. A secure design creates the temporary mount directory with mkdtemp/QTemporaryDir semantics (unpredictable suffix, 0700, created atomically) inside a directory not writable by other users."
+    }
+  ],
+  "summary": "A privileged (root) mount helper builds its mount point at a fully predictable path in a world-writable temporary directory (/tmp/.<appname>/mount/<name>) from an unsanitized caller-supplied 'name', creates it with mkpath (which follows symlinks), then mounts an attacker-supplied device there. This is a classic CWE-61 symlink-following / TOCTOU local privilege-escalation surface, compounded by path traversal through 'name'. No genuine mitigation (O_NOFOLLOW, unpredictable suffix, name sanitization, ownership check) is present in the shown code.",
+  "reviewed_anchors": [
+    {
+      "anchor": "Helper::temporaryMountDevice(const QString &device, const QString &name, bool readonly) — signature, line 2",
+      "disposition": "finding",
+      "reason": "Privileged entry point whose 'device' and 'name' parameters are attacker-controlled inputs to a root mount; 'name' flows into the filesystem path (traversal + symlink surface)."
+    },
+    {
+      "anchor": "QString mount_point = mountPoint(device); (line 4) and the isEmpty early return (lines 6-7)",
+      "disposition": "dismissed",
+      "reason": "Read-only lookup and short-circuit; carries no direct memory/path-safety contract of its own (its result is not attacker-writable state)."
+    },
+    {
+      "anchor": "mount_point = \"%1/.%2/mount/%3\"; template (line 9) with QStandardPaths TempLocation / \"/tmp\" fallback (line 10)",
+      "disposition": "finding",
+      "reason": "Establishes a predictable path rooted in a world-writable temp directory with no random component (CWE-377), the precondition for symlink/TOCTOU abuse."
+    },
+    {
+      "anchor": ".arg(...).arg(qApp->applicationName()).arg(name) substitution (line 12)",
+      "disposition": "finding",
+      "reason": "Unsanitized caller-controlled 'name' inserted into a filesystem path used by a root mount (path traversal, CWE-22)."
+    },
+    {
+      "anchor": "QDir::current().mkpath(mount_point) (line 14)",
+      "disposition": "finding",
+      "reason": "Follows existing symlinks and accepts pre-existing directories; no O_NOFOLLOW/ownership/leaf-is-real-dir check — core of the symlink-following (CWE-61) and TOCTOU (CWE-367) exposure."
+    },
+    {
+      "anchor": "mountDevice(device, mount_point, readonly) (line 20)",
+      "disposition": "finding",
+      "reason": "Privileged mount onto a path that may have been redirected by a symlink or swapped between creation and use; the point where the exploit lands."
+    },
+    {
+      "anchor": "dCError(\"mkpath \\\"%s\\\" failed\", ...) and dCError(\"Mount the device ...\") (lines 15, 21)",
+      "disposition": "dismissed",
+      "reason": "Format-string arguments are fixed literals with %s bound to valid QString data via qPrintable; no attacker-controlled format string and no NULL-handle dereference shown."
+    },
+    {
+      "anchor": "readonly bool parameter (line 2) and return QString() error paths (lines 17, 23)",
+      "disposition": "dismissed",
+      "reason": "A plain flag and empty-string error returns; no buffer, length, or path-safety contract attaches to them."
+    }
+  ],
+  "findings": [
+    {
+      "title": "Root mount onto a predictable /tmp path allows symlink-following privilege escalation",
+      "anchor": "mkpath(mount_point) then mountDevice(device, mount_point, readonly) on /tmp/.<appname>/mount/<name>",
+      "file": "corpus/train/train_0084_cwe61.cpp",
+      "line": "12-20",
+      "code": "mount_point = mount_point.arg(tmp_paths.isEmpty() ? \"/tmp\" : tmp_paths.first()).arg(qApp->applicationName()).arg(name);\n\n    if (!QDir::current().mkpath(mount_point)) {\n        dCError(\"mkpath \\\"%s\\\" failed\", qPrintable(mount_point));\n\n        return QString();\n    }\n\n    if (!mountDevice(device, mount_point, readonly)) {",
+      "bug_class": "UNIX symbolic link following on a privileged mount (predictable temp path)",
+      "cwe": "CWE-61",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0084_cwe61.cpp (plus mkpath/mountDevice implementation, files not provided)",
+      "invariant": "The mount directory must be created atomically at an unpredictable path the helper exclusively owns, with symlink-safe semantics (O_NOFOLLOW / lstat), and the helper must refuse to mount onto any path it did not itself just create as a real, root-owned directory.",
+      "failure_mode": "A local unprivileged user pre-creates /tmp/.<appname>/mount/<name> (or a parent component) as a symlink to a sensitive directory such as /etc, /root/.ssh, or a binary directory. mkpath follows the link and treats the target as an existing directory; the root helper then mount(2)s the caller-supplied 'device' filesystem over that target, shadowing or replacing trusted files (e.g. authorized_keys, PAM/sudo config) and yielding local privilege escalation or system compromise.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether mkpath/mountDevice resolve the path with symlink protection, whether the created leaf's ownership/type is verified before mount, and whether any unpredictable component is added; confirm the helper runs with elevated privileges via D-Bus/polkit."
+    },
+    {
+      "title": "Path traversal via unsanitized caller-supplied 'name'",
+      "anchor": ".arg(name) substitution into the mount-point template",
+      "file": "corpus/train/train_0084_cwe61.cpp",
+      "line": "12",
+      "code": "mount_point = mount_point.arg(tmp_paths.isEmpty() ? \"/tmp\" : tmp_paths.first()).arg(qApp->applicationName()).arg(name);",
+      "bug_class": "Path traversal (external control of file path)",
+      "cwe": "CWE-22",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0084_cwe61.cpp",
+      "invariant": "The 'name' component must be validated to a safe single path segment (no '/', no '..', bounded length, restricted character set) before it is concatenated into a filesystem path consumed by a privileged mkpath/mount.",
+      "failure_mode": "The client passes name = \"../../../../root/.ssh\" (or similar); the .arg() substitution produces a mount_point that escapes /tmp/.<appname>/mount/ entirely, so the root helper creates and mounts onto an arbitrary directory of the attacker's choosing without needing any symlink race — directly redirecting the privileged mount to a chosen sensitive location.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether any caller or this function validates/normalizes 'name' before it enters the path template; whether the D-Bus interface constrains 'name'."
+    },
+    {
+      "title": "TOCTOU race between directory creation and mount",
+      "anchor": "mkpath(mount_point) (line 14) vs mountDevice(device, mount_point, readonly) (line 20)",
+      "file": "corpus/train/train_0084_cwe61.cpp",
+      "line": "14-20",
+      "code": "if (!QDir::current().mkpath(mount_point)) {\n        dCError(\"mkpath \\\"%s\\\" failed\", qPrintable(mount_point));\n\n        return QString();\n    }\n\n    if (!mountDevice(device, mount_point, readonly)) {",
+      "bug_class": "Time-of-check to time-of-use race on the mount path",
+      "cwe": "CWE-367",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0084_cwe61.cpp (plus mountDevice implementation, file not provided)",
+      "invariant": "Directory creation and the subsequent mount must reference the same immutable file object (e.g. an fd opened O_NOFOLLOW, mounted via /proc/self/fd), so the path cannot be substituted between the two operations.",
+      "failure_mode": "After mkpath creates the leaf directory but before mountDevice runs, another local user unlinks it and replaces it with a symlink to a chosen target; mount(2) resolves the swapped path and mounts the attacker's device onto that target, achieving the same redirection as the static-symlink case even if the initial path was clean.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether mountDevice re-resolves mount_point by name (racy) or operates on a previously-opened directory fd; whether creation and mount are performed under a lock or on a private mount namespace."
+    },
+    {
+      "title": "Predictable temporary mount directory in a world-writable location",
+      "anchor": "\"%1/.%2/mount/%3\" template with TempLocation/\"/tmp\" fallback",
+      "file": "corpus/train/train_0084_cwe61.cpp",
+      "line": "9-12",
+      "code": "mount_point = \"%1/.%2/mount/%3\";\n    const QStringList &tmp_paths = QStandardPaths::standardLocations(QStandardPaths::TempLocation);\n\n    mount_point = mount_point.arg(tmp_paths.isEmpty() ? \"/tmp\" : tmp_paths.first()).arg(qApp->applicationName()).arg(name);",
+      "bug_class": "Insecure temporary path (predictable, no randomness)",
+      "cwe": "CWE-377",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0084_cwe61.cpp",
+      "invariant": "Temporary mount points must be created with an unpredictable, atomically-generated component (mkdtemp/QTemporaryDir) with mode 0700 inside a directory not writable by other users.",
+      "failure_mode": "Because the entire path is deterministic (app name + caller string, fallback hard-coded /tmp), a local user can predict and pre-occupy it, enabling the symlink/TOCTOU attacks above and simple denial of service (squatting the path so mkpath or mount fails).",
+      "cve_analog": "",
+      "what_to_confirm": "Whether the deployment's TempLocation resolves to a per-user or shared directory and whether any unpredictable suffix is added elsewhere in the mount pipeline."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm the privilege level: does Helper::temporaryMountDevice execute as root behind a D-Bus/polkit service with unprivileged callers?",
+    "Trace where 'device' and 'name' originate and whether either is validated (name as a single safe path segment; device as an allowed block device) before use.",
+    "Inspect mkpath/QDir behavior and the mountDevice implementation for symlink safety (O_NOFOLLOW, lstat of the leaf, ownership/type check) before mounting.",
+    "Check whether the mount path includes any unpredictable component or is created via mkdtemp/QTemporaryDir with mode 0700; flag the hard-coded /tmp fallback.",
+    "Verify the leaf directory is created and mounted through the same file descriptor to close the TOCTOU window between mkpath (line 14) and mountDevice (line 20).",
+    "Confirm that an already-existing path at the target is treated as an error rather than reused as success.",
+    "Assess DoS exposure from a local user squatting the predictable mount path."
+  ]
+}

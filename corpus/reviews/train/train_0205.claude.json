@@ -1,0 +1,223 @@
+{
+  "subsystem": "OpenEXR image I/O — ScanLineInputFile::initialize(), the setup path of the scanline-based EXR reader. It ingests a parsed EXR file Header, derives geometry (data window), compression, and per-scanline sizing, sizes the chunk/lineOffsets table, and pre-allocates per-thread LineBuffer compressor objects and their scanline buffers before decoding begins.",
+  "provenance": "Identified from OpenEXR-specific namespaces and types: OPENEXR_IMF_INTERNAL_NAMESPACE and OPENEXR_IMF_INTERNAL_NAMESPACE::Xdr::read<...StreamIO>, IEX_NAMESPACE::InputExc / LogicExc, and OpenEXR domain types Header, Box2i, Compression, Int64, LineBuffer, plus helpers numLinesInBuffer(), bytesPerLineTable(), offsetInLineBufferTable(), newCompressor(), EXRAllocAligned(). The method signature ScanLineInputFile::initialize(const Header&) matches ImfScanLineInputFile.cpp. The corpus banner (train_0205_cwe770.cpp) and the in-code sample tag 'primevul_validation_0363_fixed' indicate this is the FIXED revision of an uncontrolled-allocation (CWE-770) sample; the gLargeChunkTableSize guard is the added mitigation.",
+  "trust_boundary": "The Header passed to initialize() is parsed directly from an untrusted .exr file (local file, network download, or attachment opened by a viewer/thumbnailer). Every value read from it is attacker-controlled: dataWindow.min/max.x/y (lines 8-13), compression() (line 15), and the channel list consumed by bytesPerLineTable() (line 42). These drive size arithmetic (lineOffsetSize, maxBytesPerLine, lineBufferSize) and the size of the lineOffsets table and scanline buffers that get allocated. The stream _streamData->is is the on-disk file, whose length is also attacker-chosen. Everything derived from the header before a validation gate is hostile.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0205_cwe770.cpp",
+      "lines": "2-4",
+      "code": "void ScanLineInputFile::initialize(const Header& header)\n{\n        _data->header = header;",
+      "explanation": "The initialize() member function receives a fully-parsed EXR Header by const reference and immediately copies it into the object's private _data->header. From this point on all geometry, compression, and channel metadata used to size buffers comes from this attacker-supplied header. There is no validation of the header contents in this function beyond the two size guards that appear later; the fields are trusted enough to be used directly in arithmetic and allocation sizing."
+    },
+    {
+      "file": "corpus/train/train_0205_cwe770.cpp",
+      "lines": "6-6",
+      "code": "_data->lineOrder = _data->header.lineOrder();",
+      "explanation": "Caches the file's line order (INCREASING_Y / DECREASING_Y / RANDOM_Y) from the header. lineOrder determines the direction scanlines are stored and later how offsets are indexed. It is metadata only here and does not by itself size any buffer, but it is attacker-controlled and influences later scanline addressing."
+    },
+    {
+      "file": "corpus/train/train_0205_cwe770.cpp",
+      "lines": "8-13",
+      "code": "const Box2i &dataWindow = _data->header.dataWindow();\n\n        _data->minX = dataWindow.min.x;\n        _data->maxX = dataWindow.max.x;\n        _data->minY = dataWindow.min.y;\n        _data->maxY = dataWindow.max.y;",
+      "explanation": "Reads the data window — the integer bounding box (Box2i holds min and max points, each with int x/y) describing the pixel region actually stored in the file — and caches its four extremes into _data. minY/maxY in particular define the number of scanlines (height = maxY - minY + 1). Because Box2i coordinates are signed 32-bit ints taken verbatim from the file, an attacker can set them to extreme or inconsistent values (e.g. min > max, or min = INT_MIN, max = INT_MAX). No consistency check (min <= max, height within limits) is performed here."
+    },
+    {
+      "file": "corpus/train/train_0205_cwe770.cpp",
+      "lines": "15-18",
+      "code": "Compression comp = _data->header.compression();\n\n        _data->linesInBuffer =\n            numLinesInBuffer (comp);",
+      "explanation": "Reads the compression method from the header and asks numLinesInBuffer() how many scanlines are grouped into one compression unit for that method (e.g. 1 for NONE/RLE/ZIPS, 16 for ZIP, 32 for PIZ). This value, cached in _data->linesInBuffer, becomes the divisor and multiplier in the chunk-count arithmetic that follows, so a wrong/degenerate value here propagates directly into table sizing."
+    },
+    {
+      "file": "corpus/train/train_0205_cwe770.cpp",
+      "lines": "20-21",
+      "code": "int lineOffsetSize = (dataWindow.max.y - dataWindow.min.y +\n                              _data->linesInBuffer) / _data->linesInBuffer;",
+      "explanation": "Computes the number of chunks (entries in the lineOffsets table) as ceil(height / linesInBuffer): (maxY - minY + linesInBuffer) / linesInBuffer, all in signed int arithmetic. The result lineOffsetSize is the count of Int64 offsets the file must contain and the number of slots the lineOffsets vector will be resized to at line 83. Both operands of the subtraction are attacker-controlled signed ints, and the result is stored in a signed int, so this expression is the single most sensitive piece of arithmetic in the function."
+    },
+    {
+      "file": "corpus/train/train_0205_cwe770.cpp",
+      "lines": "31-39",
+      "code": "if (lineOffsetSize * _data->linesInBuffer > gLargeChunkTableSize)\n        {\n            Int64 pos = _streamData->is->tellg();\n            _streamData->is->seekg(pos + (lineOffsetSize-1)*sizeof(Int64));\n            Int64 temp;\n            OPENEXR_IMF_INTERNAL_NAMESPACE::Xdr::read <OPENEXR_IMF_INTERNAL_NAMESPACE::StreamIO> (*_streamData->is, temp);\n            _streamData->is->seekg(pos);\n\n        }",
+      "explanation": "This is the added CWE-770 mitigation. When the claimed chunk table (lineOffsetSize * linesInBuffer) exceeds a threshold gLargeChunkTableSize, the code refuses to trust the claimed size blindly: it records the current stream position, seeks to where the LAST offset entry would live ((lineOffsetSize-1)*sizeof(Int64) bytes ahead), and attempts to Xdr::read one Int64 there. If the file is too short to actually contain a table that large, the seekg() or read() throws, aborting before any large allocation. It then seeks back to the saved position. The intent is: don't allocate a huge lineOffsets/bytesPerLine table for a tiny file that merely claims a huge chunk count. Note the guard condition itself is evaluated in signed int arithmetic."
+    },
+    {
+      "file": "corpus/train/train_0205_cwe770.cpp",
+      "lines": "42-43",
+      "code": "size_t maxBytesPerLine = bytesPerLineTable (_data->header,\n                                                    _data->bytesPerLine);",
+      "explanation": "Builds the per-scanline byte-count table (_data->bytesPerLine) from the header's channel list and returns the maximum bytes any single scanline occupies as a size_t. This value depends on channel count, pixel types, and the data-window width — all attacker-controlled — so maxBytesPerLine can be made large by declaring many wide channels."
+    },
+    {
+      "file": "corpus/train/train_0205_cwe770.cpp",
+      "lines": "45-48",
+      "code": "if (maxBytesPerLine*numLinesInBuffer(comp) > INT_MAX)\n        {\n            throw IEX_NAMESPACE::InputExc(\"maximum bytes per scanline exceeds maximum permissible size\");\n        }",
+      "explanation": "A second guard: it rejects files whose per-buffer byte size (maxBytesPerLine * linesInBuffer) would exceed INT_MAX. Because maxBytesPerLine is size_t, this multiplication is done in size_t (unsigned 64-bit on LP64), so it does not itself overflow on typical platforms, and it bounds the lineBufferSize computed at line 63. This caps the size of each scanline buffer but does NOT bound the NUMBER of chunks (lineOffsetSize) — that is only bounded by the line-31 guard."
+    },
+    {
+      "file": "corpus/train/train_0205_cwe770.cpp",
+      "lines": "54-59",
+      "code": "for (size_t i = 0; i < _data->lineBuffers.size(); i++)\n        {\n            _data->lineBuffers[i] = new LineBuffer (newCompressor(comp,\n                                                 maxBytesPerLine,\n                                                 _data->header));\n        }",
+      "explanation": "Allocates one LineBuffer per slot in _data->lineBuffers (a fixed, thread-count-sized vector), each wrapping a freshly constructed compressor object sized for maxBytesPerLine. These are heap objects owned by _data and destroyed with delete elsewhere (LineBuffer is a scalar new, correctly paired). The count here is bounded by the thread pool, not by attacker input, so the loop itself is not an amplification vector; the compressor's internal buffers, however, scale with maxBytesPerLine."
+    },
+    {
+      "file": "corpus/train/train_0205_cwe770.cpp",
+      "lines": "63-63",
+      "code": "_data->lineBufferSize = maxBytesPerLine * _data->linesInBuffer;",
+      "explanation": "Computes the size of each scanline decode buffer as maxBytesPerLine * linesInBuffer, in size_t. This is exactly the quantity the line-45 guard checked against INT_MAX (using numLinesInBuffer(comp), which equals _data->linesInBuffer), so lineBufferSize is known to be <= INT_MAX at this point and cannot overflow size_t."
+    },
+    {
+      "file": "corpus/train/train_0205_cwe770.cpp",
+      "lines": "65-75",
+      "code": "if (!_streamData->is->isMemoryMapped())\n        {\n            for (size_t i = 0; i < _data->lineBuffers.size(); i++)\n            {\n                _data->lineBuffers[i]->buffer = (char *) EXRAllocAligned(_data->lineBufferSize*sizeof(char),16);\n                if (!_data->lineBuffers[i]->buffer)\n                {\n                    throw IEX_NAMESPACE::LogicExc(\"Failed to allocate memory for scanline buffers\");\n                }\n            }\n        }",
+      "explanation": "For non-memory-mapped streams, allocates a 16-byte-aligned scanline buffer of lineBufferSize bytes for each LineBuffer via EXRAllocAligned, and throws LogicExc if allocation fails (the NULL return is checked). Each buffer is at most INT_MAX bytes (per the line-45 guard) and the number of buffers equals the thread count, so aggregate memory here is bounded. This is the raw storage the decompressor writes decoded scanlines into."
+    },
+    {
+      "file": "corpus/train/train_0205_cwe770.cpp",
+      "lines": "76-80",
+      "code": "_data->nextLineBufferMinY = _data->minY - 1;\n\n        offsetInLineBufferTable (_data->bytesPerLine,\n                                 _data->linesInBuffer,\n                                 _data->offsetInLineBuffer);",
+      "explanation": "Initializes bookkeeping: nextLineBufferMinY is primed to minY-1 (the sentinel meaning 'no buffer loaded yet'), and offsetInLineBufferTable() precomputes, from the per-line byte table and linesInBuffer, the byte offset of each scanline within its shared line buffer (stored in _data->offsetInLineBuffer). These tables are indexed later during pixel reads, so their correctness depends on bytesPerLine and linesInBuffer being consistent with the buffer size computed above."
+    },
+    {
+      "file": "corpus/train/train_0205_cwe770.cpp",
+      "lines": "83-83",
+      "code": "_data->lineOffsets.resize (lineOffsetSize);",
+      "explanation": "Finally resizes the lineOffsets table to lineOffsetSize entries (each an Int64 file offset for one chunk). This is the allocation the line-31 guard is meant to protect: resize() allocates lineOffsetSize * sizeof(Int64) bytes. lineOffsetSize is a signed int computed at lines 20-21 and validated only indirectly by the line-31 size/seek check, so the safety of this allocation hinges entirely on that arithmetic being non-negative, non-overflowing, and correctly gated."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0205_cwe770.cpp",
+      "lines": "20-21",
+      "code": "int lineOffsetSize = (dataWindow.max.y - dataWindow.min.y +\n                              _data->linesInBuffer) / _data->linesInBuffer;",
+      "explanation": "dataWindow.max.y and dataWindow.min.y are attacker-controlled signed 32-bit ints taken verbatim from the file header with no min<=max or height-bound check. The subtraction (max.y - min.y) can overflow the signed int range (undefined behavior, CWE-190): e.g. max.y = INT_MAX (2147483647) and min.y = INT_MIN wraps; even max.y=2000000000, min.y=-2000000000 overflows. Adding linesInBuffer can push it further. The result — stored in a signed int lineOffsetSize — can therefore be a large positive value, or a NEGATIVE value. The invariant the implementation must uphold: reject the file unless minY <= maxY AND the height (maxY - minY + 1) fits in a bounded range BEFORE computing lineOffsetSize, and perform the computation in a wide unsigned type (e.g. int64_t/uint64_t) so no signed overflow occurs. Everything downstream (the line-31 guard and the line-83 resize) inherits this tainted value."
+    },
+    {
+      "file": "corpus/train/train_0205_cwe770.cpp",
+      "lines": "31-31",
+      "code": "if (lineOffsetSize * _data->linesInBuffer > gLargeChunkTableSize)",
+      "explanation": "The mitigation's gate itself is computed in signed int: lineOffsetSize * linesInBuffer. If lineOffsetSize is large (attacker-chosen height with small linesInBuffer), this product can overflow int (CWE-190) and wrap to a small or negative value that is NOT greater than gLargeChunkTableSize. The guard is then skipped entirely, so the seekg()/read() file-length probe never runs, and control falls through to the resize at line 83 with a huge lineOffsetSize — defeating exactly the CWE-770 protection this branch was added to provide. Likewise if lineOffsetSize is negative (from the line 20-21 overflow), the product is negative and the guard is bypassed. The invariant: the size-vs-file check must be computed in a 64-bit unsigned type and must trigger for ALL oversized chunk counts, including those that overflow int."
+    },
+    {
+      "file": "corpus/train/train_0205_cwe770.cpp",
+      "lines": "83-83",
+      "code": "_data->lineOffsets.resize (lineOffsetSize);",
+      "explanation": "This is the payload of the CWE-770 uncontrolled-allocation class. std::vector::resize takes a size_type (size_t, unsigned). If lineOffsetSize is negative (from the signed overflow at lines 20-21), the int-to-size_t conversion produces an enormous value (e.g. -1 -> 2^64-1), causing resize to throw std::length_error/std::bad_alloc or attempt an absurd allocation — at best a crash/DoS, at worst a large-allocation resource exhaustion. If lineOffsetSize is a large positive value that slipped past the (overflowing) line-31 guard, resize commits lineOffsetSize*sizeof(Int64) bytes for a file that does not actually contain that table — attacker-triggered memory amplification from a tiny input (CWE-770). The invariant: lineOffsetSize must be proven non-negative and its byte size proven to fit both memory limits and the actual remaining file length before this resize."
+    },
+    {
+      "file": "corpus/train/train_0205_cwe770.cpp",
+      "lines": "34-34",
+      "code": "_streamData->is->seekg(pos + (lineOffsetSize-1)*sizeof(Int64));",
+      "explanation": "Inside the guard, the target offset is pos + (lineOffsetSize-1)*sizeof(Int64). (lineOffsetSize-1) is a signed int; multiplied by sizeof(Int64) (size_t) it promotes to unsigned, but if lineOffsetSize is 0 then (lineOffsetSize-1) is -1 which converts to a gigantic byte offset, and if lineOffsetSize overflowed to a large value the offset computation can itself wrap. Practically the read is expected to throw when the file is short, which is the intended safety behavior, but the correctness of this probe depends on lineOffsetSize being a sane positive count; a value that reached here via overflow makes the probe test the wrong offset. The invariant: only reach this probe with a validated positive lineOffsetSize, and compute the seek offset in a width that cannot wrap."
+    },
+    {
+      "file": "corpus/train/train_0205_cwe770.cpp",
+      "lines": "45-48",
+      "code": "if (maxBytesPerLine*numLinesInBuffer(comp) > INT_MAX)\n        {\n            throw IEX_NAMESPACE::InputExc(\"maximum bytes per scanline exceeds maximum permissible size\");\n        }",
+      "explanation": "This guard only bounds the per-buffer BYTE size, not the chunk COUNT, and it recomputes numLinesInBuffer(comp) rather than reusing _data->linesInBuffer; the two must stay identical or the checked quantity (line 45) and the used quantity (line 63) diverge. More importantly, an attacker who keeps maxBytesPerLine small can pass this check while still driving a gigantic lineOffsetSize — so this guard gives no protection against the table-count allocation at line 83. The invariant to confirm: numLinesInBuffer(comp) is deterministic and equal to _data->linesInBuffer, and a separate explicit cap bounds the chunk count independently of the per-line byte cap."
+    }
+  ],
+  "summary": "This is the 'fixed' revision of an OpenEXR ScanLineInputFile::initialize() uncontrolled-allocation (CWE-770) sample. The added gLargeChunkTableSize guard (lines 31-39) probes the file length before allocating a large lineOffsets table, which mitigates the naive case. However the chunk count lineOffsetSize (lines 20-21) is computed from attacker-controlled signed data-window coordinates in 32-bit signed arithmetic with no min<=max/height bound, and the guard condition (line 31) is itself evaluated in signed int; a crafted data window can overflow either expression to a negative or wrapped value that bypasses the guard and reaches _data->lineOffsets.resize(lineOffsetSize) (line 83), causing a huge/negative-converted allocation (DoS / resource exhaustion). Risk: high, latent in the sizing arithmetic rather than a copy.",
+  "reviewed_anchors": [
+    {"anchor": "void ScanLineInputFile::initialize(const Header& header) (line 2)", "disposition": "dismissed", "reason": "Entry signature; header is const-ref input. The risk is in how its fields are used, tracked in the field-level anchors below, not the signature itself."},
+    {"anchor": "_data->header = header; (line 4)", "disposition": "dismissed", "reason": "A Header copy; imports untrusted metadata but performs no arithmetic or allocation itself."},
+    {"anchor": "_data->lineOrder = _data->header.lineOrder(); (line 6)", "disposition": "dismissed", "reason": "Enum metadata cache; influences later addressing but sizes nothing here."},
+    {"anchor": "dataWindow.min/max.x/y (lines 8-13)", "disposition": "finding", "reason": "Attacker-controlled signed Box2i coordinates with no min<=max/height validation; feed the overflow-prone lineOffsetSize arithmetic (see F1)."},
+    {"anchor": "Compression comp = _data->header.compression(); (line 15)", "disposition": "dismissed", "reason": "Enum selector; constrains numLinesInBuffer() output but is not itself a size or buffer."},
+    {"anchor": "_data->linesInBuffer = numLinesInBuffer (comp); (lines 17-18)", "disposition": "dismissed", "reason": "Compression-fixed small constant (>=1) used as divisor/multiplier; assumed non-zero by contract, so division at line 21 is safe. Its role in overflow is captured under the lineOffsetSize findings."},
+    {"anchor": "int lineOffsetSize = (dataWindow.max.y - dataWindow.min.y + linesInBuffer) / linesInBuffer; (lines 20-21)", "disposition": "finding", "reason": "Signed 32-bit chunk-count computed from attacker data; can overflow or go negative (CWE-190). Root cause feeding both the guard and the resize."},
+    {"anchor": "gLargeChunkTableSize guard: if (lineOffsetSize * _data->linesInBuffer > gLargeChunkTableSize) (line 31)", "disposition": "finding", "reason": "The mitigation gate is evaluated in signed int and can overflow/wrap, bypassing the file-length probe (CWE-190/CWE-770)."},
+    {"anchor": "seekg(pos + (lineOffsetSize-1)*sizeof(Int64)) / Xdr::read probe (lines 33-37)", "disposition": "finding", "reason": "Intended file-length safety probe, but its offset math depends on a validated positive lineOffsetSize; degenerate/overflowed values misdirect the probe."},
+    {"anchor": "size_t maxBytesPerLine = bytesPerLineTable(...) (lines 42-43)", "disposition": "dismissed", "reason": "Computed in size_t and bounded by the line-45 INT_MAX guard before use; no unchecked overflow into the byte-size path."},
+    {"anchor": "if (maxBytesPerLine*numLinesInBuffer(comp) > INT_MAX) throw (lines 45-48)", "disposition": "finding", "reason": "Per-line byte-size guard that does NOT bound the chunk count and re-derives linesInBuffer; worth calling out for its scope limitation."},
+    {"anchor": "new LineBuffer (newCompressor(comp, maxBytesPerLine, header)) (lines 54-59)", "disposition": "dismissed", "reason": "Scalar new correctly paired with delete; count bounded by thread-pool-sized lineBuffers.size(), not attacker input. No new/delete[] mismatch."},
+    {"anchor": "_data->lineBufferSize = maxBytesPerLine * _data->linesInBuffer; (line 63)", "disposition": "dismissed", "reason": "size_t product already bounded <= INT_MAX by the line-45 guard (same operands); cannot overflow size_t on LP64."},
+    {"anchor": "EXRAllocAligned(_data->lineBufferSize*sizeof(char),16) + NULL check (lines 69-73)", "disposition": "dismissed", "reason": "Bounded size (<=INT_MAX), NULL return explicitly checked and converted to LogicExc; correctly handled."},
+    {"anchor": "_data->nextLineBufferMinY = _data->minY - 1; (line 76)", "disposition": "dismissed", "reason": "Sentinel bookkeeping; minY-1 can underflow only if minY==INT_MIN, but it is used as an equality sentinel, not a size, so no security contract."},
+    {"anchor": "offsetInLineBufferTable(bytesPerLine, linesInBuffer, offsetInLineBuffer) (lines 78-80)", "disposition": "dismissed", "reason": "Precomputes intra-buffer offsets from already-bounded byte tables; no attacker-controlled size crosses a boundary here."},
+    {"anchor": "_data->lineOffsets.resize (lineOffsetSize); (line 83)", "disposition": "finding", "reason": "The actual uncontrolled/negative-converted allocation (CWE-770); consumes the tainted lineOffsetSize."}
+  ],
+  "findings": [
+    {
+      "title": "Uncontrolled / negative-converted allocation of the lineOffsets chunk table",
+      "anchor": "_data->lineOffsets.resize (lineOffsetSize);",
+      "file": "corpus/train/train_0205_cwe770.cpp",
+      "line": "83",
+      "code": "_data->lineOffsets.resize (lineOffsetSize);",
+      "bug_class": "Uncontrolled resource/memory allocation (attacker-controlled size, signed->size_t conversion)",
+      "cwe": "CWE-770",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0205_cwe770.cpp (initialize), with the count derived at lines 20-21 and gated at lines 31-39",
+      "invariant": "lineOffsetSize must be proven non-negative and lineOffsetSize*sizeof(Int64) proven to fit both a hard memory cap AND the actual remaining file length before this resize; a negative int must never reach resize() where it converts to a huge size_t.",
+      "failure_mode": "std::vector::resize takes an unsigned size_type. A negative lineOffsetSize (from the signed overflow at lines 20-21) converts to ~2^64, throwing bad_alloc/length_error or attempting an absurd allocation. A large positive lineOffsetSize that slips past the overflowing line-31 guard commits lineOffsetSize*8 bytes for a tiny file, giving attacker-controlled memory amplification / DoS from a crafted data window.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether lineOffsetSize is validated non-negative and range-limited (and computed in 64-bit) before resize, and whether the file-length probe reliably runs for every oversized value."
+    },
+    {
+      "title": "Signed integer overflow computing the chunk count lineOffsetSize from the data window",
+      "anchor": "int lineOffsetSize = (dataWindow.max.y - dataWindow.min.y + _data->linesInBuffer) / _data->linesInBuffer;",
+      "file": "corpus/train/train_0205_cwe770.cpp",
+      "line": "20-21",
+      "code": "int lineOffsetSize = (dataWindow.max.y - dataWindow.min.y +\n                              _data->linesInBuffer) / _data->linesInBuffer;",
+      "bug_class": "Signed integer overflow / missing data-window bounds check",
+      "cwe": "CWE-190",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0205_cwe770.cpp (initialize)",
+      "invariant": "The implementation must reject files unless dataWindow.min.y <= dataWindow.max.y and the height (maxY - minY + 1) is within a sane bound, and must compute the chunk count in a wide (64-bit) type so the subtraction and addition cannot overflow before the division.",
+      "failure_mode": "max.y and min.y are attacker-controlled signed 32-bit header fields with no min<=max/height guard. (max.y - min.y) overflows int (UB, CWE-190) for extreme coordinates (e.g. INT_MAX / INT_MIN), yielding a large-positive or negative lineOffsetSize. This tainted value feeds the guard at line 31 and the resize at line 83, enabling both guard bypass and the uncontrolled allocation above.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether a data-window validation (min<=max, bounded height) precedes this line and whether the arithmetic is widened to int64_t/uint64_t."
+    },
+    {
+      "title": "Chunk-table size guard evaluated in signed int can overflow and be bypassed",
+      "anchor": "if (lineOffsetSize * _data->linesInBuffer > gLargeChunkTableSize)",
+      "file": "corpus/train/train_0205_cwe770.cpp",
+      "line": "31",
+      "code": "if (lineOffsetSize * _data->linesInBuffer > gLargeChunkTableSize)",
+      "bug_class": "Integer overflow defeating a size/limit check",
+      "cwe": "CWE-190",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0205_cwe770.cpp (initialize)",
+      "invariant": "The 'is this table suspiciously large?' comparison must be computed in a 64-bit unsigned type and must evaluate true for every chunk count large enough to matter, including counts whose 32-bit product wraps.",
+      "failure_mode": "lineOffsetSize * linesInBuffer is a signed int product. With a large lineOffsetSize (tall image, small linesInBuffer) the product overflows int and wraps to a small/negative value <= gLargeChunkTableSize, so the branch is skipped: the file-length probe (seekg/read) never executes and the code proceeds straight to the large resize at line 83, nullifying the very mitigation this branch implements.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether the product is computed in 64-bit (e.g. size_t/uint64_t) and whether gLargeChunkTableSize is compared against a non-overflowing quantity."
+    },
+    {
+      "title": "File-length probe offset depends on an unvalidated chunk count",
+      "anchor": "_streamData->is->seekg(pos + (lineOffsetSize-1)*sizeof(Int64));",
+      "file": "corpus/train/train_0205_cwe770.cpp",
+      "line": "34",
+      "code": "_streamData->is->seekg(pos + (lineOffsetSize-1)*sizeof(Int64));",
+      "bug_class": "Integer conversion/wrap in a safety probe offset",
+      "cwe": "CWE-190",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0205_cwe770.cpp (initialize)",
+      "invariant": "This probe must only run with a validated positive lineOffsetSize, and the seek offset must be computed in a width that cannot wrap, so that a short file reliably triggers the seekg/read exception.",
+      "failure_mode": "(lineOffsetSize-1) is signed int; when lineOffsetSize is 0 it becomes -1 and converts to a huge unsigned byte offset when multiplied by sizeof(Int64), and when lineOffsetSize came from an overflow the probe targets the wrong offset. In degenerate cases the probe may seek/read at an unintended position, so the intended 'throw if file too small' guarantee can be weakened rather than the clean rejection intended.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether lineOffsetSize is guaranteed >= 1 before this branch and whether the offset math is done in a non-wrapping type."
+    },
+    {
+      "title": "Per-line byte guard does not bound the chunk count and re-derives linesInBuffer",
+      "anchor": "if (maxBytesPerLine*numLinesInBuffer(comp) > INT_MAX)",
+      "file": "corpus/train/train_0205_cwe770.cpp",
+      "line": "45-48",
+      "code": "if (maxBytesPerLine*numLinesInBuffer(comp) > INT_MAX)\n        {\n            throw IEX_NAMESPACE::InputExc(\"maximum bytes per scanline exceeds maximum permissible size\");\n        }",
+      "bug_class": "Incomplete validation gate (bounds byte size but not element count)",
+      "cwe": "CWE-20",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0205_cwe770.cpp (initialize)",
+      "invariant": "numLinesInBuffer(comp) must be deterministic and identical to _data->linesInBuffer used at line 63, and a separate explicit cap must bound the chunk COUNT independently of this per-line byte cap.",
+      "failure_mode": "This guard caps maxBytesPerLine*linesInBuffer at INT_MAX (protecting lineBufferSize) but places no limit on lineOffsetSize, so an attacker who keeps per-line bytes small still drives the table-count allocation at line 83. It also recomputes numLinesInBuffer(comp) rather than reusing _data->linesInBuffer; if these ever differ, the checked quantity and the used quantity (line 63) diverge.",
+      "cve_analog": "",
+      "what_to_confirm": "That the chunk count is bounded elsewhere and that numLinesInBuffer(comp) == _data->linesInBuffer holds by construction."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm a data-window sanity check (dataWindow.min.y <= dataWindow.max.y, bounded height, and min.x<=max.x) runs BEFORE the lineOffsetSize computation at lines 20-21.",
+    "Confirm lineOffsetSize and the line-31 guard product are computed in a 64-bit (unsigned) type so neither the subtraction nor the multiply can overflow int.",
+    "Confirm lineOffsetSize is proven non-negative before _data->lineOffsets.resize(lineOffsetSize) at line 83, and that resize is additionally bounded against a hard memory cap.",
+    "Confirm gLargeChunkTableSize is a sane bound and that the file-length probe (seekg/read) is reached for EVERY oversized chunk count, including overflow-wrapped ones.",
+    "Confirm numLinesInBuffer(comp) is deterministic and equals _data->linesInBuffer used at line 63, so the line-45 guard actually bounds the buffer allocated later.",
+    "Confirm LineBuffer objects (new at line 56) are released with delete (not delete[]/free) and that EXRAllocAligned buffers are freed with the matching aligned deallocator.",
+    "Confirm the seekg offset (lineOffsetSize-1)*sizeof(Int64) at line 34 cannot wrap and is only computed for lineOffsetSize >= 1."
+  ]
+}

@@ -1,0 +1,174 @@
+{
+  "subsystem": "TensorFlow Grappler graph optimizer — the ConstantFolding pass. EvaluateOneFoldable takes a single graph node whose inputs are all compile-time constants, materializes each input as a runtime Tensor, executes the node on CPU via EvaluateNode, and rewrites the graph so the node is replaced by NodeDef(s) holding the precomputed constant output. It is invoked during graph optimization on a loaded GraphDef/model.",
+  "provenance": "Identified by the TensorFlow C++ API surface and naming: the ConstantFolding::EvaluateOneFoldable member (a Grappler optimizer method), TensorFlow types NodeDef, TensorProto, Tensor, TensorVector, TensorId, DataType/DT_INVALID, Status/error::INVALID_ARGUMENT/errors::InvalidArgument, and helpers ParseTensorName, node_map_->GetNode, IsReallyConstant, CheckAttrExists, IsRefType, EvaluateNode, CreateNodeDef, OptimizedNodeName, gtl::MakeCleanup, strings::StrCat, TF_RETURN_IF_ERROR. This is tensorflow/core/grappler/optimizers/constant_folding.cc. The banner tag 'primevul_test_0006_fixed' and file name cwe617 indicate this is the post-fix revision of a reachable-crash (CWE-617) sample.",
+  "trust_boundary": "The NodeDef 'node' and its inputs originate from a GraphDef/SavedModel, which is attacker-controllable whenever an untrusted model is loaded and optimized. Every field consumed here is hostile: node.input() strings, the resolved input NodeDefs in node_map_, and above all the 'value' attribute's TensorProto — its dtype (raw_val.dtype()), its shape (raw_val.tensor_shape()), and its serialized contents (consumed by FromProto). A malformed or malicious graph can reference nonexistent nodes, declare pathological dtypes/shapes, or inflate tensor sizes. TensorFlow treats crashes triggered by such graphs as security-relevant denial-of-service.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0152_cwe617.cpp",
+      "lines": "2-4",
+      "code": "Status ConstantFolding::EvaluateOneFoldable(const NodeDef& node,\n                                            std::vector<NodeDef>* outputs,\n                                            bool* result_too_large) {",
+      "explanation": "Entry point of the pass for one candidate node. 'node' is the graph node being folded (read-only reference, but its contents come from an untrusted graph). 'outputs' is an out-parameter vector that will receive the replacement NodeDef(s) representing the folded constant result. 'result_too_large' is an out flag the caller uses to learn that folding was aborted because the produced constant would be too big to embed back into the graph. The function returns a Status carrying success or an error explanation."
+    },
+    {
+      "file": "corpus/train/train_0152_cwe617.cpp",
+      "lines": "5-16",
+      "code": "  TensorVector inputs;\n  TensorVector output_tensors;\n  auto inputs_cleanup = gtl::MakeCleanup([&inputs, &output_tensors] {\n    for (const auto& input : inputs) {\n      delete input.tensor;\n    }\n    for (const auto& output : output_tensors) {\n      if (output.tensor) {\n        delete output.tensor;\n      }\n    }\n  });",
+      "explanation": "Two TensorVector containers hold the input Tensors that will be constructed and the output Tensors produced by EvaluateNode. Because the Tensors are heap-allocated with raw 'new' (see line 45) and the TensorValue entries only hold raw pointers, a scope-guard (gtl::MakeCleanup) is registered so that on ANY return path the lambda runs and deletes every input tensor and every non-null output tensor. This is a manual RAII pattern: it centralizes freeing so the many early-return error paths below cannot leak. Note the asymmetry — inputs are deleted unconditionally, outputs are null-checked before delete, because EvaluateNode may leave null tensors for dead outputs."
+    },
+    {
+      "file": "corpus/train/train_0152_cwe617.cpp",
+      "lines": "18-24",
+      "code": "  size_t total_inputs_size = 0;\n  for (const auto& input : node.input()) {\n    const TensorId input_tensor = ParseTensorName(input);\n    if (input_tensor.index() < 0) {\n      // Control dependency\n      break;\n    }",
+      "explanation": "total_inputs_size accumulates the byte size of all realized input tensors; it is later handed to CreateNodeDef as a budget to decide whether the folded result is too large. The loop walks each entry of node.input(). ParseTensorName splits a string like \"node:port\" into a TensorId (node name + output index). A negative index marks a control dependency (\"^node\"); on the FIRST control dependency the loop breaks entirely, on the assumption that control inputs are sorted last, so the remaining inputs are not processed."
+    },
+    {
+      "file": "corpus/train/train_0152_cwe617.cpp",
+      "lines": "25-30",
+      "code": "    const NodeDef* input_node = node_map_->GetNode(input);\n    if (!IsReallyConstant(*input_node)) {\n      return Status(error::INVALID_ARGUMENT,\n                    strings::StrCat(\"Can't fold \", node.name(), \", its \", input,\n                                    \" isn't constant\"));\n    }",
+      "explanation": "The producer NodeDef for this input is looked up in node_map_ by name. It is then dereferenced (*input_node) and passed to IsReallyConstant to confirm the input is a genuine Const node; if not, folding is refused with an INVALID_ARGUMENT status whose message is built with StrCat from the node and input names. GetNode returns a raw pointer that can be null when the referenced name is absent from the graph, and the code dereferences it before any null check."
+    },
+    {
+      "file": "corpus/train/train_0152_cwe617.cpp",
+      "lines": "31-44",
+      "code": "    TF_RETURN_IF_ERROR(CheckAttrExists(*input_node, \"value\"));\n    const TensorProto& raw_val = input_node->attr().at(\"value\").tensor();\n    if (raw_val.dtype() == DT_INVALID) {\n      return Status(\n          error::INVALID_ARGUMENT,\n          strings::StrCat(\"A tensor in the input node, with TensorId of \",\n                          input_tensor.ToString(),\n                          \" has a dtype of DT_INVALID.\"));\n    }\n    if (IsRefType(raw_val.dtype())) {\n      return errors::InvalidArgument(\n          \"Not allowed to construct a tensor with reference dtype, got \",\n          DataTypeString(raw_val.dtype()));\n    }",
+      "explanation": "CheckAttrExists verifies the constant node has a \"value\" attribute before the subsequent .at(\"value\") lookup, so the map access cannot throw std::out_of_range. raw_val is the TensorProto payload. The next two guards are the validation gates that were ADDED in this fixed revision: reject a dtype of DT_INVALID, and reject reference dtypes (IsRefType). Both conditions, if allowed through to the Tensor constructor below, would previously crash the process; here they are turned into clean InvalidArgument errors. These are the defensive checks that make this the 'fixed' sample."
+    },
+    {
+      "file": "corpus/train/train_0152_cwe617.cpp",
+      "lines": "45-54",
+      "code": "    Tensor* value = new Tensor(raw_val.dtype(), raw_val.tensor_shape());\n    if (!value->FromProto(raw_val)) {\n      delete (value);\n      return errors::InvalidArgument(\"Unable to make Tensor from proto for \",\n                                     node.name(), \" with shape \",\n                                     raw_val.tensor_shape().DebugString());\n    }\n    inputs.emplace_back(value);\n    total_inputs_size += value->TotalBytes();\n  }",
+      "explanation": "A runtime Tensor is heap-allocated from the (now dtype-validated) proto dtype and the proto's declared tensor_shape. FromProto then attempts to deserialize the actual element bytes into that tensor; on failure the just-allocated tensor is freed with delete and an InvalidArgument error including the shape is returned. On success the raw pointer is pushed into 'inputs' (so ownership transfers to the cleanup guard) and the tensor's TotalBytes() is added to total_inputs_size. Note the Tensor is constructed from the attacker's dtype+shape at line 45 BEFORE FromProto validates the contents."
+    },
+    {
+      "file": "corpus/train/train_0152_cwe617.cpp",
+      "lines": "56-59",
+      "code": "  TF_RETURN_IF_ERROR(EvaluateNode(node, inputs, &output_tensors));\n  if (output_tensors.empty()) {\n    return Status(error::INVALID_ARGUMENT, \"Expected at least one output.\");\n  }",
+      "explanation": "EvaluateNode actually executes the node's kernel on CPU with the materialized input tensors, writing results into output_tensors; TF_RETURN_IF_ERROR propagates any failure (and the cleanup guard frees everything). If the kernel produced no outputs the pass aborts with INVALID_ARGUMENT. This is where attacker-chosen op semantics run against attacker-chosen constant inputs."
+    },
+    {
+      "file": "corpus/train/train_0152_cwe617.cpp",
+      "lines": "61-79",
+      "code": "  outputs->resize(output_tensors.size());\n  for (size_t i = 0; i < output_tensors.size(); i++) {\n    string node_name = OptimizedNodeName(node, \"-folded\");\n    if (output_tensors.size() > 1) {\n      node_name = strings::StrCat(node_name, \"-\", i);\n    }\n    if (output_tensors[i].tensor) {\n      Status s = CreateNodeDef(node_name, output_tensors[i], &outputs->at(i),\n                               total_inputs_size);\n      if (!s.ok()) {\n        *result_too_large = true;\n        return s;\n      }\n    } else {\n      // Create an empty NodeDef to identify dead outputs (e.g. the output of a\n      // switch that's not selected by the switch predicate).\n      outputs->at(i) = NodeDef();\n    }\n  }",
+      "explanation": "The output vector is sized to the number of produced tensors. For each output a folded node name is derived (suffixed with the index when there is more than one). For a real (non-null) output tensor, CreateNodeDef serializes it back into a NodeDef constant, using total_inputs_size as the size budget; if that fails (typically because the encoded constant would be larger than the inputs it replaces), result_too_large is set and the error returned. Null output tensors correspond to dead branches (e.g. an unselected Switch output) and are represented by an empty NodeDef."
+    },
+    {
+      "file": "corpus/train/train_0152_cwe617.cpp",
+      "lines": "80-81",
+      "code": "  return Status::OK();\n}",
+      "explanation": "On full success the function returns OK; the inputs_cleanup guard then fires at scope exit and frees all input and output tensors. Ownership of the folded constants has already been copied into the caller's 'outputs' vector as NodeDefs, so freeing the working Tensors is safe."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0152_cwe617.cpp",
+      "lines": "25-26",
+      "code": "    const NodeDef* input_node = node_map_->GetNode(input);\n    if (!IsReallyConstant(*input_node)) {",
+      "explanation": "node_map_->GetNode(input) returns a raw NodeDef* that is null when the requested input name does not exist in the graph's node map. The very next statement dereferences it as *input_node inside IsReallyConstant, with no null check in between. A malicious or malformed GraphDef can list an input edge that names a node not present in the graph (dangling edge), driving GetNode to return null and causing a null-pointer dereference and process abort. Invariant the implementation must uphold: every string returned by node.input() must resolve to a live NodeDef before dereference — GetNode's result must be null-checked and turned into an error Status, exactly as the surrounding code does for other malformed-input cases."
+    },
+    {
+      "file": "corpus/train/train_0152_cwe617.cpp",
+      "lines": "45",
+      "code": "    Tensor* value = new Tensor(raw_val.dtype(), raw_val.tensor_shape());",
+      "explanation": "This is the reachable-assertion surface the fix targets (CWE-617). The DT_INVALID and IsRefType guards above close two known crash vectors, but the Tensor is still constructed directly from the attacker-controlled tensor_shape before FromProto validates anything. The Tensor constructor computes the number of elements and allocates a backing buffer; a shape declaring an enormous or overflowing element count causes the constructor to fail an internal CHECK (or abort on a failed allocation), which terminates the whole TensorFlow process. The attacker controls raw_val.tensor_shape() entirely via the serialized model. Invariant: the declared shape's element count and byte size must be validated against a sane bound (and the allocation attempted in a non-fatal, status-returning way) BEFORE constructing the Tensor, so a hostile shape yields an error instead of a crash. This is a latent contract risk realized in Tensor construction, not fully in the shown lines."
+    },
+    {
+      "file": "corpus/train/train_0152_cwe617.cpp",
+      "lines": "53",
+      "code": "    total_inputs_size += value->TotalBytes();",
+      "explanation": "total_inputs_size is a size_t accumulated across all inputs and later used at line 68-69 as the budget passed to CreateNodeDef to decide result_too_large. With many large constant inputs the running sum can wrap around size_t (integer overflow, CWE-190), producing a small total. That underestimate defeats the 'result too large' guard, so CreateNodeDef may accept a folded constant far bigger than the inputs it replaces, allowing graph/memory blow-up. Invariant: the size accumulation must saturate or be bounds-checked so the budget passed downstream is never an underflowed/wrapped value."
+    },
+    {
+      "file": "corpus/train/train_0152_cwe617.cpp",
+      "lines": "45-52",
+      "code": "    Tensor* value = new Tensor(raw_val.dtype(), raw_val.tensor_shape());\n    if (!value->FromProto(raw_val)) {\n      delete (value);\n      return errors::InvalidArgument(\"Unable to make Tensor from proto for \",\n                                     node.name(), \" with shape \",\n                                     raw_val.tensor_shape().DebugString());\n    }\n    inputs.emplace_back(value);",
+      "explanation": "Raw new/delete lifetime management. The success path relies on inputs.emplace_back(value) transferring ownership to the cleanup guard. Between the successful 'new' at line 45 and the emplace_back at line 52 there is a window: if emplace_back itself throws (std::bad_alloc while growing the vector), 'value' is not yet in 'inputs', so the cleanup guard will not free it — a memory leak on the exception path. This is a minor, low-severity robustness gap, not an attacker-directed primitive; the more common paths (FromProto failure, later returns) are handled correctly. Invariant: ownership of a freshly new'd Tensor should be handed to an RAII owner (std::unique_ptr) at the point of allocation rather than several statements later."
+    }
+  ],
+  "summary": "This is the post-fix revision of TensorFlow Grappler ConstantFolding::EvaluateOneFoldable; the DT_INVALID and reference-dtype guards close the two crash vectors the fix targeted. The most significant residual issue is an unchecked node_map_->GetNode(input) result dereferenced at line 26 (NULL-deref DoS on a dangling graph edge), followed by a latent reachable-assertion risk when constructing a Tensor from an attacker-controlled shape at line 45 (CWE-617), and a size_t overflow of total_inputs_size that can defeat the result-too-large budget. All are graph-loading denial-of-service class, not memory-corruption primitives.",
+  "reviewed_anchors": [
+    {"anchor": "EvaluateOneFoldable(const NodeDef&, std::vector<NodeDef>*, bool*) signature (lines 2-4)", "disposition": "dismissed", "reason": "Entry signature; all three params trusted as C++ ABI, hostility is in the NodeDef contents analyzed at the field level below."},
+    {"anchor": "TensorVector inputs / output_tensors + MakeCleanup lambda (lines 5-16)", "disposition": "finding", "reason": "Manual raw-pointer ownership with a scope-guard; narrow exception-window leak between new and emplace_back — low-severity finding."},
+    {"anchor": "size_t total_inputs_size (line 18) and += value->TotalBytes() (line 53)", "disposition": "finding", "reason": "Attacker-influenced size accumulation that can overflow size_t and defeat the CreateNodeDef budget (CWE-190)."},
+    {"anchor": "node.input() loop + ParseTensorName(input) + input_tensor.index() < 0 break (lines 19-24)", "disposition": "dismissed", "reason": "Parses input names and breaks on the first control dependency; no memory operation on attacker length here."},
+    {"anchor": "node_map_->GetNode(input) then *input_node in IsReallyConstant (lines 25-26)", "disposition": "finding", "reason": "GetNode may return null for a dangling edge and is dereferenced without a null check — NULL-pointer dereference (CWE-476)."},
+    {"anchor": "CheckAttrExists(*input_node, \"value\") + attr().at(\"value\").tensor() (lines 31-32)", "disposition": "dismissed", "reason": "The CheckAttrExists gate guarantees the key exists before .at(), so the map access cannot throw; correctly ordered."},
+    {"anchor": "raw_val.dtype() == DT_INVALID guard (line 33)", "disposition": "dismissed", "reason": "This is a validation gate added by the fix; it correctly rejects the DT_INVALID crash vector before Tensor construction."},
+    {"anchor": "IsRefType(raw_val.dtype()) guard (line 40)", "disposition": "dismissed", "reason": "Validation gate added by the fix; correctly rejects reference dtypes that would crash the Tensor constructor."},
+    {"anchor": "new Tensor(raw_val.dtype(), raw_val.tensor_shape()) (line 45)", "disposition": "finding", "reason": "Tensor built from attacker-controlled shape; an overlarge/overflowing shape can trip an internal CHECK or failed-allocation abort — reachable assertion (CWE-617), the residual of this fix."},
+    {"anchor": "value->FromProto(raw_val) + delete(value) failure path (lines 46-51)", "disposition": "dismissed", "reason": "Content deserialization is validated and the tensor is freed on failure; failure path is handled cleanly."},
+    {"anchor": "EvaluateNode(node, inputs, &output_tensors) + empty check (lines 56-59)", "disposition": "dismissed", "reason": "Executes the kernel and checks for empty output; error is propagated by TF_RETURN_IF_ERROR with cleanup — inherent to constant folding, no distinct anchor bug."},
+    {"anchor": "outputs->resize + output loop + OptimizedNodeName (lines 61-66)", "disposition": "dismissed", "reason": "Sizes and names the output NodeDefs; bounded by output_tensors.size(), no attacker length driving a fixed buffer."},
+    {"anchor": "CreateNodeDef(node_name, output_tensors[i], &outputs->at(i), total_inputs_size) + result_too_large (lines 67-73)", "disposition": "dismissed", "reason": "Serializes output within a size budget and reports too-large via status; the budget's integrity is captured by the total_inputs_size overflow finding rather than here."},
+    {"anchor": "outputs->at(i) = NodeDef() dead-output branch (lines 74-77)", "disposition": "dismissed", "reason": "Handles null (dead) output tensors with an empty NodeDef; benign."}
+  ],
+  "findings": [
+    {
+      "title": "NULL-pointer dereference of unchecked node_map_->GetNode() result",
+      "anchor": "const NodeDef* input_node = node_map_->GetNode(input); if (!IsReallyConstant(*input_node))",
+      "file": "corpus/train/train_0152_cwe617.cpp",
+      "line": "25-26",
+      "code": "    const NodeDef* input_node = node_map_->GetNode(input);\n    if (!IsReallyConstant(*input_node)) {",
+      "bug_class": "NULL pointer dereference (missing null check on lookup result)",
+      "cwe": "CWE-476",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0152_cwe617.cpp (and implementation of node_map_->GetNode / IsReallyConstant, files not provided)",
+      "invariant": "The pointer returned by GetNode(input) must be null-checked and converted to an error Status before it is dereferenced in *input_node.",
+      "failure_mode": "A malformed/malicious GraphDef lists an input edge naming a node absent from the graph; GetNode returns null; *input_node inside IsReallyConstant dereferences null and aborts the process (denial of service).",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm node_map_->GetNode returns null for missing names and that there is no null guard between line 25 and the dereference at line 26."
+    },
+    {
+      "title": "Reachable CHECK/abort constructing Tensor from attacker-controlled shape",
+      "anchor": "Tensor* value = new Tensor(raw_val.dtype(), raw_val.tensor_shape());",
+      "file": "corpus/train/train_0152_cwe617.cpp",
+      "line": "45",
+      "code": "    Tensor* value = new Tensor(raw_val.dtype(), raw_val.tensor_shape());",
+      "bug_class": "Reachable assertion / CHECK failure on unvalidated shape (denial of service)",
+      "cwe": "CWE-617",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided) — the Tensor(DataType, TensorShape) constructor",
+      "invariant": "Before constructing a Tensor the declared shape's element count and byte size must be validated/bounded, and the allocation must be attempted in a status-returning (non-fatal) manner, so a hostile shape yields an error rather than a CHECK failure or abort.",
+      "failure_mode": "An attacker-supplied TensorProto declares an enormous or overflowing tensor_shape; the Tensor constructor at line 45 computes the element count and allocates, tripping an internal CHECK or aborting on failed allocation, terminating the TensorFlow process. The DT_INVALID/RefType fixes above do not cover this shape-based path.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the Tensor(dtype, shape) constructor CHECK-fails/aborts on pathological shapes and that no shape/size bound is enforced before line 45."
+    },
+    {
+      "title": "Integer overflow of total_inputs_size defeats the result-too-large budget",
+      "anchor": "total_inputs_size += value->TotalBytes();",
+      "file": "corpus/train/train_0152_cwe617.cpp",
+      "line": "53",
+      "code": "    total_inputs_size += value->TotalBytes();",
+      "bug_class": "Unsigned integer overflow of size accumulator",
+      "cwe": "CWE-190",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0152_cwe617.cpp (budget consumed by CreateNodeDef, file not provided)",
+      "invariant": "The accumulated input-size budget must saturate or be range-checked so it cannot wrap size_t before being used as the too-large threshold at lines 68-69.",
+      "failure_mode": "With many/large constant inputs the running sum of TotalBytes() wraps size_t to a small value; CreateNodeDef then receives an understated budget and accepts a folded constant much larger than the inputs it replaces, causing graph/memory blow-up instead of setting result_too_large.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm how CreateNodeDef uses total_inputs_size as a threshold and that no saturation/overflow check guards the accumulation at line 53."
+    },
+    {
+      "title": "Raw new/delete Tensor ownership leaks on emplace_back exception",
+      "anchor": "Tensor* value = new Tensor(...); ... inputs.emplace_back(value);",
+      "file": "corpus/train/train_0152_cwe617.cpp",
+      "line": "45-52",
+      "code": "    Tensor* value = new Tensor(raw_val.dtype(), raw_val.tensor_shape());\n    if (!value->FromProto(raw_val)) {\n      delete (value);\n      return errors::InvalidArgument(\"Unable to make Tensor from proto for \",\n                                     node.name(), \" with shape \",\n                                     raw_val.tensor_shape().DebugString());\n    }\n    inputs.emplace_back(value);",
+      "bug_class": "Memory leak on exception window between allocation and ownership transfer",
+      "cwe": "CWE-401",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0152_cwe617.cpp",
+      "invariant": "A freshly new'd Tensor must be owned by an RAII holder (e.g. std::unique_ptr) at the point of allocation, not several statements later, so no path can drop the pointer before the cleanup guard tracks it.",
+      "failure_mode": "If inputs.emplace_back(value) at line 52 throws (std::bad_alloc growing the vector), 'value' is not yet stored in 'inputs', so the MakeCleanup guard never frees it and the Tensor leaks. Not attacker-directed; a robustness/hygiene defect.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm TensorVector::emplace_back can throw and that no unique_ptr wraps 'value' between lines 45 and 52."
+    }
+  ],
+  "audit_checklist": [
+    "Add a null check on node_map_->GetNode(input) at line 25 and return an error before dereferencing at line 26.",
+    "Validate raw_val.tensor_shape() (element count and byte size, overflow-safe) before constructing the Tensor at line 45, and use a status-returning allocation path so hostile shapes cannot CHECK-fail/abort.",
+    "Make the total_inputs_size accumulation at line 53 overflow-safe (saturating add or explicit check) so the CreateNodeDef budget cannot wrap.",
+    "Wrap the new Tensor at line 45 in std::unique_ptr and release into 'inputs' to remove the emplace_back exception leak window.",
+    "Confirm the DT_INVALID (line 33) and IsRefType (line 40) guards are the complete set of dtype classes that crash the Tensor constructor, or add any missing ones.",
+    "Verify EvaluateNode and CreateNodeDef propagate all failure Statuses so the MakeCleanup guard always frees input and output tensors on every early return."
+  ]
+}

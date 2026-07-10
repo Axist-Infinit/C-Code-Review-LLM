@@ -1,0 +1,330 @@
+{
+  "subsystem": "AVI/RIFF container demuxer. The single function avi_parse_input_file() from GPAC's avilib (the 'aviplay'/import path) parses the header list (hdrl), the movi start, the idx1 index and the OpenDML super-index/extended-index chunks of an AVI file. It fills an avi_t structure (stream headers, per-track audio/video state, video_index/audio_index arrays) that the rest of the demuxer relies on.",
+  "provenance": "Identified by the AVI/RIFF FourCC vocabulary parsed inline ('RIFF','AVI ','LIST','hdrl','movi','idx1','strh','strf','indx','dmlh','vids','auds','iavs'), the GPAC-specific helpers and macros (gf_malloc/gf_realloc/gf_free, gf_ftell/gf_fseek, GF_LOG with GF_LOG_CONTAINER, AVI_errno/ERR_EXIT, str2ulong/str2ushort/str2ullong, PAD_EVEN), GPAC types (u8/u32/u64/s64, avi_t, avisuperindex_chunk, alAVISTREAMHEADER, alBITMAPINFOHEADER, alWAVEFORMATEX), and the sample tag 'primevul_c_train_2206_fixed' / filename train_0297_cwe835.c. This is the well-known avilib.c avi_parse_input_file() routine.",
+  "trust_boundary": "The entire input is an attacker-supplied AVI file read from AVI->fdes via avi_read()/gf_fseek()/gf_ftell(). Every FourCC, every 32-bit chunk size read by str2ulong(), the hdrl_data buffer contents, the strf BITMAPINFOHEADER bi_size, the WAVEFORMATEX cb_size, and the OpenDML super-index fields wLongsPerEntry/nEntriesInUse/dwSize/qwOffset are all hostile wire data. The only structural validation before heavy parsing is the 'RIFF'/'AVI ' magic check at line 31. hdrl_data is a heap buffer whose length hdrl_len comes straight from the file, and the hdrl walk uses fixed byte offsets into it with no per-access bound against hdrl_len — this is the central attack surface.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0297_cwe835.c",
+      "lines": "2-21",
+      "code": "int avi_parse_input_file(avi_t *AVI, int getIndex)\n{\n\tint rate, scale, idx_type;\n\ts64 n, i;\n\tunsigned char *hdrl_data;\n\tu64 header_offset=0;\n\tint hdrl_len=0;\n\tint nvi, nai[AVI_MAX_TRACKS], ioff;\n\tu64 tot[AVI_MAX_TRACKS];\n\tu32 j;\n\tint lasttag = 0;\n\tint vids_strh_seen = 0;\n\tint vids_strf_seen = 0;\n\tint auds_strh_seen = 0;\n\t//  int auds_strf_seen = 0;\n\tint num_stream = 0;\n\tchar data[256];\n\ts64 oldpos=-1, newpos=-1;\n\n\tint aud_chunks = 0;",
+      "explanation": "Entry point. AVI is the caller-owned demux context to populate; getIndex selects whether the idx1/OpenDML index is built. Local state: n and i are s64 chunk-size / cursor values, hdrl_data is the heap buffer that will hold the header list, hdrl_len is its length, header_offset records the file offset of the header list. nai[AVI_MAX_TRACKS] and tot[AVI_MAX_TRACKS] are fixed-size per-track counters, and data[256] is a fixed 256-byte scratch buffer used both to read 8/12-byte chunk headers and (in the idx phase) tag data. oldpos/newpos are file offsets used to detect a non-advancing (broken) stream. All sizes here are int/s64 and will be filled from attacker-controlled 32-bit little-endian fields."
+    },
+    {
+      "file": "corpus/train/train_0297_cwe835.c",
+      "lines": "22-32",
+      "code": "\tif (!AVI) {\n\t   AVI_errno = AVI_ERR_OPEN;\n\t   return 0;\n\t}\n\n\t/* Read first 12 bytes and check that this is an AVI file */\n\tif (avi_read(AVI->fdes,data,12) != 12 )\n\t\tERR_EXIT(AVI_ERR_READ)\n\n\tif (strnicmp(data  ,\"RIFF\",4) !=0 || strnicmp(data+8,\"AVI \",4) !=0 )\n\t\tERR_EXIT(AVI_ERR_NO_AVI)",
+      "explanation": "NULL guard on the context, then the only structural gate on the whole file: read 12 bytes and require bytes 0-3 == 'RIFF' and bytes 8-11 == 'AVI '. The 4-byte RIFF size at data+4 is ignored. ERR_EXIT sets AVI_errno and returns. After this point the file is trusted enough to allocate and copy based on its declared sizes, so any attacker who supplies a valid 12-byte RIFF/AVI preamble passes the only sanity check."
+    },
+    {
+      "file": "corpus/train/train_0297_cwe835.c",
+      "lines": "40-52",
+      "code": "\twhile(1)\n\t{\n\t\tif( avi_read(AVI->fdes,data,8) != 8 ) break; /* We assume it's EOF */\n\t\tnewpos = gf_ftell(AVI->fdes);\n\t\tif(oldpos==newpos) {\n\t\t\t/* This is a broken AVI stream... */\n\t\t\treturn -1;\n\t\t}\n\t\toldpos=newpos;\n\n\t\tn = str2ulong((unsigned char *)data+4);\n\t\tn = PAD_EVEN(n);",
+      "explanation": "Top-level chunk scanner. Each iteration reads an 8-byte chunk header (4-byte FourCC + 4-byte size) into data. The oldpos==newpos check (lines 44-47) is the anti-infinite-loop guard characteristic of the CWE-835 'fixed' revision: if the file offset did not advance between iterations the loop bails with -1 instead of spinning forever. n is the little-endian 32-bit chunk size, rounded up to even by PAD_EVEN. n is fully attacker-controlled and drives every subsequent allocation and seek."
+    },
+    {
+      "file": "corpus/train/train_0297_cwe835.c",
+      "lines": "53-76",
+      "code": "\t\tif(strnicmp(data,\"LIST\",4) == 0)\n\t\t{\n\t\t\tif( avi_read(AVI->fdes,data,4) != 4 ) ERR_EXIT(AVI_ERR_READ)\n\t\t\t\tn -= 4;\n\t\t\tif(strnicmp(data,\"hdrl\",4) == 0)\n\t\t\t{\n\t\t\t\tif (n>0xFFFFFFFF) ERR_EXIT(AVI_ERR_READ)\n\t\t\t\thdrl_len = (u32) n;\n\t\t\t\thdrl_data = (unsigned char *) gf_malloc((u32)n);\n\t\t\t\tif(hdrl_data==0) ERR_EXIT(AVI_ERR_NO_MEM);\n\n\t\t\t\t// offset of header\n\n\t\t\t\theader_offset = gf_ftell(AVI->fdes);\n\n\t\t\t\tif( avi_read(AVI->fdes,(char *)hdrl_data, (u32) n) != n ) ERR_EXIT(AVI_ERR_READ)\n\t\t\t\t}\n\t\t\telse if(strnicmp(data,\"movi\",4) == 0)\n\t\t\t{\n\t\t\t\tAVI->movi_start = gf_ftell(AVI->fdes);\n\t\t\t\tif (gf_fseek(AVI->fdes,n,SEEK_CUR)==(u64)-1) break;\n\t\t\t}\n\t\t\telse if (gf_fseek(AVI->fdes,n,SEEK_CUR)==(u64)-1) break;\n\t\t}",
+      "explanation": "LIST handling. The list sub-type FourCC is read (consuming 4 of the n bytes, hence n -= 4). For 'hdrl' the code caps n at 0xFFFFFFFF, stores hdrl_len, allocates hdrl_data of exactly n bytes, records header_offset, and reads n bytes of the header list into hdrl_data. hdrl_data therefore contains raw attacker bytes of exactly hdrl_len length. For 'movi' it records movi_start and seeks over the list body. Other lists are skipped by seeking n bytes."
+    },
+    {
+      "file": "corpus/train/train_0297_cwe835.c",
+      "lines": "77-93",
+      "code": "\t\telse if(strnicmp(data,\"idx1\",4) == 0)\n\t\t{\n\t\t\t/* n must be a multiple of 16, but the reading does not\n\t\t\t   break if this is not the case */\n\n\t\t\tAVI->n_idx = AVI->max_idx = (u32) (n/16);\n\t\t\tAVI->idx = (unsigned  char((*)[16]) ) gf_malloc((u32)n);\n\t\t\tif(AVI->idx==0) ERR_EXIT(AVI_ERR_NO_MEM)\n\t\t\t\tif(avi_read(AVI->fdes, (char *) AVI->idx, (u32) n) != n ) {\n\t\t\t\t\tgf_free( AVI->idx);\n\t\t\t\t\tAVI->idx=NULL;\n\t\t\t\t\tAVI->n_idx = 0;\n\t\t\t\t}\n\t\t}\n\t\telse\n\t\t\tgf_fseek(AVI->fdes,n,SEEK_CUR);",
+      "explanation": "idx1 (the legacy AVI index). n_idx/max_idx is set to n/16 (each idx1 entry is a 16-byte record: FourCC, flags, offset, size). AVI->idx is malloc'd of n bytes and read from the file; on a short read the allocation is freed and n_idx zeroed. The entry count n_idx is derived purely from the attacker's declared n, and the idx buffer is a raw copy of file bytes consumed later as AVI->idx[i]."
+    },
+    {
+      "file": "corpus/train/train_0297_cwe835.c",
+      "lines": "95-114",
+      "code": "\tif(!hdrl_data      ) ERR_EXIT(AVI_ERR_NO_HDRL)\n\t\tif(!AVI->movi_start) ERR_EXIT(AVI_ERR_NO_MOVI)\n\n\t\t\t/* Interpret the header list */\n\n\t\t\tfor(i=0; i<hdrl_len;)\n\t\t\t{\n\t\t\t\t/* List tags are completly ignored */\n\n#ifdef DEBUG_ODML\n\t\t\t\tGF_LOG(GF_LOG_DEBUG, GF_LOG_CONTAINER, (\"[avilib] TAG %c%c%c%c\\n\", (hdrl_data+i)[0], (hdrl_data+i)[1], (hdrl_data+i)[2], (hdrl_data+i)[3]));\n#endif\n\n\t\t\t\tif(strnicmp((char *)hdrl_data+i,\"LIST\",4)==0) {\n\t\t\t\t\ti+= 12;\n\t\t\t\t\tcontinue;\n\t\t\t\t}\n\n\t\t\t\tn = str2ulong(hdrl_data+i+4);\n\t\t\t\tn = PAD_EVEN(n);",
+      "explanation": "The hdrl walk. After confirming hdrl_data and movi_start were found, the loop iterates a cursor i from 0 to hdrl_len. Each element is expected to begin with a 4-byte FourCC at hdrl_data+i and a 4-byte size at hdrl_data+i+4 (read via str2ulong into n). Crucially the loop condition only checks i<hdrl_len; it never checks that i+4 (or i+8, or i+sizeof(struct)) stays within hdrl_len before dereferencing. n here is the per-element size and is re-derived from attacker bytes each pass; i is advanced by fixed amounts plus n at the bottom of the loop."
+    },
+    {
+      "file": "corpus/train/train_0297_cwe835.c",
+      "lines": "119-143",
+      "code": "\t\t\t\tif(strnicmp((char *)hdrl_data+i,\"strh\",4)==0)\n\t\t\t\t{\n\t\t\t\t\ti += 8;\n#ifdef DEBUG_ODML\n\t\t\t\t\tGF_LOG(GF_LOG_DEBUG, GF_LOG_CONTAINER, (\"[avilib] TAG   %c%c%c%c\\n\", (hdrl_data+i)[0], (hdrl_data+i)[1], (hdrl_data+i)[2], (hdrl_data+i)[3]));\n#endif\n\t\t\t\t\tif(strnicmp((char *)hdrl_data+i,\"vids\",4) == 0 && !vids_strh_seen)\n\t\t\t\t\t{\n\t\t\t\t\t\tmemcpy(AVI->compressor,hdrl_data+i+4,4);\n\t\t\t\t\t\tAVI->compressor[4] = 0;\n\n\t\t\t\t\t\t// ThOe\n\t\t\t\t\t\tAVI->v_codech_off = header_offset + i+4;\n\n\t\t\t\t\t\tscale = str2ulong(hdrl_data+i+20);\n\t\t\t\t\t\trate  = str2ulong(hdrl_data+i+24);\n\t\t\t\t\t\tif(scale!=0) AVI->fps = (double)rate/(double)scale;\n\t\t\t\t\t\tAVI->video_frames = str2ulong(hdrl_data+i+32);\n\t\t\t\t\t\tAVI->video_strn = num_stream;\n\t\t\t\t\t\tAVI->max_len = 0;\n\t\t\t\t\t\tvids_strh_seen = 1;\n\t\t\t\t\t\tlasttag = 1; /* vids */\n\t\t\t\t\t\tmemcpy(&AVI->video_stream_header, hdrl_data + i,\n\t\t\t\t\t\t       sizeof(alAVISTREAMHEADER));\n\t\t\t\t\t}",
+      "explanation": "strh (stream header) for a video track. After stepping i past the 8-byte tag, it reads the stream type FourCC. For 'vids' it copies the 4-byte compressor, reads scale/rate/frame-count at fixed offsets +20/+24/+32, sets lasttag=1 to steer the following strf, and finally memcpy's a whole sizeof(alAVISTREAMHEADER) block from hdrl_data+i into AVI->video_stream_header. All of these are fixed-offset reads relative to i with no check that i+offset+size <= hdrl_len."
+    },
+    {
+      "file": "corpus/train/train_0297_cwe835.c",
+      "lines": "144-179",
+      "code": "\t\t\t\t\telse if (strnicmp ((char *)hdrl_data+i,\"auds\",4) ==0 && ! auds_strh_seen)\n\t\t\t\t\t{\n\n\t\t\t\t\t\t//inc audio tracks\n\t\t\t\t\t\tAVI->aptr=AVI->anum;\n\t\t\t\t\t\t++AVI->anum;\n\n\t\t\t\t\t\tif(AVI->anum > AVI_MAX_TRACKS) {\n\t\t\t\t\t\t\tGF_LOG(GF_LOG_ERROR, GF_LOG_CONTAINER, (\"[avilib] error - only %d audio tracks supported\\n\", AVI_MAX_TRACKS));\n\t\t\t\t\t\t\treturn(-1);\n\t\t\t\t\t\t}\n\n\t\t\t\t\t\tAVI->track[AVI->aptr].audio_bytes = str2ulong(hdrl_data+i+32)*avi_sampsize(AVI, 0);\n\t\t\t\t\t\tAVI->track[AVI->aptr].audio_strn = num_stream;\n\n\t\t\t\t\t\t// if samplesize==0 -> vbr\n\t\t\t\t\t\tAVI->track[AVI->aptr].a_vbr = !str2ulong(hdrl_data+i+44);\n\n\t\t\t\t\t\tAVI->track[AVI->aptr].padrate = str2ulong(hdrl_data+i+24);\n\t\t\t\t\t\tmemcpy(&AVI->stream_headers[AVI->aptr], hdrl_data + i,\n\t\t\t\t\t\t       sizeof(alAVISTREAMHEADER));\n\n\t\t\t\t\t\t//\t   auds_strh_seen = 1;\n\t\t\t\t\t\tlasttag = 2; /* auds */\n\n\t\t\t\t\t\t// ThOe\n\t\t\t\t\t\tAVI->track[AVI->aptr].a_codech_off = header_offset + i;\n\n\t\t\t\t\t}",
+      "explanation": "strh for an audio track. aptr is set to the current anum and anum is incremented; the bound check rejects only when anum > AVI_MAX_TRACKS. It reads audio_bytes/vbr/padrate at fixed offsets and memcpy's sizeof(alAVISTREAMHEADER) from hdrl_data+i into stream_headers[aptr]. lasttag=2 steers the next strf/indx into the audio path. Note the check uses '>' not '>=', and it never sets auds_strh_seen (the assignment is commented out), so 'auds' strh blocks are processed repeatedly, each one allocating a new track slot."
+    },
+    {
+      "file": "corpus/train/train_0297_cwe835.c",
+      "lines": "188-217",
+      "code": "\t\t\t\telse if(strnicmp((char *)hdrl_data+i,\"strf\",4)==0)\n\t\t\t\t{\n\t\t\t\t\ti += 8;\n\t\t\t\t\tif(lasttag == 1)\n\t\t\t\t\t{\n\t\t\t\t\t\talBITMAPINFOHEADER bih;\n\n\t\t\t\t\t\tmemcpy(&bih, hdrl_data + i, sizeof(alBITMAPINFOHEADER));\n\t\t\t\t\t\tAVI->bitmap_info_header = (alBITMAPINFOHEADER *)\n\t\t\t\t\t\t                          gf_malloc(str2ulong((unsigned char *)&bih.bi_size));\n\t\t\t\t\t\tif (AVI->bitmap_info_header != NULL)\n\t\t\t\t\t\t\tmemcpy(AVI->bitmap_info_header, hdrl_data + i,\n\t\t\t\t\t\t\t       str2ulong((unsigned char *)&bih.bi_size));\n\n\t\t\t\t\t\tAVI->width  = str2ulong(hdrl_data+i+4);\n\t\t\t\t\t\tAVI->height = str2ulong(hdrl_data+i+8);\n\t\t\t\t\t\tvids_strf_seen = 1;\n\t\t\t\t\t\t//ThOe\n\t\t\t\t\t\tAVI->v_codecf_off = header_offset + i+16;\n\n\t\t\t\t\t\tmemcpy(AVI->compressor2, hdrl_data+i+16, 4);\n\t\t\t\t\t\tAVI->compressor2[4] = 0;\n\n\t\t\t\t\t\tif (n>40) {\n\t\t\t\t\t\t\tif (n>0xFFFFFFFF) ERR_EXIT(AVI_ERR_READ)\n\t\t\t\t\t\t\tAVI->extradata_size = (u32) (n - 40);\n\t\t\t\t\t\t\tAVI->extradata = gf_malloc(sizeof(u8)* AVI->extradata_size);\n\t\t\t\t\t\t\tif (!AVI->extradata) ERR_EXIT(AVI_ERR_NO_MEM)\n\t\t\t\t\t\t\tmemcpy(AVI->extradata, hdrl_data + i + 40, AVI->extradata_size);\n\t\t\t\t\t\t}\n\n\t\t\t\t\t}",
+      "explanation": "strf (stream format) for video (lasttag==1). It copies a BITMAPINFOHEADER from hdrl_data+i into local bih, then allocates a buffer of size bih.bi_size (an attacker field) and copies bi_size bytes from hdrl_data+i into it. width/height and compressor2 are read at fixed offsets. If the element size n>40 it computes extradata_size = n-40 and memcpy's that many bytes from hdrl_data+i+40. Both the bi_size copy and the extradata copy read a length that is not bounded against the remaining hdrl_data (hdrl_len - i)."
+    },
+    {
+      "file": "corpus/train/train_0297_cwe835.c",
+      "lines": "220-246",
+      "code": "\t\t\t\t\telse if(lasttag == 2)\n\t\t\t\t\t{\n\t\t\t\t\t\talWAVEFORMATEX *wfe;\n\t\t\t\t\t\tchar *nwfe;\n\t\t\t\t\t\tint wfes;\n\n\t\t\t\t\t\tif ((u32) (hdrl_len - i) < sizeof(alWAVEFORMATEX))\n\t\t\t\t\t\t\twfes = hdrl_len - i;\n\t\t\t\t\t\telse\n\t\t\t\t\t\t\twfes = sizeof(alWAVEFORMATEX);\n\t\t\t\t\t\twfe = (alWAVEFORMATEX *)gf_malloc(sizeof(alWAVEFORMATEX));\n\t\t\t\t\t\tif (wfe != NULL) {\n\t\t\t\t\t\t\tmemset(wfe, 0, sizeof(alWAVEFORMATEX));\n\t\t\t\t\t\t\tmemcpy(wfe, hdrl_data + i, wfes);\n\t\t\t\t\t\t\tif (str2ushort((unsigned char *)&wfe->cb_size) != 0) {\n\t\t\t\t\t\t\t\tnwfe = (char *)\n\t\t\t\t\t\t\t\t       gf_realloc(wfe, sizeof(alWAVEFORMATEX) +\n\t\t\t\t\t\t\t\t                  str2ushort((unsigned char *)&wfe->cb_size));\n\t\t\t\t\t\t\t\tif (nwfe != 0) {\n\t\t\t\t\t\t\t\t\ts64 lpos = gf_ftell(AVI->fdes);\n\t\t\t\t\t\t\t\t\tgf_fseek(AVI->fdes, header_offset + i + sizeof(alWAVEFORMATEX),\n\t\t\t\t\t\t\t\t\t         SEEK_SET);\n\t\t\t\t\t\t\t\t\twfe = (alWAVEFORMATEX *)nwfe;\n\t\t\t\t\t\t\t\t\tnwfe = &nwfe[sizeof(alWAVEFORMATEX)];\n\t\t\t\t\t\t\t\t\tavi_read(AVI->fdes, nwfe,\n\t\t\t\t\t\t\t\t\t         str2ushort((unsigned char *)&wfe->cb_size));\n\t\t\t\t\t\t\t\t\tgf_fseek(AVI->fdes, lpos, SEEK_SET);\n\t\t\t\t\t\t\t\t}\n\t\t\t\t\t\t\t}\n\t\t\t\t\t\t\tAVI->wave_format_ex[AVI->aptr] = wfe;\n\t\t\t\t\t\t}",
+      "explanation": "strf for audio (lasttag==2). This branch is comparatively careful: wfes is clamped to min(hdrl_len - i, sizeof(alWAVEFORMATEX)) before the copy, so the initial memcpy into wfe is bounded. The realloc uses a temporary (nwfe) and only commits on success (good realloc hygiene), and the extra cb_size bytes are read from the file (bounded by the u16 cb_size). The remaining fixed-offset scalar reads (a_fmt, a_chans, a_rate, mp3rate, a_bits at +0/+2/+4/+8/+14) are not bounded, however."
+    },
+    {
+      "file": "corpus/train/train_0297_cwe835.c",
+      "lines": "266-301",
+      "code": "\t\t\t\telse if(strnicmp((char*)hdrl_data+i,\"indx\",4) == 0) {\n\t\t\t\t\tchar *a;\n\n\t\t\t\t\tif(lasttag == 1) // V I D E O\n\t\t\t\t\t{\n\n\t\t\t\t\t\ta = (char*)hdrl_data+i;\n\n\t\t\t\t\t\tAVI->video_superindex = (avisuperindex_chunk *) gf_malloc (sizeof (avisuperindex_chunk));\n\t\t\t\t\t\tmemset(AVI->video_superindex, 0, sizeof (avisuperindex_chunk));\n\t\t\t\t\t\tmemcpy (AVI->video_superindex->fcc, a, 4);\n\t\t\t\t\t\ta += 4;\n\t\t\t\t\t\tAVI->video_superindex->dwSize = str2ulong((unsigned char *)a);\n\t\t\t\t\t\ta += 4;\n\t\t\t\t\t\tAVI->video_superindex->wLongsPerEntry = str2ushort((unsigned char *)a);\n\t\t\t\t\t\ta += 2;\n\t\t\t\t\t\tAVI->video_superindex->bIndexSubType = *a;\n\t\t\t\t\t\ta += 1;\n\t\t\t\t\t\tAVI->video_superindex->bIndexType = *a;\n\t\t\t\t\t\ta += 1;\n\t\t\t\t\t\tAVI->video_superindex->nEntriesInUse = str2ulong((unsigned char *)a);\n\t\t\t\t\t\ta += 4;\n\t\t\t\t\t\tmemcpy (AVI->video_superindex->dwChunkId, a, 4);\n\t\t\t\t\t\ta += 4;\n\n\t\t\t\t\t\t// 3 * reserved\n\t\t\t\t\t\ta += 4;\n\t\t\t\t\t\ta += 4;\n\t\t\t\t\t\ta += 4;\n\n\t\t\t\t\t\tif (AVI->video_superindex->bIndexSubType != 0) {\n\t\t\t\t\t\t\tGF_LOG(GF_LOG_ERROR, GF_LOG_CONTAINER, (\"[avilib] Invalid Header, bIndexSubType != 0\\n\"));\n\t\t\t\t\t\t}\n\n\t\t\t\t\t\tAVI->video_superindex->aIndex = (avisuperindex_entry*)\n\t\t\t\t\t\t                                gf_malloc (AVI->video_superindex->wLongsPerEntry * AVI->video_superindex->nEntriesInUse * sizeof (u32));",
+      "explanation": "indx (OpenDML super-index) for video. A cursor a walks over hdrl_data+i reading fcc, dwSize, wLongsPerEntry (u16), sub-type/type bytes, and nEntriesInUse (u32) at fixed offsets. is_opendml is later set to 1. The aIndex array is allocated as wLongsPerEntry * nEntriesInUse * sizeof(u32): all three (well, two attacker) factors are file-controlled, the product is computed in 32-bit-ish arithmetic, and the result is NOT null-checked before the entry loop writes into it."
+    },
+    {
+      "file": "corpus/train/train_0297_cwe835.c",
+      "lines": "304-333",
+      "code": "\t\t\t\t\t\tfor (j=0; j<AVI->video_superindex->nEntriesInUse; ++j) {\n\t\t\t\t\t\t\tAVI->video_superindex->aIndex[j].qwOffset = str2ullong ((unsigned char*)a);\n\t\t\t\t\t\t\ta += 8;\n\t\t\t\t\t\t\tAVI->video_superindex->aIndex[j].dwSize = str2ulong ((unsigned char*)a);\n\t\t\t\t\t\t\ta += 4;\n\t\t\t\t\t\t\tAVI->video_superindex->aIndex[j].dwDuration = str2ulong ((unsigned char*)a);\n\t\t\t\t\t\t\ta += 4;\n\n#ifdef DEBUG_ODML\n\t\t\t\t\t\t\tGF_LOG(GF_LOG_DEBUG, GF_LOG_CONTAINER, (\"[avilib] [%d] 0x%llx 0x%lx %lu\\n\", j,\n\t\t\t\t\t\t\t                                        (unsigned int long)AVI->video_superindex->aIndex[j].qwOffset,\n\t\t\t\t\t\t\t                                        (unsigned long)AVI->video_superindex->aIndex[j].dwSize,\n\t\t\t\t\t\t\t                                        (unsigned long)AVI->video_superindex->aIndex[j].dwDuration));\n#endif\n\t\t\t\t\t\t}\n\n\n#ifdef DEBUG_ODML\n\t\t\t\t\t\tGF_LOG(GF_LOG_DEBUG, GF_LOG_CONTAINER, (\"[avilib] FOURCC \\\"%c%c%c%c\\\"\\n\", AVI->video_superindex->fcc[0], AVI->video_superindex->fcc[1],\n\t\t\t\t\t\t                                        AVI->video_superindex->fcc[2], AVI->video_superindex->fcc[3]));",
+      "explanation": "The super-index entry loop writes nEntriesInUse entries of 16 bytes each (qwOffset 8 + dwSize 4 + dwDuration 4) into aIndex, and reads 16 bytes per entry from the hdrl cursor a. Both the destination writes and the source reads scale with nEntriesInUse, which is attacker-controlled and unbounded relative to both the aIndex allocation (see the previous step) and the hdrl_data buffer length. is_opendml is then set, causing the OpenDML extended-index phase later to consume these qwOffset/dwSize values as file offsets and sizes."
+    },
+    {
+      "file": "corpus/train/train_0297_cwe835.c",
+      "lines": "339-368",
+      "code": "\t\t\t\t\t\ta = (char*) hdrl_data+i;\n\n\t\t\t\t\t\tAVI->track[AVI->aptr].audio_superindex = (avisuperindex_chunk *) gf_malloc (sizeof (avisuperindex_chunk));\n\t\t\t\t\t\tmemcpy (AVI->track[AVI->aptr].audio_superindex->fcc, a, 4);\n\t\t\t\t\t\ta += 4;\n\t\t\t\t\t\tAVI->track[AVI->aptr].audio_superindex->dwSize = str2ulong((unsigned char*)a);\n\t\t\t\t\t\ta += 4;\n\t\t\t\t\t\tAVI->track[AVI->aptr].audio_superindex->wLongsPerEntry = str2ushort((unsigned char*)a);\n\t\t\t\t\t\ta += 2;\n\t\t\t\t\t\tAVI->track[AVI->aptr].audio_superindex->bIndexSubType = *a;\n\t\t\t\t\t\ta += 1;\n\t\t\t\t\t\tAVI->track[AVI->aptr].audio_superindex->bIndexType = *a;\n\t\t\t\t\t\ta += 1;\n\t\t\t\t\t\tAVI->track[AVI->aptr].audio_superindex->nEntriesInUse = str2ulong((unsigned char*)a);\n\t\t\t\t\t\ta += 4;\n\t\t\t\t\t\tmemcpy (AVI->track[AVI->aptr].audio_superindex->dwChunkId, a, 4);\n\t\t\t\t\t\ta += 4;\n\n\t\t\t\t\t\t// 3 * reserved\n\t\t\t\t\t\ta += 4;\n\t\t\t\t\t\ta += 4;\n\t\t\t\t\t\ta += 4;\n\n\t\t\t\t\t\tif (AVI->track[AVI->aptr].audio_superindex->bIndexSubType != 0) {\n\t\t\t\t\t\t\tGF_LOG(GF_LOG_ERROR, GF_LOG_CONTAINER, (\"[avilib] Invalid Header, bIndexSubType != 0\\n\"));\n\t\t\t\t\t\t}\n\n\t\t\t\t\t\tAVI->track[AVI->aptr].audio_superindex->aIndex = (avisuperindex_entry*)\n\t\t\t\t\t\t        gf_malloc (AVI->track[AVI->aptr].audio_superindex->wLongsPerEntry *\n\t\t\t\t\t\t                   AVI->track[AVI->aptr].audio_superindex->nEntriesInUse * sizeof (u32));",
+      "explanation": "indx for audio (lasttag==2). This mirrors the video path but is worse in two ways: the audio_superindex allocation is used immediately by memcpy(...->fcc, a, 4) with NO memset and NO null check (the video path at least memset's after allocating), so an allocation failure is an immediate NULL write; and the aIndex allocation again uses the attacker product wLongsPerEntry*nEntriesInUse*sizeof(u32) with no overflow guard and no null check before the following entry loop."
+    },
+    {
+      "file": "corpus/train/train_0297_cwe835.c",
+      "lines": "402-415",
+      "code": "\t\t\t\telse if((strnicmp((char*)hdrl_data+i,\"JUNK\",4) == 0) ||\n\t\t\t\t        (strnicmp((char*)hdrl_data+i,\"strn\",4) == 0) ||\n\t\t\t\t        (strnicmp((char*)hdrl_data+i,\"vprp\",4) == 0)) {\n\t\t\t\t\ti += 8;\n\t\t\t\t\t// do not reset lasttag\n\t\t\t\t} else\n\t\t\t\t{\n\t\t\t\t\ti += 8;\n\t\t\t\t\tlasttag = 0;\n\t\t\t\t}\n\t\t\t\t//GF_LOG(GF_LOG_DEBUG, GF_LOG_CONTAINER, (\"[avilib] adding %ld bytes\\n\", (int int)n));\n\n\t\t\t\ti += (u32) n;",
+      "explanation": "Tail of the hdrl loop: JUNK/strn/vprp and unknown tags simply skip the 8-byte header, then every non-LIST path advances i by the element size n (line 414). Because each recognized tag first does i += 8 and then i += n, the cursor advances at least 8 bytes per element, so this loop itself terminates. The concern is not termination but that i can be advanced (via n) to values near or beyond hdrl_len while subsequent iterations still dereference hdrl_data+i at fixed sub-offsets."
+    },
+    {
+      "file": "corpus/train/train_0297_cwe835.c",
+      "lines": "525-573",
+      "code": "\tif (AVI->is_opendml) {\n\t\tu64 offset = 0;\n\t\thdrl_len = 4+4+2+1+1+4+4+8+4;\n\t\tchar *en, *chunk_start;\n\t\tint k = 0;\n\t\tu32 audtr = 0;\n\t\tu32 nrEntries = 0;\n\n\t\tAVI->video_index = NULL;\n\n\t\tnvi = 0;\n\t\tfor(audtr=0; audtr<AVI->anum; ++audtr) {\n\t\t\tnai[audtr] = 0;\n\t\t\ttot[audtr] = 0;\n\t\t}\n\n\t\tfor (j=0; j<AVI->video_superindex->nEntriesInUse; j++) {\n\n\t\t\t// read from file\n\t\t\tchunk_start = en = (char*) gf_malloc ((u32) (AVI->video_superindex->aIndex[j].dwSize+hdrl_len) );\n\n\t\t\tif (gf_fseek(AVI->fdes, AVI->video_superindex->aIndex[j].qwOffset, SEEK_SET) == (u64)-1) {\n\t\t\t\tgf_free(chunk_start);\n\t\t\t\tcontinue;\n\t\t\t}\n\n\t\t\tif (avi_read(AVI->fdes, en, (u32) (AVI->video_superindex->aIndex[j].dwSize+hdrl_len) ) <= 0) {\n\t\t\t\tgf_free(chunk_start);\n\t\t\t\tcontinue;\n\t\t\t}\n\n\t\t\tnrEntries = str2ulong((unsigned char*)en + 12);\n#ifdef DEBUG_ODML\n\t\t\t//GF_LOG(GF_LOG_DEBUG, GF_LOG_CONTAINER, (\"[avilib] [%d:0] Video nrEntries %ld\\n\", j, nrEntries));\n#endif\n\t\t\toffset = str2ullong((unsigned char*)en + 20);\n\n\t\t\t// skip header\n\t\t\ten += hdrl_len;\n\t\t\tnvi += nrEntries;\n\t\t\tAVI->video_index = (video_index_entry *) gf_realloc (AVI->video_index, nvi * sizeof (video_index_entry));\n\t\t\tif (!AVI->video_index) {\n\t\t\t\tGF_LOG(GF_LOG_ERROR, GF_LOG_CONTAINER, (\"[avilib] out of mem (size = %ld)\\n\", nvi * sizeof (video_index_entry)));\n\t\t\t\texit(1);\n\t\t\t}",
+      "explanation": "OpenDML extended-index reader for video. hdrl_len is repurposed as the 38-byte ix## chunk header size. For each super-index entry it allocates dwSize+hdrl_len bytes, seeks to qwOffset in the file (both attacker values), and reads that many bytes into en. nrEntries and offset are then read from the chunk at +12 and +20. nvi accumulates nrEntries and video_index is grown to nvi*sizeof(video_index_entry). The realloc failure aborts the whole process with exit(1)."
+    },
+    {
+      "file": "corpus/train/train_0297_cwe835.c",
+      "lines": "575-603",
+      "code": "\t\t\twhile (k < nvi) {\n\n\t\t\t\tAVI->video_index[k].pos = offset + str2ulong((unsigned char*)en);\n\t\t\t\ten += 4;\n\t\t\t\tAVI->video_index[k].len = str2ulong_len((unsigned char*)en);\n\t\t\t\tAVI->video_index[k].key = str2ulong_key((unsigned char*)en);\n\t\t\t\ten += 4;\n\n\t\t\t\t// completely empty chunk\n\t\t\t\tif (AVI->video_index[k].pos-offset == 0 && AVI->video_index[k].len == 0) {\n\t\t\t\t\tk--;\n\t\t\t\t\tnvi--;\n\t\t\t\t}\n\n#ifdef DEBUG_ODML\n\t\t\t\t/*\n\t\t\t\tGF_LOG(GF_LOG_DEBUG, GF_LOG_CONTAINER, (\"[avilib] [%d] POS 0x%llX len=%d key=%s offset (%llx) (%ld)\\n\", k,\n\t\t\t\t  AVI->video_index[k].pos,\n\t\t\t\t  (int)AVI->video_index[k].len,\n\t\t\t\t  AVI->video_index[k].key?\"yes\":\"no \", offset,\n\t\t\t\t  AVI->video_superindex->aIndex[j].dwSize));\n\t\t\t\t  */\n#endif\n\n\t\t\t\tk++;\n\t\t\t}\n\n\t\t\tgf_free(chunk_start);\n\t\t}",
+      "explanation": "The per-chunk entry loop fills video_index[k] from the mapped chunk, advancing en by 8 bytes per iteration. The loop runs while k<nvi, and nvi was bumped by the attacker's nrEntries, but en points into a buffer of only dwSize+38 bytes: nothing checks that 8*nrEntries stays within that buffer, so en walks past chunk_start's end. The empty-chunk special case does k--/nvi-- to compact, but that does not re-bound the read pointer."
+    },
+    {
+      "file": "corpus/train/train_0297_cwe835.c",
+      "lines": "623-648",
+      "code": "\t\t\tfor (j=0; j<AVI->track[audtr].audio_superindex->nEntriesInUse; j++) {\n\n\t\t\t\t// read from file\n\t\t\t\tchunk_start = en = (char*)gf_malloc ((u32) (AVI->track[audtr].audio_superindex->aIndex[j].dwSize+hdrl_len));\n\n\t\t\t\tif (gf_fseek(AVI->fdes, AVI->track[audtr].audio_superindex->aIndex[j].qwOffset, SEEK_SET) == (u64)-1) {\n\t\t\t\t\tgf_free(chunk_start);\n\t\t\t\t\tcontinue;\n\t\t\t\t}\n\n\t\t\t\tif (avi_read(AVI->fdes, en, (u32) (AVI->track[audtr].audio_superindex->aIndex[j].dwSize+hdrl_len)) <= 0) {\n\t\t\t\t\tgf_free(chunk_start);\n\t\t\t\t\tcontinue;\n\t\t\t\t}\n\n\t\t\t\tnrEntries = str2ulong((unsigned char*)en + 12);\n\t\t\t\t//if (nrEntries > 50) nrEntries = 2; // XXX\n#ifdef DEBUG_ODML\n\t\t\t\t//GF_LOG(GF_LOG_DEBUG, GF_LOG_CONTAINER, (\"[avilib] [%d:%d] Audio nrEntries %ld\\n\", j, audtr, nrEntries));\n#endif\n\t\t\t\toffset = str2ullong((unsigned char*)en + 20);\n\n\t\t\t\t// skip header\n\t\t\t\ten += hdrl_len;\n\t\t\t\tnai[audtr] += nrEntries;\n\t\t\t\tAVI->track[audtr].audio_index = (audio_index_entry *) gf_realloc (AVI->track[audtr].audio_index, nai[audtr] * sizeof (audio_index_entry));",
+      "explanation": "The audio OpenDML extended-index reader is the same shape as video but with a weaker allocation contract: the audio_index gf_realloc has NO null check (unlike the video path which at least calls exit(1)), and it uses the p = realloc(p, ...) anti-pattern, so on failure the old audio_index pointer is leaked and replaced with NULL, which the following k-loop then writes through."
+    },
+    {
+      "file": "corpus/train/train_0297_cwe835.c",
+      "lines": "718-736",
+      "code": "\t\twhile(1)\n\t\t{\n\t\t\tif (nvi >= AVI->total_frames) break;\n\n\t\t\tif( avi_read(AVI->fdes,data,8) != 8 ) break;\n\t\t\tn = str2ulong((unsigned char *)data+4);\n\n\n\t\t\tj=0;\n\n\t\t\tif (aud_chunks - nai[j] -1 <= 0) {\n\t\t\t\taud_chunks += AVI->total_frames;\n\t\t\t\tAVI->track[j].audio_index = (audio_index_entry *)\n\t\t\t\t                            gf_realloc( AVI->track[j].audio_index, (aud_chunks+1)*sizeof(audio_index_entry));\n\t\t\t\tif (!AVI->track[j].audio_index) {\n\t\t\t\t\tGF_LOG(GF_LOG_ERROR, GF_LOG_CONTAINER, (\"[avilib] Internal error in avilib -- no mem\\n\"));\n\t\t\t\t\tAVI_errno = AVI_ERR_NO_MEM;\n\t\t\t\t\treturn -1;\n\t\t\t\t}\n\t\t\t}",
+      "explanation": "The multiple-RIFF reconstruction loop (reached when total_frames is set but there is no idx1). It caps iterations at total_frames and reads 8-byte chunk headers. It grows track[0].audio_index in blocks of total_frames using a temporary-less realloc but does null-check it here. The video_index and audio_index arrays were pre-sized from total_frames; nvi/nai indices are bounded by the total_frames break condition and the audio realloc growth. This block is comparatively defensive."
+    },
+    {
+      "file": "corpus/train/train_0297_cwe835.c",
+      "lines": "805-857",
+      "code": "\t\tfor(i=0; i<AVI->n_idx; i++) {\n\n\t\t\t//video\n\t\t\tif(strnicmp((char *)AVI->idx[i],AVI->video_tag,3) == 0) {\n\t\t\t\tAVI->video_index[nvi].key = str2ulong(AVI->idx[i]+ 4);\n\t\t\t\tAVI->video_index[nvi].pos = str2ulong(AVI->idx[i]+ 8)+ioff;\n\t\t\t\tAVI->video_index[nvi].len = str2ulong(AVI->idx[i]+12);\n\t\t\t\tnvi++;\n\t\t\t}\n\n\t\t\t//audio\n\t\t\tfor(j=0; j<AVI->anum; ++j) {\n\n\t\t\t\tif(strnicmp((char *)AVI->idx[i],AVI->track[j].audio_tag,4) == 0) {\n\t\t\t\t\tAVI->track[j].audio_index[nai[j]].pos = str2ulong(AVI->idx[i]+ 8)+ioff;\n\t\t\t\t\tAVI->track[j].audio_index[nai[j]].len = str2ulong(AVI->idx[i]+12);\n\t\t\t\t\tAVI->track[j].audio_index[nai[j]].tot = tot[j];\n\t\t\t\t\ttot[j] += AVI->track[j].audio_index[nai[j]].len;\n\t\t\t\t\tnai[j]++;\n\t\t\t\t}\n\t\t\t}\n\t\t}",
+      "explanation": "The non-OpenDML idx1 path. It makes two passes over AVI->idx: first counting video/audio entries into nvi/nai[j] to size the arrays, then re-scanning to fill them. Because the sizing pass and the fill pass use the identical strnicmp predicate over the same idx[] data, nvi/nai here stay consistent with the allocations (this is the safe pattern). The str2ulong reads at +4/+8/+12 stay inside each 16-byte idx entry. This path is the intended, bounded index construction."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0297_cwe835.c",
+      "lines": "300-311",
+      "code": "\t\t\t\t\t\tAVI->video_superindex->aIndex = (avisuperindex_entry*)\n\t\t\t\t\t\t                                gf_malloc (AVI->video_superindex->wLongsPerEntry * AVI->video_superindex->nEntriesInUse * sizeof (u32));\n\n\t\t\t\t\t\t// position of ix## chunks\n\t\t\t\t\t\tfor (j=0; j<AVI->video_superindex->nEntriesInUse; ++j) {\n\t\t\t\t\t\t\tAVI->video_superindex->aIndex[j].qwOffset = str2ullong ((unsigned char*)a);",
+      "explanation": "wLongsPerEntry (u16) and nEntriesInUse (u32) are attacker-controlled fields read straight from hdrl. The allocation size wLongsPerEntry*nEntriesInUse*sizeof(u32) can (a) integer-overflow to a small value when nEntriesInUse is large (e.g. nEntriesInUse=0x20000000 makes the product wrap on a 32-bit size_t), and (b) be smaller than the space the entry loop needs regardless, because the loop always writes 16-byte avisuperindex_entry records nEntriesInUse times independent of wLongsPerEntry (attacker can set wLongsPerEntry < 4). Either way gf_malloc returns a buffer too small for nEntriesInUse*16 bytes and the for-loop performs a heap out-of-bounds write. The result (aIndex) is also never null-checked, so an allocation failure is a NULL write. The audio path at lines 366-372 has the identical defect. Invariant: validate wLongsPerEntry (must be 4) and bound nEntriesInUse against the actual chunk size, compute the size with overflow checking, and null-check the result before writing."
+    },
+    {
+      "file": "corpus/train/train_0297_cwe835.c",
+      "lines": "100-114",
+      "code": "\t\t\tfor(i=0; i<hdrl_len;)\n\t\t\t{\n\t\t\t\t/* List tags are completly ignored */\n\n#ifdef DEBUG_ODML\n\t\t\t\tGF_LOG(GF_LOG_DEBUG, GF_LOG_CONTAINER, (\"[avilib] TAG %c%c%c%c\\n\", (hdrl_data+i)[0], (hdrl_data+i)[1], (hdrl_data+i)[2], (hdrl_data+i)[3]));\n#endif\n\n\t\t\t\tif(strnicmp((char *)hdrl_data+i,\"LIST\",4)==0) {\n\t\t\t\t\ti+= 12;\n\t\t\t\t\tcontinue;\n\t\t\t\t}\n\n\t\t\t\tn = str2ulong(hdrl_data+i+4);\n\t\t\t\tn = PAD_EVEN(n);",
+      "explanation": "The hdrl walk's only bound is i < hdrl_len, but every access reads a fixed number of bytes AFTER i: strnicmp(hdrl_data+i, ...) touches i..i+3, str2ulong(hdrl_data+i+4) touches i+4..i+7, and the tag handlers read as far as i+44 and copy whole structs (see next steps). When i is close to hdrl_len (e.g. i == hdrl_len-2, which is reachable because i advances by attacker-chosen n), all of these read past the end of the hdrl_data heap allocation. This is a classic heap out-of-bounds read across the whole parser. Invariant: before each field/struct access the code must verify i + required_offset + required_size <= hdrl_len."
+    },
+    {
+      "file": "corpus/train/train_0297_cwe835.c",
+      "lines": "141-142",
+      "code": "\t\t\t\t\t\tmemcpy(&AVI->video_stream_header, hdrl_data + i,\n\t\t\t\t\t\t       sizeof(alAVISTREAMHEADER));",
+      "explanation": "For a 'vids' strh the code copies a full sizeof(alAVISTREAMHEADER) (an AVISTREAMHEADER is 56+ bytes) from hdrl_data+i with no check that i + sizeof(alAVISTREAMHEADER) <= hdrl_len. An attacker can place a short 'strh'/'vids' element near the end of hdrl_data so the copy reads dozens of bytes past the heap buffer into AVI->video_stream_header, an out-of-bounds read that can leak adjacent heap contents into the parsed header (and, when hdrl_data sits at the end of a page, crash). The 'auds' variant at lines 163-164 (memcpy(&AVI->stream_headers[AVI->aptr], hdrl_data + i, sizeof(alAVISTREAMHEADER))) has the same flaw. Invariant: require at least sizeof(alAVISTREAMHEADER) bytes remaining (hdrl_len - i) before copying."
+    },
+    {
+      "file": "corpus/train/train_0297_cwe835.c",
+      "lines": "195-200",
+      "code": "\t\t\t\t\t\tmemcpy(&bih, hdrl_data + i, sizeof(alBITMAPINFOHEADER));\n\t\t\t\t\t\tAVI->bitmap_info_header = (alBITMAPINFOHEADER *)\n\t\t\t\t\t\t                          gf_malloc(str2ulong((unsigned char *)&bih.bi_size));\n\t\t\t\t\t\tif (AVI->bitmap_info_header != NULL)\n\t\t\t\t\t\t\tmemcpy(AVI->bitmap_info_header, hdrl_data + i,\n\t\t\t\t\t\t\t       str2ulong((unsigned char *)&bih.bi_size));",
+      "explanation": "The video strf copies a BITMAPINFOHEADER, then allocates bi_size bytes and copies bi_size bytes from hdrl_data+i. bi_size is a fully attacker-controlled 32-bit field. The destination is sized to match, but the SOURCE read length is bi_size and is never bounded against (hdrl_len - i): a large bi_size makes memcpy read far past the end of hdrl_data (heap over-read, CWE-125), copying out-of-bounds heap memory into bitmap_info_header. A bi_size of 0 also yields gf_malloc(0). Invariant: clamp the copy length to min(bi_size, hdrl_len - i) and reject bi_size < sizeof(BITMAPINFOHEADER)."
+    },
+    {
+      "file": "corpus/train/train_0297_cwe835.c",
+      "lines": "211-216",
+      "code": "\t\t\t\t\t\tif (n>40) {\n\t\t\t\t\t\t\tif (n>0xFFFFFFFF) ERR_EXIT(AVI_ERR_READ)\n\t\t\t\t\t\t\tAVI->extradata_size = (u32) (n - 40);\n\t\t\t\t\t\t\tAVI->extradata = gf_malloc(sizeof(u8)* AVI->extradata_size);\n\t\t\t\t\t\t\tif (!AVI->extradata) ERR_EXIT(AVI_ERR_NO_MEM)\n\t\t\t\t\t\t\tmemcpy(AVI->extradata, hdrl_data + i + 40, AVI->extradata_size);\n\t\t\t\t\t\t}",
+      "explanation": "extradata_size is derived as n-40, where n is the strf element's declared size (attacker). The subtraction is guarded by n>40 so it does not underflow, and the destination is allocated to extradata_size, but the memcpy source is hdrl_data + i + 40 for extradata_size bytes with no check that i + 40 + extradata_size <= hdrl_len. Because n is the element's OWN declared size and is independent of how many bytes actually remain in hdrl_data, an attacker sets a large n on a strf element positioned near the end of hdrl_data and the memcpy over-reads the heap buffer into extradata. Invariant: bound extradata_size by (hdrl_len - i - 40)."
+    },
+    {
+      "file": "corpus/train/train_0297_cwe835.c",
+      "lines": "545-573",
+      "code": "\t\tfor (j=0; j<AVI->video_superindex->nEntriesInUse; j++) {\n\n\t\t\t// read from file\n\t\t\tchunk_start = en = (char*) gf_malloc ((u32) (AVI->video_superindex->aIndex[j].dwSize+hdrl_len) );\n\n\t\t\tif (gf_fseek(AVI->fdes, AVI->video_superindex->aIndex[j].qwOffset, SEEK_SET) == (u64)-1) {\n\t\t\t\tgf_free(chunk_start);\n\t\t\t\tcontinue;\n\t\t\t}\n\n\t\t\tif (avi_read(AVI->fdes, en, (u32) (AVI->video_superindex->aIndex[j].dwSize+hdrl_len) ) <= 0) {\n\t\t\t\tgf_free(chunk_start);\n\t\t\t\tcontinue;\n\t\t\t}\n\n\t\t\tnrEntries = str2ulong((unsigned char*)en + 12);",
+      "explanation": "In the OpenDML phase, dwSize is attacker-controlled and the allocation dwSize+hdrl_len (hdrl_len==38 here) is cast to (u32): dwSize == 0xFFFFFFDA makes dwSize+38 wrap to a tiny value, so gf_malloc returns a small buffer while avi_read is asked to read the same (wrapped-small) count. More damagingly, nrEntries is read from the chunk and used at lines 575-599 to iterate en in 8-byte steps with NO bound against the dwSize+38 buffer, so the k-loop reads far past the mapped chunk (heap over-read). gf_malloc's return is also not null-checked before en is dereferenced. Invariant: compute the allocation with overflow checking, null-check en, and bound nrEntries by (bytes_read - 38)/8."
+    },
+    {
+      "file": "corpus/train/train_0297_cwe835.c",
+      "lines": "568-573",
+      "code": "\t\t\tnvi += nrEntries;\n\t\t\tAVI->video_index = (video_index_entry *) gf_realloc (AVI->video_index, nvi * sizeof (video_index_entry));\n\t\t\tif (!AVI->video_index) {\n\t\t\t\tGF_LOG(GF_LOG_ERROR, GF_LOG_CONTAINER, (\"[avilib] out of mem (size = %ld)\\n\", nvi * sizeof (video_index_entry)));\n\t\t\t\texit(1);\n\t\t\t}",
+      "explanation": "nvi is the running sum of attacker nrEntries values, and the reallocation size nvi * sizeof(video_index_entry) is an unchecked multiplication. A large nrEntries (or the accumulation across many super-index entries) overflows the size computation, producing an under-sized video_index while the subsequent while(k<nvi) loop writes nvi entries into it (heap out-of-bounds write). Even absent overflow, exit(1) on realloc failure is a denial-of-service: an attacker file can force process termination in a library routine. Invariant: check nrEntries and nvi against a sane bound and use overflow-checked size arithmetic; do not exit() from a parser."
+    },
+    {
+      "file": "corpus/train/train_0297_cwe835.c",
+      "lines": "341-342",
+      "code": "\t\t\t\t\t\tAVI->track[AVI->aptr].audio_superindex = (avisuperindex_chunk *) gf_malloc (sizeof (avisuperindex_chunk));\n\t\t\t\t\t\tmemcpy (AVI->track[AVI->aptr].audio_superindex->fcc, a, 4);",
+      "explanation": "The audio super-index allocation result is dereferenced immediately by memcpy(...->fcc, a, 4) with no NULL check (and, unlike the video path at line 275, no memset). If gf_malloc fails under memory pressure (which an attacker can induce via the earlier huge, attacker-sized allocations) this is a NULL-pointer write / crash. The same missing null-check applies to the audio_index gf_realloc at line 648, which additionally uses the leak-prone p = realloc(p, n) form. Invariant: check every gf_malloc/gf_realloc return before use and assign realloc results to a temporary."
+    },
+    {
+      "file": "corpus/train/train_0297_cwe835.c",
+      "lines": "148-154",
+      "code": "\t\t\t\t\t\tAVI->aptr=AVI->anum;\n\t\t\t\t\t\t++AVI->anum;\n\n\t\t\t\t\t\tif(AVI->anum > AVI_MAX_TRACKS) {\n\t\t\t\t\t\t\tGF_LOG(GF_LOG_ERROR, GF_LOG_CONTAINER, (\"[avilib] error - only %d audio tracks supported\\n\", AVI_MAX_TRACKS));\n\t\t\t\t\t\t\treturn(-1);\n\t\t\t\t\t\t}",
+      "explanation": "aptr indexes fixed-size arrays (AVI->track[], AVI->stream_headers[], AVI->wave_format_ex[], and the local nai[]/tot[] of size AVI_MAX_TRACKS). The guard uses '>' rather than '>=' and, more importantly, auds_strh_seen is never set (the assignment at line 166 is commented out), so an attacker can supply many 'auds' strh elements. On the iteration where anum becomes AVI_MAX_TRACKS the guard (anum > AVI_MAX_TRACKS) is false, so aptr == AVI_MAX_TRACKS-1 is still in range; the return at line 153 fires the iteration AFTER, before track[aptr] is used, so the immediate strh write stays in bounds. However, downstream OpenDML loops iterate audtr over AVI->anum (lines 536, 616) and index nai[audtr]/tot[audtr] which are only AVI_MAX_TRACKS wide — confirm anum can never exceed AVI_MAX_TRACKS at those sites. Invariant: bound anum before it is used to index any AVI_MAX_TRACKS-sized array, and reject rather than merely return so partial state is consistent."
+    },
+    {
+      "file": "corpus/train/train_0297_cwe835.c",
+      "lines": "82-89",
+      "code": "\t\t\tAVI->n_idx = AVI->max_idx = (u32) (n/16);\n\t\t\tAVI->idx = (unsigned  char((*)[16]) ) gf_malloc((u32)n);\n\t\t\tif(AVI->idx==0) ERR_EXIT(AVI_ERR_NO_MEM)\n\t\t\t\tif(avi_read(AVI->fdes, (char *) AVI->idx, (u32) n) != n ) {\n\t\t\t\t\tgf_free( AVI->idx);\n\t\t\t\t\tAVI->idx=NULL;\n\t\t\t\t\tAVI->n_idx = 0;\n\t\t\t\t}",
+      "explanation": "n_idx is set to n/16 and idx is allocated n bytes, but the source comment itself admits n need not be a multiple of 16. If n is not a multiple of 16 the buffer is n bytes while n_idx entries each 16 bytes span n_idx*16 <= n bytes, so entry reads stay inside — the truncation is benign here. The real concern is the interaction with the idx-scanning loops (lines 457-478, 805-857) that dereference AVI->idx[i] and read str2ulong(AVI->idx[i]+8/+12): those rely on n_idx being consistent with the allocation, which holds. Also note the (u32) casts silently truncate a >4GB n. Invariant: n must be validated as a positive multiple of 16 and consistent with the allocation before n_idx-driven iteration."
+    }
+  ],
+  "summary": "This is GPAC avilib's avi_parse_input_file(), an AVI/RIFF demuxer that parses a fully attacker-controlled file. The oldpos==newpos guard (lines 44-47) neutralises the labeled CWE-835 top-level infinite loop, but the routine remains riddled with latent memory-safety defects: the entire hdrl walk performs fixed-offset reads and whole-struct memcpys into/out of the heap buffer hdrl_data with no bound against hdrl_len (heap over-reads), the OpenDML super-index allocation multiplies two attacker fields (wLongsPerEntry*nEntriesInUse*sizeof(u32)) without overflow or size validation and then writes nEntriesInUse 16-byte entries into it (heap over-write), and the OpenDML extended-index reader trusts attacker nrEntries/dwSize for both allocation sizes and loop bounds. Several allocations are also used without NULL checks. High-to-critical remote memory corruption from a crafted AVI file.",
+  "reviewed_anchors": [
+    {"anchor": "char data[256] (line 18)", "disposition": "dismissed", "reason": "Fixed 256-byte scratch buffer only ever filled by avi_read(...,8/12) and small strnicmp reads; no length-driven copy exceeds it."},
+    {"anchor": "nai[AVI_MAX_TRACKS], tot[AVI_MAX_TRACKS] (lines 9-10)", "disposition": "finding", "reason": "Indexed by audtr/j up to AVI->anum in OpenDML loops; safety depends on anum <= AVI_MAX_TRACKS (see anum guard finding)."},
+    {"anchor": "RIFF/AVI magic check (line 31)", "disposition": "dismissed", "reason": "Only structural gate; correctly compares the two required FourCCs, no byte-order issue (ASCII tags)."},
+    {"anchor": "while(1) top-level chunk loop + oldpos==newpos guard (lines 40-48)", "disposition": "dismissed", "reason": "The oldpos==newpos check is exactly the CWE-835 infinite-loop fix; the loop provably advances or bails."},
+    {"anchor": "n = str2ulong(data+4); PAD_EVEN(n) (lines 50-51)", "disposition": "dismissed", "reason": "Attacker size, but here it only drives gf_fseek/allocation that are separately covered; no direct copy at this line."},
+    {"anchor": "hdrl_data = gf_malloc((u32)n); avi_read n bytes (lines 61-68)", "disposition": "dismissed", "reason": "Allocation and read lengths match and n is capped at 0xFFFFFFFF and null-checked; the danger is downstream unbounded indexing, filed separately."},
+    {"anchor": "AVI->idx malloc / n_idx = n/16 (lines 82-89)", "disposition": "finding", "reason": "n_idx derived from attacker n; consistency of n_idx vs allocation and multiple-of-16 assumption worth confirming."},
+    {"anchor": "for(i=0; i<hdrl_len;) hdrl walk (line 100)", "disposition": "finding", "reason": "Loop bound only checks i<hdrl_len while every access reads bytes after i without a remaining-length check: heap over-read."},
+    {"anchor": "LIST skip i+=12 (lines 108-110)", "disposition": "dismissed", "reason": "Advances the cursor by a fixed 12; contributes to progress, not itself a memory-safety bug beyond the general over-read."},
+    {"anchor": "memcpy(&AVI->video_stream_header, hdrl_data+i, sizeof(alAVISTREAMHEADER)) (lines 141-142)", "disposition": "finding", "reason": "Whole-struct copy from hdrl_data+i with no bound on hdrl_len - i: heap over-read."},
+    {"anchor": "AVI->anum guard '>' AVI_MAX_TRACKS (line 151); auds_strh_seen never set (line 166)", "disposition": "finding", "reason": "Off-by-one-shaped guard plus un-set once-flag; must confirm anum can never index past AVI_MAX_TRACKS arrays downstream."},
+    {"anchor": "memcpy(&AVI->stream_headers[AVI->aptr], hdrl_data+i, sizeof(alAVISTREAMHEADER)) (lines 163-164)", "disposition": "finding", "reason": "Same unbounded whole-struct over-read as the video variant (covered by the strh over-read finding)."},
+    {"anchor": "bih copy + gf_malloc(bi_size) + memcpy(bi_size) (lines 195-200)", "disposition": "finding", "reason": "Copy length bi_size is attacker-controlled and unbounded against hdrl_len - i: heap over-read."},
+    {"anchor": "extradata: n-40, gf_malloc, memcpy(hdrl_data+i+40, extradata_size) (lines 211-216)", "disposition": "finding", "reason": "Source read of extradata_size bytes not bounded against hdrl_len - i - 40: heap over-read."},
+    {"anchor": "alWAVEFORMATEX wfes clamp + realloc (lines 226-249)", "disposition": "dismissed", "reason": "wfes is clamped to min(hdrl_len - i, sizeof(alWAVEFORMATEX)); realloc uses a temporary and is null-checked; cb_size read is from file and u16-bounded."},
+    {"anchor": "AVI->video_superindex->aIndex = gf_malloc(wLongsPerEntry*nEntriesInUse*sizeof(u32)) (lines 300-301)", "disposition": "finding", "reason": "Attacker product with no overflow/size validation and no null check, then nEntriesInUse 16-byte writes: heap over-write."},
+    {"anchor": "video super-index entry loop reading cursor a (lines 304-311)", "disposition": "finding", "reason": "Reads 16 bytes/entry from hdrl cursor a for nEntriesInUse iterations with no bound: heap over-read (paired with the aIndex over-write finding)."},
+    {"anchor": "audio_superindex gf_malloc + immediate memcpy, no null/memset (lines 341-342)", "disposition": "finding", "reason": "Allocation dereferenced without null check; possible NULL write."},
+    {"anchor": "audio super-index aIndex gf_malloc (lines 366-368)", "disposition": "finding", "reason": "Identical attacker-product allocation defect as the video aIndex (same finding class)."},
+    {"anchor": "i += (u32) n tail advance (line 414)", "disposition": "dismissed", "reason": "Ensures forward progress (>= 8 bytes/element); does not itself corrupt memory beyond the covered over-reads."},
+    {"anchor": "OpenDML video: gf_malloc(dwSize+hdrl_len), avi_read, nrEntries (lines 548-560)", "disposition": "finding", "reason": "dwSize+38 (u32) can wrap; nrEntries unbounded loop bound; no null check: heap over-read."},
+    {"anchor": "nvi += nrEntries; gf_realloc(nvi*sizeof); exit(1) (lines 568-573)", "disposition": "finding", "reason": "Unchecked size multiplication -> under-sized video_index over-write; exit(1) is a DoS."},
+    {"anchor": "OpenDML video k-loop en += 8 (lines 575-600)", "disposition": "finding", "reason": "Iterates nvi entries reading en past the dwSize+38 buffer (covered by the OpenDML over-read finding)."},
+    {"anchor": "OpenDML audio: gf_realloc audio_index no null check (line 648)", "disposition": "finding", "reason": "Missing null check + p=realloc(p) leak pattern; NULL write on failure (covered by the null-check finding)."},
+    {"anchor": "multiple_riff while(1) loop (lines 718-782)", "disposition": "dismissed", "reason": "Bounded by nvi>=total_frames and EOF break; audio_index growth is null-checked; arrays pre-sized from total_frames."},
+    {"anchor": "idx1 two-pass fill (lines 805-857)", "disposition": "dismissed", "reason": "Sizing and fill passes use identical predicates over the same idx[] data, so counters match allocations; reads stay within 16-byte entries."},
+    {"anchor": "video_tag/audio_tag construction (lines 421-438)", "disposition": "dismissed", "reason": "Writes 4 fixed bytes into fixed 4+ byte tag arrays from small integer arithmetic; no attacker length."}
+  ],
+  "findings": [
+    {
+      "title": "OpenDML super-index aIndex allocation: attacker size product -> heap out-of-bounds write",
+      "anchor": "AVI->video_superindex->aIndex = gf_malloc (wLongsPerEntry * nEntriesInUse * sizeof(u32)); for(j..nEntriesInUse) writes 16-byte entries",
+      "file": "corpus/train/train_0297_cwe835.c",
+      "line": "300-311",
+      "code": "AVI->video_superindex->aIndex = (avisuperindex_entry*)\n                                gf_malloc (AVI->video_superindex->wLongsPerEntry * AVI->video_superindex->nEntriesInUse * sizeof (u32));\n\n// position of ix## chunks\nfor (j=0; j<AVI->video_superindex->nEntriesInUse; ++j) {\n\tAVI->video_superindex->aIndex[j].qwOffset = str2ullong ((unsigned char*)a);",
+      "bug_class": "Heap buffer overflow via integer overflow / undersized allocation",
+      "cwe": "CWE-787",
+      "severity": "critical",
+      "where_it_lives": "corpus/train/train_0297_cwe835.c (this function)",
+      "invariant": "The aIndex allocation must hold nEntriesInUse * sizeof(avisuperindex_entry) (16) bytes; wLongsPerEntry must equal 4 and nEntriesInUse must be bounded by the chunk's actual size, with overflow-checked multiplication and a NULL check before any write.",
+      "failure_mode": "wLongsPerEntry (u16) and nEntriesInUse (u32) are read verbatim from the hdrl 'indx' chunk. The size wLongsPerEntry*nEntriesInUse*4 can wrap on a 32-bit size_t for large nEntriesInUse, or simply be too small when wLongsPerEntry<4, while the following loop unconditionally writes nEntriesInUse fixed 16-byte avisuperindex_entry records. This yields a controlled heap out-of-bounds write from a crafted AVI. The audio path at lines 366-372 is identical. The result is also never null-checked.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm no caller clamps nEntriesInUse/wLongsPerEntry before this, that avisuperindex_entry is 16 bytes, and that gf_malloc does not internally overflow-check; then verify the loop bound equals the allocation basis."
+    },
+    {
+      "title": "hdrl header-list walk performs unbounded fixed-offset reads and whole-struct memcpys (heap over-read)",
+      "anchor": "for(i=0; i<hdrl_len;) with str2ulong(hdrl_data+i+4) and memcpy(..., hdrl_data+i, sizeof(struct))",
+      "file": "corpus/train/train_0297_cwe835.c",
+      "line": "100-142",
+      "code": "for(i=0; i<hdrl_len;)\n{\n...\n\tn = str2ulong(hdrl_data+i+4);\n...\n\t\tmemcpy(&AVI->video_stream_header, hdrl_data + i,\n\t\t       sizeof(alAVISTREAMHEADER));",
+      "bug_class": "Heap out-of-bounds read (missing remaining-length bound)",
+      "cwe": "CWE-125",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0297_cwe835.c (this function)",
+      "invariant": "Every access of the form hdrl_data + i + off (and every memcpy of size S from hdrl_data + i) must first verify i + off + field_size <= hdrl_len (respectively i + S <= hdrl_len).",
+      "failure_mode": "hdrl_data is a heap buffer of exactly hdrl_len attacker bytes. The loop guard only checks i<hdrl_len, yet it reads the size at hdrl_data+i+4, sub-fields as far as hdrl_data+i+44, and copies whole alAVISTREAMHEADER/alBITMAPINFOHEADER structs from hdrl_data+i. By placing a short element near the end of hdrl_data the attacker makes these reads run past the allocation, leaking adjacent heap bytes into parsed header state or crashing at a page boundary.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm there is no outer guarantee that hdrl elements are self-length-checked; verify sizeof(alAVISTREAMHEADER)/alBITMAPINFOHEADER exceed the minimum spacing the attacker must leave, making over-read reachable."
+    },
+    {
+      "title": "Video strf bi_size / extradata copies read attacker length from hdrl without remaining bound",
+      "anchor": "gf_malloc(str2ulong(&bih.bi_size)) + memcpy(bi_size); memcpy(AVI->extradata, hdrl_data+i+40, extradata_size)",
+      "file": "corpus/train/train_0297_cwe835.c",
+      "line": "196-216",
+      "code": "AVI->bitmap_info_header = (alBITMAPINFOHEADER *)\n                          gf_malloc(str2ulong((unsigned char *)&bih.bi_size));\nif (AVI->bitmap_info_header != NULL)\n\tmemcpy(AVI->bitmap_info_header, hdrl_data + i,\n\t       str2ulong((unsigned char *)&bih.bi_size));\n...\n\tAVI->extradata_size = (u32) (n - 40);\n\tAVI->extradata = gf_malloc(sizeof(u8)* AVI->extradata_size);\n\tif (!AVI->extradata) ERR_EXIT(AVI_ERR_NO_MEM)\n\tmemcpy(AVI->extradata, hdrl_data + i + 40, AVI->extradata_size);",
+      "bug_class": "Heap out-of-bounds read (attacker-controlled copy length)",
+      "cwe": "CWE-125",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0297_cwe835.c (this function)",
+      "invariant": "Source copy lengths (bi_size and extradata_size=n-40) must be clamped to the bytes actually remaining in hdrl_data, i.e. <= hdrl_len - i (and hdrl_len - i - 40 for extradata).",
+      "failure_mode": "bi_size and the element size n are attacker fields independent of the real remaining hdrl length. The destination buffers are sized to match the declared length, but the memcpy SOURCE (hdrl_data+i / hdrl_data+i+40) is only hdrl_len bytes long. A large declared size on a strf element positioned near the end of hdrl_data over-reads the heap into bitmap_info_header/extradata, leaking heap contents or crashing.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm n and bi_size are not validated against hdrl_len-i earlier; check whether extradata/bitmap_info_header are later exposed to the caller (information disclosure surface)."
+    },
+    {
+      "title": "OpenDML extended-index: attacker dwSize/nrEntries drive allocation size and loop bound (over-read + over-write)",
+      "anchor": "gf_malloc(dwSize+hdrl_len); nrEntries=str2ulong(en+12); nvi+=nrEntries; while(k<nvi) en+=8",
+      "file": "corpus/train/train_0297_cwe835.c",
+      "line": "548-600",
+      "code": "chunk_start = en = (char*) gf_malloc ((u32) (AVI->video_superindex->aIndex[j].dwSize+hdrl_len) );\n...\nnrEntries = str2ulong((unsigned char*)en + 12);\n...\nnvi += nrEntries;\nAVI->video_index = (video_index_entry *) gf_realloc (AVI->video_index, nvi * sizeof (video_index_entry));\n...\nwhile (k < nvi) {\n\tAVI->video_index[k].pos = offset + str2ulong((unsigned char*)en);\n\ten += 4;",
+      "bug_class": "Heap out-of-bounds read/write via integer overflow and unbounded count",
+      "cwe": "CWE-190",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0297_cwe835.c (this function)",
+      "invariant": "dwSize+hdrl_len and nvi*sizeof(video_index_entry) must be computed without wrap and null-checked; nrEntries must be bounded by (bytes actually read - 38)/8 so en never advances past the mapped chunk.",
+      "failure_mode": "dwSize is attacker-controlled: (u32)(dwSize+38) can wrap to a tiny allocation while avi_read/loop expect the full size. nrEntries (read from the mapped chunk) is unbounded, so nvi grows arbitrarily and (a) nvi*sizeof(video_index_entry) can overflow to an undersized video_index that the k-loop over-writes, and (b) the k-loop reads en in 8-byte steps far past the dwSize+38 buffer. gf_malloc is also unchecked before deref, and realloc failure calls exit(1) (DoS).",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm dwSize/nrEntries are unvalidated at this point and that avi_read's short-read (<=0) is the only guard; verify video_index_entry size to bound the overflow threshold."
+    },
+    {
+      "title": "Unchecked allocations in super-index/extended-index paths (NULL dereference / DoS)",
+      "anchor": "audio_superindex gf_malloc then immediate memcpy; audio_index gf_realloc without null check; aIndex gf_malloc without null check",
+      "file": "corpus/train/train_0297_cwe835.c",
+      "line": "341-342",
+      "code": "AVI->track[AVI->aptr].audio_superindex = (avisuperindex_chunk *) gf_malloc (sizeof (avisuperindex_chunk));\nmemcpy (AVI->track[AVI->aptr].audio_superindex->fcc, a, 4);",
+      "bug_class": "NULL pointer dereference (unchecked allocation return)",
+      "cwe": "CWE-476",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0297_cwe835.c (this function)",
+      "invariant": "Every gf_malloc/gf_realloc result must be NULL-checked before being written through, and realloc results must be captured in a temporary to avoid losing the original pointer on failure.",
+      "failure_mode": "The audio_superindex allocation (line 341) is memcpy'd into immediately with no NULL check or memset (the video path memset's at line 275). The video/audio aIndex allocations (lines 300, 366) and the audio_index gf_realloc (line 648, p=realloc(p,...)) are likewise unchecked. Under memory pressure - readily induced via the earlier attacker-sized huge allocations - these return NULL and the code writes through it, crashing the process; the realloc form additionally leaks the prior buffer.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm gf_malloc/gf_realloc return NULL (not abort) on failure; then confirm none of these sites recheck before the first dereference."
+    },
+    {
+      "title": "Audio track count guard uses '>' and never sets the once-flag",
+      "anchor": "AVI->aptr=AVI->anum; ++AVI->anum; if(AVI->anum > AVI_MAX_TRACKS) return(-1); (auds_strh_seen assignment commented out)",
+      "file": "corpus/train/train_0297_cwe835.c",
+      "line": "148-166",
+      "code": "AVI->aptr=AVI->anum;\n++AVI->anum;\n\nif(AVI->anum > AVI_MAX_TRACKS) {\n\tGF_LOG(GF_LOG_ERROR, GF_LOG_CONTAINER, (\"[avilib] error - only %d audio tracks supported\\n\", AVI_MAX_TRACKS));\n\treturn(-1);\n}",
+      "bug_class": "Improper array-index validation (off-by-one shaped bound)",
+      "cwe": "CWE-20",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0297_cwe835.c (this function)",
+      "invariant": "AVI->anum must never exceed AVI_MAX_TRACKS at any site that indexes an AVI_MAX_TRACKS-sized array (track[], stream_headers[], wave_format_ex[], nai[], tot[]).",
+      "failure_mode": "Because auds_strh_seen is never set (line 166 commented out), repeated 'auds' strh elements each allocate a new track slot. The guard rejects only when anum > AVI_MAX_TRACKS, so anum can reach exactly AVI_MAX_TRACKS. The immediate strh writes at aptr stay in bounds (return fires before an out-of-range aptr is used), but the OpenDML loops iterate audtr over AVI->anum and index nai[audtr]/tot[audtr]/track[audtr]; those must be confirmed safe when anum == AVI_MAX_TRACKS.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the declared size of track[]/stream_headers[]/nai[]/tot[] versus AVI_MAX_TRACKS and whether any indexed access uses anum (not anum-1); decide if the guard should be '>='."
+    },
+    {
+      "title": "idx1 count derived from attacker size without multiple-of-16 validation",
+      "anchor": "AVI->n_idx = AVI->max_idx = (u32)(n/16); AVI->idx = gf_malloc((u32)n);",
+      "file": "corpus/train/train_0297_cwe835.c",
+      "line": "82-89",
+      "code": "AVI->n_idx = AVI->max_idx = (u32) (n/16);\nAVI->idx = (unsigned  char((*)[16]) ) gf_malloc((u32)n);\nif(AVI->idx==0) ERR_EXIT(AVI_ERR_NO_MEM)\n\tif(avi_read(AVI->fdes, (char *) AVI->idx, (u32) n) != n ) {",
+      "bug_class": "Improper input validation / silent truncation",
+      "cwe": "CWE-20",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0297_cwe835.c (this function)",
+      "invariant": "n_idx*16 must never exceed the idx allocation, and (u32) casts of a 64-bit n must not truncate the size used for allocation versus reading.",
+      "failure_mode": "The in-code comment concedes n need not be a multiple of 16. n_idx=n/16 keeps n_idx*16 <= n so per-entry reads (str2ulong(idx[i]+8/+12)) stay in bounds, making this benign in isolation; the residual risk is the (u32) truncation of a >4GB n (allocation vs read length) and reliance on n_idx staying consistent with the buffer at all later idx-scanning loops.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm n is bounded before the (u32) casts and that every AVI->idx[i] access site uses n_idx as the bound."
+    }
+  ],
+  "audit_checklist": [
+    "In the OpenDML indx handler, verify wLongsPerEntry==4 and bound nEntriesInUse against the chunk size, and compute wLongsPerEntry*nEntriesInUse*sizeof(u32) with overflow checking and a NULL check before the entry loop (both video line 300 and audio line 366).",
+    "Add a remaining-length guard (i + offset + size <= hdrl_len) before every hdrl_data+i access in the header walk, especially the sizeof(alAVISTREAMHEADER) memcpys at lines 141 and 163.",
+    "Clamp the strf copy lengths bi_size (lines 197-200) and extradata_size=n-40 (line 216) to hdrl_len - i (minus 40) so the memcpy source cannot over-read hdrl_data.",
+    "In the OpenDML extended-index reader, compute dwSize+hdrl_len and nvi*sizeof(video_index_entry) without wrap, null-check the gf_malloc at line 548, bound nrEntries by the bytes actually read, and replace exit(1) with graceful error handling.",
+    "NULL-check every gf_malloc/gf_realloc return before dereference (audio_superindex line 341, aIndex lines 300/366, audio_index realloc line 648) and capture realloc results in a temporary.",
+    "Confirm AVI->anum can never reach a value that indexes past AVI_MAX_TRACKS in track[]/stream_headers[]/wave_format_ex[]/nai[]/tot[]; consider changing the guard at line 151 to '>=' and restoring a once-flag for auds strh.",
+    "Validate the idx1 size n as a positive multiple of 16 and ensure the (u32) casts at lines 82-85 do not truncate a >4GB size differently for allocation vs read.",
+    "Confirm the oldpos==newpos guard (lines 44-47) is the only progress guarantee for the top-level loop and that no inner loop (hdrl walk, OpenDML k-loop, multiple_riff loop) can spin without advancing the file/cursor."
+  ]
+}

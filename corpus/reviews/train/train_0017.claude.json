@@ -1,0 +1,244 @@
+{
+  "subsystem": "Exiv2 image-metadata library: Image::printIFDStructure(), the recursive walker that parses and pretty-prints the TIFF/EXIF Image File Directory (IFD) structure of an image file. It seeks through a BasicIo stream, reads 2-byte directory-entry counts and 12-byte IFD entries, decodes tag/type/count/offset fields with byte-swap helpers, follows pointer offsets to read out-of-line values, and recurses into sub-IFDs (Exif, SubIFDs, MakerNote, IPTC). It processes fully attacker-controlled image files.",
+  "provenance": "Identified from the fully-qualified method name Image::printIFDStructure and the Exiv2-specific types/enums: Exiv2::PrintStructureOption, kpsBasic/kpsRecursive, DataBuf, BasicIo, byteSwap2/byteSwap4, Error(kerCorruptedMetadata/kerTiffDirectoryTooLarge/kerInvalidTypeValue/kerInvalidMalloc), Internal::indent/stringFormat, IptcData::printStructure, Safe::add, makeSlice/makeSliceUntil, tiffIfd, and the TIFF tag constants 0x8769 (ExifTag), 0x014a (SubIFDs), 0x83bb (IPTCNAA), 0x927c (MakerNote). The sample header 'primevul_train_2877_fixed' and file name cwe835.cpp indicate this is the patched variant of the well-known Exiv2 printIFDStructure image parser.",
+  "trust_boundary": "The entire input is untrusted: every byte read via io.seek()/io.read() comes from an image file supplied by an attacker (uploaded, emailed, embedded in a document, or crawled). All of the following are hostile and fully attacker-chosen: the 16-bit dirLength (line 19), the per-entry tag/type/count/offset fields (lines 39-42), the pointer offset that out-of-line values live at (lines 42, 82, 124, 128, 135, 149), and the 32-bit next-IFD pointer that continues the do-loop (line 179). The only server-side trust is that BasicIo bounds each individual read to the file; it does NOT bound recursion depth, loop iteration count, or offset cycles.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0017_cwe835.cpp",
+      "lines": "2-5",
+      "code": "    void Image::printIFDStructure(BasicIo& io, std::ostream& out, Exiv2::PrintStructureOption option,uint32_t start,bool bSwap,char c,int depth)\n    {\n        depth++;\n        bool bFirst  = true  ;",
+      "explanation": "The function signature. `io` is the untrusted image stream; `out` is the text sink for the human-readable dump; `option` selects the verbosity (kpsBasic/kpsRecursive/etc.); `start` is the absolute file offset of the IFD to parse and is attacker-controlled on every recursive call; `bSwap` selects endianness; `c` is a cosmetic character used only in header formatting; `depth` is the current recursion/indent level. Line 4 increments `depth` on entry (and line 187 decrements it on exit) so nested IFDs print indented. Critically, `depth` is used ONLY for indentation — it is never compared against any maximum, so it provides no recursion limit. `bFirst` gates one-time header lines within the directory loop."
+    },
+    {
+      "file": "corpus/train/train_0017_cwe835.cpp",
+      "lines": "7-10",
+      "code": "        // buffer\n        const size_t dirSize = 32;\n        DataBuf  dir(dirSize);\n        bool bPrint = option == kpsBasic || option == kpsRecursive;",
+      "explanation": "A fixed 32-byte scratch buffer `dir` is allocated to hold one directory header (2 bytes) or one directory entry (12 bytes) at a time. 32 comfortably exceeds the 12-byte entry, so reads into `dir` are structurally safe. `bPrint` records whether this invocation should emit output at all; recursion still occurs even when printing is off, because the recursion is driven by `option == kpsRecursive`, not by `bPrint`."
+    },
+    {
+      "file": "corpus/train/train_0017_cwe835.cpp",
+      "lines": "12-19",
+      "code": "        do {\n            // Read top of directory\n            const int seekSuccess = !io.seek(start,BasicIo::beg);\n            const long bytesRead = io.read(dir.pData_, 2);\n            if (!seekSuccess || bytesRead == 0) {\n                throw Error(kerCorruptedMetadata);\n            }\n            uint16_t   dirLength = byteSwap2(dir,0,bSwap);",
+      "explanation": "The outer do/while begins. It seeks to `start` and reads 2 bytes into `dir`, which are byte-swapped into `dirLength` — the number of entries in this IFD, a 16-bit value fully controlled by the file (max 65535). If the seek fails or nothing is read, it throws. This is the top of the directory: `dirLength` decides how many 12-byte entries the inner loop will process."
+    },
+    {
+      "file": "corpus/train/train_0017_cwe835.cpp",
+      "lines": "21-27",
+      "code": "            bool tooBig = dirLength > 500;\n            if ( tooBig ) throw Error(kerTiffDirectoryTooLarge);\n\n            if ( bFirst && bPrint ) {\n                out << Internal::indent(depth) << Internal::stringFormat(\"STRUCTURE OF TIFF FILE (%c%c): \",c,c) << io.path() << std::endl;\n                if ( tooBig ) out << Internal::indent(depth) << \"dirLength = \" << dirLength << std::endl;\n            }",
+      "explanation": "`dirLength` is capped at 500; a larger directory throws kerTiffDirectoryTooLarge. This bounds the inner loop to at most 500 iterations per IFD, which is a real mitigation against a single oversized directory. On the first pass, when printing is enabled, it emits the file-level header line. Note the cap applies per-IFD only — it does nothing to bound how many IFDs are chained (do-while) or how deep recursion goes."
+    },
+    {
+      "file": "corpus/train/train_0017_cwe835.cpp",
+      "lines": "29-42",
+      "code": "            // Read the dictionary\n            for ( int i = 0 ; i < dirLength ; i ++ ) {\n                if ( bFirst && bPrint ) {\n                    out << Internal::indent(depth)\n                        << \" address |    tag                              |     \"\n                        << \" type |    count |    offset | value\\n\";\n                }\n                bFirst = false;\n\n                io.read(dir.pData_, 12);\n                uint16_t tag    = byteSwap2(dir,0,bSwap);\n                uint16_t type   = byteSwap2(dir,2,bSwap);\n                uint32_t count  = byteSwap4(dir,4,bSwap);\n                uint32_t offset = byteSwap4(dir,8,bSwap);",
+      "explanation": "The inner loop iterates once per directory entry. Each entry is 12 bytes read into `dir` (safe: 12 < 32). The 12 bytes are decoded into the standard TIFF IFD-entry fields: `tag` (2 bytes), `type` (2 bytes), `count` (4 bytes, number of components), and `offset` (4 bytes — either an inline value or a file pointer). `count` and `offset` are 32-bit and fully attacker-controlled; they drive every subsequent allocation, copy length, loop bound, and recursion target."
+    },
+    {
+      "file": "corpus/train/train_0017_cwe835.cpp",
+      "lines": "44-49",
+      "code": "                // Break for unknown tag types else we may segfault.\n                if ( !typeValid(type) ) {\n                    std::cerr << \"invalid type value detected in Image::printIFDStructure:  \" << type << std::endl;\n                    start = 0; // break from do loop\n                    throw Error(kerInvalidTypeValue);\n                }",
+      "explanation": "The entry `type` is validated; an unrecognized type logs to stderr and throws kerInvalidTypeValue. This gate ensures the later size-by-type logic (lines 61-66) sees a known type, avoiding an undefined element size. `start = 0` is set but immediately followed by a throw, so it is dead here — the throw unwinds the loop regardless."
+    },
+    {
+      "file": "corpus/train/train_0017_cwe835.cpp",
+      "lines": "51-66",
+      "code": "                std::string sp  = \"\" ; // output spacer\n\n                //prepare to print the value\n                uint32_t kount  = isPrintXMP(tag,option) ? count // haul in all the data\n                                : isPrintICC(tag,option) ? count // ditto\n                                : isStringType(type)     ? (count > 32 ? 32 : count) // restrict long arrays\n                                : count > 5              ? 5\n                                : count\n                                ;\n                uint32_t pad    = isStringType(type) ? 1 : 0;\n                uint32_t size   = isStringType(type) ? 1\n                                : is2ByteType(type)  ? 2\n                                : is4ByteType(type)  ? 4\n                                : is8ByteType(type)  ? 8\n                                : 1\n                                ;",
+      "explanation": "`kount` is how many components to PRINT: for XMP/ICC tags it keeps the full `count`, for string types it clamps to 32, otherwise to 5 — this limits the display loops but NOT the allocation. `pad` reserves a trailing NUL byte for string types. `size` is the per-component byte width derived from the type (1/2/4/8), defaulting to 1. `size` and `count` together define how many bytes an entry's value occupies. Because `typeValid` passed, `size` is well-defined and at least 1."
+    },
+    {
+      "file": "corpus/train/train_0017_cwe835.cpp",
+      "lines": "68-77",
+      "code": "                // if ( offset > io.size() ) offset = 0; // Denial of service?\n\n                // #55 and #56 memory allocation crash test/data/POC8\n                long long allocate = (long long) size*count + pad+20;\n                if ( allocate > (long long) io.size() ) {\n                    throw Error(kerInvalidMalloc);\n                }\n                DataBuf  buf((long)allocate);  // allocate a buffer\n                std::memset(buf.pData_, 0, buf.size_);\n                std::memcpy(buf.pData_,dir.pData_+8,4);  // copy dir[8:11] into buffer (short strings)",
+      "explanation": "This is the patch's central guard. `allocate` is computed in 64-bit (`(long long) size*count`) as the byte size needed for the value plus padding and 20 slack bytes, then rejected if it exceeds the actual file size io.size(). Because a value cannot be larger than the file it lives in, this caps `size*count` and therefore the buffer and any read into it — this is the fix for the historical integer-overflow/over-read. `buf` is allocated at `(long)allocate`, zero-filled, and the inline 4 bytes from the entry (dir offset 8-11, the `offset` field bytes) are pre-copied so short inline values print without a file read."
+    },
+    {
+      "file": "corpus/train/train_0017_cwe835.cpp",
+      "lines": "78-85",
+      "code": "                const bool bOffsetIsPointer = count*size > 4;\n\n                if ( bOffsetIsPointer ) {         // read into buffer\n                    size_t   restore = io.tell();  // save\n                    io.seek(offset,BasicIo::beg);  // position\n                    io.read(buf.pData_,count*size);// read\n                    io.seek(restore,BasicIo::beg); // restore\n                }",
+      "explanation": "Per the TIFF spec, if the value is larger than 4 bytes it does not fit inline and `offset` is a file pointer. `bOffsetIsPointer` tests `count*size > 4` — but note this multiplication is done in 32-bit unsigned arithmetic here, unlike the 64-bit computation on line 71. When it is a pointer, the current position is saved, the code seeks to the attacker's `offset`, reads `count*size` bytes into `buf`, and restores. The read length is again `count*size` in 32-bit."
+    },
+    {
+      "file": "corpus/train/train_0017_cwe835.cpp",
+      "lines": "87-119",
+      "code": "                if ( bPrint ) {\n                    const uint32_t address = start + 2 + i*12 ;\n                    const std::string offsetString = bOffsetIsPointer?\n                        Internal::stringFormat(\"%10u\", offset):\n                        \"\";\n\n                    out << Internal::indent(depth)\n                    << Internal::stringFormat(\"%8u | %#06x %-28s |%10s |%9u |%10s | \"\n                                              ,address,tag,tagName(tag).c_str(),typeName(type),count,offsetString.c_str());\n                    if ( isShortType(type) ){\n                        for ( size_t k = 0 ; k < kount ; k++ ) {\n                            out << sp << byteSwap2(buf,k*size,bSwap);\n                            sp = \" \";\n                        }\n                    } else if ( isLongType(type) ){\n                        for ( size_t k = 0 ; k < kount ; k++ ) {\n                            out << sp << byteSwap4(buf,k*size,bSwap);\n                            sp = \" \";\n                        }\n\n                    } else if ( isRationalType(type) ){\n                        for ( size_t k = 0 ; k < kount ; k++ ) {\n                            uint32_t a = byteSwap4(buf,k*size+0,bSwap);\n                            uint32_t b = byteSwap4(buf,k*size+4,bSwap);\n                            out << sp << a << \"/\" << b;\n                            sp = \" \";\n                        }\n                    } else if ( isStringType(type) ) {\n                        out << sp << Internal::binaryToString(makeSlice(buf, 0, kount));\n                    }\n\n                    sp = kount == count ? \"\" : \" ...\";\n                    out << sp << std::endl;",
+      "explanation": "The printing block. It formats the entry header (address, tag name via .c_str() on a temporary std::string from tagName(tag), type name, count, offset). It then dumps the value according to type: short types byteSwap2 each of `kount` 2-byte words, long types byteSwap4 each 4-byte word, rational types two 32-bit words per component (k*size+0 and k*size+4), and string types via binaryToString over a slice of length `kount`. Every index into `buf` is `k*size` with k < kount <= count, and `buf` holds at least size*count+20 bytes, so these reads stay inside the allocation. A ' ...' suffix marks truncated (kount<count) output."
+    },
+    {
+      "file": "corpus/train/train_0017_cwe835.cpp",
+      "lines": "121-127",
+      "code": "                    if ( option == kpsRecursive && (tag == 0x8769 /* ExifTag */ || tag == 0x014a/*SubIFDs*/  || type == tiffIfd) ) {\n                        for ( size_t k = 0 ; k < count ; k++ ) {\n                            size_t   restore = io.tell();\n                            uint32_t offset = byteSwap4(buf,k*size,bSwap);\n                            printIFDStructure(io,out,option,offset,bSwap,c,depth);\n                            io.seek(restore,BasicIo::beg);\n                        }\n                    }",
+      "explanation": "The recursive descent for the Exif IFD, SubIFDs, or any entry whose type is tiffIfd. For each of `count` sub-pointers stored in `buf`, it decodes a new `offset` (attacker-controlled) and calls printIFDStructure on it, then restores position. This is the core recursion: the loop bound `count` and the recursion target `offset` are BOTH from the file, and there is no depth/visited guard on the recursive call — `depth` is passed through unchanged and merely incremented on entry."
+    },
+    {
+      "file": "corpus/train/train_0017_cwe835.cpp",
+      "lines": "128-141",
+      "code": "                    } else if ( option == kpsRecursive && tag == 0x83bb /* IPTCNAA */ ) {\n\n                        if (static_cast<size_t>(Safe::add(count, offset)) > io.size()) {\n                            throw Error(kerCorruptedMetadata);\n                        }\n\n                        const size_t restore = io.tell();\n                        io.seek(offset, BasicIo::beg);  // position\n                        std::vector<byte> bytes(count) ;  // allocate memory\n                        // TODO: once we have C++11 use bytes.data()\n                        const long read_bytes = io.read(&bytes[0], count);\n                        io.seek(restore, BasicIo::beg);\n                        IptcData::printStructure(out, makeSliceUntil(&bytes[0], read_bytes), depth);",
+      "explanation": "The IPTC branch. It first uses Safe::add(count, offset) to detect wraparound and rejects the entry if count+offset exceeds the file size — an overflow-safe bound that is a deliberate hardening. It then allocates a std::vector<byte> of `count` bytes (RAII, so no leak), reads up to `count` bytes from `offset`, and hands the actual read length to IptcData::printStructure. Because count+offset is bounded by io.size(), `count` itself is bounded by the file size, so the vector allocation is bounded. This branch is well-guarded."
+    },
+    {
+      "file": "corpus/train/train_0017_cwe835.cpp",
+      "lines": "143-166",
+      "code": "                    }  else if ( option == kpsRecursive && tag == 0x927c /* MakerNote */ && count > 10) {\n                        size_t   restore = io.tell();  // save\n\n                        uint32_t jump= 10           ;\n                        byte     bytes[20]          ;\n                        const char* chars = (const char*) &bytes[0] ;\n                        io.seek(offset,BasicIo::beg);  // position\n                        io.read(bytes,jump    )     ;  // read\n                        bytes[jump]=0               ;\n                        if ( ::strcmp(\"Nikon\",chars) == 0 ) {\n                            // tag is an embedded tiff\n                            byte* bytes=new byte[count-jump] ;  // allocate memory\n                            io.read(bytes,count-jump)        ;  // read\n                            MemIo memIo(bytes,count-jump)    ;  // create a file\n                            printTiffStructure(memIo,out,option,depth);\n                            delete[] bytes                   ;  // free\n                        } else {\n                            // tag is an IFD\n                            io.seek(0,BasicIo::beg);  // position\n                            printIFDStructure(io,out,option,offset,bSwap,c,depth);\n                        }\n\n                        io.seek(restore,BasicIo::beg); // restore\n                    }",
+      "explanation": "The MakerNote branch, taken only when count>10. It reads 10 bytes into a 20-byte stack buffer `bytes`, NUL-terminates at index 10 (bytes[10]=0, safely within [0,19]), and compares to \"Nikon\". For a Nikon note it heap-allocates `count-jump` bytes (count>10 guarantees this is positive), reads that many bytes, wraps them in a MemIo, and parses as an embedded TIFF; the buffer is released with matching delete[] on line 158 (the new[]/delete[] pairing is correct). Otherwise it treats `offset` as another IFD and recurses via printIFDStructure — a second unbounded recursion site."
+    },
+    {
+      "file": "corpus/train/train_0017_cwe835.cpp",
+      "lines": "169-176",
+      "code": "                if ( isPrintXMP(tag,option) ) {\n                    buf.pData_[count]=0;\n                    out << (char*) buf.pData_;\n                }\n                if ( isPrintICC(tag,option) ) {\n                    out.write((const char*)buf.pData_,count);\n                }",
+      "explanation": "For XMP tags it NUL-terminates `buf` at index `count` and prints it as a C string; for ICC it writes exactly `count` bytes. For XMP/ICC, kount==count and size>=1, so `allocate = size*count + pad + 20 >= count + 20`, meaning index `count` and a `count`-byte write both stay within `buf`. The trailing +20/pad slack in the allocation is what makes the `buf.pData_[count]=0` write in-bounds."
+    },
+    {
+      "file": "corpus/train/train_0017_cwe835.cpp",
+      "lines": "177-188",
+      "code": "            if ( start ) {\n                io.read(dir.pData_, 4);\n                start = tooBig ? 0 : byteSwap4(dir,0,bSwap);\n            }\n        } while (start) ;\n\n        if ( bPrint ) {\n            out << Internal::indent(depth) << \"END \" << io.path() << std::endl;\n        }\n        out.flush();\n        depth--;\n    }",
+      "explanation": "After processing the directory, if `start` was non-zero it reads the 4-byte next-IFD pointer and sets `start` to it (or 0 if this directory was tooBig). The do/while repeats as long as `start` is non-zero, forming the standard chained-IFD walk. Because the next `start` is read straight from the file with no bound and no record of previously-visited offsets, the file controls whether and where the loop continues. Finally the END marker is printed, the stream flushed, and `depth` decremented to mirror the entry increment."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0017_cwe835.cpp",
+      "lines": "121-126",
+      "code": "                    if ( option == kpsRecursive && (tag == 0x8769 /* ExifTag */ || tag == 0x014a/*SubIFDs*/  || type == tiffIfd) ) {\n                        for ( size_t k = 0 ; k < count ; k++ ) {\n                            size_t   restore = io.tell();\n                            uint32_t offset = byteSwap4(buf,k*size,bSwap);\n                            printIFDStructure(io,out,option,offset,bSwap,c,depth);\n                            io.seek(restore,BasicIo::beg);",
+      "explanation": "Uncontrolled recursion / stack exhaustion (the CWE-835 the file is named for, more precisely CWE-674). When option==kpsRecursive, an Exif/SubIFD/tiffIfd entry recurses into printIFDStructure at an attacker-chosen `offset`. `depth` is incremented on entry (line 4) but is NEVER compared to any limit — it is used only for indentation. An attacker crafts an IFD whose sub-IFD pointer references another IFD (or points back at itself/an ancestor) so each recursion reads a valid-looking directory that again contains a sub-IFD pointer. There is no visited-offset set and no depth cap, so the call stack grows until it is exhausted, crashing the process (denial of service) or, in some builds, enabling stack-clash effects. The second recursion site at line 162 (MakerNote non-Nikon branch) has the identical defect. The invariant the implementation must uphold: bound recursion by a hard depth limit (e.g. refuse when depth exceeds a small constant) and/or track already-visited IFD offsets to break cycles."
+    },
+    {
+      "file": "corpus/train/train_0017_cwe835.cpp",
+      "lines": "177-181",
+      "code": "            if ( start ) {\n                io.read(dir.pData_, 4);\n                start = tooBig ? 0 : byteSwap4(dir,0,bSwap);\n            }\n        } while (start) ;",
+      "explanation": "Loop with attacker-controlled continuation (CWE-835 infinite loop). The do/while continues while `start` is non-zero, and the next `start` is read verbatim from the file's next-IFD pointer with no check that it advances, differs from a previously-visited offset, or points anywhere sane. An attacker builds a directory at offset A whose next-IFD pointer is B, and a directory at B whose next-IFD pointer is A (each kept under the 500-entry cap so `tooBig` never fires). The loop then ping-pongs between the two directories forever, re-reading and re-emitting output without termination — a CPU/output denial of service that does not even require recursion. The per-IFD `dirLength <= 500` cap (line 21) does nothing to stop this because it bounds a single directory, not the chain length. Safe design: maintain a set of visited IFD offsets and reject a `start` that has already been processed (or require strictly increasing offsets)."
+    },
+    {
+      "file": "corpus/train/train_0017_cwe835.cpp",
+      "lines": "78-83",
+      "code": "                const bool bOffsetIsPointer = count*size > 4;\n\n                if ( bOffsetIsPointer ) {         // read into buffer\n                    size_t   restore = io.tell();  // save\n                    io.seek(offset,BasicIo::beg);  // position\n                    io.read(buf.pData_,count*size);// read",
+      "explanation": "32-bit unsigned multiply inconsistency (CWE-190, latent). The allocation guard on line 71 computes the value size in 64-bit as `(long long) size*count`, but the pointer test on line 78 and the read length on line 83 use `count*size` evaluated in 32-bit unsigned arithmetic. If `count*size` overflows 2^32, the 64-bit `allocate` on line 71 becomes huge and is rejected by the io.size() check (line 72), so the dangerous path is defended — but the two expressions can DISAGREE about the value size. This is the class of bug that historically produced an out-of-bounds read in byteSwap4 (indices k*size at lines 98/103) before the allocate guard was added; the guard mitigates it, so residual risk is limited to reading zero-filled (memset) slack within `buf` rather than a true over-read. The invariant: use a single overflow-checked width computation (the 64-bit one) consistently for the pointer test, the read length, and the allocation, so buffer size and read length can never diverge."
+    },
+    {
+      "file": "corpus/train/train_0017_cwe835.cpp",
+      "lines": "170-171",
+      "code": "                    buf.pData_[count]=0;\n                    out << (char*) buf.pData_;",
+      "explanation": "One-past-write into `buf` at index `count` (CWE-787 class, currently in-bounds). This writes at `buf.pData_[count]` and then prints the buffer as a NUL-terminated C string. It is safe ONLY because for XMP tags size>=1 and pad guarantee `allocate = size*count + pad + 20` exceeds `count`, and the whole buffer was memset to zero. The safety therefore depends entirely on the +20 slack and on `size` never being 0 (guaranteed by typeValid + the size default of 1). The invariant to keep this correct: any refactor must preserve that the allocation strictly exceeds `count` for XMP/ICC tags; if the +20 slack or the size>=1 guarantee were ever removed, `buf.pData_[count]=0` becomes a one-byte heap overflow and the subsequent unbounded C-string print (line 171) could over-read if the terminator is absent."
+    },
+    {
+      "file": "corpus/train/train_0017_cwe835.cpp",
+      "lines": "154-156",
+      "code": "                            byte* bytes=new byte[count-jump] ;  // allocate memory\n                            io.read(bytes,count-jump)        ;  // read\n                            MemIo memIo(bytes,count-jump)    ;  // create a file",
+      "explanation": "Raw new[] with an exception-exposed lifetime (CWE-401/CWE-762 class, currently benign). `count-jump` is safe from underflow because the branch requires count>10 and jump==10, so the subtraction is at least 1. The new[] is correctly released by delete[] on line 158, so under normal flow there is no leak or mismatch. The residual concern is exception safety: printTiffStructure(memIo,...) on line 157 can throw (it recurses into the same untrusted-parsing machinery), and because `bytes` is a raw pointer rather than std::vector/std::unique_ptr, an exception between new[] and delete[] leaks the buffer. The invariant: own heap buffers with RAII (std::vector<byte> as the IPTC branch already does on line 136) so the delete happens on every path including exceptional unwinding."
+    }
+  ],
+  "summary": "The dominant risk is denial of service from attacker-controlled traversal: printIFDStructure recurses into sub-IFDs at file-supplied offsets with no depth cap or cycle detection (unbounded recursion / stack exhaustion), and its outer do/while follows file-supplied next-IFD pointers with no visited-offset guard (potential infinite loop). Both are reachable from any image parsed with kpsRecursive. The patched allocation guard (64-bit size check against io.size) and the Safe::add IPTC check defuse the historical integer-overflow heap over-reads, leaving those as latent/mitigated rather than live; memory management (new[]/delete[], std::vector) is otherwise correctly paired.",
+  "reviewed_anchors": [
+    {"anchor": "printIFDStructure(...) signature, uint32_t start / int depth params (line 2)", "disposition": "finding", "reason": "start and depth are the recursion/loop drivers; depth is never bounded"},
+    {"anchor": "depth++ (line 4)", "disposition": "finding", "reason": "increments recursion level but is compared to no limit; used only for indentation"},
+    {"anchor": "const size_t dirSize = 32; DataBuf dir(dirSize) (lines 8-9)", "disposition": "dismissed", "reason": "fixed 32-byte buffer; all reads into it are 2/12/4 bytes, well within bounds"},
+    {"anchor": "uint16_t dirLength = byteSwap2(dir,0,bSwap) (line 19)", "disposition": "dismissed", "reason": "16-bit attacker value but capped at 500 on line 22, bounding the inner loop"},
+    {"anchor": "tooBig = dirLength > 500; throw kerTiffDirectoryTooLarge (lines 21-22)", "disposition": "dismissed", "reason": "effective per-IFD cap; a real mitigation, not a defect"},
+    {"anchor": "for ( int i = 0 ; i < dirLength ; i++ ) (line 30)", "disposition": "dismissed", "reason": "bounded by dirLength<=500"},
+    {"anchor": "io.read(dir.pData_, 12) (line 38)", "disposition": "dismissed", "reason": "12 bytes into a 32-byte buffer, in-bounds"},
+    {"anchor": "tag/type/count/offset = byteSwap* (lines 39-42)", "disposition": "finding", "reason": "count and offset are 32-bit attacker-controlled and drive allocations, reads, loops, and recursion"},
+    {"anchor": "typeValid(type) gate (lines 45-49)", "disposition": "dismissed", "reason": "validates type so size-by-type is well-defined; defensive"},
+    {"anchor": "kount clamp (count>32/count>5) (lines 54-59)", "disposition": "dismissed", "reason": "bounds display loops; mitigation"},
+    {"anchor": "size = 1/2/4/8 by type (lines 61-66)", "disposition": "dismissed", "reason": "well-defined element width, minimum 1, after typeValid"},
+    {"anchor": "long long allocate = (long long) size*count + pad+20; guard vs io.size() (lines 71-74)", "disposition": "dismissed", "reason": "64-bit computation + file-size check bounds buffer and reads; this is the patch"},
+    {"anchor": "DataBuf buf((long)allocate) (line 75)", "disposition": "dismissed", "reason": "(long) cast; allocate already bounded by io.size(), so no meaningful truncation on LP64"},
+    {"anchor": "memcpy(buf.pData_,dir.pData_+8,4) (line 77)", "disposition": "dismissed", "reason": "4 bytes from dir offset 8 (<=12) into buf sized >=size*count+20; in-bounds"},
+    {"anchor": "count*size > 4 and io.read(buf.pData_,count*size) (lines 78,83)", "disposition": "finding", "reason": "32-bit multiply here vs 64-bit on line 71 — inconsistent width; latent CWE-190, mitigated by allocate guard"},
+    {"anchor": "value print loops byteSwap2/byteSwap4 buf[k*size] (lines 96-115)", "disposition": "dismissed", "reason": "k<kount<=count and buf>=size*count+20, so indices stay in bounds"},
+    {"anchor": "recursive printIFDStructure for Exif/SubIFDs/tiffIfd (lines 121-126)", "disposition": "finding", "reason": "unbounded recursion at attacker offset, no depth/cycle guard"},
+    {"anchor": "Safe::add(count, offset) > io.size() IPTC guard (line 130)", "disposition": "dismissed", "reason": "overflow-safe bound; hardening, and bounds the vector(count) allocation"},
+    {"anchor": "std::vector<byte> bytes(count) (line 136)", "disposition": "dismissed", "reason": "RAII allocation bounded by the Safe::add/io.size() check; no leak"},
+    {"anchor": "byte bytes[20]; io.read(bytes,jump=10); bytes[jump]=0 (lines 147-151)", "disposition": "dismissed", "reason": "reads 10 and writes index 10 into a 20-byte buffer; strcmp is NUL-terminated; in-bounds"},
+    {"anchor": "new byte[count-jump] / delete[] bytes (lines 154,158)", "disposition": "finding", "reason": "count-jump cannot underflow (count>10) and pairing is correct, but raw new[] leaks if printTiffStructure throws"},
+    {"anchor": "recursive printIFDStructure MakerNote non-Nikon branch (line 162)", "disposition": "finding", "reason": "second unbounded-recursion site at attacker offset (same class as lines 121-126)"},
+    {"anchor": "buf.pData_[count]=0; out << (char*)buf.pData_ (lines 170-171)", "disposition": "finding", "reason": "one-past write and unbounded C-string print; in-bounds only due to +20 slack and size>=1"},
+    {"anchor": "out.write((const char*)buf.pData_,count) ICC (line 174)", "disposition": "dismissed", "reason": "count bytes from buf sized >=count; may print zero-filled slack but no over-read"},
+    {"anchor": "do/while chained IFD: start = byteSwap4(dir,0,bSwap) (lines 177-181)", "disposition": "finding", "reason": "next-IFD pointer from file with no visited-set; cyclic chain loops forever (CWE-835)"}
+  ],
+  "findings": [
+    {
+      "title": "Unbounded recursion into sub-IFDs at attacker-controlled offset (stack exhaustion)",
+      "anchor": "printIFDStructure(io,out,option,offset,bSwap,c,depth) recursive calls; depth++ never bounded",
+      "file": "corpus/train/train_0017_cwe835.cpp",
+      "line": "121-126, 162, 4",
+      "code": "                    if ( option == kpsRecursive && (tag == 0x8769 /* ExifTag */ || tag == 0x014a/*SubIFDs*/  || type == tiffIfd) ) {\n                        for ( size_t k = 0 ; k < count ; k++ ) {\n                            size_t   restore = io.tell();\n                            uint32_t offset = byteSwap4(buf,k*size,bSwap);\n                            printIFDStructure(io,out,option,offset,bSwap,c,depth);\n                            io.seek(restore,BasicIo::beg);",
+      "bug_class": "Uncontrolled recursion / stack exhaustion (denial of service)",
+      "cwe": "CWE-674",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0017_cwe835.cpp",
+      "invariant": "Recursion depth must be hard-capped (reject when depth exceeds a small constant) and/or IFD offsets already visited on the current chain must be tracked so cyclic/self-referential sub-IFD pointers cannot recurse indefinitely.",
+      "failure_mode": "With option==kpsRecursive, a crafted image whose Exif/SubIFD/tiffIfd entry points to another IFD (or back at itself/an ancestor) drives printIFDStructure to call itself with a fresh attacker-chosen offset on every level. depth is incremented on entry but never checked, so the call stack grows without limit until it is exhausted and the process crashes — a remote denial of service triggered simply by parsing the file. The MakerNote non-Nikon branch (line 162) is a second instance of the same recursion with no additional guard.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm no caller-side or global depth limit exists and that printIFDStructure keeps no visited-offset set; verify that a self-referential SubIFD/Exif pointer actually re-enters the function unbounded."
+    },
+    {
+      "title": "Infinite loop over chained next-IFD pointers (no cycle detection)",
+      "anchor": "start = tooBig ? 0 : byteSwap4(dir,0,bSwap); } while (start)",
+      "file": "corpus/train/train_0017_cwe835.cpp",
+      "line": "177-181",
+      "code": "            if ( start ) {\n                io.read(dir.pData_, 4);\n                start = tooBig ? 0 : byteSwap4(dir,0,bSwap);\n            }\n        } while (start) ;",
+      "bug_class": "Loop with attacker-controlled, unbounded exit condition (denial of service)",
+      "cwe": "CWE-835",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0017_cwe835.cpp",
+      "invariant": "The next-IFD offset must be validated against previously-visited offsets (a visited set, or a requirement that offsets strictly increase) so a chain cannot cycle; the loop must be guaranteed to terminate.",
+      "failure_mode": "The do/while continues while start is non-zero, and the next start is the file's next-IFD pointer read verbatim (line 179). An attacker links directory A's next pointer to B and B's next pointer to A, each kept at <=500 entries so tooBig never fires, causing the loop to ping-pong between the two directories forever — unbounded CPU consumption and output, without any recursion. The per-IFD dirLength<=500 cap does not help because it bounds one directory, not the chain.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the implementation keeps no record of visited IFD offsets and does not require monotonically increasing start values; build a two-node offset cycle and verify the loop does not terminate."
+    },
+    {
+      "title": "Inconsistent 32-bit vs 64-bit value-size arithmetic (latent integer-overflow over-read)",
+      "anchor": "const bool bOffsetIsPointer = count*size > 4; io.read(buf.pData_,count*size)",
+      "file": "corpus/train/train_0017_cwe835.cpp",
+      "line": "78, 83",
+      "code": "                const bool bOffsetIsPointer = count*size > 4;\n\n                if ( bOffsetIsPointer ) {         // read into buffer\n                    size_t   restore = io.tell();  // save\n                    io.seek(offset,BasicIo::beg);  // position\n                    io.read(buf.pData_,count*size);// read",
+      "bug_class": "Integer overflow in size arithmetic (out-of-bounds read primitive)",
+      "cwe": "CWE-190",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0017_cwe835.cpp",
+      "invariant": "The value width must be computed once with overflow checking (the 64-bit size*count) and that single value used consistently for the pointer test, the read length, and the buffer allocation, so read length can never exceed allocated size.",
+      "failure_mode": "Line 71 sizes the buffer with a 64-bit `(long long) size*count`, but lines 78 and 83 recompute `count*size` in 32-bit unsigned arithmetic. If the true product exceeds 2^32 the 64-bit allocate is huge and rejected by the io.size() guard, so the live over-read path (historically an out-of-bounds read in byteSwap4 at lines 98/103) is mitigated by the patch. Residual risk: the two widths can disagree, and any weakening of the allocate guard would re-expose a read length larger than the buffer. This is the integer-overflow-to-heap-over-read class the surrounding guard was added to fix.",
+      "cve_analog": "CVE-2018-12265",
+      "what_to_confirm": "Verify the allocate guard on line 72 is reached on every path that performs the count*size read, and that count*size cannot overflow 32-bit while allocate (64-bit) stays under io.size()."
+    },
+    {
+      "title": "Raw new[] buffer leaks if embedded-TIFF parse throws",
+      "anchor": "byte* bytes=new byte[count-jump]; ... printTiffStructure(memIo,...); delete[] bytes",
+      "file": "corpus/train/train_0017_cwe835.cpp",
+      "line": "154-158",
+      "code": "                            byte* bytes=new byte[count-jump] ;  // allocate memory\n                            io.read(bytes,count-jump)        ;  // read\n                            MemIo memIo(bytes,count-jump)    ;  // create a file\n                            printTiffStructure(memIo,out,option,depth);\n                            delete[] bytes                   ;  // free",
+      "bug_class": "Memory leak on exception path (non-RAII ownership)",
+      "cwe": "CWE-401",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0017_cwe835.cpp",
+      "invariant": "Heap buffers holding parsed untrusted data must be owned by RAII (std::vector<byte> or std::unique_ptr<byte[]>) so the deallocation runs on every path, including stack unwinding from a thrown Error.",
+      "failure_mode": "`bytes` is a raw new[] pointer freed only by the delete[] on line 158. printTiffStructure on line 157 recurses into the same untrusted-parsing code and can throw (e.g. kerCorruptedMetadata/kerInvalidTypeValue); the throw unwinds past line 158, leaking the buffer. Repeated over many crafted MakerNote entries this is an attacker-driven memory leak. count-jump itself cannot underflow because the branch guard requires count>10 with jump==10.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm printTiffStructure can throw and that no surrounding try/catch frees `bytes`; check whether the buffer should be a std::vector like the IPTC branch on line 136."
+    },
+    {
+      "title": "One-past NUL write and unbounded C-string print for XMP tags",
+      "anchor": "buf.pData_[count]=0; out << (char*) buf.pData_;",
+      "file": "corpus/train/train_0017_cwe835.cpp",
+      "line": "170-171",
+      "code": "                    buf.pData_[count]=0;\n                    out << (char*) buf.pData_;",
+      "bug_class": "Potential out-of-bounds write / over-read (bounds depend on allocation slack)",
+      "cwe": "CWE-787",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0017_cwe835.cpp",
+      "invariant": "For any tag that writes buf.pData_[count], the allocation must strictly exceed count bytes (guaranteed today by size>=1 and the +pad+20 slack in `allocate`), and the buffer must be NUL-terminated before being printed as a C string.",
+      "failure_mode": "For XMP tags the code writes buf.pData_[count]=0 and prints buf as a NUL-terminated string. This is in-bounds only because `allocate = size*count + pad + 20` exceeds count (size>=1) and the whole buffer was memset to zero. The correctness is entirely dependent on that +20 slack and size>=1; if a refactor tightened the allocation or allowed size==0, this becomes a one-byte heap overflow, and the C-string print on line 171 could over-read past the value if the terminator were ever absent.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify that for every tag reaching line 170 the buffer size is strictly greater than count, and that size can never be 0 for such tags."
+    }
+  ],
+  "audit_checklist": [
+    "Add a hard recursion-depth cap in printIFDStructure and reject when exceeded; confirm both recursion sites (lines 125 and 162) are covered.",
+    "Track visited IFD file offsets (or require strictly increasing offsets) to break cycles in BOTH the recursive descent and the do/while next-IFD chain (line 179).",
+    "Use a single overflow-checked 64-bit width for the pointer test, the read length, and the allocation so line 78/83 (count*size, 32-bit) cannot diverge from line 71 (size*count, 64-bit).",
+    "Confirm the allocate>io.size() guard (line 72) is unavoidably reached before every count*size read into buf.",
+    "Replace the raw new byte[count-jump]/delete[] pair (lines 154-158) with std::vector<byte> or unique_ptr so it is exception-safe against a throwing printTiffStructure.",
+    "Confirm buf.pData_[count]=0 (line 170) is always strictly inside buf: size>=1 and the +pad+20 slack must hold for every XMP/ICC tag.",
+    "Verify Safe::add(count,offset) (line 130) is the model for all offset+length checks and that count-derived allocations elsewhere are similarly bounded by io.size().",
+    "Confirm typeValid (line 45) actually rejects every type not handled by the size table so size is never 0."
+  ]
+}

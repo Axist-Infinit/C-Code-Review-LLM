@@ -1,0 +1,200 @@
+{
+  "subsystem": "Linux kernel FUSE (Filesystem in Userspace) client — the fuse_do_getattr() helper in fs/fuse/dir.c. It builds a FUSE_GETATTR request, sends it to the userspace filesystem daemon via fuse_simple_request(), and applies the returned attributes to the VFS inode cache and to a caller-supplied struct kstat (the backing store for stat(2)/statx(2)).",
+  "provenance": "Identified by the kernel-internal API vocabulary and naming: struct inode/struct kstat/struct file (VFS), get_fuse_mount(), struct fuse_mount, fuse_get_attr_version(), FUSE_ARGS(), FUSE_GETATTR / FUSE_GETATTR_FH, struct fuse_getattr_in / struct fuse_attr_out, fuse_simple_request(), fuse_invalid_attr(), fuse_change_attributes(), fuse_fillattr(), make_bad_inode(), attr_timeout(). These are the exact symbols of fs/fuse in the mainline Linux kernel. The sample banner (corpus/train/train_0079_cwe459.c, header comment 'primevul_c_validation_0200_vuln') indicates a PrimeVul-derived kernel C sample. The presence of fuse_invalid_attr() plus the (i_mode ^ attr.mode) & S_IFMT check matches the FUSE 'fix bad inode' hardening series (Jann Horn, 2020).",
+  "trust_boundary": "The FUSE server is an ordinary, potentially unprivileged or malicious USERSPACE process on the other side of /dev/fuse; the kernel must treat every byte it returns as hostile. Here the outbound request (inarg) is built entirely by the kernel and is trusted, but the reply landed in `outarg` (struct fuse_attr_out) by fuse_simple_request() at line 31 is fully attacker-controlled: outarg.attr (mode, size, nlink, uid/gid, rdev, blocks, times, etc.) and the timeout/version fields come straight from the daemon. That data is then written into the shared inode via fuse_change_attributes() and copied out to userspace via fuse_fillattr(). A secondary boundary is the caller-supplied `stat` out-pointer and `file`/file->private_data.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0079_cwe459.c",
+      "lines": "2-4",
+      "code": "static int fuse_do_getattr(struct inode *inode, struct kstat *stat,\n\t\t\t   struct file *file)\n{",
+      "explanation": "Declares the internal helper that fetches attributes for a FUSE inode. `inode` is the target VFS inode whose cached metadata will be refreshed; `stat` is an optional caller-owned struct kstat that, if non-NULL, receives the results for stat(2)/statx(2); `file` is an optional open-file handle used to obtain a FUSE file handle (fh) so the server can key the request on an open fd. It returns a negative errno on failure or 0 on success. Being `static` it is only callable from within the FUSE module, but it sits directly on the syscall path (stat/statx/fstat), so its inputs from the server side are remote-untrusted."
+    },
+    {
+      "file": "corpus/train/train_0079_cwe459.c",
+      "lines": "5-10",
+      "code": "\tint err;\n\tstruct fuse_getattr_in inarg;\n\tstruct fuse_attr_out outarg;\n\tstruct fuse_mount *fm = get_fuse_mount(inode);\n\tFUSE_ARGS(args);\n\tu64 attr_version;",
+      "explanation": "Local state. `err` holds the return code. `inarg` (struct fuse_getattr_in) is the on-stack request payload the kernel fills and sends. `outarg` (struct fuse_attr_out) is the on-stack reply buffer the server writes into — this is the untrusted sink. `fm = get_fuse_mount(inode)` resolves the FUSE mount/connection object from the inode. `FUSE_ARGS(args)` is a macro that stack-allocates and zero-initialises a struct fuse_args request descriptor named `args`. `attr_version` is a 64-bit generation counter used to detect whether the inode's attributes were changed by someone else while this request was in flight."
+    },
+    {
+      "file": "corpus/train/train_0079_cwe459.c",
+      "lines": "12",
+      "code": "\tattr_version = fuse_get_attr_version(fm->fc);",
+      "explanation": "Snapshots the connection-wide attribute-version counter BEFORE issuing the request. This is the read side of an optimistic-concurrency scheme: fuse_change_attributes() later compares this saved value against the inode's current attr_version and refuses to overwrite the cache if a newer update landed in the meantime. Capturing it before the (blocking) request is the correct ordering; capturing it after would defeat the check."
+    },
+    {
+      "file": "corpus/train/train_0079_cwe459.c",
+      "lines": "14-15",
+      "code": "\tmemset(&inarg, 0, sizeof(inarg));\n\tmemset(&outarg, 0, sizeof(outarg));",
+      "explanation": "Zero-initialises both the request and reply structs. Zeroing `inarg` ensures no uninitialised stack bytes (e.g. unused flag bits or the fh field) are transmitted to the server. Zeroing `outarg` gives a defined starting state, though it is immaterial to safety since the server overwrites it; the real protection for outarg is the post-reply validation, not this memset."
+    },
+    {
+      "file": "corpus/train/train_0079_cwe459.c",
+      "lines": "16-22",
+      "code": "\t/* Directories have separate file-handle space */\n\tif (file && S_ISREG(inode->i_mode)) {\n\t\tstruct fuse_file *ff = file->private_data;\n\n\t\tinarg.getattr_flags |= FUSE_GETATTR_FH;\n\t\tinarg.fh = ff->fh;\n\t}",
+      "explanation": "When the caller passed an open `file` AND the inode is a regular file, the code pulls the FUSE per-file object out of file->private_data and copies its server-issued handle `ff->fh` into the request, setting FUSE_GETATTR_FH so the server knows to interpret the request against that open handle. The regular-file guard exists because directories use a separate handle namespace, so a directory fh must not be sent here. `ff = file->private_data` is dereferenced at line 21 without a NULL check — see the risk walkthrough."
+    },
+    {
+      "file": "corpus/train/train_0079_cwe459.c",
+      "lines": "23-30",
+      "code": "\targs.opcode = FUSE_GETATTR;\n\targs.nodeid = get_node_id(inode);\n\targs.in_numargs = 1;\n\targs.in_args[0].size = sizeof(inarg);\n\targs.in_args[0].value = &inarg;\n\targs.out_numargs = 1;\n\targs.out_args[0].size = sizeof(outarg);\n\targs.out_args[0].value = &outarg;",
+      "explanation": "Marshals the request descriptor. It sets the opcode to FUSE_GETATTR and the target nodeid from the inode. It declares exactly one inbound argument (the request) of size sizeof(inarg) pointing at &inarg, and exactly one outbound argument (the reply) of size sizeof(outarg) pointing at &outarg. Crucially out_args[0].size = sizeof(outarg) fixes the maximum bytes the transport will copy back into the fixed-size stack buffer, which bounds the reply copy to the struct size regardless of what the server claims."
+    },
+    {
+      "file": "corpus/train/train_0079_cwe459.c",
+      "lines": "31",
+      "code": "\terr = fuse_simple_request(fm, &args);",
+      "explanation": "Synchronously submits the request over the FUSE connection and blocks until the userspace daemon replies (or the request is aborted). On return, `err` is 0 on success, and on success `outarg` has been populated from the server's reply. This call is the trust boundary crossing: everything downstream reads attacker-influenced data out of outarg."
+    },
+    {
+      "file": "corpus/train/train_0079_cwe459.c",
+      "lines": "32-37",
+      "code": "\tif (!err) {\n\t\tif (fuse_invalid_attr(&outarg.attr) ||\n\t\t    (inode->i_mode ^ outarg.attr.mode) & S_IFMT) {\n\t\t\tmake_bad_inode(inode);\n\t\t\terr = -EIO;",
+      "explanation": "Only when the request succeeded does the code inspect the reply. It applies two sanity gates on the server-supplied attributes: fuse_invalid_attr(&outarg.attr) rejects structurally impossible attributes (e.g. a too-large size, or a mode whose type bits are not a legal file type), and (inode->i_mode ^ outarg.attr.mode) & S_IFMT rejects a reply whose S_IFMT file-type bits differ from the inode's established type — i.e. the server trying to turn a regular file into a symlink/device/directory (type confusion). If either gate trips, make_bad_inode(inode) marks the inode unusable and err is set to -EIO so the syscall fails safely instead of caching poisoned metadata."
+    },
+    {
+      "file": "corpus/train/train_0079_cwe459.c",
+      "lines": "38-43",
+      "code": "\t\t} else {\n\t\t\tfuse_change_attributes(inode, &outarg.attr,\n\t\t\t\t\t       attr_timeout(&outarg),\n\t\t\t\t\t       attr_version);\n\t\t\tif (stat)\n\t\t\t\tfuse_fillattr(inode, &outarg.attr, stat);\n\t\t}",
+      "explanation": "On the accepted path, fuse_change_attributes() writes the validated server attributes into the inode's cached metadata, using attr_timeout(&outarg) as the cache lifetime and the previously snapshotted attr_version to avoid clobbering a concurrent newer update. Then, only if the caller wants results, fuse_fillattr() copies the same attributes into the caller's struct kstat, which is ultimately returned to userspace. Both consumers receive &outarg.attr directly, so their correctness depends entirely on the two gates above and on their own internal bounds checks."
+    },
+    {
+      "file": "corpus/train/train_0079_cwe459.c",
+      "lines": "44-46",
+      "code": "\t\t}\n\t}\n\treturn err;",
+      "explanation": "Closes the success block and returns err. Note that when err != 0 (transport failure) none of the validation or attribute-application runs and `stat` is left untouched by this function; the caller is expected to honour the negative return and not read stat. On the make_bad_inode path err is forced to -EIO for the same reason."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0079_cwe459.c",
+      "lines": "7",
+      "code": "\tstruct fuse_attr_out outarg;",
+      "explanation": "`outarg` is filled from the reply of an untrusted userspace FUSE server at line 31. Every field of outarg.attr (mode, nlink, uid, gid, size, blocks, rdev, atime/mtime/ctime and their nsec, blksize) is attacker-chosen. The fixed out_args[0].size = sizeof(outarg) at line 29 does bound the transport copy to the struct size, so there is no buffer overflow of outarg itself; the danger is purely semantic — bogus values are trusted downstream. The invariant the implementation must uphold is that NO field of outarg is used for a size/offset/index computation (in fuse_fillattr, fuse_change_attributes, or their callers) without independent range validation."
+    },
+    {
+      "file": "corpus/train/train_0079_cwe459.c",
+      "lines": "33-34",
+      "code": "\t\tif (fuse_invalid_attr(&outarg.attr) ||\n\t\t    (inode->i_mode ^ outarg.attr.mode) & S_IFMT) {",
+      "explanation": "These two checks are the ONLY validation gate standing between the malicious server and both the inode cache and userspace. Their strength is entirely inside fuse_invalid_attr() (not shown). If fuse_invalid_attr() fails to reject, for example, an attr.size larger than the filesystem/page-cache can represent, or leaves nlink/uid/gid unchecked, the bad values propagate. This is a latent missing/insufficient-input-validation contract (CWE-20): the header/decl shown proves the gate exists but not that it is complete. The S_IFMT XOR is a genuine anti-type-confusion control; its correctness depends on inode->i_mode already reflecting the true type before this call."
+    },
+    {
+      "file": "corpus/train/train_0079_cwe459.c",
+      "lines": "38-40",
+      "code": "\t\t\tfuse_change_attributes(inode, &outarg.attr,\n\t\t\t\t\t       attr_timeout(&outarg),\n\t\t\t\t\t       attr_version);",
+      "explanation": "Server-controlled attributes are committed into the shared inode cache. Two hazards: (1) fuse_change_attributes must honour attr_version — the snapshot from line 12 — to prevent a slow/racing getattr reply from rolling the inode back over a newer update (attribute cache-consistency / TOCTOU, CWE-362); if the version comparison is dropped or reversed, an attacker who controls reply timing can install stale attributes. (2) attr.size flows into inode size and page-cache i_size; if fuse_change_attributes does not clamp it, a huge server-supplied size can mislead read/mmap/truncate logic downstream. Both are latent in the not-shown implementation."
+    },
+    {
+      "file": "corpus/train/train_0079_cwe459.c",
+      "lines": "42",
+      "code": "\t\t\t\tfuse_fillattr(inode, &outarg.attr, stat);",
+      "explanation": "This copies the attacker-influenced attributes into the caller's struct kstat, which is handed back to userspace by stat(2)/statx(2). A malicious server can therefore spoof ownership (uid/gid), permissions (mode within the same S_IFMT type), link counts, timestamps, and reported size for any process that stats a file on its mount. Impact is metadata spoofing / potential privilege-decision confusion in callers that trust stat output; it is bounded by fuse_invalid_attr but not otherwise. The invariant: fuse_fillattr must not itself derive an array index or copy length from any attr field, and callers must not make trust decisions from FUSE-reported ownership."
+    },
+    {
+      "file": "corpus/train/train_0079_cwe459.c",
+      "lines": "18-21",
+      "code": "\t\tstruct fuse_file *ff = file->private_data;\n\n\t\tinarg.getattr_flags |= FUSE_GETATTR_FH;\n\t\tinarg.fh = ff->fh;",
+      "explanation": "`ff` is taken from file->private_data and immediately dereferenced (ff->fh) with no NULL check. On the normal FUSE open path private_data is always set to a valid struct fuse_file, so this is safe in practice; but it is a latent NULL-pointer-dereference contract (CWE-476) if fuse_do_getattr is ever reached with a regular-file `file` whose private_data was not initialised (e.g. an internal/anon file object, or a future caller). The invariant the implementation relies on: any `file` passed here with S_ISREG(inode->i_mode) has a fully-initialised fuse_file in private_data."
+    },
+    {
+      "file": "corpus/train/train_0079_cwe459.c",
+      "lines": "35-36",
+      "code": "\t\t\tmake_bad_inode(inode);\n\t\t\terr = -EIO;",
+      "explanation": "This is the cleanup/error path implied by the sample's CWE-459 (incomplete cleanup) tag. Here cleanup is actually complete: the rejecting gate runs BEFORE any attribute is applied, so make_bad_inode()+ -EIO leaves no partially-committed state, and `stat` is left untouched (the caller must respect the non-zero err). The residual risk to confirm is ordering elsewhere: if a future edit moved fuse_change_attributes/fuse_fillattr before this validation, or applied attributes and only then discovered the type mismatch, the inode/stat would be left in a poisoned, half-updated state — the incomplete-cleanup failure this pattern warns about. As written, the guard-before-mutate ordering is correct."
+    }
+  ],
+  "summary": "A defensively-written kernel FUSE getattr helper. The reply struct `outarg` is fully controlled by the untrusted userspace FUSE server, and its attributes flow into the shared inode cache (fuse_change_attributes) and back to userspace (fuse_fillattr). The shown code gates that flow with fuse_invalid_attr() plus an S_IFMT type-confusion check before applying anything, and snapshots attr_version before the request for cache-consistency — so no bug is visible in this function itself. Real risk is LATENT in the not-shown helpers (completeness of fuse_invalid_attr, size clamping and version handling in fuse_change_attributes, and metadata spoofing via fuse_fillattr), plus an unchecked file->private_data dereference.",
+  "reviewed_anchors": [
+    {"anchor": "fuse_do_getattr(struct inode *inode, struct kstat *stat, struct file *file) signature (lines 2-3)", "disposition": "finding", "reason": "Sits on the stat/statx syscall path; propagates untrusted server attributes into the caller's kstat out-parameter."},
+    {"anchor": "int err (line 5)", "disposition": "dismissed", "reason": "Plain return-code local; forced to -EIO on the reject path, no attacker influence on control beyond the transport result."},
+    {"anchor": "struct fuse_getattr_in inarg (line 6)", "disposition": "dismissed", "reason": "Outbound request built entirely by the kernel and zeroed before use; not attacker-controlled."},
+    {"anchor": "struct fuse_attr_out outarg (line 7)", "disposition": "finding", "reason": "Reply buffer written by the untrusted FUSE server; every attr field is hostile and flows into the inode cache and userspace."},
+    {"anchor": "struct fuse_mount *fm = get_fuse_mount(inode) (line 8)", "disposition": "dismissed", "reason": "Kernel-side lookup of the mount/connection object; not derived from attacker data."},
+    {"anchor": "FUSE_ARGS(args) macro (line 9)", "disposition": "dismissed", "reason": "Stack-allocates and zero-inits the request descriptor; a plumbing container with no untrusted input at declaration."},
+    {"anchor": "attr_version = fuse_get_attr_version(fm->fc) (lines 10,12)", "disposition": "finding", "reason": "Optimistic-concurrency snapshot; correctness of the cache-consistency guard depends on it being taken before the request and honoured in fuse_change_attributes."},
+    {"anchor": "memset(&inarg,0,..) / memset(&outarg,0,..) (lines 14-15)", "disposition": "dismissed", "reason": "Initialisation hygiene; prevents leaking uninitialised request bytes, no security contract violated."},
+    {"anchor": "if (file && S_ISREG(inode->i_mode)) guard (line 17)", "disposition": "dismissed", "reason": "Correct gate ensuring only regular-file handles are sent; directories use a separate fh space."},
+    {"anchor": "struct fuse_file *ff = file->private_data; inarg.fh = ff->fh (lines 18,21)", "disposition": "finding", "reason": "ff dereferenced without a NULL check — latent NULL-pointer dereference if private_data is ever unset."},
+    {"anchor": "inarg.getattr_flags |= FUSE_GETATTR_FH (line 20)", "disposition": "dismissed", "reason": "Sets an outbound flag on the kernel-built request; no untrusted data involved."},
+    {"anchor": "args.opcode/nodeid/in_numargs/in_args[0] (lines 23-27)", "disposition": "dismissed", "reason": "Outbound marshalling with kernel-controlled values; in_args[0].size = sizeof(inarg) is a fixed correct bound."},
+    {"anchor": "args.out_numargs / args.out_args[0].size = sizeof(outarg) / value = &outarg (lines 28-30)", "disposition": "dismissed", "reason": "Fixes the reply copy length to the struct size, bounding the transport write into the fixed-size stack buffer — this is the mitigating bound, not a bug."},
+    {"anchor": "err = fuse_simple_request(fm, &args) (line 31)", "disposition": "dismissed", "reason": "Transport call; itself trusted, but marks the boundary after which outarg is untrusted (covered by the outarg finding)."},
+    {"anchor": "fuse_invalid_attr(&outarg.attr) (line 33)", "disposition": "finding", "reason": "Primary validation gate for untrusted attributes; its completeness (latent, not shown) determines whether bogus metadata is rejected."},
+    {"anchor": "(inode->i_mode ^ outarg.attr.mode) & S_IFMT (line 34)", "disposition": "finding", "reason": "Anti-type-confusion control; if removed/bypassed a malicious server could change a file's S_IFMT type under a live inode."},
+    {"anchor": "make_bad_inode(inode); err = -EIO (lines 35-36)", "disposition": "dismissed", "reason": "Fail-safe reject path; runs before any mutation so cleanup is complete (the CWE-459 concern is addressed by guard-before-mutate ordering)."},
+    {"anchor": "fuse_change_attributes(inode,&outarg.attr,attr_timeout(&outarg),attr_version) (lines 38-40)", "disposition": "finding", "reason": "Commits untrusted attributes into the shared inode cache; latent size-clamp and attr_version race contracts live here."},
+    {"anchor": "attr_timeout(&outarg) (line 39)", "disposition": "dismissed", "reason": "Derives a cache-timeout from the reply; a bad value only affects cache lifetime, not memory safety."},
+    {"anchor": "if (stat) fuse_fillattr(inode,&outarg.attr,stat) (lines 41-42)", "disposition": "finding", "reason": "Copies attacker-influenced attributes to the userspace-visible kstat — metadata-spoofing surface."},
+    {"anchor": "return err (line 45)", "disposition": "dismissed", "reason": "Returns the status; callers must honour non-zero err before reading stat — no contract violated here."}
+  ],
+  "findings": [
+    {
+      "title": "Untrusted FUSE-server attributes committed to inode cache and userspace gated only by fuse_invalid_attr()",
+      "anchor": "if (fuse_invalid_attr(&outarg.attr) || (inode->i_mode ^ outarg.attr.mode) & S_IFMT)",
+      "file": "corpus/train/train_0079_cwe459.c",
+      "line": "33-34",
+      "code": "\t\tif (fuse_invalid_attr(&outarg.attr) ||\n\t\t    (inode->i_mode ^ outarg.attr.mode) & S_IFMT) {",
+      "bug_class": "Insufficient validation of untrusted attribute record",
+      "cwe": "CWE-20",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided) — fuse_invalid_attr(), fuse_change_attributes(), fuse_fillattr()",
+      "invariant": "fuse_invalid_attr() must reject every structurally-impossible or out-of-range attribute (mode type bits, size beyond the addressable/i_size limit, nlink, blocks) BEFORE any consumer uses the value, so no downstream size/index/trust decision is made on unvalidated server data.",
+      "failure_mode": "A malicious or compromised userspace FUSE daemon returns a fuse_attr_out with crafted attr fields; if fuse_invalid_attr() is incomplete, the values flow through fuse_change_attributes() into the shared inode and through fuse_fillattr() to userspace stat, enabling metadata poisoning and misleading size/ownership downstream.",
+      "cve_analog": "",
+      "what_to_confirm": "Read fuse_invalid_attr() and confirm it bounds attr.size and validates attr.mode type bits; confirm no field of outarg.attr is later used as a length or index without its own check."
+    },
+    {
+      "title": "File-type confusion prevented by a single inline S_IFMT check",
+      "anchor": "(inode->i_mode ^ outarg.attr.mode) & S_IFMT",
+      "file": "corpus/train/train_0079_cwe459.c",
+      "line": "34",
+      "code": "\t\t    (inode->i_mode ^ outarg.attr.mode) & S_IFMT) {",
+      "bug_class": "Type confusion via server-changed file type",
+      "cwe": "CWE-843",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0079_cwe459.c (this function) plus make_bad_inode()/fuse_change_attributes() in the implementation",
+      "invariant": "The S_IFMT (file-type) bits of a live inode must never be changed by a getattr reply; a reply whose type differs from inode->i_mode must abort with make_bad_inode()+ -EIO before any attribute is applied.",
+      "failure_mode": "Without this XOR check a malicious server could answer a getattr for a regular file with mode bits of a symlink/device/directory, causing the kernel to operate on the inode with the wrong ops/handling (type confusion, potential memory-safety or privilege issues). As shown the check is present and correctly ordered before fuse_change_attributes(); the risk is regression if this gate is weakened or moved after attribute application.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm this check runs before fuse_change_attributes()/fuse_fillattr() on every attribute-refresh path (getattr, lookup, revalidate), not only here."
+    },
+    {
+      "title": "attr_version optimistic-concurrency snapshot must be honoured to prevent stale-attribute rollback",
+      "anchor": "attr_version = fuse_get_attr_version(fm->fc); ... fuse_change_attributes(inode, &outarg.attr, attr_timeout(&outarg), attr_version)",
+      "file": "corpus/train/train_0079_cwe459.c",
+      "line": "12",
+      "code": "\tattr_version = fuse_get_attr_version(fm->fc);",
+      "bug_class": "Attribute-cache consistency race (TOCTOU)",
+      "cwe": "CWE-362",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided) — fuse_change_attributes()",
+      "invariant": "fuse_change_attributes() must compare the passed attr_version against the inode's current attr_version and skip the update if a newer one landed, so a delayed getattr reply cannot roll the inode back over a fresher update.",
+      "failure_mode": "An attacker who controls reply timing (the userspace server) can delay a getattr reply until after a newer attribute update; if the version comparison is dropped or inverted in the implementation, the stale server attributes overwrite the fresher cache. The snapshot is correctly taken before the request here (line 12), so the ordering half of the contract is satisfied.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm fuse_change_attributes() actually gates the write on attr_version and does so with the correct comparison direction."
+    },
+    {
+      "title": "Unchecked dereference of file->private_data (ff->fh)",
+      "anchor": "struct fuse_file *ff = file->private_data; ... inarg.fh = ff->fh;",
+      "file": "corpus/train/train_0079_cwe459.c",
+      "line": "18-21",
+      "code": "\t\tstruct fuse_file *ff = file->private_data;\n\n\t\tinarg.getattr_flags |= FUSE_GETATTR_FH;\n\t\tinarg.fh = ff->fh;",
+      "bug_class": "NULL-pointer dereference",
+      "cwe": "CWE-476",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0079_cwe459.c (this function)",
+      "invariant": "Any `file` passed to fuse_do_getattr with S_ISREG(inode->i_mode) must carry a fully-initialised struct fuse_file in file->private_data.",
+      "failure_mode": "If a regular-file `file` reaches this path with private_data == NULL (e.g. an internal/anon file, or an inode whose type raced with open), ff->fh dereferences NULL and oopses. On the standard FUSE open path private_data is always set, so this is latent rather than directly reachable, but it is an unchecked contract.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm every caller that passes a non-NULL `file` for a regular-file inode has completed fuse_open/init of private_data before reaching getattr."
+    }
+  ],
+  "audit_checklist": [
+    "Read fuse_invalid_attr() and confirm it fully bounds attr.size and validates attr.mode/type, nlink, and blkbits — it is the sole validation gate for untrusted server attributes.",
+    "Confirm fuse_change_attributes() clamps/handles server-supplied attr.size before writing inode i_size and page-cache size, and does not derive any index/length from attr fields.",
+    "Confirm fuse_change_attributes() enforces the attr_version snapshot (correct comparison direction) so a delayed reply cannot roll back a newer attribute update.",
+    "Confirm the (i_mode ^ attr.mode) & S_IFMT type-confusion check and fuse_invalid_attr() run before ANY attribute application on every refresh path (getattr, lookup, revalidate), not just here.",
+    "Confirm fuse_fillattr() copies attributes into kstat without using any attr field as a length/index, and that no in-kernel trust decision relies on FUSE-reported uid/gid/mode.",
+    "Confirm file->private_data is always a valid struct fuse_file for regular-file inodes reaching fuse_do_getattr, or add a NULL guard before ff->fh.",
+    "Confirm the make_bad_inode()+ -EIO reject path leaves no partially-applied inode/stat state (guard-before-mutate ordering preserved) to avoid the incomplete-cleanup pattern."
+  ]
+}

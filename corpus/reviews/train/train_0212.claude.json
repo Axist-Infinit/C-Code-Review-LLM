@@ -1,0 +1,200 @@
+{
+  "subsystem": "TensorFlow graph optimization / constant-folding pass. The function IsConstantFoldable is a predicate used by the ConstantFold rewrite (grappler / common_runtime constant_folding) to decide whether a single Node in a computation graph is eligible to be evaluated ahead of time and replaced by a constant. It inspects node type, statefulness, device kernel availability, scoped-allocator attributes, and — most importantly — the node's inferred output shapes to reject nodes whose constant result would be too large to materialize.",
+  "provenance": "Identified by API shape and naming, not SPDX (no header banner is present in the sample). The types Node*, PartialTensorShape, Tensor, DataTypeSize, DeviceType(DEVICE_CPU), KernelDefAvailable, op_def().is_stateful(), n->output_type(i), n->attrs().Find(kScopedAllocatorAttrName), and predicates IsGetSessionHandle/IsGetSessionTensor/IsDeleteSessionTensor/IsSend/IsRecv/IsSource/IsSink/IsFakeParam, plus the VLOG(2) logging macro, are all TensorFlow core graph types and match the signature of IsConstantFoldable in tensorflow/core/common_runtime/constant_folding.cc. The sample id 'primevul_test_0134_vuln' and file suffix cwe824 corroborate a real-world TensorFlow source excerpt.",
+  "trust_boundary": "The Node* n and the associated shape_map come from a deserialized GraphDef. In TensorFlow's threat model a GraphDef / SavedModel loaded from an untrusted source is attacker-controlled: the attacker chooses each node's op, its declared number of outputs, its attributes, and (through crafted shape functions or a pre-populated shape map) the vector of PartialTensorShape entries associated with the node name. The hostile inputs here are therefore (1) the per-node shape vector shape_it->second — its length and its element shapes — and (2) the node's declared output arity that backs n->output_type(i). The consider callback and max_constant_size_in_bytes are supplied by the (trusted) caller. The core danger is that the loop bound is taken from the shape vector while the index is also used to address the node's output-type table, two collections whose sizes are NOT guaranteed to agree.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0212_cwe824.cpp",
+      "lines": "2-9",
+      "code": "bool IsConstantFoldable(\n    const Node* n,\n    const std::unordered_map<string, std::vector<PartialTensorShape>>*\n        shape_map,\n    const std::function<bool(const Node*)>& consider,\n    int64_t max_constant_size_in_bytes,\n    std::unordered_map<const Node*, std::vector<Tensor>>*\n        shape_replacement_map) {",
+      "explanation": "The signature of the eligibility predicate. n is the graph node under consideration (a const pointer, dereferenced repeatedly below without a null check). shape_map is an optional pointer to a table mapping a node's string name to a vector of PartialTensorShape, one entry per output of that node as produced by shape inference. consider is a caller-supplied filter callback that can veto a node. max_constant_size_in_bytes is the byte budget above which a foldable constant is rejected to avoid materializing huge tensors. shape_replacement_map is an out-parameter (pointer to a map from Node* to vector<Tensor>) used by the shape-op replacement path. The function returns true if the node may be constant-folded."
+    },
+    {
+      "file": "corpus/train/train_0212_cwe824.cpp",
+      "lines": "10-12",
+      "code": "  if (n->IsConstant()) {\n    return true;\n  }",
+      "explanation": "Fast path: a node that is already a Const op is trivially foldable, so the function returns true immediately. This is the first dereference of n; the function assumes n is non-null."
+    },
+    {
+      "file": "corpus/train/train_0212_cwe824.cpp",
+      "lines": "13-15",
+      "code": "  if (MaybeReplaceShapeOp(n, shape_map, shape_replacement_map)) {\n    return true;\n  }",
+      "explanation": "Delegates to a helper that handles Shape/Size/Rank-style ops whose value is fully determined by the (already known) input shapes in shape_map. If the helper recognizes and stages a replacement (recording the substitute tensors into shape_replacement_map), the node is treated as foldable and the function returns true. Note that shape_map is passed here without a prior null check; the null guard only appears later at line 22."
+    },
+    {
+      "file": "corpus/train/train_0212_cwe824.cpp",
+      "lines": "16-18",
+      "code": "  if (n->op_def().is_stateful()) {\n    return false;\n  }",
+      "explanation": "Stateful ops (variables, random ops, queue/IO ops) must not be evaluated early because doing so would change program semantics or produce non-reproducible results; such nodes are rejected."
+    },
+    {
+      "file": "corpus/train/train_0212_cwe824.cpp",
+      "lines": "19-21",
+      "code": "  if (consider && !consider(n)) {\n    return false;\n  }",
+      "explanation": "If the caller supplied a consider predicate and that predicate returns false for this node, the node is rejected. The std::function is null-checked (via its operator bool) before invocation, so a default-constructed consider is safe."
+    },
+    {
+      "file": "corpus/train/train_0212_cwe824.cpp",
+      "lines": "22-35",
+      "code": "  if (shape_map != nullptr) {\n    // We can skip the node if an output is known to be oversized.\n    auto shape_it = shape_map->find(n->name());\n    if (shape_it != shape_map->end()) {\n      for (int64_t i = 0; i < shape_it->second.size(); ++i) {\n        const auto& out_shape = shape_it->second[i];\n        if (out_shape.IsFullyDefined() &&\n            out_shape.num_elements() * DataTypeSize(n->output_type(i)) >\n                max_constant_size_in_bytes) {\n          return false;\n        }\n      }\n    }\n  }",
+      "explanation": "The size-budget gate. If a shape_map is present, it is looked up by node name to obtain shape_it->second, the vector of inferred output shapes for this node. The loop walks that vector by index i. For each fully-defined shape it computes the estimated output byte size as out_shape.num_elements() (the element count of the i-th output) multiplied by DataTypeSize(n->output_type(i)) (the byte width of the i-th output's dtype). If any output would exceed max_constant_size_in_bytes the node is rejected. The critical structural fact is that the loop bound comes from shape_it->second.size() (the length of the shape vector) but the index i is ALSO fed into n->output_type(i), which indexes a DIFFERENT collection: the node's declared output-type table. Nothing in this function proves those two lengths are equal. The loop counter is a signed int64_t compared against an unsigned size() result."
+    },
+    {
+      "file": "corpus/train/train_0212_cwe824.cpp",
+      "lines": "36-38",
+      "code": "  if (n->IsControlFlow() || n->IsSend() || n->IsRecv()) {\n    return false;\n  }",
+      "explanation": "Control-flow ops (Switch/Merge/Enter/Exit/NextIteration) and cross-device Send/Recv ops carry execution-graph semantics that cannot be replaced by a static constant, so they are rejected."
+    },
+    {
+      "file": "corpus/train/train_0212_cwe824.cpp",
+      "lines": "39-43",
+      "code": "  // TODO(yuanbyu): For now disable these session handle operations.\n  if (n->IsGetSessionHandle() || n->IsGetSessionTensor() ||\n      n->IsDeleteSessionTensor()) {\n    return false;\n  }",
+      "explanation": "Session-handle/tensor ops interact with per-session state and are conservatively excluded from folding per the inline TODO."
+    },
+    {
+      "file": "corpus/train/train_0212_cwe824.cpp",
+      "lines": "44-52",
+      "code": "  if (n->IsSource()) {\n    return false;\n  }\n  if (n->IsSink()) {\n    return false;\n  }\n  if (n->IsFakeParam()) {\n    return false;\n  }",
+      "explanation": "The graph's synthetic Source and Sink boundary nodes and FakeParam placeholder nodes have no real computable value and are rejected."
+    },
+    {
+      "file": "corpus/train/train_0212_cwe824.cpp",
+      "lines": "53-60",
+      "code": "  // Since constant-folding runs on the CPU, do not attempt to constant-fold\n  // operators that have no CPU kernel. Also implies that we will not\n  // constant-fold functions.\n  // TODO(phawkins): allow constant-folding for functions; functions may\n  // be arbitrarily expensive to execute.\n  if (!KernelDefAvailable(DeviceType(DEVICE_CPU), n->def())) {\n    return false;\n  }",
+      "explanation": "Constant folding executes the node on the CPU, so a node lacking a registered CPU kernel (including function-call nodes) cannot be folded and is rejected."
+    },
+    {
+      "file": "corpus/train/train_0212_cwe824.cpp",
+      "lines": "61-69",
+      "code": "  // Do not constant fold nodes which will be allocated by ScopedAllocator.\n  // This is because the constant-folding graph will not contain the\n  // `_ScopedAllocator` node, and that is necessary to be able to run a node\n  // that will use this allocator.\n  if (n->attrs().Find(kScopedAllocatorAttrName) != nullptr) {\n    VLOG(2) << \"Skip node [\" << n->DebugString()\n            << \"] for constant folding due to scoped allocator\";\n    return false;\n  }",
+      "explanation": "Nodes tagged with the scoped-allocator attribute depend on a _ScopedAllocator node that will not exist in the isolated folding subgraph, so they are rejected (with a verbose log). This is the last exclusion."
+    },
+    {
+      "file": "corpus/train/train_0212_cwe824.cpp",
+      "lines": "70-71",
+      "code": "  return true;\n}",
+      "explanation": "If none of the exclusion criteria matched, the node is deemed constant-foldable and the function returns true."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0212_cwe824.cpp",
+      "lines": "26-30",
+      "code": "      for (int64_t i = 0; i < shape_it->second.size(); ++i) {\n        const auto& out_shape = shape_it->second[i];\n        if (out_shape.IsFullyDefined() &&\n            out_shape.num_elements() * DataTypeSize(n->output_type(i)) >\n                max_constant_size_in_bytes) {",
+      "explanation": "Out-of-bounds / uninitialized read of the node's output-type table. The loop iterates i in [0, shape_it->second.size()), i.e. over the number of shapes recorded for the node in shape_map, but then calls n->output_type(i), which indexes the node's own output_types_ vector whose length is the node's declared number of outputs (num_outputs()). These two lengths are independent: shape_map is populated by shape inference and can, for a maliciously constructed or inconsistent GraphDef, contain MORE entries than the node actually declares outputs. Node::output_type(int) performs an unchecked vector index (output_types_[i]); when i >= num_outputs() it reads past the end of the DataType array — an out-of-bounds read that returns an uninitialized/garbage DataType. That garbage DataType is passed to DataTypeSize(), and the product with num_elements() feeds a size comparison, so the corrupted read can also flip the oversize decision. The implementation MUST bound the loop by std::min(shape vector size, n->num_outputs()) — or verify shape_it->second.size() == n->num_outputs() before indexing — so that i is a valid index into BOTH collections. This is the vulnerability the sample is built around (CWE-824 / CWE-125)."
+    },
+    {
+      "file": "corpus/train/train_0212_cwe824.cpp",
+      "lines": "28-30",
+      "code": "        if (out_shape.IsFullyDefined() &&\n            out_shape.num_elements() * DataTypeSize(n->output_type(i)) >\n                max_constant_size_in_bytes) {",
+      "explanation": "Signed integer overflow in the size estimate. num_elements() returns an int64_t element count that an attacker can drive arbitrarily large by declaring a fully-defined shape with huge dimensions, and DataTypeSize() returns the per-element byte width (e.g. 8 or 16). The product out_shape.num_elements() * DataTypeSize(...) is an int64_t multiplication with no overflow check; a crafted shape whose true byte size exceeds INT64_MAX wraps to a small or negative value. Because the guard only rejects when the product is GREATER than max_constant_size_in_bytes, an overflowed (wrapped-negative) product silently passes the gate, defeating the very oversize protection this block implements and allowing a multi-exabyte constant to be scheduled for materialization (memory-exhaustion / DoS). The implementation should use a checked/saturating multiply (e.g. MultiplyWithoutOverflow) before comparing."
+    },
+    {
+      "file": "corpus/train/train_0212_cwe824.cpp",
+      "lines": "26",
+      "code": "      for (int64_t i = 0; i < shape_it->second.size(); ++i) {",
+      "explanation": "Signed/unsigned comparison mismatch. i is declared int64_t (signed) while std::vector::size() returns size_t (unsigned). The comparison i < shape_it->second.size() forces the signed operand to unsigned; while a monotonically increasing non-negative i does not misbehave in practice here, this is exactly the class of comparison that hides off-by-one and bound-confusion bugs and, combined with the output_type(i) mismatch above, makes the true iteration domain non-obvious. The loop bound should be an explicit, correctly-typed count derived from the node's output arity, not the shape vector's size."
+    },
+    {
+      "file": "corpus/train/train_0212_cwe824.cpp",
+      "lines": "10",
+      "code": "  if (n->IsConstant()) {",
+      "explanation": "Unchecked pointer dereference (latent). n is dereferenced here and throughout the function with no null check. If any caller can reach IsConstantFoldable with a null Node* (e.g. a malformed edge/endpoint during graph rewriting), this is an immediate null-pointer dereference and crash. n originates from the graph and is normally non-null, so this is low severity, but the contract (n != nullptr) is implicit and unenforced."
+    }
+  ],
+  "summary": "This is TensorFlow's IsConstantFoldable eligibility predicate. Its central security defect is at lines 26-30: the output-size loop is bounded by the shape_map vector length but uses the same index i to address the node's declared output-type table via n->output_type(i), an unchecked vector access; when the shape vector has more entries than the node has outputs (reachable from a crafted GraphDef) this is an out-of-bounds read of uninitialized memory (CWE-824/CWE-125). A secondary defect is an unchecked int64 multiply (line 29) whose overflow can bypass the oversize-constant guard (CWE-190). Both are high-value hardening targets when the graph is attacker-supplied.",
+  "reviewed_anchors": [
+    {"anchor": "IsConstantFoldable(...) signature, lines 2-9", "disposition": "finding", "reason": "Function contract requires n != nullptr and consistency between shape_map entries and node output arity; neither is enforced."},
+    {"anchor": "const Node* n parameter", "disposition": "finding", "reason": "Dereferenced without null check (latent NULL-deref) and its output_type table is indexed out of range at line 29."},
+    {"anchor": "shape_map parameter (unordered_map<string, vector<PartialTensorShape>>*)", "disposition": "finding", "reason": "Its per-node vector length drives a loop that also indexes the node output-type table — the length-mismatch is the core bug."},
+    {"anchor": "consider (std::function<bool(const Node*)>&)", "disposition": "dismissed", "reason": "Null-checked via operator bool before invocation at line 19; caller-supplied, not attacker-controlled."},
+    {"anchor": "max_constant_size_in_bytes (int64_t)", "disposition": "dismissed", "reason": "Trusted caller-supplied budget; only read in a comparison. Its guard is defeated by overflow, but that risk is charged to line 29, not this scalar."},
+    {"anchor": "shape_replacement_map parameter (out map<Node*, vector<Tensor>>*)", "disposition": "dismissed", "reason": "Only forwarded to MaybeReplaceShapeOp; no direct access in this file to review."},
+    {"anchor": "n->IsConstant() (line 10)", "disposition": "finding", "reason": "First unchecked dereference of n (latent NULL-deref anchor)."},
+    {"anchor": "MaybeReplaceShapeOp(n, shape_map, shape_replacement_map) (line 13)", "disposition": "dismissed", "reason": "External helper not shown; shape_map used here before its null check but the callee is expected to tolerate null. No in-file contract to assess."},
+    {"anchor": "n->op_def().is_stateful() (line 16)", "disposition": "dismissed", "reason": "Pure predicate read; correct semantic exclusion, no memory-safety contract."},
+    {"anchor": "consider && !consider(n) (line 19)", "disposition": "dismissed", "reason": "Guarded callback invocation; safe."},
+    {"anchor": "shape_map != nullptr guard (line 22)", "disposition": "dismissed", "reason": "Correct null guard; the risk is inside the loop it protects, not the guard."},
+    {"anchor": "for (int64_t i = 0; i < shape_it->second.size(); ++i) (line 26)", "disposition": "finding", "reason": "Loop bound taken from shape vector, index reused on node output-type table; signed/unsigned comparison."},
+    {"anchor": "shape_it->second[i] (line 27)", "disposition": "dismissed", "reason": "This index is in-bounds by construction because i < shape_it->second.size(); the OOB is on the OTHER collection (output_type(i))."},
+    {"anchor": "out_shape.num_elements() * DataTypeSize(n->output_type(i)) (line 29)", "disposition": "finding", "reason": "Unchecked int64 multiply (overflow bypasses size cap) AND the OOB output_type(i) read both live here."},
+    {"anchor": "n->output_type(i) (line 29)", "disposition": "finding", "reason": "Unchecked index into node output-type vector with a counter bounded by a different collection — the CWE-824 core."},
+    {"anchor": "IsControlFlow/IsSend/IsRecv (line 36)", "disposition": "dismissed", "reason": "Semantic exclusions; no memory contract."},
+    {"anchor": "IsGetSessionHandle/IsGetSessionTensor/IsDeleteSessionTensor (line 40-41)", "disposition": "dismissed", "reason": "Semantic exclusions; no memory contract."},
+    {"anchor": "IsSource/IsSink/IsFakeParam (lines 44-51)", "disposition": "dismissed", "reason": "Boundary/placeholder-node exclusions; no memory contract."},
+    {"anchor": "KernelDefAvailable(DeviceType(DEVICE_CPU), n->def()) (line 58)", "disposition": "dismissed", "reason": "Kernel-availability check; no attacker-controlled memory access."},
+    {"anchor": "n->attrs().Find(kScopedAllocatorAttrName) (line 65)", "disposition": "dismissed", "reason": "Attribute lookup returning nullptr-checked pointer; safe."},
+    {"anchor": "VLOG(2) << n->DebugString() (lines 66-67)", "disposition": "dismissed", "reason": "Diagnostic logging on an already-validated non-null n; no NULL-deref at the log site here."}
+  ],
+  "findings": [
+    {
+      "title": "Out-of-bounds / uninitialized read of node output-type table (loop bounded by wrong collection)",
+      "anchor": "n->output_type(i) inside for (int64_t i = 0; i < shape_it->second.size(); ++i)",
+      "file": "corpus/train/train_0212_cwe824.cpp",
+      "line": "26-30",
+      "code": "      for (int64_t i = 0; i < shape_it->second.size(); ++i) {\n        const auto& out_shape = shape_it->second[i];\n        if (out_shape.IsFullyDefined() &&\n            out_shape.num_elements() * DataTypeSize(n->output_type(i)) >\n                max_constant_size_in_bytes) {\n          return false;\n        }",
+      "bug_class": "Out-of-bounds read of uninitialized memory (index bounded by a different collection than the one indexed)",
+      "cwe": "CWE-824",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0212_cwe824.cpp (and Node::output_type in the TensorFlow core graph implementation, file not provided)",
+      "invariant": "The loop index used for n->output_type(i) must be a valid output index, i.e. i < n->num_outputs(). The loop must be bounded by std::min(shape_it->second.size(), n->num_outputs()) or the code must verify shape_it->second.size() == n->num_outputs() before indexing either collection.",
+      "failure_mode": "For a node whose shape_map entry contains more PartialTensorShape entries than the node declares outputs (reachable via a crafted or shape-inference-inconsistent GraphDef), the iteration reaches i >= num_outputs(). n->output_type(i) then indexes output_types_[i] past the end of the vector, reading uninitialized/out-of-bounds memory. The garbage DataType is passed to DataTypeSize() and can crash, leak adjacent heap contents through the folding decision, or corrupt the oversize check.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm that Node::output_type performs an unchecked vector index (output_types_[o]) and that no earlier code guarantees shape_map[n->name()].size() equals n->num_outputs(); verify the upstream fix bounds the loop with num_outputs()."
+    },
+    {
+      "title": "Unchecked int64 multiply lets an oversized constant bypass the size-budget gate",
+      "anchor": "out_shape.num_elements() * DataTypeSize(n->output_type(i)) > max_constant_size_in_bytes",
+      "file": "corpus/train/train_0212_cwe824.cpp",
+      "line": "29-30",
+      "code": "            out_shape.num_elements() * DataTypeSize(n->output_type(i)) >\n                max_constant_size_in_bytes) {",
+      "bug_class": "Signed integer overflow bypassing a resource-size guard",
+      "cwe": "CWE-190",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0212_cwe824.cpp",
+      "invariant": "The estimated output byte size (element_count * dtype_width) must be computed with overflow detection so that a value exceeding INT64_MAX is treated as 'too large' rather than wrapping to a small/negative number.",
+      "failure_mode": "An attacker declares a fully-defined output shape with dimensions whose product times the dtype width overflows int64_t. The wrapped product becomes small or negative, so the '> max_constant_size_in_bytes' test is false, the oversize rejection is skipped, and folding proceeds to materialize an astronomically large tensor — memory exhaustion / denial of service and a defeat of the intended guard.",
+      "cve_analog": "",
+      "what_to_confirm": "Check whether the multiplication uses a checked helper (e.g. MultiplyWithoutOverflow) upstream; if not, the guard is bypassable for large declared shapes."
+    },
+    {
+      "title": "Signed/unsigned loop comparison obscures the true iteration bound",
+      "anchor": "for (int64_t i = 0; i < shape_it->second.size(); ++i)",
+      "file": "corpus/train/train_0212_cwe824.cpp",
+      "line": "26",
+      "code": "      for (int64_t i = 0; i < shape_it->second.size(); ++i) {",
+      "bug_class": "Signed/unsigned comparison (sign-conversion hygiene)",
+      "cwe": "CWE-195",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0212_cwe824.cpp",
+      "invariant": "Loop counters should match the type/domain of the bound they index; the counter should be derived from the collection actually addressed (node output arity), not from an unrelated container's size().",
+      "failure_mode": "int64_t i is compared against a size_t; the signed operand converts to unsigned. It does not misbehave for this non-negative counter, but it masks the fact that the loop domain is the shape vector while the body indexes the output-type table, feeding the CWE-824 defect above.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the corrected code both fixes the type and bounds the loop by n->num_outputs()."
+    },
+    {
+      "title": "Unchecked dereference of Node* n (latent NULL deref)",
+      "anchor": "const Node* n; if (n->IsConstant())",
+      "file": "corpus/train/train_0212_cwe824.cpp",
+      "line": "10",
+      "code": "  if (n->IsConstant()) {",
+      "bug_class": "NULL pointer dereference",
+      "cwe": "CWE-476",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0212_cwe824.cpp",
+      "invariant": "Callers must pass a non-null n; the function assumes but never enforces this precondition.",
+      "failure_mode": "If any rewrite path reaches IsConstantFoldable with n == nullptr (e.g. a malformed graph endpoint), the first n-> dereference crashes the process. Normally n comes from a valid graph node, so this is low risk, but the precondition is implicit.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify all call sites establish n != nullptr before invoking, or add an explicit guard."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm the loop is bounded by n->num_outputs() (or std::min with the shape vector size) so n->output_type(i) can never be indexed out of range — this is the primary fix.",
+    "Confirm Node::output_type(i) performs no internal bounds check (unchecked output_types_[i]) and would read uninitialized memory for i >= num_outputs().",
+    "Verify no invariant elsewhere guarantees shape_map[n->name()].size() == n->num_outputs(); if it is not guaranteed, the mismatch is reachable from untrusted graphs.",
+    "Replace the num_elements() * DataTypeSize(...) product with an overflow-checked multiply so oversized shapes cannot wrap past the max_constant_size_in_bytes guard.",
+    "Fix the signed/unsigned loop counter to a type matching the correctly-derived output count.",
+    "Confirm all call sites of IsConstantFoldable pass a non-null Node* n, or add an explicit null guard at entry.",
+    "Check that MaybeReplaceShapeOp tolerates being called before the shape_map != nullptr check at line 22."
+  ]
+}

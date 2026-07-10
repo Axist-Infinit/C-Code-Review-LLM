@@ -1,0 +1,164 @@
+{
+  "subsystem": "Linux kernel networking stack, Generic Receive Offload (GRO) fast path. This is napi_frags_skb(), the helper that napi_gro_frags() calls to reconstruct/validate the Ethernet header of a page-fragment-based sk_buff before it is fed into the GRO receive engine. It processes raw received frames handed up by a NIC driver.",
+  "provenance": "Identified by Linux-kernel networking identifiers: struct sk_buff, struct napi_struct, struct ethhdr, the GRO helpers skb_gro_header_fast/_hard/_slow, skb_gro_reset_offset, gro_pull_from_frag0, NAPI_GRO_CB(), __skb_pull(), skb_reset_mac_header(), napi_reuse_skb(), and net_warn_ratelimited(). These live in net/core/dev.c. The in-code comment references napi_frags_finish(). The sample header comment 'primevul_c_train_2378_vuln' and the file name eval_0076_cwe416.c indicate a use-after-free class defect.",
+  "trust_boundary": "The sk_buff (napi->skb) is filled from bytes received off the wire by a network device driver. The Ethernet header and its h_proto field are entirely attacker-controllable frame content. Critically, in the GRO fast path the header lives in a paged fragment (frag0), a page-backed region whose lifetime and position are managed by the driver/GRO machinery. Any raw pointer captured into that packet memory is only valid until the buffer is copied, pulled, advanced, or reallocated. The frame is remote and untrusted by default.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/eval/eval_0076_cwe416.c",
+      "lines": "3-7",
+      "code": "static struct sk_buff *napi_frags_skb(struct napi_struct *napi)\n{\n\tstruct sk_buff *skb = napi->skb;\n\tconst struct ethhdr *eth;\n\tunsigned int hlen = sizeof(*eth);",
+      "explanation": "The function takes the per-CPU NAPI context and returns the prepared sk_buff (or NULL on failure). It caches the in-progress skb from napi->skb into a local. It declares eth, a pointer to a 14-byte Ethernet header (struct ethhdr), and computes hlen = sizeof(*eth) = 14, the number of leading bytes that must be present and consumable as the L2 header. hlen is the length used for every subsequent header-availability check, pull, and pointer advance in the function."
+    },
+    {
+      "file": "corpus/eval/eval_0076_cwe416.c",
+      "lines": "9",
+      "code": "\tnapi->skb = NULL;",
+      "explanation": "The skb is detached from the NAPI context so the caller/GRO engine now owns it exclusively; on any later error path the code must explicitly re-arm it (via napi_reuse_skb) or free it, since napi->skb no longer references it."
+    },
+    {
+      "file": "corpus/eval/eval_0076_cwe416.c",
+      "lines": "11-12",
+      "code": "\tskb_reset_mac_header(skb);\n\tskb_gro_reset_offset(skb);",
+      "explanation": "skb_reset_mac_header() points skb->mac_header at the current skb->data (the start of the L2 header). skb_gro_reset_offset() sets up the GRO offset bookkeeping, in particular initializing NAPI_GRO_CB(skb)->frag0 to point directly into the first paged fragment's data and NAPI_GRO_CB(skb)->frag0_len to the number of contiguous bytes available there. This is the frag0 optimization: it lets the header be read straight from the page without first copying it into the linear (skb->data) area."
+    },
+    {
+      "file": "corpus/eval/eval_0076_cwe416.c",
+      "lines": "14",
+      "code": "\teth = skb_gro_header_fast(skb, 0);",
+      "explanation": "skb_gro_header_fast(skb, 0) returns a pointer at offset 0 into the fast-path header region, i.e. NAPI_GRO_CB(skb)->frag0. When the header sits in the paged fragment this returns a pointer INTO the frag0 page, not into the linear skb->data buffer. eth is captured here BEFORE the code decides which path (slow copy vs. fast frag0) it will take, and before any buffer mutation. This eager capture is the crux of the defect."
+    },
+    {
+      "file": "corpus/eval/eval_0076_cwe416.c",
+      "lines": "15-22",
+      "code": "\tif (unlikely(skb_gro_header_hard(skb, hlen))) {\n\t\teth = skb_gro_header_slow(skb, hlen, 0);\n\t\tif (unlikely(!eth)) {\n\t\t\tnet_warn_ratelimited(\"%s: dropping impossible skb from %s\\n\",\n\t\t\t\t\t     __func__, napi->dev->name);\n\t\t\tnapi_reuse_skb(napi, skb);\n\t\t\treturn NULL;\n\t\t}\n\t}",
+      "explanation": "skb_gro_header_hard(skb, hlen) returns true when the first hlen bytes are NOT already contiguously available in frag0 (the 'hard' / slow case). In that case skb_gro_header_slow(skb, hlen, 0) pulls/linearizes hlen bytes into skb->data and returns a fresh pointer to them; this call can reallocate the skb head, which is why eth is reassigned to its return value. If the packet is too short to even contain the header, skb_gro_header_slow returns NULL, the code rate-limits a warning that dereferences napi->dev->name, hands the skb back to NAPI via napi_reuse_skb() for reuse, and returns NULL. In this branch eth is (correctly) re-derived after the buffer settles."
+    },
+    {
+      "file": "corpus/eval/eval_0076_cwe416.c",
+      "lines": "23-27",
+      "code": "\t} else {\n\t\tgro_pull_from_frag0(skb, hlen);\n\t\tNAPI_GRO_CB(skb)->frag0 += hlen;\n\t\tNAPI_GRO_CB(skb)->frag0_len -= hlen;\n\t}",
+      "explanation": "The fast path: the header IS available in frag0. gro_pull_from_frag0(skb, hlen) copies the first hlen bytes from the frag0 page into the skb's linear data area (skb_copy_to_linear_data) so the linear buffer now holds a valid Ethernet header. It then advances NAPI_GRO_CB(skb)->frag0 by hlen and decrements frag0_len by hlen to reflect the consumed header. Note what this branch does NOT do: it never re-points eth at the freshly-populated skb->data. eth still holds the value captured at line 14 — a pointer to the original frag0 location that has now been logically consumed and advanced past."
+    },
+    {
+      "file": "corpus/eval/eval_0076_cwe416.c",
+      "lines": "28",
+      "code": "\t__skb_pull(skb, hlen);",
+      "explanation": "__skb_pull(skb, hlen) advances skb->data forward by hlen and reduces skb->len, moving the packet's logical start past the L2 header so upper layers begin at L3. This assumes hlen bytes are present; both the slow and fast paths above are supposed to guarantee that."
+    },
+    {
+      "file": "corpus/eval/eval_0076_cwe416.c",
+      "lines": "30-35",
+      "code": "\t/*\n\t * This works because the only protocols we care about don't require\n\t * special handling.\n\t * We'll fix it up properly in napi_frags_finish()\n\t */\n\tskb->protocol = eth->h_proto;",
+      "explanation": "The EtherType from the header is provisionally stored into skb->protocol; it is finalized later in napi_frags_finish(). This is the single dereference of eth in the function. In the fast path eth still points at the original frag0 page memory captured at line 14, AFTER that region was copied out, advanced, and pulled past — so this read is not guaranteed to observe live, valid header bytes."
+    },
+    {
+      "file": "corpus/eval/eval_0076_cwe416.c",
+      "lines": "37",
+      "code": "\treturn skb;",
+      "explanation": "On success the prepared skb is returned to napi_gro_frags() for GRO processing, with skb->data pointing at L3 and skb->protocol set from the (possibly stale) EtherType."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/eval/eval_0076_cwe416.c",
+      "lines": "14",
+      "code": "\teth = skb_gro_header_fast(skb, 0);",
+      "explanation": "eth is captured eagerly as a raw pointer into the frag0 paged fragment BEFORE the code knows whether it will take the slow or fast branch and before any buffer mutation. In the fast (else) branch this pointer is never refreshed. Because subsequent operations copy the header out of frag0, advance the frag0 cursor, and pull skb->data, the pointer becomes stale: it references packet memory that has been logically consumed/relocated and, at the page/head level, may be reallocated or reused by GRO. The safe contract is to derive eth from the destination the header actually ends up in (skb->data) AFTER gro_pull_from_frag0() and __skb_pull(), or to read h_proto before any buffer-mutating call — not to reuse a pre-mutation frag0 pointer."
+    },
+    {
+      "file": "corpus/eval/eval_0076_cwe416.c",
+      "lines": "35",
+      "code": "\tskb->protocol = eth->h_proto;",
+      "explanation": "This is the sink. In the fast path eth still points into the pre-consumption frag0 page. Between the capture (line 14) and this dereference, gro_pull_from_frag0() (line 24) copied the bytes elsewhere and NAPI_GRO_CB(skb)->frag0 was advanced (line 25), and __skb_pull() (line 28) moved the linear window. In the general GRO flow the frag0-backing page can be released/reused once its bytes are pulled into the linear area, so dereferencing the stale eth here is a use-after-free / stale-pointer read of attacker-supplied packet memory. Impact: reading h_proto from freed or repurposed memory yields an attacker-influenced or garbage EtherType (info leak / mis-steer of protocol handling) and, if the page is unmapped, a kernel crash (remote DoS). The invariant: the pointer dereferenced here MUST point at currently-live header bytes in skb->data, re-derived after all buffer copies/pulls."
+    },
+    {
+      "file": "corpus/eval/eval_0076_cwe416.c",
+      "lines": "26",
+      "code": "\t\tNAPI_GRO_CB(skb)->frag0_len -= hlen;",
+      "explanation": "frag0_len is an unsigned length; subtracting hlen underflows to a near-UINT_MAX value if frag0_len < hlen. This else branch is only entered when skb_gro_header_hard(skb, hlen) returned false, whose contract is that at least hlen bytes are contiguously present in frag0, so frag0_len >= hlen and the subtraction is guarded. The latent risk is entirely dependent on that guarantee: if skb_gro_reset_offset()/skb_gro_header_hard() ever report frag0 availability inconsistently (e.g. frag0_len set smaller than the region skb_gro_header_hard validated), this becomes an unsigned integer underflow (CWE-191) that makes downstream frag0 length checks treat the fragment as effectively unbounded. Confirm the hard-check and frag0_len are derived from the same byte count."
+    },
+    {
+      "file": "corpus/eval/eval_0076_cwe416.c",
+      "lines": "18-19",
+      "code": "\t\t\tnet_warn_ratelimited(\"%s: dropping impossible skb from %s\\n\",\n\t\t\t\t\t     __func__, napi->dev->name);",
+      "explanation": "The warning path dereferences napi->dev->name. If napi->dev is NULL (a NAPI context not associated with a netdev, as some virtual/software NAPI users do), this is a NULL-pointer dereference at the log site (CWE-476), turning a benign 'impossible skb' drop into a kernel oops. This is only reachable when skb_gro_header_slow() fails (runt frame), which an attacker can induce by sending a frame shorter than 14 bytes. Confirm napi->dev is always non-NULL for callers reaching napi_frags_skb, or make the log NULL-tolerant."
+    }
+  ],
+  "summary": "This GRO helper eagerly captures eth as a raw pointer into the frag0 paged fragment (line 14) and, in the fast path, never refreshes it before dereferencing eth->h_proto (line 35) after the header has been copied out, the frag0 cursor advanced, and skb->data pulled — a use-after-free / stale-pointer read of attacker-controlled packet memory (CWE-416), remotely triggerable, causing an EtherType info-leak/mis-steer or a crash. Secondary latent issues: an unsigned frag0_len subtraction that relies on the hard-check invariant (CWE-191) and a NULL napi->dev deref in the warning path (CWE-476).",
+  "reviewed_anchors": [
+    { "anchor": "static struct sk_buff *napi_frags_skb(struct napi_struct *napi) (signature, line 3)", "disposition": "dismissed", "reason": "Function signature; the single napi pointer is trusted kernel context, not a buffer/length pair. Attack surface is in the body." },
+    { "anchor": "struct sk_buff *skb = napi->skb; (line 5)", "disposition": "dismissed", "reason": "Local alias of the in-progress skb; no contract of its own beyond the deref sites analyzed below." },
+    { "anchor": "const struct ethhdr *eth; (line 6)", "disposition": "finding", "reason": "This pointer into packet memory is captured pre-mutation and dereferenced post-mutation — the core use-after-free/stale-read anchor." },
+    { "anchor": "unsigned int hlen = sizeof(*eth); (line 7)", "disposition": "dismissed", "reason": "Compile-time constant 14; not attacker-controlled, cannot overflow. It is the pull/advance length but its value is fixed." },
+    { "anchor": "napi->skb = NULL; (line 9)", "disposition": "dismissed", "reason": "Ownership transfer; error paths correctly re-arm via napi_reuse_skb. No leak/UAF from this line itself." },
+    { "anchor": "skb_reset_mac_header(skb); (line 11)", "disposition": "dismissed", "reason": "Sets mac_header offset to current data; no untrusted length consumed." },
+    { "anchor": "skb_gro_reset_offset(skb); (line 12)", "disposition": "dismissed", "reason": "Initializes frag0/frag0_len bookkeeping; correctness assumed here, its output is consumed by the anchors below." },
+    { "anchor": "eth = skb_gro_header_fast(skb, 0); (line 14)", "disposition": "finding", "reason": "Eager capture of a frag0 pointer that is not refreshed in the fast path — the source of the stale/UAF pointer." },
+    { "anchor": "skb_gro_header_hard(skb, hlen) (line 15)", "disposition": "dismissed", "reason": "Availability predicate; its contract (>=hlen bytes in frag0) is what guards the line-26 subtraction, tracked under that finding." },
+    { "anchor": "eth = skb_gro_header_slow(skb, hlen, 0); (line 16)", "disposition": "dismissed", "reason": "Slow path correctly re-derives eth after linearization; may reallocate head but returns the fresh pointer, so this branch's eth is valid." },
+    { "anchor": "if (unlikely(!eth)) (line 17)", "disposition": "dismissed", "reason": "Proper NULL guard on the slow-path return; runt-frame handling." },
+    { "anchor": "net_warn_ratelimited(..., napi->dev->name) (lines 18-19)", "disposition": "finding", "reason": "Dereferences napi->dev->name at the log site; NULL napi->dev crashes (CWE-476)." },
+    { "anchor": "napi_reuse_skb(napi, skb); (line 20)", "disposition": "dismissed", "reason": "Correctly recycles the detached skb on the failure path; no defect." },
+    { "anchor": "gro_pull_from_frag0(skb, hlen); (line 24)", "disposition": "dismissed", "reason": "Copies hlen bytes frag0->linear correctly; it is the mutation that invalidates the stale eth, folded into the line-14/35 finding." },
+    { "anchor": "NAPI_GRO_CB(skb)->frag0 += hlen; (line 25)", "disposition": "dismissed", "reason": "Advances frag0 cursor by the fixed constant hlen; bounded by the hard-check that admitted this branch." },
+    { "anchor": "NAPI_GRO_CB(skb)->frag0_len -= hlen; (line 26)", "disposition": "finding", "reason": "Unsigned subtraction that underflows if frag0_len < hlen; guarded by the hard-check invariant, latent (CWE-191)." },
+    { "anchor": "__skb_pull(skb, hlen); (line 28)", "disposition": "dismissed", "reason": "Pulls fixed hlen bytes; both prior branches guarantee hlen present, so no skb->len underflow in normal flow. It is a mutation that helps invalidate eth (folded into UAF finding)." },
+    { "anchor": "skb->protocol = eth->h_proto; (line 35)", "disposition": "finding", "reason": "The sink: dereferences the stale eth pointer after buffer mutation — the use-after-free/stale-read." }
+  ],
+  "findings": [
+    {
+      "title": "Use-after-free / stale-pointer read of frag0 Ethernet header (eth captured before, dereferenced after, buffer mutation)",
+      "anchor": "eth = skb_gro_header_fast(skb, 0);  ...  skb->protocol = eth->h_proto;",
+      "file": "corpus/eval/eval_0076_cwe416.c",
+      "line": "14,35",
+      "code": "\teth = skb_gro_header_fast(skb, 0);\n...\n\tskb->protocol = eth->h_proto;",
+      "bug_class": "Use-after-free / stale pointer read of paged packet memory",
+      "cwe": "CWE-416",
+      "severity": "high",
+      "where_it_lives": "corpus/eval/eval_0076_cwe416.c (net/core/dev.c napi_frags_skb)",
+      "invariant": "The pointer dereferenced at line 35 must reference currently-live L2 header bytes. In the fast/frag0 path, eth must be re-derived from skb->data AFTER gro_pull_from_frag0() has copied the header into the linear area and after __skb_pull(), or h_proto must be read before any frag0-consuming/pull operation. A raw frag0 pointer captured at line 14 must not be reused once frag0 is advanced/consumed.",
+      "failure_mode": "An attacker sends a frame whose L2 header is served from the frag0 page (the common GRO fast path). eth is captured at line 14 pointing into that page. The else branch (lines 24-26) copies the header out, advances NAPI_GRO_CB(skb)->frag0 past it, and __skb_pull() (line 28) moves skb->data, but eth is never refreshed. Line 35 then reads eth->h_proto from the now-consumed frag0 location; because the frag0-backing page can be released/reused after its bytes are pulled, this reads freed or repurposed memory. Result: an attacker-influenced or garbage EtherType steers protocol handling incorrectly / leaks stale memory contents, and an unmapped page yields a kernel oops (remote DoS).",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm that in the fast (else) branch eth is NOT re-assigned to skb->data before line 35, and that gro_pull_from_frag0 + frag0 advance can leave the original frag0 page freed/reused by the time eth->h_proto is read. The fix is to set eth = (const struct ethhdr *)skb->data in the else branch (post-pull) or read h_proto before mutation."
+    },
+    {
+      "title": "Unsigned underflow of frag0_len if fewer than hlen bytes are present",
+      "anchor": "NAPI_GRO_CB(skb)->frag0_len -= hlen;",
+      "file": "corpus/eval/eval_0076_cwe416.c",
+      "line": "26",
+      "code": "\t\tNAPI_GRO_CB(skb)->frag0_len -= hlen;",
+      "bug_class": "Unsigned integer underflow of a length counter",
+      "cwe": "CWE-191",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0076_cwe416.c (net/core/dev.c napi_frags_skb)",
+      "invariant": "frag0_len must be >= hlen whenever this branch executes; this must be guaranteed by skb_gro_header_hard(skb, hlen) returning false meaning at least hlen contiguous bytes exist in frag0, and by frag0_len being computed from the same byte count skb_gro_header_hard validated.",
+      "failure_mode": "If frag0_len is ever smaller than hlen when the else branch runs (an inconsistency between how skb_gro_reset_offset sets frag0_len and how skb_gro_header_hard measures availability), the unsigned subtraction wraps to ~UINT_MAX. Downstream GRO length checks that trust frag0_len would then treat the fragment as effectively unbounded, enabling over-reads of frag0 page memory (CWE-125) in later processing.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify skb_gro_header_hard(skb, hlen)==false strictly implies NAPI_GRO_CB(skb)->frag0_len >= hlen, i.e. both derive from the same contiguous-byte measurement, so the subtraction can never underflow."
+    },
+    {
+      "title": "Potential NULL dereference of napi->dev in the drop-warning path",
+      "anchor": "net_warn_ratelimited(\"%s: dropping impossible skb from %s\\n\", __func__, napi->dev->name);",
+      "file": "corpus/eval/eval_0076_cwe416.c",
+      "line": "18-19",
+      "code": "\t\t\tnet_warn_ratelimited(\"%s: dropping impossible skb from %s\\n\",\n\t\t\t\t\t     __func__, napi->dev->name);",
+      "bug_class": "NULL pointer dereference at logging site",
+      "cwe": "CWE-476",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0076_cwe416.c (net/core/dev.c napi_frags_skb)",
+      "invariant": "napi->dev must be non-NULL for any NAPI instance whose frames reach napi_frags_skb, or the log must tolerate a NULL dev.",
+      "failure_mode": "If a NAPI context without an associated netdev (napi->dev == NULL) reaches this path, reading napi->dev->name dereferences NULL and oopses the kernel. The path is reached whenever skb_gro_header_slow() fails, which an attacker triggers by sending a frame shorter than the 14-byte Ethernet header, so the crash is remotely inducible if such a NAPI configuration exists.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm every caller of napi_gro_frags()/napi_frags_skb sets napi->dev before frames flow, or that this warning is unreachable with napi->dev == NULL."
+    }
+  ],
+  "audit_checklist": [
+    "In the fast (else) branch, is eth re-derived from skb->data after gro_pull_from_frag0()+__skb_pull(), or is the pre-mutation frag0 pointer from line 14 reused at line 35? (primary UAF).",
+    "Can the frag0-backing page be released or reused between the eth capture (line 14) and the eth->h_proto read (line 35) in the fast path?",
+    "Does skb_gro_header_hard(skb, hlen)==false strictly guarantee frag0_len >= hlen so the line-26 subtraction cannot underflow?",
+    "Is NAPI_GRO_CB(skb)->frag0_len derived from the exact same contiguous-byte count that skb_gro_header_hard validates?",
+    "Can napi->dev be NULL for any caller reaching napi_frags_skb, making napi->dev->name (line 19) a NULL deref on a runt frame?",
+    "Does skb_gro_header_slow() reallocation on the slow path leave any other cached pointer (besides eth) dangling?",
+    "Is __skb_pull(skb, hlen) always preceded by a guarantee that skb has >= hlen bytes, in both slow and fast branches?"
+  ]
+}

@@ -1,0 +1,233 @@
+{
+  "subsystem": "Linux kernel VFS mount / namespace subsystem (fs/namespace.c). The function clone_private_mount() creates a private, longterm clone of an existing mount for an in-kernel consumer (notably overlayfs, which clones the lower/upper/work directory mounts). It takes a struct path, resolves the underlying struct mount, validates that the mount may legitimately be cloned into a private context, produces a fresh CL_PRIVATE clone, marks it with the internal mount namespace sentinel, and returns the new vfsmount (or an ERR_PTR).",
+  "provenance": "Identified by naming and API surface rather than SPDX/copyright (none shown). The identifiers are unmistakably Linux VFS internals: clone_private_mount, real_mount(), struct mount / struct vfsmount / struct path, down_read/up_read(&namespace_sem), IS_MNT_UNBINDABLE(), check_mnt(), has_locked_children(), clone_mnt(..., CL_PRIVATE), MNT_NS_INTERNAL, ERR_PTR/ERR_CAST/IS_ERR, and kern_unmount referenced in the comment. This is fs/namespace.c. The sample header comment 'primevul_c_test_0241_fixed' and the corpus filename eval_0027_cwe200.c indicate this is the FIXED variant of a CWE-200 (information exposure) case, i.e. the hardened version that added the check_mnt/has_locked_children gating.",
+  "trust_boundary": "clone_private_mount() is an in-kernel API, but its struct path argument is derived from user-controllable input. Its principal caller, overlayfs, builds these paths from mount options (lowerdir=, upperdir=, workdir=) supplied by whoever performs the mount(2) — increasingly reachable by unprivileged users inside a user namespace. The hostile-controllable elements are therefore path->mnt and path->dentry: an attacker chooses WHICH mount subtree gets cloned into a private, longterm mount. The security question is whether the routine lets a caller clone a subtree it should not be permitted to see or detach — specifically one containing mounts that a more-privileged namespace locked in place. namespace_sem protects the mount tree topology while the checks run.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/eval/eval_0027_cwe200.c",
+      "lines": "1-2",
+      "code": "/* sample: primevul_c_test_0241_fixed */\nstruct vfsmount *clone_private_mount(const struct path *path)",
+      "explanation": "The banner comment labels this as a 'fixed' sample. The signature declares clone_private_mount taking a const struct path * and returning a struct vfsmount *. In kernel convention a struct vfsmount * return that may encode an error is checked with IS_ERR/PTR_ERR. The const on the path means the function must not mutate the caller's path, only read path->mnt and path->dentry from it. The caller retains ownership of path; the returned vfsmount is a NEW reference the caller must eventually release (the comment at line 23 says via kern_unmount*())."
+    },
+    {
+      "file": "corpus/eval/eval_0027_cwe200.c",
+      "lines": "4-5",
+      "code": "struct mount *old_mnt = real_mount(path->mnt);\n\tstruct mount *new_mnt;",
+      "explanation": "real_mount(path->mnt) converts the public struct vfsmount * embedded in the path into the internal struct mount * (via container_of), which exposes the topology fields the mount code needs (mnt_flags, mnt_ns, child list, etc.). old_mnt is the source subtree the caller wants cloned. new_mnt is declared but not yet initialised; it will hold the clone. Note old_mnt is computed before namespace_sem is taken, but it is only a pointer arithmetic derivation of an object the caller already holds a reference to via path."
+    },
+    {
+      "file": "corpus/eval/eval_0027_cwe200.c",
+      "lines": "7",
+      "code": "down_read(&namespace_sem);",
+      "explanation": "Acquires the global namespace_sem reader lock. namespace_sem serialises reads and writes of the mount tree topology. Holding it read-locked here guarantees the subsequent property checks (unbindable flag, in-namespace check, locked-children walk) and the clone_mnt() operation observe a consistent, non-shifting mount tree — nobody can graft, move, or detach mounts underneath old_mnt while these decisions are made."
+    },
+    {
+      "file": "corpus/eval/eval_0027_cwe200.c",
+      "lines": "8-9",
+      "code": "if (IS_MNT_UNBINDABLE(old_mnt))\n\t\tgoto invalid;",
+      "explanation": "First gate: rejects mounts marked MNT_UNBINDABLE (mount --make-unbindable). An unbindable mount is explicitly declared by the administrator/namespace owner as one that may never be bind-mounted or cloned. Cloning it privately would defeat that guarantee, so the function bails to the invalid label, releasing the lock and returning -EINVAL."
+    },
+    {
+      "file": "corpus/eval/eval_0027_cwe200.c",
+      "lines": "11-12",
+      "code": "if (!check_mnt(old_mnt))\n\t\tgoto invalid;",
+      "explanation": "Second gate: check_mnt(old_mnt) verifies that old_mnt belongs to the current task's mount namespace (mnt->mnt_ns == current->nsproxy->mnt_ns and is not the internal/anonymous namespace). This ensures the caller can only clone a mount it legitimately sees in its own namespace, not some foreign namespace's mount that happened to be reachable by pointer. Failing the check jumps to invalid."
+    },
+    {
+      "file": "corpus/eval/eval_0027_cwe200.c",
+      "lines": "14-15",
+      "code": "if (has_locked_children(old_mnt, path->dentry))\n\t\tgoto invalid;",
+      "explanation": "Third and most security-critical gate: has_locked_children walks the children of old_mnt beneath path->dentry and returns true if any child mount is locked (MNT_LOCKED). Locked child mounts are ones a more-privileged context mounted over a directory to hide/protect its contents and which an unprivileged namespace is forbidden to unmount or peek under. If such a locked child exists in the subtree being cloned, the clone is rejected — this is precisely the CWE-200 information-exposure defence: a private clone would otherwise let the caller detach or see around the locked mount and read the underlying contents."
+    },
+    {
+      "file": "corpus/eval/eval_0027_cwe200.c",
+      "lines": "17-18",
+      "code": "new_mnt = clone_mnt(old_mnt, path->dentry, CL_PRIVATE);\n\tup_read(&namespace_sem);",
+      "explanation": "After all three gates pass, clone_mnt() creates the actual clone rooted at path->dentry within old_mnt, with the CL_PRIVATE flag. CL_PRIVATE produces a clone that is not part of any peer/propagation group and not attached to a namespace — a standalone longterm mount. clone_mnt runs while namespace_sem is still held (correct: it reads/links topology). Immediately after, up_read releases namespace_sem. Crucially the lock is dropped here BEFORE the error check on the next line, so the success path holds no lock past this point."
+    },
+    {
+      "file": "corpus/eval/eval_0027_cwe200.c",
+      "lines": "20-21",
+      "code": "if (IS_ERR(new_mnt))\n\t\treturn ERR_CAST(new_mnt);",
+      "explanation": "clone_mnt() can fail (e.g. -ENOMEM, or an internal policy rejection) and returns an ERR_PTR-encoded struct mount *. IS_ERR detects that encoded error; ERR_CAST re-casts the same error pointer to the struct vfsmount * return type without dereferencing it. Because up_read already ran at line 18, this early return does not leak namespace_sem. No new_mnt cleanup is needed because on error clone_mnt returned no object."
+    },
+    {
+      "file": "corpus/eval/eval_0027_cwe200.c",
+      "lines": "23-26",
+      "code": "/* Longterm mount to be removed by kern_unmount*() */\n\tnew_mnt->mnt_ns = MNT_NS_INTERNAL;\n\n\treturn &new_mnt->mnt;",
+      "explanation": "On success the clone is tagged by setting new_mnt->mnt_ns to the MNT_NS_INTERNAL sentinel, marking it as a kernel-internal longterm mount not owned by any user mount namespace; this both documents its lifetime (freed by kern_unmount*()) and keeps namespace bookkeeping (mnt_ns counting, umount propagation) from treating it as a real namespace member. The function returns &new_mnt->mnt, the embedded struct vfsmount inside the struct mount, i.e. the public handle the caller uses."
+    },
+    {
+      "file": "corpus/eval/eval_0027_cwe200.c",
+      "lines": "28-30",
+      "code": "invalid:\n\tup_read(&namespace_sem);\n\treturn ERR_PTR(-EINVAL);",
+      "explanation": "The shared error label reached from all three rejecting gates (lines 9, 12, 15). It releases namespace_sem (which is always held when a goto invalid executes, since the gates run after down_read and before up_read) and returns ERR_PTR(-EINVAL). This single-exit unlock pattern guarantees the lock is released exactly once on the rejection paths, mirroring the single up_read on the success path at line 18."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/eval/eval_0027_cwe200.c",
+      "lines": "14-15",
+      "code": "if (has_locked_children(old_mnt, path->dentry))\n\t\tgoto invalid;",
+      "explanation": "This is the core contract of the fix and the CWE-200 exposure surface. path->dentry is attacker-selectable (overlayfs lowerdir/upperdir), so an attacker deliberately points clone_private_mount at a subtree that contains a locked child mount — one that a privileged namespace mounted to hide the directory beneath it. If this check were absent, weakened, or applied against the wrong dentry, clone_mnt(CL_PRIVATE) would produce a standalone clone from which the caller can detach or navigate around the locked child and read the underlying (hidden) files: an information-disclosure and mount-namespace-escape primitive. The invariant the implementation must uphold is that has_locked_children considers the ENTIRE subtree that clone_mnt will copy (rooted at path->dentry), so no locked descendant slips through, and that it runs under namespace_sem so the child set cannot change between the check and clone_mnt at line 17. In this fixed sample the gate is present and correctly ordered before the clone; the residual risk is entirely in the correctness of has_locked_children itself (not shown)."
+    },
+    {
+      "file": "corpus/eval/eval_0027_cwe200.c",
+      "lines": "8-12",
+      "code": "if (IS_MNT_UNBINDABLE(old_mnt))\n\t\tgoto invalid;\n\n\tif (!check_mnt(old_mnt))\n\t\tgoto invalid;",
+      "explanation": "The unbindable and namespace-membership gates are the other half of the access-control contract. check_mnt confines the caller to cloning a mount that actually lives in its own mount namespace; without it, a subtree reachable only by pointer (e.g. from another namespace or an internal/anonymous mount) could be cloned, violating namespace isolation. IS_MNT_UNBINDABLE enforces the administrator's explicit 'never clone/bind this' policy. The failure mode if either is dropped or reordered after clone_mnt is a policy bypass: the clone is materialised first and the check comes too late. The invariant is that all three gates must precede clone_mnt() and all must be evaluated (no short-circuit that skips a later one) — satisfied here."
+    },
+    {
+      "file": "corpus/eval/eval_0027_cwe200.c",
+      "lines": "4",
+      "code": "struct mount *old_mnt = real_mount(path->mnt);",
+      "explanation": "real_mount(path->mnt) is a container_of derivation that unconditionally treats path->mnt as a valid embedded vfsmount, and old_mnt is dereferenced by IS_MNT_UNBINDABLE/check_mnt/has_locked_children before any NULL or type validation. If a caller ever passes a path whose ->mnt is NULL or not a real vfsmount, this becomes a NULL/wild dereference (CWE-476). In practice clone_private_mount's callers always pass a fully resolved struct path, so path->mnt is a valid pinned mount — the contract is a caller-side precondition, not an in-function check. The invariant to confirm is that every caller resolves path via kern_path()/user_path or equivalent and holds a reference so path->mnt is non-NULL and stable for the duration."
+    },
+    {
+      "file": "corpus/eval/eval_0027_cwe200.c",
+      "lines": "17-24",
+      "code": "new_mnt = clone_mnt(old_mnt, path->dentry, CL_PRIVATE);\n\tup_read(&namespace_sem);\n\n\tif (IS_ERR(new_mnt))\n\t\treturn ERR_CAST(new_mnt);\n\n\t/* Longterm mount to be removed by kern_unmount*() */\n\tnew_mnt->mnt_ns = MNT_NS_INTERNAL;",
+      "explanation": "The new_mnt->mnt_ns assignment happens AFTER up_read at line 18. This is safe only because the CL_PRIVATE clone is brand-new and not yet linked into any namespace or propagation tree, so no concurrent walker can observe it before mnt_ns is set — there is no lock protecting the field here. The lifetime contract is that the returned longterm mount is destroyed via kern_unmount*() (per the comment), not through the normal namespace umount path; a caller that instead attaches it to a real namespace, or fails to kern_unmount it, causes either a mismatched mnt_ns accounting or a mount leak. The invariant to confirm downstream is that every consumer of the returned vfsmount pairs it with kern_unmount and never grafts an MNT_NS_INTERNAL mount into a live namespace."
+    },
+    {
+      "file": "corpus/eval/eval_0027_cwe200.c",
+      "lines": "18-30",
+      "code": "up_read(&namespace_sem);\n\n\tif (IS_ERR(new_mnt))\n\t\treturn ERR_CAST(new_mnt);",
+      "explanation": "Lock-balance audit of every exit. Success path: down_read (line 7) ... up_read (line 18) — balanced. Error-from-clone path (line 21): lock already released at line 18, so returning without unlocking is correct, not a leak. Reject paths (goto invalid from lines 9/12/15): reach line 29 up_read exactly once. There is no path that unlocks twice or returns while still holding namespace_sem. The failure mode this guards against — a namespace_sem leak (system-wide mount deadlock) or a double up_read (lock underflow) — does not occur in this arrangement; the split of up_read across line 18 (non-error) and line 29 (error label) is the thing to confirm stays balanced if the code is refactored."
+    }
+  ],
+  "summary": "This is the hardened ('fixed') version of clone_private_mount() from the Linux VFS namespace code. It gates a user-influenced mount clone behind three checks under namespace_sem — unbindable, in-namespace (check_mnt), and no-locked-children — before producing a CL_PRIVATE longterm clone, and it balances the lock correctly across all exits. No exploitable defect is visible; the entire security posture rests on the correctness of those three gates (especially has_locked_children) and on callers upholding the path validity and kern_unmount lifetime contracts. Findings below are low/informational and latent (they live in the un-shown helpers or the caller), documenting the contracts an attacker would target rather than a bug present in this snippet.",
+  "reviewed_anchors": [
+    {
+      "anchor": "struct vfsmount *clone_private_mount(const struct path *path) (signature, line 2)",
+      "disposition": "finding",
+      "reason": "Entry point whose path argument is user-influenced; its return is an ERR_PTR-or-object contract callers must honor."
+    },
+    {
+      "anchor": "real_mount(path->mnt) -> old_mnt (line 4)",
+      "disposition": "finding",
+      "reason": "Unconditional container_of + later deref; NULL/validity is a caller precondition (latent CWE-476)."
+    },
+    {
+      "anchor": "struct mount *new_mnt (line 5)",
+      "disposition": "dismissed",
+      "reason": "Uninitialised local assigned only by clone_mnt() before any use; no security contract of its own."
+    },
+    {
+      "anchor": "down_read(&namespace_sem) / up_read(&namespace_sem) (lines 7,18,29)",
+      "disposition": "finding",
+      "reason": "Lock balance and coverage across success/error/reject exits is a correctness contract; verified balanced but flagged as the thing to keep balanced."
+    },
+    {
+      "anchor": "IS_MNT_UNBINDABLE(old_mnt) gate (lines 8-9)",
+      "disposition": "finding",
+      "reason": "Access-control gate enforcing make-unbindable policy; bypass/reorder is a policy-bypass class."
+    },
+    {
+      "anchor": "check_mnt(old_mnt) gate (lines 11-12)",
+      "disposition": "finding",
+      "reason": "Namespace-membership gate; core to isolation, part of the same access-control contract."
+    },
+    {
+      "anchor": "has_locked_children(old_mnt, path->dentry) gate (lines 14-15)",
+      "disposition": "finding",
+      "reason": "The central CWE-200 defence added by the fix; correctness of subtree coverage is the primary contract."
+    },
+    {
+      "anchor": "clone_mnt(old_mnt, path->dentry, CL_PRIVATE) (line 17)",
+      "disposition": "dismissed",
+      "reason": "Called under the lock after all gates pass; its internal safety is out of scope (helper not shown) and it is correctly ordered."
+    },
+    {
+      "anchor": "IS_ERR(new_mnt) / ERR_CAST(new_mnt) (lines 20-21)",
+      "disposition": "dismissed",
+      "reason": "Standard kernel error-pointer handling; lock already released, no leak, no deref of an error pointer."
+    },
+    {
+      "anchor": "new_mnt->mnt_ns = MNT_NS_INTERNAL (line 24)",
+      "disposition": "finding",
+      "reason": "Set after unlock and encodes the longterm/kern_unmount lifetime contract; misuse by callers is a latent lifetime/accounting risk."
+    },
+    {
+      "anchor": "return &new_mnt->mnt (line 26)",
+      "disposition": "dismissed",
+      "reason": "Returns the embedded public vfsmount handle; ownership transfer is documented, no defect."
+    },
+    {
+      "anchor": "invalid: up_read + return ERR_PTR(-EINVAL) (lines 28-30)",
+      "disposition": "dismissed",
+      "reason": "Single-exit reject path; unlocks exactly once and returns a proper error pointer — correct."
+    }
+  ],
+  "findings": [
+    {
+      "title": "Locked-child exposure defence rests entirely on has_locked_children subtree coverage",
+      "anchor": "has_locked_children(old_mnt, path->dentry)",
+      "file": "corpus/eval/eval_0027_cwe200.c",
+      "line": "14-15",
+      "code": "if (has_locked_children(old_mnt, path->dentry))\n\t\tgoto invalid;",
+      "bug_class": "Information exposure via mount-namespace clone (locked-mount bypass)",
+      "cwe": "CWE-200",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided) — has_locked_children() and clone_mnt() in fs/namespace.c",
+      "invariant": "has_locked_children must evaluate the ENTIRE subtree that clone_mnt(CL_PRIVATE) will copy (all descendants of old_mnt beneath path->dentry), and it must run under namespace_sem so the child set cannot change before clone_mnt at line 17; if any MNT_LOCKED descendant exists the clone must be rejected.",
+      "failure_mode": "An unprivileged caller (e.g. via overlayfs lowerdir=/upperdir= inside a user namespace) chooses path->dentry at a subtree containing a mount that a more-privileged namespace locked (MNT_LOCKED) to hide the directory underneath. If has_locked_children misses that descendant (wrong root dentry, partial walk) or is removed, clone_private_mount hands back a private clone from which the attacker can detach/step around the locked mount and read the concealed contents — an information disclosure and namespace-escape. This snippet has the gate correctly placed; the residual risk is the helper's correctness.",
+      "cve_analog": "",
+      "what_to_confirm": "Read has_locked_children(): confirm it recurses over all children of old_mnt rooted at path->dentry and returns true for any MNT_LOCKED child, and that no locked descendant can be reached by the clone that the walk skips."
+    },
+    {
+      "title": "Access-control gates must precede clone_mnt and all be evaluated (unbindable + in-namespace)",
+      "anchor": "IS_MNT_UNBINDABLE(old_mnt) / check_mnt(old_mnt)",
+      "file": "corpus/eval/eval_0027_cwe200.c",
+      "line": "8-12",
+      "code": "if (IS_MNT_UNBINDABLE(old_mnt))\n\t\tgoto invalid;\n\n\tif (!check_mnt(old_mnt))\n\t\tgoto invalid;",
+      "bug_class": "Improper access control / mount-namespace isolation bypass",
+      "cwe": "CWE-284",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided) — check_mnt() and the IS_MNT_UNBINDABLE macro; consumers in overlayfs",
+      "invariant": "Both gates, plus has_locked_children, must be checked while holding namespace_sem and strictly BEFORE clone_mnt() creates the clone; check_mnt must confine old_mnt to the caller's own (non-internal) mount namespace and IS_MNT_UNBINDABLE must honor the make-unbindable flag.",
+      "failure_mode": "If either gate is dropped or moved after line 17, a caller could clone an unbindable mount (defeating make-unbindable policy) or a mount not in its own namespace (defeating isolation), because the clone would already be materialised before the rejection. As shown the ordering is correct; the finding documents the contract a refactor must preserve.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm check_mnt rejects mounts whose mnt_ns is not the current task's namespace (and the internal/anonymous namespace), and that no code path skips these gates when reaching clone_mnt."
+    },
+    {
+      "title": "old_mnt dereferenced from path->mnt without in-function NULL/type validation",
+      "anchor": "real_mount(path->mnt)",
+      "file": "corpus/eval/eval_0027_cwe200.c",
+      "line": "4",
+      "code": "struct mount *old_mnt = real_mount(path->mnt);",
+      "bug_class": "NULL / invalid pointer dereference (caller precondition)",
+      "cwe": "CWE-476",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided) — all callers of clone_private_mount()",
+      "invariant": "Every caller must pass a fully resolved struct path with a non-NULL, reference-held path->mnt that is a genuine embedded vfsmount, so that real_mount() and the subsequent gate dereferences of old_mnt are valid.",
+      "failure_mode": "real_mount is container_of arithmetic and old_mnt is dereferenced immediately by IS_MNT_UNBINDABLE/check_mnt/has_locked_children with no NULL guard. A caller passing a path with ->mnt == NULL (or a non-mount pointer) triggers a NULL/wild dereference and oops. Not reachable from the correct callers, hence low; it is a precondition, not a defect in this snippet.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm every caller resolves path via kern_path/user_path (or holds an existing pinned path) so path->mnt is always a valid, referenced vfsmount before calling clone_private_mount."
+    },
+    {
+      "title": "Returned mount encodes MNT_NS_INTERNAL longterm lifetime contract (kern_unmount only)",
+      "anchor": "new_mnt->mnt_ns = MNT_NS_INTERNAL",
+      "file": "corpus/eval/eval_0027_cwe200.c",
+      "line": "23-26",
+      "code": "/* Longterm mount to be removed by kern_unmount*() */\n\tnew_mnt->mnt_ns = MNT_NS_INTERNAL;\n\n\treturn &new_mnt->mnt;",
+      "bug_class": "Object lifetime / resource management contract",
+      "cwe": "CWE-404",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided) — consumers of the returned vfsmount",
+      "invariant": "The returned MNT_NS_INTERNAL mount is a kernel-internal longterm mount: it must be released with kern_unmount*() and must never be grafted into a live user mount namespace; the mnt_ns write is safe only because the fresh CL_PRIVATE clone is not yet visible to any concurrent walker at line 24 (post-unlock).",
+      "failure_mode": "A consumer that forgets to kern_unmount the returned mount leaks it; one that attaches an MNT_NS_INTERNAL mount into a real namespace corrupts mnt_ns accounting and umount propagation. No defect in this function — the risk is downstream and the tag exists precisely to signal the lifetime rule.",
+      "cve_analog": "",
+      "what_to_confirm": "Trace each caller's use of the returned vfsmount and confirm it is paired with kern_unmount*() and never inserted into a user namespace mount tree."
+    }
+  ],
+  "audit_checklist": [
+    "has_locked_children(): confirm it walks the full subtree rooted at path->dentry under old_mnt and returns true for ANY MNT_LOCKED descendant, so no locked child can leak through the CL_PRIVATE clone (primary CWE-200 gate).",
+    "Confirm all three gates (IS_MNT_UNBINDABLE, check_mnt, has_locked_children) execute under namespace_sem and strictly before clone_mnt(), with no reordering or short-circuit that reaches clone_mnt() unchecked.",
+    "Verify check_mnt() restricts old_mnt to the caller's own (non-internal) mount namespace, preventing cloning of foreign/anonymous mounts.",
+    "Audit lock balance across every exit: down_read (line 7) matched by exactly one up_read on the success path (line 18) and the reject path (line 29); the IS_ERR return at line 21 must not re-unlock.",
+    "Confirm every caller passes a resolved, reference-held struct path so real_mount(path->mnt) never dereferences NULL/invalid pointers.",
+    "Trace consumers of the returned MNT_NS_INTERNAL vfsmount to ensure each is released via kern_unmount*() and none is attached into a live user mount namespace.",
+    "Confirm clone_mnt(..., CL_PRIVATE) does not itself re-enter code that could observe new_mnt before mnt_ns is set, and that CL_PRIVATE keeps the clone out of propagation/peer groups."
+  ]
+}

@@ -1,0 +1,229 @@
+{
+  "subsystem": "TensorFlow GPU (CUDA) linear-algebra op kernel: the ComputeAsync method of a MatrixSolve-family OpKernel that solves the batched linear system op(A) X = B on the GPU. It validates tensor ranks/shapes, copies/transposes the input matrices, computes a partially-pivoted LU factorization via cuBLAS/cuSolver (GetrfBatched/Getrf), solves for the right-hand sides (GetrsBatched/Getrs), transposes the result back to row-major, and schedules an async info-check callback that reports singular-matrix / illegal-argument errors.",
+  "provenance": "Identified by TensorFlow-specific types and idioms: OpKernelContext, DoneCallback, OP_REQUIRES_ASYNC / OP_REQUIRES_OK_ASYNC macros, Tensor / TensorShape, DataTypeToEnum<Scalar>, flat_inner_dims, GPUDevice / eigen_device, CudaSolver with GetrfBatched/Getrf/GetrsBatched/Getrs and CheckLapackInfoAndDeleteSolverAsync, DoMatrixTranspose, CUBLAS_OP_C/CUBLAS_OP_T. This is the GPU specialization of tensorflow/core/kernels/linalg/matrix_solve_op.cc (Apache-2.0). The banner comment '/* sample: primevul_test_0087_fixed */' marks it as a PrimeVul sample; the file name references CWE-354, but the code is reviewed blind on its merits.",
+  "trust_boundary": "The two operands input = context->input(0) and rhs = context->input(1) are graph tensors whose RANK, DIMENSION SIZES and element counts are fully attacker-controllable by anyone who can invoke the op (e.g. a crafted SavedModel, a tf.raw_ops.MatrixSolve call, or a serving request that reaches this kernel). The numeric contents are relevant to CUDA numerics, but the security-relevant hostile surface is the SHAPE metadata: ndims, dim_size(...) values, NumElements(), and the derived n / nrhs / batch_size, all of which drive index arithmetic, allocation sizes, and memcpy lengths.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0187_cwe354.cpp",
+      "lines": "2-7",
+      "code": "  void ComputeAsync(OpKernelContext* context, DoneCallback done) final {\n    const Tensor& input = context->input(0);\n    const Tensor& rhs = context->input(1);\n    const int ndims = input.dims();\n    const int64 n = input.dim_size(ndims - 1);\n    const int64 nrhs = rhs.dim_size(ndims - 1);",
+      "explanation": "The async kernel entry point. It binds const references to the two input tensors: input (the coefficient matrix/matrices A) and rhs (the right-hand sides B). ndims is the rank of A. n is taken as the size of A's last dimension (the matrix order, i.e. an n x n square is expected), and nrhs as the size of B's last dimension (number of right-hand sides). Crucially, n and nrhs are read via dim_size(ndims - 1) BEFORE any rank validation has run: ndims is computed from input, and the SAME ndims is used to index rhs on line 7 even though rhs may have a different rank."
+    },
+    {
+      "file": "corpus/train/train_0187_cwe354.cpp",
+      "lines": "8-28",
+      "code": "    // Validate inputs.\n    OP_REQUIRES_ASYNC(\n        context, ndims >= 2,\n        errors::InvalidArgument(\"Input must have rank >= 2, got \", ndims),\n        done);\n    OP_REQUIRES_ASYNC(context, rhs.dims() == ndims,\n                      errors::InvalidArgument(\n                          \"Input and right-hand side must have same rank, got \",\n                          ndims, \" != \", rhs.dims()),\n                      done);\n    OP_REQUIRES_ASYNC(\n        context, input.dim_size(ndims - 2) == n,\n        errors::InvalidArgument(\"Input matrices must be squares, got \",\n                                input.dim_size(ndims - 2), \" != \", n),\n        done);\n    OP_REQUIRES_ASYNC(context, rhs.dim_size(ndims - 2) == n,\n                      errors::InvalidArgument(\n                          \"Input matrix and right-hand side must have the \"\n                          \"same number of rows, got \",\n                          n, \" != \", rhs.dim_size(ndims - 2)),\n                      done);",
+      "explanation": "The validation gates. OP_REQUIRES_ASYNC checks a predicate and, if false, records an InvalidArgument error, invokes the done() callback and returns from the kernel. Four invariants are enforced: (1) input rank >= 2; (2) rhs has the same rank as input; (3) the last two dims of input are equal (A is square, n x n); (4) rhs has n rows in its second-to-last dimension. These are the shape contracts the downstream LAPACK/cuBLAS calls rely on. Note the ordering: these checks run AFTER lines 6-7 already dereferenced dim_size(ndims - 1) on both operands."
+    },
+    {
+      "file": "corpus/train/train_0187_cwe354.cpp",
+      "lines": "29-35",
+      "code": "    for (int dim = 0; dim < ndims - 2; dim++) {\n      OP_REQUIRES_ASYNC(\n          context, input.dim_size(dim) == rhs.dim_size(dim),\n          errors::InvalidArgument(\n              \"All input tensors must have the same outer dimensions.\"),\n          done);\n    }",
+      "explanation": "Validates that all leading batch dimensions (every dim before the trailing two matrix dims) match between input and rhs. This guarantees the batched solve iterates a consistent batch_size for both operands. Because ndims >= 2 has already been confirmed, the loop bound ndims - 2 is non-negative and both dim_size(dim) accesses are in range for both tensors."
+    },
+    {
+      "file": "corpus/train/train_0187_cwe354.cpp",
+      "lines": "37-49",
+      "code": "    // Allocate output.\n    Tensor* output;\n    OP_REQUIRES_OK_ASYNC(\n        context,\n        context->forward_input_or_allocate_output({1}, 0, rhs.shape(), &output),\n        done);\n\n    // To be consistent with the MatrixInverse op, we define the solution for\n    // an empty set of equations as the empty matrix.\n    if (input.NumElements() == 0 || rhs.NumElements() == 0) {\n      done();\n      return;\n    }",
+      "explanation": "Allocates (or forwards input index 1, the rhs buffer, into) the output tensor with rhs's shape. OP_REQUIRES_OK_ASYNC propagates any allocation error to done() and returns. Then an early-out: if either operand is empty (zero elements), the solution is defined as the empty matrix, so it invokes done() and returns before touching any GPU solver. This guards the subsequent code against zero-size tensors."
+    },
+    {
+      "file": "corpus/train/train_0187_cwe354.cpp",
+      "lines": "51-79",
+      "code": "    // TODO(rmlarsen): Convert to std::make_unique when available.\n    std::unique_ptr<CudaSolver> solver(new CudaSolver(context));\n\n    // Make a copy of the input for the factorization step, or, if adjoint_ is\n    // false, try to reuse the input buffer if this op owns it exclusively.\n    Tensor input_copy;\n    const GPUDevice& device = context->eigen_device<GPUDevice>();\n    if (adjoint_) {\n      // For the adjoint case, it is simpler to always make a transposed copy up\n      // front.\n      OP_REQUIRES_OK_ASYNC(\n          context,\n          solver->allocate_scoped_tensor(DataTypeToEnum<Scalar>::value,\n                                         input.shape(), &input_copy),\n          done);\n      OP_REQUIRES_OK_ASYNC(context,\n                           DoMatrixTranspose(device, input, &input_copy), done);\n    } else {\n      OP_REQUIRES_OK_ASYNC(\n          context,\n          solver->forward_input_or_allocate_scoped_tensor(\n              {0}, DataTypeToEnum<Scalar>::value, input.shape(), &input_copy),\n          done);\n      if (!input.SharesBufferWith(input_copy)) {\n        device.memcpy(input_copy.flat<Scalar>().data(),\n                      input.flat<Scalar>().data(),\n                      input.NumElements() * sizeof(Scalar));\n      }\n    }",
+      "explanation": "Creates a CudaSolver bound to the op context (owns the cuBLAS/cuSolver handles and scratch lifetime). LU factorization overwrites its input, so the kernel needs a writable copy of A. If adjoint_ (a solve of A^H) is requested, it allocates a scoped tensor input_copy of A's shape and produces a transposed copy via DoMatrixTranspose. Otherwise it tries to forward/reuse input's buffer into input_copy; if the buffer was not shared (the op does not exclusively own it), it does a device-to-device memcpy of input.NumElements() * sizeof(Scalar) bytes. The memcpy length is derived from the same tensor that sized input_copy (both use input.shape()), so source and destination element counts match."
+    },
+    {
+      "file": "corpus/train/train_0187_cwe354.cpp",
+      "lines": "80-90",
+      "code": "    auto input_copy_reshaped = input_copy.template flat_inner_dims<Scalar, 3>();\n    const int64 batch_size = input_copy_reshaped.dimension(0);\n\n    // Allocate pivots on the device.\n    Tensor pivots;\n    OP_REQUIRES_OK_ASYNC(\n        context,\n        solver->allocate_scoped_tensor(DataTypeToEnum<int>::value,\n                                       TensorShape{batch_size, n}, &pivots),\n        done);\n    auto pivots_mat = pivots.template matrix<int>();",
+      "explanation": "Collapses input_copy to a 3-D view [batch_size, n, n] via flat_inner_dims<Scalar,3>() (all leading batch dims folded into dimension 0). batch_size is the product of the outer dims. It then allocates a device tensor pivots of shape [batch_size, n] to hold the LU pivot indices, and takes a 2-D matrix view pivots_mat over it. batch_size and n both come from attacker-controlled shape metadata but have passed the rank/square checks above."
+    },
+    {
+      "file": "corpus/train/train_0187_cwe354.cpp",
+      "lines": "92-115",
+      "code": "    // 1. Compute the partially pivoted LU factorization(s) of the\n    // matrix/matrices.\n    std::vector<DeviceLapackInfo> dev_info;\n    auto input_copy_ptrs = solver->GetScratchSpace<uint8>(\n        sizeof(Scalar*) * batch_size, \"input_copt_ptrs\",\n        /* on_host */ true);\n    const int kMaxMatrixSizeToBatchSizeRatio = 128;\n    const bool use_batched_solver =\n        n <= kMaxMatrixSizeToBatchSizeRatio * batch_size;\n    if (use_batched_solver) {\n      // For small matrices or large batch sizes, we use the batched interface\n      // from cuBlas.\n      const Scalar** input_copy_ptrs_base =\n          reinterpret_cast<const Scalar**>(input_copy_ptrs.mutable_data());\n      for (int batch = 0; batch < batch_size; ++batch) {\n        input_copy_ptrs_base[batch] = &input_copy_reshaped(batch, 0, 0);\n      }\n      dev_info.push_back(\n          solver->GetDeviceLapackInfo(batch_size, \"getrfBatched\"));\n      OP_REQUIRES_OK_ASYNC(\n          context,\n          solver->GetrfBatched(n, input_copy_ptrs_base, n, pivots_mat.data(),\n                               &dev_info.back(), batch_size),\n          done);",
+      "explanation": "Allocates host scratch space of sizeof(Scalar*) * batch_size bytes to hold an array of per-batch matrix pointers, chooses the batched vs. non-batched solver based on the heuristic n <= 128 * batch_size, and for the batched path reinterpret_casts the uint8 scratch buffer to Scalar** and fills it with the base address of each batch's n x n block. GetrfBatched then computes an in-place LU factorization of all batch_size matrices, writing pivots into pivots_mat and a per-batch info code into dev_info.back(). The leading dimension n is passed as both the order and the stride."
+    },
+    {
+      "file": "corpus/train/train_0187_cwe354.cpp",
+      "lines": "116-127",
+      "code": "    } else {\n      // For small batch sizes or large matrices, we use the non-batched\n      // interface from cuSolver, which is much faster for large matrices.\n      dev_info.push_back(solver->GetDeviceLapackInfo(batch_size, \"getrf\"));\n      for (int batch = 0; batch < batch_size; ++batch) {\n        OP_REQUIRES_OK_ASYNC(\n            context,\n            solver->Getrf(n, n, &input_copy_reshaped(batch, 0, 0), n,\n                          &pivots_mat(batch, 0), &dev_info.back()(batch)),\n            done);\n      }\n    }",
+      "explanation": "The non-batched alternative: for each batch it calls cuSolver Getrf on the n x n block, with leading dimension n, writing pivots to pivots_mat(batch, 0) and an info code to dev_info.back()(batch). Same factorization result, iterated per matrix rather than through the batched pointer array."
+    },
+    {
+      "file": "corpus/train/train_0187_cwe354.cpp",
+      "lines": "129-149",
+      "code": "    // 2. Make a transposed copy of the right-hand sides. This is necessary\n    // because cuBLAS assumes column-major storage while TensorFlow TF uses\n    // row-major.\n    TensorShape transposed_rhs_shape(rhs.shape());\n    transposed_rhs_shape.RemoveLastDims(2);\n    transposed_rhs_shape.AddDim(nrhs);\n    transposed_rhs_shape.AddDim(n);\n    Tensor transposed_rhs;\n    OP_REQUIRES_OK_ASYNC(\n        context,\n        solver->allocate_scoped_tensor(DataTypeToEnum<Scalar>::value,\n                                       transposed_rhs_shape, &transposed_rhs),\n        done);\n    if (nrhs > 1) {\n      OP_REQUIRES_OK_ASYNC(\n          context, DoMatrixTranspose(device, rhs, &transposed_rhs), done);\n    } else {\n      device.memcpy(transposed_rhs.flat<Scalar>().data(),\n                    rhs.flat<Scalar>().data(),\n                    rhs.NumElements() * sizeof(Scalar));\n    }",
+      "explanation": "Builds the column-major transposed RHS shape by dropping rhs's last two dims and re-appending [nrhs, n], then allocates transposed_rhs. cuBLAS is column-major while TF is row-major, so B must be transposed. If there is more than one RHS column it uses DoMatrixTranspose; if exactly one, a transpose is a no-op layout-wise so it memcpy's rhs.NumElements() * sizeof(Scalar) bytes straight across. The [nrhs, n] product equals rhs's original [n, nrhs] product, so element counts match."
+    },
+    {
+      "file": "corpus/train/train_0187_cwe354.cpp",
+      "lines": "151-202",
+      "code": "    // 3. Solve op(A) X = B (in column major form).\n    auto input_copy_ptr_array = solver->GetScratchSpace<uint8>(\n        sizeof(Scalar*) * batch_size, \"input_copy_ptr_array\",\n        /* on_host */ true);\n    auto transposed_rhs_ptr_array = solver->GetScratchSpace<uint8>(\n        sizeof(Scalar*) * batch_size, \"transposed_rhs_ptr_array\",\n        /* on_host */ true);\n    auto transposed_rhs_reshaped =\n        transposed_rhs.template flat_inner_dims<Scalar, 3>();\n    if (use_batched_solver) {\n      const Scalar** input_copy_ptrs_base =\n          reinterpret_cast<const Scalar**>(input_copy_ptr_array.mutable_data());\n      const Scalar** transposed_rhs_ptrs_base =\n          reinterpret_cast<const Scalar**>(\n              transposed_rhs_ptr_array.mutable_data());\n      for (int batch = 0; batch < batch_size; ++batch) {\n        input_copy_ptrs_base[batch] = &input_copy_reshaped(batch, 0, 0);\n        transposed_rhs_ptrs_base[batch] = &transposed_rhs_reshaped(batch, 0, 0);\n      }\n      int host_info = 0;\n      OP_REQUIRES_OK_ASYNC(\n          context,\n          solver->GetrsBatched(adjoint_ ? CUBLAS_OP_C : CUBLAS_OP_T, n, nrhs,\n                               input_copy_ptrs_base, n, pivots_mat.data(),\n                               transposed_rhs_ptrs_base, n, &host_info,\n                               batch_size),\n          done);\n      OP_REQUIRES_ASYNC(\n          context, host_info == 0,\n          errors::InvalidArgument(\"The \", -host_info,\n                                  \"'th argument to cublas*getrsBatched had \"\n                                  \"an illegal value.\"),\n          done);\n    } else {\n      dev_info.push_back(solver->GetDeviceLapackInfo(batch_size, \"getrs\"));\n      for (int batch = 0; batch < batch_size; ++batch) {\n        OP_REQUIRES_OK_ASYNC(\n            context,\n            solver->Getrs(adjoint_ ? CUBLAS_OP_C : CUBLAS_OP_T, n, nrhs,\n                          &input_copy_reshaped(batch, 0, 0), n,\n                          &pivots_mat(batch, 0),\n                          &transposed_rhs_reshaped(batch, 0, 0), n,\n                          &dev_info.back()(batch)),\n            done);\n      }\n    }",
+      "explanation": "The solve step. Two more host scratch pointer arrays (sizeof(Scalar*) * batch_size) are allocated and, in the batched path, reinterpret_cast to Scalar** and filled with per-batch pointers into the LU-factored A and the transposed B. GetrsBatched solves op(A) X = B for all batches at once, using CUBLAS_OP_C for the adjoint case and CUBLAS_OP_T otherwise (the trick documented in the comments: leaving A in row-major and transposing on the fly is equivalent to using A^T). host_info < 0 signals an illegal argument and is surfaced via OP_REQUIRES_ASYNC. The else branch performs the same solve per batch with the non-batched Getrs."
+    },
+    {
+      "file": "corpus/train/train_0187_cwe354.cpp",
+      "lines": "204-212",
+      "code": "    // 4. Transpose X to get the final result in row-major form.\n    if (nrhs > 1) {\n      OP_REQUIRES_OK_ASYNC(\n          context, DoMatrixTranspose(device, transposed_rhs, output), done);\n    } else {\n      device.memcpy(output->flat<Scalar>().data(),\n                    transposed_rhs.flat<Scalar>().data(),\n                    transposed_rhs.NumElements() * sizeof(Scalar));\n    }",
+      "explanation": "Converts the column-major solution X held in transposed_rhs back to TF's row-major layout in output. For nrhs > 1 it transposes; for a single RHS it memcpy's transposed_rhs.NumElements() * sizeof(Scalar) bytes into output. output was allocated with rhs.shape() (line 41), and transposed_rhs has the same total element count as rhs, so the memcpy length matches the destination as long as those shape invariants hold."
+    },
+    {
+      "file": "corpus/train/train_0187_cwe354.cpp",
+      "lines": "214-234",
+      "code": "    // Callback for checking info after kernels finish. Also capture the\n    // temporary Tensors/ScratchSpace so they don't get deallocated before the\n    // kernels run. TODO(rmlarsen): Use move capture once C++14 becomes\n    // available.\n    auto info_checker = [context, done, dev_info](\n                            const Status& status,\n                            const std::vector<HostLapackInfo>& host_infos) {\n      if (!status.ok() && errors::IsInvalidArgument(status) &&\n          !host_infos.empty()) {\n        for (int i = 0; i < host_infos[0].size(); ++i) {\n          // Match the CPU error message for singular matrices. Otherwise\n          // just print the original error message from the status below.\n          OP_REQUIRES_ASYNC(context, host_infos[0].data()[i] <= 0,\n                            errors::InvalidArgument(kErrMsg), done);\n        }\n      }\n      OP_REQUIRES_OK_ASYNC(context, status, done);\n      done();\n    };\n    CudaSolver::CheckLapackInfoAndDeleteSolverAsync(std::move(solver), dev_info,\n                                                    std::move(info_checker));",
+      "explanation": "Defines an async completion callback info_checker that, once the GPU kernels finish, inspects the copied-back LAPACK info codes: a positive entry means a singular matrix, reported with kErrMsg; other failures propagate the original status. It captures context, done and dev_info by value (dev_info by value so the DeviceLapackInfo temporaries outlive the async kernels). Finally CheckLapackInfoAndDeleteSolverAsync takes ownership of the solver via std::move and schedules the check; std::move(info_checker) transfers the lambda. After both moves, solver and info_checker are in valid-but-unspecified states and are not read again."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0187_cwe354.cpp",
+      "lines": "5-7",
+      "code": "    const int ndims = input.dims();\n    const int64 n = input.dim_size(ndims - 1);\n    const int64 nrhs = rhs.dim_size(ndims - 1);",
+      "explanation": "n and nrhs are read via dim_size(ndims - 1) BEFORE the rank checks on lines 9-28 execute. Two attacker-reachable problems: (1) if input is a scalar or rank-0/1 tensor, ndims - 1 is -1 or 0 while dim_size expects 0 <= d < dims(); in a DCHECK-disabled release build dim_size(-1) reads outside TensorShape's dimension storage (CWE-125 out-of-bounds read), and in a debug/CHECK build it aborts the process (reachable assertion / denial of service, CWE-617/CWE-20). (2) line 7 indexes rhs with input's ndims, not rhs's own rank; if rhs has fewer dimensions than input, rhs.dim_size(ndims - 1) is out of range for rhs even when it is valid for input — and the rhs.dims() == ndims guard that would catch this does not run until line 13. The invariant the implementation must uphold is: validate ndims >= 2 (and rhs.dims() == ndims) BEFORE computing n and nrhs, so no dim_size call is ever passed an index outside the tensor it is applied to. The derived garbage value is unused on the reject path, but the out-of-range access itself has already happened."
+    },
+    {
+      "file": "corpus/train/train_0187_cwe354.cpp",
+      "lines": "104-105",
+      "code": "      const Scalar** input_copy_ptrs_base =\n          reinterpret_cast<const Scalar**>(input_copy_ptrs.mutable_data());",
+      "explanation": "The host scratch space is allocated as a uint8 buffer (line 95) and then reinterpret_cast to Scalar** here (and again at lines 167-171 for the two ptr arrays). reinterpret_cast performs no runtime, size, or alignment check (CWE-704 incorrect type conversion / strict-aliasing UB). This is safe only if GetScratchSpace<uint8> returns a buffer that is at least sizeof(Scalar*) * batch_size bytes AND suitably aligned for a pointer type. The invariant the implementation must uphold is that the scratch allocator returns pointer-aligned, correctly-sized host memory; if batch_size were miscomputed or the allocation short (see the overflow risk below), the subsequent per-batch writes input_copy_ptrs_base[batch] = ... would write out of bounds (CWE-787). This is idiomatic in this codebase and the allocation size is matched to the cast type, so risk is latent, but the cast defeats the type system's ability to catch a size/alignment mistake."
+    },
+    {
+      "file": "corpus/train/train_0187_cwe354.cpp",
+      "lines": "95-97",
+      "code": "    auto input_copy_ptrs = solver->GetScratchSpace<uint8>(\n        sizeof(Scalar*) * batch_size, \"input_copt_ptrs\",\n        /* on_host */ true);",
+      "explanation": "batch_size is an int64 derived from the product of the attacker-controlled leading tensor dimensions (line 81). sizeof(Scalar*) * batch_size (also at lines 158-163) is the byte size passed to the scratch allocator and is implicitly the bound for the per-batch pointer writes and the subsequent GetrfBatched/GetrsBatched calls that pass batch_size as the count. If a caller supplies a tensor whose outer dims multiply to a very large batch_size, this multiply by 8 can overflow size_t / wrap (CWE-190 integer overflow), yielding an undersized allocation while the loops on lines 106-108 / 172-175 still iterate the full batch_size and write past the buffer (CWE-787). The implementation must reject or cap element counts before allocating; TF's allocator typically fails a too-large request, but the multiply happens before the allocator sees a sane size, so the guard depends entirely on GetScratchSpace validating the product rather than the caller."
+    },
+    {
+      "file": "corpus/train/train_0187_cwe354.cpp",
+      "lines": "146-148",
+      "code": "      device.memcpy(transposed_rhs.flat<Scalar>().data(),\n                    rhs.flat<Scalar>().data(),\n                    rhs.NumElements() * sizeof(Scalar));",
+      "explanation": "This memcpy (and the analogous ones at lines 75-77 and 209-211) uses a byte length computed from the SOURCE tensor's NumElements() but writes into a DESTINATION allocated from a separately-constructed shape. Correctness relies on the invariant that source and destination hold the same element count: here transposed_rhs was sized [.., nrhs, n] (lines 132-135) and rhs is [.., n, nrhs], products equal; on line 209-211 output was sized rhs.shape() and transposed_rhs has the same total. That equality in turn depends on the earlier square/rhs-rows validations holding and on RemoveLastDims(2)/AddDim not being fed a rank-1 shape. If any of those shape invariants is violated (e.g. via the pre-validation ordering bug above corrupting n/nrhs, or a future edit that reorders checks), the copy length no longer matches the destination and the device.memcpy is an out-of-bounds write (CWE-787). The implementation must guarantee element-count equality between every memcpy's source and destination shapes."
+    },
+    {
+      "file": "corpus/train/train_0187_cwe354.cpp",
+      "lines": "223",
+      "code": "        for (int i = 0; i < host_infos[0].size(); ++i) {",
+      "explanation": "The loop counter i is a plain int, while host_infos[0].size() is a container size (int64/size_t in TF's HostLapackInfo). If size() ever exceeds INT_MAX the comparison mixes signed/unsigned or truncates the bound (CWE-197 numeric truncation / CWE-190), potentially skipping elements or, in the worst case, looping unexpectedly. In practice size() equals batch_size and is bounded by device memory, so this is an info/low hygiene issue rather than a live exploit, but it is the kind of sign-width mismatch the reviewer should note and the implementation should fix by using an int64/size_t index."
+    }
+  ],
+  "summary": "This is the GPU MatrixSolve OpKernel; its attack surface is entirely the attacker-controlled shapes of the two input tensors. The code has a solid set of rank/square/row validation gates, but it reads dim_size(ndims - 1) on both operands BEFORE those gates run (lines 6-7 vs 9-28), giving a reachable out-of-bounds shape access / CHECK-abort denial-of-service on low-rank or rank-mismatched inputs. The remaining risks are latent implementation contracts: reinterpret_cast of uint8 scratch to Scalar** (type/alignment), sizeof(Scalar*) * batch_size integer-overflow sizing of that scratch, and several device.memcpy lengths that assume source/destination element-count equality. No heap-overflow primitive is directly visible in this shown code.",
+  "reviewed_anchors": [
+    {"anchor": "void ComputeAsync(OpKernelContext* context, DoneCallback done) final (line 2)", "disposition": "dismissed", "reason": "Async op-kernel entry signature; the security surface is its tensor inputs, reviewed below, not the signature itself."},
+    {"anchor": "input / rhs = context->input(0/1) (lines 3-4)", "disposition": "finding", "reason": "Attacker-controlled graph tensors; their shape metadata drives all downstream indexing and allocation."},
+    {"anchor": "const int ndims = input.dims() (line 5)", "disposition": "finding", "reason": "Rank used to index both operands before rank is validated; root of the pre-validation OOB access."},
+    {"anchor": "const int64 n = input.dim_size(ndims - 1) (line 6)", "disposition": "finding", "reason": "dim_size(ndims-1) evaluated before ndims>=2 check; OOB read / CHECK-abort on low-rank input."},
+    {"anchor": "const int64 nrhs = rhs.dim_size(ndims - 1) (line 7)", "disposition": "finding", "reason": "Indexes rhs with input's rank before rhs.dims()==ndims check; OOB on rank-mismatched rhs."},
+    {"anchor": "OP_REQUIRES_ASYNC ndims >= 2 (lines 9-12)", "disposition": "dismissed", "reason": "Correct rank gate; its only defect is that it runs after lines 6-7, captured in the finding above."},
+    {"anchor": "OP_REQUIRES_ASYNC rhs.dims() == ndims (lines 13-17)", "disposition": "dismissed", "reason": "Correct same-rank gate; ordering defect captured above."},
+    {"anchor": "OP_REQUIRES_ASYNC input.dim_size(ndims-2) == n (lines 18-22)", "disposition": "dismissed", "reason": "Square-matrix invariant, correctly enforced (runs after ndims>=2)."},
+    {"anchor": "OP_REQUIRES_ASYNC rhs.dim_size(ndims-2) == n (lines 23-28)", "disposition": "dismissed", "reason": "RHS-rows invariant, correctly enforced."},
+    {"anchor": "outer-dim match loop (lines 29-35)", "disposition": "dismissed", "reason": "Bounds ndims-2 are safe after ndims>=2; enforces consistent batch dims."},
+    {"anchor": "forward_input_or_allocate_output({1},0,rhs.shape(),&output) (lines 39-42)", "disposition": "dismissed", "reason": "Output sized from validated rhs.shape(); allocation errors handled via OP_REQUIRES_OK_ASYNC."},
+    {"anchor": "empty-tensor early-out (lines 46-49)", "disposition": "dismissed", "reason": "Correctly short-circuits zero-element inputs before any solver work."},
+    {"anchor": "std::unique_ptr<CudaSolver> solver (line 52)", "disposition": "dismissed", "reason": "RAII owner; ownership transferred cleanly via std::move at line 233."},
+    {"anchor": "adjoint_ branch + allocate_scoped_tensor(input.shape()) (lines 58-67)", "disposition": "dismissed", "reason": "input_copy sized from input.shape(); transpose path has no length arithmetic of its own."},
+    {"anchor": "device.memcpy(input_copy, input, input.NumElements()*sizeof(Scalar)) (lines 75-77)", "disposition": "finding", "reason": "memcpy length from source element count into shape-derived destination; safe only under shape-equality invariant (grouped with the memcpy finding)."},
+    {"anchor": "flat_inner_dims<Scalar,3>() / batch_size (lines 80-81)", "disposition": "dismissed", "reason": "Derives batch_size from validated shape; the overflow risk is on its later use as an allocation multiplier, flagged separately."},
+    {"anchor": "allocate_scoped_tensor pivots TensorShape{batch_size, n} (lines 84-89)", "disposition": "dismissed", "reason": "Pivot buffer sized consistently with batch_size and n; allocator handles oversize."},
+    {"anchor": "GetScratchSpace<uint8>(sizeof(Scalar*)*batch_size) (lines 95-97,158-163)", "disposition": "finding", "reason": "Integer-overflow-prone byte sizing of pointer scratch driven by attacker batch_size."},
+    {"anchor": "kMaxMatrixSizeToBatchSizeRatio / use_batched_solver (lines 98-100)", "disposition": "dismissed", "reason": "Heuristic selects code path; 128*batch_size wrap only mis-selects a path, no memory-safety impact."},
+    {"anchor": "reinterpret_cast<const Scalar**>(...mutable_data()) (lines 104-105,167-171)", "disposition": "finding", "reason": "Type/alignment-unchecked cast of uint8 scratch to Scalar**; latent CWE-704/787 if allocation short or misaligned."},
+    {"anchor": "input_copy_ptrs_base[batch] = &input_copy_reshaped(batch,0,0) (lines 106-108,172-175)", "disposition": "dismissed", "reason": "Loop bounded by batch_size matching the scratch allocation; safe unless that allocation overflows (covered above)."},
+    {"anchor": "GetrfBatched(n, ..., n, ..., batch_size) / Getrf (lines 111-126)", "disposition": "dismissed", "reason": "cuBLAS/cuSolver LU calls receive validated n and batch_size; internal LAPACK contract, no shown arithmetic defect."},
+    {"anchor": "transposed_rhs_shape RemoveLastDims(2)/AddDim(nrhs)/AddDim(n) (lines 132-135)", "disposition": "dismissed", "reason": "Reshape valid because ndims>=2 and rank checks passed; product preserved vs rhs."},
+    {"anchor": "device.memcpy(transposed_rhs, rhs, rhs.NumElements()*sizeof(Scalar)) (lines 146-148)", "disposition": "finding", "reason": "Copy length from source element count; correctness depends on transposed-shape element-count equality."},
+    {"anchor": "GetrsBatched/Getrs CUBLAS_OP_C/OP_T (lines 178-201)", "disposition": "dismissed", "reason": "Solve calls receive validated n/nrhs/batch_size; host_info<0 surfaced via OP_REQUIRES_ASYNC."},
+    {"anchor": "device.memcpy(output, transposed_rhs, transposed_rhs.NumElements()*sizeof(Scalar)) (lines 209-211)", "disposition": "finding", "reason": "Copy into output; relies on output(rhs.shape()) and transposed_rhs having equal element counts (grouped with memcpy finding)."},
+    {"anchor": "info_checker lambda capture [context, done, dev_info] (lines 218-232)", "disposition": "dismissed", "reason": "dev_info captured by value to keep DeviceLapackInfo alive across async kernels; no lifetime defect."},
+    {"anchor": "for (int i = 0; i < host_infos[0].size(); ++i) (line 223)", "disposition": "finding", "reason": "Signed int loop counter vs container size(); sign/truncation hygiene."},
+    {"anchor": "CheckLapackInfoAndDeleteSolverAsync(std::move(solver), dev_info, std::move(info_checker)) (lines 233-234)", "disposition": "dismissed", "reason": "Moved-from solver/info_checker are not reused afterward; no use-after-move."}
+  ],
+  "findings": [
+    {
+      "title": "Tensor rank used to index dim_size before rank validation (OOB shape read / CHECK-abort DoS)",
+      "anchor": "const int64 n = input.dim_size(ndims - 1); const int64 nrhs = rhs.dim_size(ndims - 1);",
+      "file": "corpus/train/train_0187_cwe354.cpp",
+      "line": "5-7",
+      "code": "    const int ndims = input.dims();\n    const int64 n = input.dim_size(ndims - 1);\n    const int64 nrhs = rhs.dim_size(ndims - 1);",
+      "bug_class": "Improper input validation / out-of-bounds index before validation (reachable abort)",
+      "cwe": "CWE-20",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0187_cwe354.cpp (this file)",
+      "invariant": "ndims >= 2 and rhs.dims() == ndims MUST be checked BEFORE any dim_size(ndims - 1 / ndims - 2) call, and rhs must be indexed only with indices valid for rhs's own rank, so no dimension access is ever passed an out-of-range index.",
+      "failure_mode": "A caller supplies input with rank < 2 (scalar/vector) or an rhs whose rank is smaller than input's. Line 6 then evaluates input.dim_size(-1) (or line 7 evaluates rhs.dim_size(ndims-1) with ndims valid for input but out of range for rhs). TensorShape::dim_size only DCHECKs its argument, so in a release build this reads outside the dimension storage (CWE-125), and in a CHECK-enabled build it aborts the process — a remotely reachable denial of service for anyone who can invoke the op with crafted shapes. The reject guards on lines 9-28 fire too late to prevent the access.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm TensorShape::dim_size behavior under the build's DCHECK setting, and that no reordering places dim_size(ndims-1)/(ndims-2) or rhs indexing before the OP_REQUIRES_ASYNC rank/same-rank gates; ideally move the n/nrhs computation to after line 28."
+    },
+    {
+      "title": "reinterpret_cast of uint8 host scratch to Scalar** (type confusion / alignment)",
+      "anchor": "reinterpret_cast<const Scalar**>(input_copy_ptrs.mutable_data())",
+      "file": "corpus/train/train_0187_cwe354.cpp",
+      "line": "104-105",
+      "code": "      const Scalar** input_copy_ptrs_base =\n          reinterpret_cast<const Scalar**>(input_copy_ptrs.mutable_data());",
+      "bug_class": "Incorrect type conversion of raw buffer to pointer array",
+      "cwe": "CWE-704",
+      "severity": "low",
+      "where_it_lives": "implementation (CudaSolver::GetScratchSpace, file not provided)",
+      "invariant": "GetScratchSpace<uint8>(sizeof(Scalar*) * batch_size) MUST return a host buffer that is at least that many bytes and aligned for a pointer type; the reinterpret_cast then treats it as an array of batch_size Scalar* elements.",
+      "failure_mode": "reinterpret_cast performs no size or alignment check. If the scratch allocation is shorter than sizeof(Scalar*) * batch_size (e.g. due to the batch_size overflow below) or under-aligned, the subsequent writes input_copy_ptrs_base[batch] = ... (and the analogous casts at lines 167-171) are out-of-bounds or misaligned pointer writes (CWE-787 / UB). Under normal allocator behavior the size and alignment match, so this is a latent contract rather than a live overflow, but the cast removes the type system's ability to catch a sizing mistake.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm GetScratchSpace returns pointer-aligned memory of exactly the requested byte size and that batch_size cannot overflow the requested size (see next finding)."
+    },
+    {
+      "title": "Integer-overflow-prone sizing of pointer scratch: sizeof(Scalar*) * batch_size",
+      "anchor": "solver->GetScratchSpace<uint8>(sizeof(Scalar*) * batch_size, ...)",
+      "file": "corpus/train/train_0187_cwe354.cpp",
+      "line": "95-97",
+      "code": "    auto input_copy_ptrs = solver->GetScratchSpace<uint8>(\n        sizeof(Scalar*) * batch_size, \"input_copt_ptrs\",\n        /* on_host */ true);",
+      "bug_class": "Integer overflow in allocation size",
+      "cwe": "CWE-190",
+      "severity": "low",
+      "where_it_lives": "implementation (CudaSolver::GetScratchSpace, file not provided)",
+      "invariant": "The product sizeof(Scalar*) * batch_size MUST NOT overflow the size type before it reaches the allocator, and the allocator MUST reject/limit oversized requests so the returned buffer always holds batch_size pointers.",
+      "failure_mode": "batch_size is the product of attacker-controlled outer tensor dimensions. For a tensor whose leading dims multiply to a value near the size-type maximum, sizeof(Scalar*) * batch_size (also at lines 158-163) can wrap to a small value, producing an undersized scratch buffer while the per-batch fill loops (lines 106-108, 172-175) and the batched cuBLAS calls still use the full batch_size, causing out-of-bounds writes (CWE-787). Whether this is reachable depends on whether tensor allocation of that many matrices would already have failed upstream and on GetScratchSpace's own bounds checks.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify GetScratchSpace validates the multiplication (or that batch_size is provably bounded by prior allocation limits) so the pointer array can always hold batch_size entries."
+    },
+    {
+      "title": "device.memcpy lengths assume source/destination element-count equality",
+      "anchor": "device.memcpy(..., rhs.NumElements() * sizeof(Scalar))",
+      "file": "corpus/train/train_0187_cwe354.cpp",
+      "line": "146-148",
+      "code": "      device.memcpy(transposed_rhs.flat<Scalar>().data(),\n                    rhs.flat<Scalar>().data(),\n                    rhs.NumElements() * sizeof(Scalar));",
+      "bug_class": "Potential out-of-bounds copy when shape invariants are violated",
+      "cwe": "CWE-787",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0187_cwe354.cpp (this file)",
+      "invariant": "For each device.memcpy (lines 75-77, 146-148, 209-211) the destination tensor MUST hold at least as many elements as the source count used for the length, i.e. the separately-constructed destination shape must have an element count equal to the source's NumElements().",
+      "failure_mode": "The copy length is derived from the SOURCE tensor's NumElements() but the destination is a distinct tensor sized from a re-derived shape (transposed_rhs = [.., nrhs, n]; output = rhs.shape()). Correctness holds only while the square/rhs-rows validations and the RemoveLastDims(2)/AddDim reshapes keep the products equal. If n/nrhs are corrupted (e.g. via the pre-validation ordering bug in finding 1) or a future edit weakens a shape check, the destination becomes smaller than the copied length and device.memcpy writes out of bounds on the GPU buffer. Under the current validated path the counts match, so this is a latent, invariant-dependent risk.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm that transposed_rhs and output always have element counts equal to their memcpy sources for all validated shapes, and that no path reaches these memcpys with unvalidated n/nrhs."
+    },
+    {
+      "title": "Signed int loop counter compared against container size()",
+      "anchor": "for (int i = 0; i < host_infos[0].size(); ++i)",
+      "file": "corpus/train/train_0187_cwe354.cpp",
+      "line": "223",
+      "code": "        for (int i = 0; i < host_infos[0].size(); ++i) {",
+      "bug_class": "Signed/unsigned comparison and numeric truncation",
+      "cwe": "CWE-197",
+      "severity": "info",
+      "where_it_lives": "corpus/train/train_0187_cwe354.cpp (this file)",
+      "invariant": "The loop index type MUST be wide/unsigned enough to represent host_infos[0].size() so the bound is not truncated or mis-compared.",
+      "failure_mode": "i is a plain int while size() returns a 64-bit/unsigned count. If the info vector ever exceeded INT_MAX entries the comparison would truncate or wrap, skipping the singular-matrix check for later entries. In practice the count equals batch_size and is bounded by device memory, so impact is negligible; it is a hygiene issue worth normalizing to int64/size_t.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm host_infos[0].size() is always well below INT_MAX in practice; prefer an int64 index to remove the sign/width mismatch."
+    }
+  ],
+  "audit_checklist": [
+    "Move the n/nrhs computation (lines 6-7) to AFTER the ndims>=2 and rhs.dims()==ndims gates, and index rhs only with indices valid for rhs's own rank, so dim_size is never called out of range.",
+    "Verify TensorShape::dim_size behavior with a negative/out-of-range argument in the shipped build (DCHECK vs CHECK) to determine whether the pre-validation access is an OOB read or a process abort.",
+    "Confirm CudaSolver::GetScratchSpace<uint8> validates sizeof(Scalar*) * batch_size against overflow and returns a pointer-aligned buffer large enough for batch_size Scalar* entries.",
+    "Check that batch_size (product of outer dims) is bounded by upstream allocation limits so the reinterpret_cast'd pointer arrays and cuBLAS batched calls cannot be driven past the scratch buffer.",
+    "Prove element-count equality between each device.memcpy source and destination (input_copy/input, transposed_rhs/rhs, output/transposed_rhs) for all shapes that pass validation.",
+    "Confirm dev_info is captured by value and the solver/info_checker moves at line 233-234 are the last use of those objects (no use-after-move in the async completion path).",
+    "Normalize the host_infos[0].size() loop counter to a 64-bit/size_t type to avoid sign/width mismatch."
+  ]
+}

@@ -1,0 +1,388 @@
+{
+  "subsystem": "BIND 9 DNSSEC managed-keys / RFC 5011 automatic trust-anchor maintenance. keyfetch_done() is the task-manager completion callback for an asynchronous fetch of a zone's apex DNSKEY RRset; it validates the fetched DNSKEY set against the currently trusted secure roots and updates the managed-keys database and the view's trust anchors (add/remove/promote) with RFC 5011 hold-down timers.",
+  "provenance": "Identifiers are unmistakably ISC BIND internals: the isc_task_t/isc_event_t event framework, dns_zone_t, dns_keytable_t/dns_keynode_t secure roots, dns_rdata_rrsig_t/dns_rdata_dnskey_t/dns_rdata_keydata_t, dns_dnssec_verify, DNS_KEYFLAG_KSK/REVOKE, dns_zone_mkey_month, fail_secure(), and the explicit RFC 5011 quotation at lines 536-543. The sample tag is 'primevul_c_train_3184_vuln'; the local filename train_0070_cwe327.c hints at CWE-327 (risky crypto) but the code was reviewed blind.",
+  "trust_boundary": "kfetch->dnskeyset and kfetch->dnskeysigset are populated by a resolver fetch of a remote zone's apex DNSKEY RRset and its RRSIGs — data returned by a potentially malicious or compromised authoritative server, or forged by an on-path spoofer, over UDP/TCP. This data enters keyfetch_done BEFORE the function performs its own DNSSEC verification, so sig.algorithm, sig.keyid, dnskey.flags, key sizes, and the number of RRSIGs/DNSKEYs are all hostile and attacker-influenced. kfetch->keydataset is local managed-keys DB state (trusted). The zone lock protects concurrent state.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0070_cwe327.c",
+      "lines": "2-28",
+      "code": "keyfetch_done(isc_task_t *task, isc_event_t *event) {\n\tisc_result_t result, eresult;\n\tdns_fetchevent_t *devent;\n\tdns_keyfetch_t *kfetch;\n\tdns_zone_t *zone;\n\tisc_mem_t *mctx = NULL;\n\tdns_keytable_t *secroots = NULL;\n\tdns_dbversion_t *ver = NULL;\n\tdns_diff_t diff;\n\tbool alldone = false;\n\tbool commit = false;\n\tdns_name_t *keyname;\n\tdns_rdata_t sigrr = DNS_RDATA_INIT;\n\tdns_rdata_t dnskeyrr = DNS_RDATA_INIT;\n\tdns_rdata_t keydatarr = DNS_RDATA_INIT;\n\tdns_rdata_rrsig_t sig;\n\tdns_rdata_dnskey_t dnskey;\n\tdns_rdata_keydata_t keydata;\n\tbool initializing;\n\tchar namebuf[DNS_NAME_FORMATSIZE];\n\tunsigned char key_buf[4096];\n\tisc_buffer_t keyb;\n\tdst_key_t *dstkey;\n\tisc_stdtime_t now;\n\tint pending = 0;\n\tbool secure = false, initial = false;\n\tbool free_needed;",
+      "explanation": "This is the body of keyfetch_done(isc_task_t *task, isc_event_t *event), BIND 9's completion callback invoked by the task manager when the asynchronous fetch of a zone's apex DNSKEY RRset finishes. The large local block declares the working state for RFC 5011 automatic trust-anchor maintenance: kfetch (the dns_keyfetch_t carrying the fetch results), zone, mctx (memory context), secroots (the view's secure-roots key table), ver (a new DB version for the managed-keys zone), and a dns_diff_t diff that accumulates the DEL/ADD tuples to journal. sigrr/dnskeyrr/keydatarr are dns_rdata_t cursors and sig/dnskey/keydata are their decoded C-struct forms (dns_rdata_rrsig_t, dns_rdata_dnskey_t, dns_rdata_keydata_t). namebuf[DNS_NAME_FORMATSIZE] holds the presentation name for logs; unsigned char key_buf[4096] is a fixed 4 KiB scratch buffer used to re-serialize a KEYDATA record via isc_buffer_t keyb. The booleans secure, initial, initializing, commit, alldone, free_needed and the int pending drive the state machine, and 'now' is the current time used for the RFC 5011 hold-down timers."
+    },
+    {
+      "file": "corpus/train/train_0070_cwe327.c",
+      "lines": "30-40",
+      "code": "\tUNUSED(task);\n\tINSIST(event != NULL && event->ev_type == DNS_EVENT_FETCHDONE);\n\tINSIST(event->ev_arg != NULL);\n\n\tkfetch = event->ev_arg;\n\tzone = kfetch->zone;\n\tisc_mem_attach(zone->mctx, &mctx);\n\tkeyname = dns_fixedname_name(&kfetch->name);\n\n\tdevent = (dns_fetchevent_t *) event;\n\teresult = devent->result;",
+      "explanation": "UNUSED(task) discards the unused task pointer. The two INSIST macros assert that event is non-NULL, is specifically a DNS_EVENT_FETCHDONE, and carries a non-NULL ev_arg; these are abort-on-failure assertions. The callback then recovers its context: kfetch = event->ev_arg, zone = kfetch->zone, attaches a memory context from zone->mctx, and derives keyname from the fixed-name embedded in the keyfetch. The event is reinterpreted as a dns_fetchevent_t to read devent->result into eresult, which is the outcome of the DNSKEY fetch itself."
+    },
+    {
+      "file": "corpus/train/train_0070_cwe327.c",
+      "lines": "42-50",
+      "code": "\t/* Free resources which are not of interest */\n\tif (devent->node != NULL) {\n\t\tdns_db_detachnode(devent->db, &devent->node);\n\t}\n\tif (devent->db != NULL) {\n\t\tdns_db_detach(&devent->db);\n\t}\n\tisc_event_free(&event);\n\tdns_resolver_destroyfetch(&kfetch->fetch);",
+      "explanation": "Housekeeping that releases fetch-owned resources not needed further: if the fetch produced a database node it is detached, the database handle is detached, the event object is freed via isc_event_free(&event) (after which 'event' must not be used again), and dns_resolver_destroyfetch tears down the resolver fetch stored in kfetch->fetch. Order matters: the node is detached before its owning db."
+    },
+    {
+      "file": "corpus/train/train_0070_cwe327.c",
+      "lines": "52-58",
+      "code": "\tLOCK_ZONE(zone);\n\tif (DNS_ZONE_FLAG(zone, DNS_ZONEFLG_EXITING) || zone->view == NULL) {\n\t\tgoto cleanup;\n\t}\n\n\tisc_stdtime_get(&now);\n\tdns_name_format(keyname, namebuf, sizeof(namebuf));",
+      "explanation": "The zone is locked for the rest of the routine. If the zone is shutting down (DNS_ZONEFLG_EXITING) or has no view, control jumps to the cleanup label, skipping all processing. Otherwise the current time is fetched into 'now' and the key name is rendered into namebuf for logging with dns_name_format bounded by sizeof(namebuf)."
+    },
+    {
+      "file": "corpus/train/train_0070_cwe327.c",
+      "lines": "60-68",
+      "code": "\tresult = dns_view_getsecroots(zone->view, &secroots);\n\tINSIST(result == ISC_R_SUCCESS);\n\n\tdns_diff_init(mctx, &diff);\n\n\tCHECK(dns_db_newversion(kfetch->db, &ver));\n\n\tzone->refreshkeycount--;\n\talldone = (zone->refreshkeycount == 0);",
+      "explanation": "dns_view_getsecroots retrieves the view's secure-roots key table into secroots; the result is asserted with INSIST. dns_diff_init prepares the diff accumulator, and CHECK(dns_db_newversion(...)) opens a writable version of the managed-keys database (CHECK jumps to the failure label on error). refreshkeycount is decremented because this fetch has now completed, and alldone records whether this was the last outstanding key refresh."
+    },
+    {
+      "file": "corpus/train/train_0070_cwe327.c",
+      "lines": "70-96",
+      "code": "\tif (alldone) {\n\t\tDNS_ZONE_CLRFLAG(zone, DNS_ZONEFLG_REFRESHING);\n\t}\n\n\tdnssec_log(zone, ISC_LOG_DEBUG(3),\n\t\t   \"Returned from key fetch in keyfetch_done() for '%s': %s\",\n\t\t   namebuf, dns_result_totext(eresult));\n\n\t/* Fetch failed */\n\tif (eresult != ISC_R_SUCCESS ||\n\t    !dns_rdataset_isassociated(&kfetch->dnskeyset))\n\t{\n\t\tdnssec_log(zone, ISC_LOG_WARNING,\n\t\t\t   \"Unable to fetch DNSKEY set '%s': %s\",\n\t\t\t   namebuf, dns_result_totext(eresult));\n\t\tCHECK(minimal_update(kfetch, ver, &diff));\n\t\tgoto done;\n\t}\n\n\t/* No RRSIGs found */\n\tif (!dns_rdataset_isassociated(&kfetch->dnskeysigset)) {\n\t\tdnssec_log(zone, ISC_LOG_WARNING,\n\t\t\t   \"No DNSKEY RRSIGs found for '%s': %s\",\n\t\t\t   namebuf, dns_result_totext(eresult));\n\t\tCHECK(minimal_update(kfetch, ver, &diff));\n\t\tgoto done;\n\t}",
+      "explanation": "If this was the final refresh, the DNS_ZONEFLG_REFRESHING flag is cleared. A debug line logs the fetch return. Two early-exit paths follow for unusable input: if the fetch failed (eresult != ISC_R_SUCCESS) or no DNSKEY rdataset is associated, and separately if no DNSKEY RRSIG rdataset is associated, the code logs a warning, calls minimal_update(kfetch, ver, &diff) to make only bookkeeping changes, and jumps to the 'done' label. These guards ensure the validation logic below only runs when both a DNSKEY set and its signatures are present."
+    },
+    {
+      "file": "corpus/train/train_0070_cwe327.c",
+      "lines": "102-116",
+      "code": "\tkfetch->dnskeyset.trust = kfetch->dnskeysigset.trust = dns_trust_none;\n\n\t/*\n\t * Validate the dnskeyset against the current trusted keys.\n\t */\n\tfor (result = dns_rdataset_first(&kfetch->dnskeysigset);\n\t     result == ISC_R_SUCCESS;\n\t     result = dns_rdataset_next(&kfetch->dnskeysigset))\n\t{\n\t\tdns_keynode_t *keynode = NULL;\n\n\t\tdns_rdata_reset(&sigrr);\n\t\tdns_rdataset_current(&kfetch->dnskeysigset, &sigrr);\n\t\tresult = dns_rdata_tostruct(&sigrr, &sig, NULL);\n\t\tRUNTIME_CHECK(result == ISC_R_SUCCESS);",
+      "explanation": "The cached trust levels on the fetched DNSKEY and RRSIG sets are reset to dns_trust_none so validation is re-run from scratch. The first validation loop iterates every RRSIG in kfetch->dnskeysigset via dns_rdataset_first/next. For each signature the rdata cursor sigrr is reset, the current RRSIG rdata is loaded, and dns_rdata_tostruct decodes it into the sig struct; RUNTIME_CHECK aborts if that decode fails. sig now exposes attacker-influenced fields sig.algorithm and sig.keyid."
+    },
+    {
+      "file": "corpus/train/train_0070_cwe327.c",
+      "lines": "118-173",
+      "code": "\t\tresult = dns_keytable_find(secroots, keyname, &keynode);\n\t\twhile (result == ISC_R_SUCCESS) {\n\t\t\tdns_keynode_t *nextnode = NULL;\n\t\t\tdns_fixedname_t fixed;\n\t\t\tdns_fixedname_init(&fixed);\n\n\t\t\tdstkey = dns_keynode_key(keynode);\n\t\t\tif (dstkey == NULL) {\n\t\t\t\t/* fail_secure() was called */\n\t\t\t\tbreak;\n\t\t\t}\n\n\t\t\tif (dst_key_alg(dstkey) == sig.algorithm &&\n\t\t\t    dst_key_id(dstkey) == sig.keyid)\n\t\t\t{\n\t\t\t\tresult = dns_dnssec_verify(keyname,\n\t\t\t\t\t\t\t   &kfetch->dnskeyset,\n\t\t\t\t\t\t\t   dstkey, false,\n\t\t\t\t\t\t\t   0,\n\t\t\t\t\t\t\t   zone->view->mctx,\n\t\t\t\t\t\t\t   &sigrr,\n\t\t\t\t\t\t\t   dns_fixedname_name(\n\t\t\t\t\t\t\t   &fixed));\n\n\t\t\t\tdnssec_log(zone, ISC_LOG_DEBUG(3),\n\t\t\t\t\t   \"Verifying DNSKEY set for zone \"\n\t\t\t\t\t   \"'%s' using key %d/%d: %s\",\n\t\t\t\t\t   namebuf, sig.keyid, sig.algorithm,\n\t\t\t\t\t   dns_result_totext(result));\n\n\t\t\t\tif (result == ISC_R_SUCCESS) {\n\t\t\t\t\tkfetch->dnskeyset.trust =\n\t\t\t\t\t\tdns_trust_secure;\n\t\t\t\t\tkfetch->dnskeysigset.trust =\n\t\t\t\t\t\tdns_trust_secure;\n\t\t\t\t\tsecure = true;\n\t\t\t\t\tinitial = dns_keynode_initial(keynode);\n\t\t\t\t\tdns_keynode_trust(keynode);\n\t\t\t\t\tbreak;\n\t\t\t\t}\n\t\t\t}\n\n\t\t\tresult = dns_keytable_nextkeynode(secroots,\n\t\t\t\t\t\t\t  keynode, &nextnode);\n\t\t\tdns_keytable_detachkeynode(secroots, &keynode);\n\t\t\tkeynode = nextnode;\n\t\t}\n\n\t\tif (keynode != NULL) {\n\t\t\tdns_keytable_detachkeynode(secroots, &keynode);\n\t\t}\n\n\t\tif (secure) {\n\t\t\tbreak;\n\t\t}\n\t}",
+      "explanation": "For the current RRSIG, dns_keytable_find looks up trusted keynodes for keyname, and the inner while loop walks the chain of matching keynodes. dstkey = dns_keynode_key(keynode); a NULL dstkey means fail_secure() was previously called and breaks the loop. When a keynode's algorithm and key id match the signature's (dst_key_alg(dstkey) == sig.algorithm && dst_key_id(dstkey) == sig.keyid), dns_dnssec_verify is called to cryptographically verify the whole DNSKEY set against that trusted key, with ignoretime=false and maxbits=0. On ISC_R_SUCCESS both sets are marked dns_trust_secure, secure is set true, 'initial' records whether this was an initializing key, dns_keynode_trust marks the node, and the loop breaks. Otherwise it advances to the next keynode, detaching each as it goes. After the chain, any still-held keynode is detached, and if secure was established the outer RRSIG loop breaks."
+    },
+    {
+      "file": "corpus/train/train_0070_cwe327.c",
+      "lines": "179-183",
+      "code": "\tif (!secure) {\n\t\tdnssec_log(zone, ISC_LOG_INFO,\n\t\t\t   \"DNSKEY set for zone '%s' could not be verified \"\n\t\t\t   \"with current keys\", namebuf);\n\t}",
+      "explanation": "If no trusted key verified the DNSKEY set (secure is still false), an informational message notes that the set could not be verified with current keys. Processing continues, because RFC 5011 still allows acting on revoked keys and refresh timers even when a full chain of trust was not established this cycle."
+    },
+    {
+      "file": "corpus/train/train_0070_cwe327.c",
+      "lines": "198-212",
+      "code": "\tinitializing = true;\n\tfor (result = dns_rdataset_first(&kfetch->keydataset);\n\t     result == ISC_R_SUCCESS;\n\t     result = dns_rdataset_next(&kfetch->keydataset))\n\t{\n\t\tdns_keytag_t keytag;\n\n\t\tdns_rdata_reset(&keydatarr);\n\t\tdns_rdataset_current(&kfetch->keydataset, &keydatarr);\n\t\tresult = dns_rdata_tostruct(&keydatarr, &keydata, NULL);\n\t\tRUNTIME_CHECK(result == ISC_R_SUCCESS);\n\n\t\tdns_keydata_todnskey(&keydata, &dnskey, NULL);\n\t\tresult = compute_tag(keyname, &dnskey, mctx, &keytag);\n\t\tRUNTIME_CHECK(result == ISC_R_SUCCESS);",
+      "explanation": "initializing starts true. The keydataset scan loop iterates the locally stored KEYDATA records (kfetch->keydataset, the managed-keys DB state). Each record is decoded into the keydata struct (RUNTIME_CHECK on failure), converted to a DNSKEY view with dns_keydata_todnskey, and its key tag computed via compute_tag (again RUNTIME_CHECK-guarded). This loop's job is to reconcile stored trust-anchor state against the freshly fetched DNSKEY set."
+    },
+    {
+      "file": "corpus/train/train_0070_cwe327.c",
+      "lines": "220-284",
+      "code": "\t\tinitializing = initializing && (keydata.addhd == 0);\n\n\t\tif (! matchkey(&kfetch->dnskeyset, &keydatarr)) {\n\t\t\tbool deletekey = false;\n\n\t\t\tif (!secure) {\n\t\t\t\tif (keydata.removehd != 0 &&\n\t\t\t\t    keydata.removehd <= now)\n\t\t\t\t{\n\t\t\t\t\tdeletekey = true;\n\t\t\t\t}\n\t\t\t} else if (keydata.addhd == 0) {\n\t\t\t\tdeletekey = true;\n\t\t\t} else if (keydata.addhd > now) {\n\t\t\t\tdnssec_log(zone, ISC_LOG_INFO,\n\t\t\t\t\t   \"Pending key %d for zone %s \"\n\t\t\t\t\t   \"unexpectedly missing \"\n\t\t\t\t\t   \"restarting 30-day acceptance \"\n\t\t\t\t\t   \"timer\", keytag, namebuf);\n\t\t\t\tif (keydata.addhd < now + dns_zone_mkey_month) {\n\t\t\t\t\tkeydata.addhd =\n\t\t\t\t\t\tnow + dns_zone_mkey_month;\n\t\t\t\t}\n\t\t\t\tkeydata.refresh = refresh_time(kfetch, false);\n\t\t\t} else if (keydata.removehd == 0) {\n\t\t\t\tdnssec_log(zone, ISC_LOG_INFO,\n\t\t\t\t\t   \"Active key %d for zone %s \"\n\t\t\t\t\t   \"unexpectedly missing\",\n\t\t\t\t\t   keytag, namebuf);\n\t\t\t\tkeydata.refresh = now + dns_zone_mkey_hour;\n\t\t\t} else if (keydata.removehd <= now) {\n\t\t\t\tdeletekey = true;\n\t\t\t\tdnssec_log(zone, ISC_LOG_INFO,\n\t\t\t\t\t   \"Revoked key %d for zone %s \"\n\t\t\t\t\t   \"missing: deleting from \"\n\t\t\t\t\t   \"managed keys database\",\n\t\t\t\t\t   keytag, namebuf);\n\t\t\t} else {\n\t\t\t\tkeydata.refresh = refresh_time(kfetch, false);\n\t\t\t}\n\n\t\t\tif (secure || deletekey) {\n\t\t\t\t/* Delete old version */\n\t\t\t\tCHECK(update_one_rr(kfetch->db, ver, &diff,\n\t\t\t\t\t\t    DNS_DIFFOP_DEL, keyname, 0,\n\t\t\t\t\t\t    &keydatarr));\n\t\t\t}\n\n\t\t\tif (!secure || deletekey) {\n\t\t\t\tcontinue;\n\t\t\t}\n\n\t\t\tdns_rdata_reset(&keydatarr);\n\t\t\tisc_buffer_init(&keyb, key_buf, sizeof(key_buf));\n\t\t\tdns_rdata_fromstruct(&keydatarr, zone->rdclass,\n\t\t\t\t\t     dns_rdatatype_keydata,\n\t\t\t\t\t     &keydata, &keyb);\n\n\t\t\t/* Insert updated version */\n\t\t\tCHECK(update_one_rr(kfetch->db, ver, &diff,\n\t\t\t\t\t    DNS_DIFFOP_ADD, keyname, 0,\n\t\t\t\t\t    &keydatarr));\n\n\t\t\tset_refreshkeytimer(zone, &keydata, now, false);\n\t\t}",
+      "explanation": "initializing is ANDed with (keydata.addhd == 0): any stored key with a nonzero add hold-down proves a pre-existing trust anchor, so the zone is not being initialized. If a stored key has no match in the fetched dnskeyset (matchkey false), the code decides whether to delete it or reset its timers based on secure and the addhd/removehd hold-down timers relative to 'now' (revoked-and-expired keys are deleted; pending keys get their 30-day acceptance timer restarted with dns_zone_mkey_month; active missing keys get short refresh). When secure or deletekey holds, the old KEYDATA version is removed from the diff via update_one_rr(DNS_DIFFOP_DEL). For non-deleted secure keys, keydata is re-serialized into key_buf through isc_buffer_init(&keyb, key_buf, sizeof(key_buf)) and dns_rdata_fromstruct, added back with DNS_DIFFOP_ADD, and set_refreshkeytimer arms the next refresh."
+    },
+    {
+      "file": "corpus/train/train_0070_cwe327.c",
+      "lines": "303-333",
+      "code": "\tfor (result = dns_rdataset_first(&kfetch->dnskeyset);\n\t     result == ISC_R_SUCCESS;\n\t     result = dns_rdataset_next(&kfetch->dnskeyset))\n\t{\n\t\tbool revoked = false;\n\t\tbool newkey = false;\n\t\tbool updatekey = false;\n\t\tbool deletekey = false;\n\t\tbool trustkey = false;\n\t\tdns_keytag_t keytag;\n\n\t\tdns_rdata_reset(&dnskeyrr);\n\t\tdns_rdataset_current(&kfetch->dnskeyset, &dnskeyrr);\n\t\tresult = dns_rdata_tostruct(&dnskeyrr, &dnskey, NULL);\n\t\tRUNTIME_CHECK(result == ISC_R_SUCCESS);\n\n\t\t/* Skip ZSK's */\n\t\tif ((dnskey.flags & DNS_KEYFLAG_KSK) == 0) {\n\t\t\tcontinue;\n\t\t}\n\n\t\tresult = compute_tag(keyname, &dnskey, mctx, &keytag);\n\t\tRUNTIME_CHECK(result == ISC_R_SUCCESS);\n\n\t\trevoked = ((dnskey.flags & DNS_KEYFLAG_REVOKE) != 0);\n\n\t\tif (matchkey(&kfetch->keydataset, &dnskeyrr)) {\n\t\t\tdns_rdata_reset(&keydatarr);\n\t\t\tdns_rdataset_current(&kfetch->keydataset, &keydatarr);\n\t\t\tresult = dns_rdata_tostruct(&keydatarr, &keydata, NULL);\n\t\t\tRUNTIME_CHECK(result == ISC_R_SUCCESS);",
+      "explanation": "The second loop scans the freshly fetched DNSKEY set (kfetch->dnskeyset). Each DNSKEY is decoded into dnskey; Zone Signing Keys are skipped because only KSKs are tracked as trust anchors ((dnskey.flags & DNS_KEYFLAG_KSK) == 0). compute_tag derives the key tag, revoked is taken from the DNS_KEYFLAG_REVOKE bit, and matchkey checks whether this DNSKEY already exists in the stored keydataset, loading that keydata for the state machine that follows."
+    },
+    {
+      "file": "corpus/train/train_0070_cwe327.c",
+      "lines": "335-479",
+      "code": "\t\t\tif (revoked && revocable(kfetch, &keydata)) {\n\t\t\t\tif (keydata.addhd > now) {\n\t\t\t\t\t/*\n\t\t\t\t\t * Key wasn't trusted yet, and now\n\t\t\t\t\t * it's been revoked?  Just remove it\n\t\t\t\t\t */\n\t\t\t\t\tdeletekey = true;\n\t\t\t\t\tdnssec_log(zone, ISC_LOG_INFO,\n\t\t\t\t\t\t   \"Pending key %d for \"\n\t\t\t\t\t\t   \"zone %s is now revoked: \"\n\t\t\t\t\t\t   \"deleting from the \"\n\t\t\t\t\t\t   \"managed keys database\",\n\t\t\t\t\t\t   keytag, namebuf);\n\t\t\t\t} else if (keydata.removehd == 0) {\n\t\t\t\t\t/*\n\t\t\t\t\t * Remove key from secroots.\n\t\t\t\t\t */\n\t\t\t\t\tdns_view_untrust(zone->view, keyname,\n\t\t\t\t\t\t\t &dnskey, mctx);\n\n\t\t\t\t\t/* If initializing, delete now */\n\t\t\t\t\tif (keydata.addhd == 0) {\n\t\t\t\t\t\tdeletekey = true;\n\t\t\t\t\t} else {\n\t\t\t\t\t\tkeydata.removehd = now +\n\t\t\t\t\t\t\tdns_zone_mkey_month;\n\t\t\t\t\t\tkeydata.flags |=\n\t\t\t\t\t\t\tDNS_KEYFLAG_REVOKE;\n\t\t\t\t\t}\n\n\t\t\t\t\tdnssec_log(zone, ISC_LOG_INFO,\n\t\t\t\t\t\t   \"Trusted key %d for \"\n\t\t\t\t\t\t   \"zone %s is now revoked\",\n\t\t\t\t\t\t   keytag, namebuf);\n\t\t\t\t} else if (keydata.removehd < now) {\n\t\t\t\t\t/* Scheduled for removal */\n\t\t\t\t\tdeletekey = true;\n\n\t\t\t\t\tdnssec_log(zone, ISC_LOG_INFO,\n\t\t\t\t\t\t   \"Revoked key %d for \"\n\t\t\t\t\t\t   \"zone %s removal timer \"\n\t\t\t\t\t\t   \"complete: deleting from \"\n\t\t\t\t\t\t   \"the managed keys database\",\n\t\t\t\t\t\t   keytag, namebuf);\n\t\t\t\t}\n\t\t\t} else if (revoked && keydata.removehd == 0) {\n\t\t\t\tdnssec_log(zone, ISC_LOG_WARNING,\n\t\t\t\t\t   \"Active key %d for zone \"\n\t\t\t\t\t   \"%s is revoked but \"\n\t\t\t\t\t   \"did not self-sign; \"\n\t\t\t\t\t   \"ignoring\", keytag, namebuf);\n\t\t\t\tcontinue;\n\t\t\t} else if (secure) {\n\t\t\t\tif (keydata.removehd != 0) {\n\t\t\t\t\t/*\n\t\t\t\t\t * Key isn't revoked--but it\n\t\t\t\t\t * seems it used to be.\n\t\t\t\t\t * Remove it now and add it\n\t\t\t\t\t * back as if it were a fresh key,\n\t\t\t\t\t * with a 30-day acceptance timer.\n\t\t\t\t\t */\n\t\t\t\t\tdeletekey = true;\n\t\t\t\t\tnewkey = true;\n\t\t\t\t\tkeydata.removehd = 0;\n\t\t\t\t\tkeydata.addhd =\n\t\t\t\t\t\tnow + dns_zone_mkey_month;\n\n\t\t\t\t\tdnssec_log(zone, ISC_LOG_INFO,\n\t\t\t\t\t\t   \"Revoked key %d for \"\n\t\t\t\t\t\t   \"zone %s has returned: \"\n\t\t\t\t\t\t   \"starting 30-day \"\n\t\t\t\t\t\t   \"acceptance timer\",\n\t\t\t\t\t\t   keytag, namebuf);\n\t\t\t\t} else if (keydata.addhd > now) {\n\t\t\t\t\tpending++;\n\t\t\t\t} else if (keydata.addhd == 0) {\n\t\t\t\t\tkeydata.addhd = now;\n\t\t\t\t}\n\n\t\t\t\tif (keydata.addhd <= now) {\n\t\t\t\t\ttrustkey = true;\n\t\t\t\t\tdnssec_log(zone, ISC_LOG_INFO,\n\t\t\t\t\t\t   \"Key %d for zone %s \"\n\t\t\t\t\t\t   \"is now trusted (%s)\",\n\t\t\t\t\t\t   keytag, namebuf,\n\t\t\t\t\t\t   initial\n\t\t\t\t\t\t    ? \"initializing key \"\n\t\t\t\t\t\t       \"verified\"\n\t\t\t\t\t\t    : \"acceptance timer \"\n\t\t\t\t\t\t       \"complete\");\n\t\t\t\t}\n\t\t\t} else if (keydata.addhd > now) {\n\t\t\t\t/*\n\t\t\t\t * Not secure, and key is pending:\n\t\t\t\t * reset the acceptance timer\n\t\t\t\t */\n\t\t\t\tpending++;\n\t\t\t\tkeydata.addhd = now + dns_zone_mkey_month;\n\t\t\t\tdnssec_log(zone, ISC_LOG_INFO,\n\t\t\t\t\t   \"Pending key %d \"\n\t\t\t\t\t   \"for zone %s was \"\n\t\t\t\t\t   \"not validated: restarting \"\n\t\t\t\t\t   \"30-day acceptance timer\",\n\t\t\t\t\t   keytag, namebuf);\n\t\t\t}\n\n\t\t\tif (!deletekey && !newkey) {\n\t\t\t\tupdatekey = true;\n\t\t\t}\n\t\t} else if (secure) {\n\t\t\t/*\n\t\t\t * Key wasn't in the key zone but it's\n\t\t\t * revoked now anyway, so just skip it\n\t\t\t */\n\t\t\tif (revoked) {\n\t\t\t\tcontinue;\n\t\t\t}\n\n\t\t\t/* Key wasn't in the key zone: add it */\n\t\t\tnewkey = true;\n\n\t\t\tif (initializing) {\n\t\t\t\tdnssec_log(zone, ISC_LOG_WARNING,\n\t\t\t\t\t   \"Initializing automatic trust \"\n\t\t\t\t\t   \"anchor management for zone '%s'; \"\n\t\t\t\t\t   \"DNSKEY ID %d is now trusted, \"\n\t\t\t\t\t   \"waiving the normal 30-day \"\n\t\t\t\t\t   \"waiting period.\",\n\t\t\t\t\t   namebuf, keytag);\n\t\t\t\ttrustkey = true;\n\t\t\t} else {\n\t\t\t\tdnssec_log(zone, ISC_LOG_INFO,\n\t\t\t\t\t   \"New key %d observed \"\n\t\t\t\t\t   \"for zone '%s': \"\n\t\t\t\t\t   \"starting 30-day \"\n\t\t\t\t\t   \"acceptance timer\",\n\t\t\t\t\t   keytag, namebuf);\n\t\t\t}\n\t\t} else {\n\t\t\t/*\n\t\t\t * No previously known key, and the key is not\n\t\t\t * secure, so skip it.\n\t\t\t */\n\t\t\tcontinue;\n\t\t}",
+      "explanation": "This is the core RFC 5011 state machine for a DNSKEY already known in the key zone. If the key is revoked and revocable, it is deleted or scheduled for removal depending on addhd/removehd, and dns_view_untrust removes it from secroots. A revoked key that never self-signed is ignored. When the set validated (secure), a key that used to be revoked is re-added with a fresh 30-day timer, pending keys increment 'pending', addhd==0 keys are stamped with now, and matured keys (addhd <= now) are marked trustkey. The 'else if secure' branch (line 444) handles keys not previously in the zone: revoked ones are skipped, otherwise newkey is set and, if initializing, trusted immediately (waiving the 30-day wait), else a 30-day acceptance timer starts. Keys that are neither known nor from a secure set are skipped."
+    },
+    {
+      "file": "corpus/train/train_0070_cwe327.c",
+      "lines": "481-533",
+      "code": "\t\t/* Delete old version */\n\t\tif (deletekey || !newkey) {\n\t\t\tCHECK(update_one_rr(kfetch->db, ver, &diff,\n\t\t\t\t\t    DNS_DIFFOP_DEL, keyname, 0,\n\t\t\t\t\t    &keydatarr));\n\t\t}\n\n\t\tif (updatekey) {\n\t\t\t/* Set refresh timer */\n\t\t\tkeydata.refresh = refresh_time(kfetch, false);\n\t\t\tdns_rdata_reset(&keydatarr);\n\t\t\tisc_buffer_init(&keyb, key_buf, sizeof(key_buf));\n\t\t\tdns_rdata_fromstruct(&keydatarr, zone->rdclass,\n\t\t\t\t\t     dns_rdatatype_keydata,\n\t\t\t\t\t     &keydata, &keyb);\n\n\t\t\t/* Insert updated version */\n\t\t\tCHECK(update_one_rr(kfetch->db, ver, &diff,\n\t\t\t\t\t    DNS_DIFFOP_ADD, keyname, 0,\n\t\t\t\t\t    &keydatarr));\n\t\t} else if (newkey) {\n\t\t\t/* Convert DNSKEY to KEYDATA */\n\t\t\tresult = dns_rdata_tostruct(&dnskeyrr, &dnskey, NULL);\n\t\t\tRUNTIME_CHECK(result == ISC_R_SUCCESS);\n\t\t\tdns_keydata_fromdnskey(&keydata, &dnskey, 0, 0, 0,\n\t\t\t\t\t       NULL);\n\t\t\tkeydata.addhd = initializing\n\t\t\t\t\t ? now : now + dns_zone_mkey_month;\n\t\t\tkeydata.refresh = refresh_time(kfetch, false);\n\t\t\tdns_rdata_reset(&keydatarr);\n\t\t\tisc_buffer_init(&keyb, key_buf, sizeof(key_buf));\n\t\t\tdns_rdata_fromstruct(&keydatarr, zone->rdclass,\n\t\t\t\t\t     dns_rdatatype_keydata,\n\t\t\t\t\t     &keydata, &keyb);\n\n\t\t\t/* Insert into key zone */\n\t\t\tCHECK(update_one_rr(kfetch->db, ver, &diff,\n\t\t\t\t\t    DNS_DIFFOP_ADD, keyname, 0,\n\t\t\t\t\t    &keydatarr));\n\t\t}\n\n\t\tif (trustkey) {\n\t\t\t/* Trust this key. */\n\t\t\tresult = dns_rdata_tostruct(&dnskeyrr, &dnskey, NULL);\n\t\t\tRUNTIME_CHECK(result == ISC_R_SUCCESS);\n\t\t\ttrust_key(zone, keyname, &dnskey, false, mctx);\n\t\t}\n\n\t\tif (secure && !deletekey) {\n\t\t\tINSIST(newkey || updatekey);\n\t\t\tset_refreshkeytimer(zone, &keydata, now, false);\n\t\t}\n\t}",
+      "explanation": "The decisions are applied. Old versions are deleted from the diff for existing or to-be-deleted keys. updatekey re-serializes keydata into key_buf and writes an updated KEYDATA record; newkey converts the DNSKEY to a KEYDATA structure via dns_keydata_fromdnskey, stamps its acceptance hold-down (now if initializing, else now+30 days), serializes it into key_buf, and inserts it. trustkey promotes the key by calling trust_key. Finally, when the set was secure and the key is not being deleted, INSIST(newkey || updatekey) asserts the state machine reached a consistent decision before set_refreshkeytimer arms the timer."
+    },
+    {
+      "file": "corpus/train/train_0070_cwe327.c",
+      "lines": "544-546",
+      "code": "\tif (pending != 0) {\n\t\tfail_secure(zone, keyname);\n\t}",
+      "explanation": "Per the RFC 5011 comment above, if any pending keydata remains (pending != 0) the code calls fail_secure(zone, keyname), which installs a null key in the security roots so that all queries to the zone fail-safe rather than the trust point silently becoming insecure when an active key is revoked before its standby is trusted."
+    },
+    {
+      "file": "corpus/train/train_0070_cwe327.c",
+      "lines": "548-569",
+      "code": " done:\n\tif (!ISC_LIST_EMPTY(diff.tuples)) {\n\t\t/* Write changes to journal file. */\n\t\tCHECK(update_soa_serial(kfetch->db, ver, &diff, mctx,\n\t\t\t\t\tzone->updatemethod));\n\t\tCHECK(zone_journal(zone, &diff, NULL, \"keyfetch_done\"));\n\t\tcommit = true;\n\n\t\tDNS_ZONE_SETFLAG(zone, DNS_ZONEFLG_LOADED);\n\t\tzone_needdump(zone, 30);\n\t} else if (result == ISC_R_NOMORE) {\n\t\t/*\n\t\t * If \"updatekey\" was true for all keys found in the DNSKEY\n\t\t * response and the previous update of those keys happened\n\t\t * during the same second (only possible if a key refresh was\n\t\t * externally triggered), it may happen that all relevant\n\t\t * update_one_rr() calls will return ISC_R_SUCCESS, but\n\t\t * diff.tuples will remain empty.  Reset result to\n\t\t * ISC_R_SUCCESS to prevent a bogus warning from being logged.\n\t\t */\n\t\tresult = ISC_R_SUCCESS;\n\t}",
+      "explanation": "At the 'done' label, if the diff accumulated any tuples, the managed-keys zone's SOA serial is bumped, the changes are journalled via zone_journal, commit is set true, the zone is flagged loaded, and a dump is scheduled. Otherwise, if the loops ended with ISC_R_NOMORE (normal end of iteration) with an empty diff, result is reset to ISC_R_SUCCESS to suppress a spurious error log."
+    },
+    {
+      "file": "corpus/train/train_0070_cwe327.c",
+      "lines": "571-614",
+      "code": " failure:\n\tif (result != ISC_R_SUCCESS) {\n\t\tdnssec_log(zone, ISC_LOG_ERROR,\n\t\t\t   \"error during managed-keys processing (%s): \"\n\t\t\t   \"DNSSEC validation may be at risk\",\n\t\t\t   isc_result_totext(result));\n\t}\n\tdns_diff_clear(&diff);\n\tif (ver != NULL) {\n\t\tdns_db_closeversion(kfetch->db, &ver, commit);\n\t}\n\n cleanup:\n\tdns_db_detach(&kfetch->db);\n\n\tINSIST(zone->irefs > 0);\n\tzone->irefs--;\n\tkfetch->zone = NULL;\n\n\tif (dns_rdataset_isassociated(&kfetch->keydataset)) {\n\t\tdns_rdataset_disassociate(&kfetch->keydataset);\n\t}\n\tif (dns_rdataset_isassociated(&kfetch->dnskeyset)) {\n\t\tdns_rdataset_disassociate(&kfetch->dnskeyset);\n\t}\n\tif (dns_rdataset_isassociated(&kfetch->dnskeysigset)) {\n\t\tdns_rdataset_disassociate(&kfetch->dnskeysigset);\n\t}\n\n\tdns_name_free(keyname, mctx);\n\tisc_mem_put(mctx, kfetch, sizeof(dns_keyfetch_t));\n\tisc_mem_detach(&mctx);\n\n\tif (secroots != NULL) {\n\t\tdns_keytable_detach(&secroots);\n\t}\n\n\tfree_needed = exit_check(zone);\n\tUNLOCK_ZONE(zone);\n\tif (free_needed) {\n\t\tzone_free(zone);\n\t}\n\n\tINSIST(ver == NULL);",
+      "explanation": "The failure/cleanup epilogue: on a non-success result an error is logged, the diff is cleared, and the DB version is closed with the 'commit' flag deciding whether changes persist. At cleanup the DB is detached, zone->irefs is decremented under INSIST(zone->irefs > 0), the fetched rdatasets are disassociated if associated, keyname is freed, the kfetch object is returned to the pool via isc_mem_put, and mctx/secroots are detached. exit_check decides whether the zone can now be freed; after unlocking, zone_free runs if needed. The final INSIST(ver == NULL) confirms the version was closed."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0070_cwe327.c",
+      "lines": "133-140",
+      "code": "\t\t\t\tresult = dns_dnssec_verify(keyname,\n\t\t\t\t\t\t\t   &kfetch->dnskeyset,\n\t\t\t\t\t\t\t   dstkey, false,\n\t\t\t\t\t\t\t   0,\n\t\t\t\t\t\t\t   zone->view->mctx,\n\t\t\t\t\t\t\t   &sigrr,\n\t\t\t\t\t\t\t   dns_fixedname_name(\n\t\t\t\t\t\t\t   &fixed));",
+      "explanation": "dns_dnssec_verify is invoked on the entire attacker-supplied DNSKEY set with maxbits = 0 (the 5th argument). maxbits is the guard that bounds the size of the key/signature material examined during verification; passing 0 disables that cap. Because kfetch->dnskeyset and the RRSIGs come from a remote, potentially malicious authoritative server (or an on-path spoofer), an attacker can present DNSKEYs/RRSIGs whose cryptographic parameters force disproportionately expensive verification, and no minimum-strength or maximum-size policy is enforced at this call site. The invariant the implementation must uphold is that signature verification of untrusted material is bounded in both work and accepted key strength; with maxbits=0 that bound depends entirely on lower layers. Impact ranges from acceptance of risky/weak crypto to CPU exhaustion during validation."
+    },
+    {
+      "file": "corpus/train/train_0070_cwe327.c",
+      "lines": "107-110",
+      "code": "\tfor (result = dns_rdataset_first(&kfetch->dnskeysigset);\n\t     result == ISC_R_SUCCESS;\n\t     result = dns_rdataset_next(&kfetch->dnskeysigset))\n\t{",
+      "explanation": "The outer loop iterates every RRSIG in the fetched dnskeysigset, and for each one the inner while loop (lines 118-164) walks every trusted keynode whose algorithm and key id match, calling dns_dnssec_verify for each match. Both the number of RRSIGs and their (algorithm, keyid) values are attacker-controlled, and DNSSEC key tags are only 16 bits and are trivially forced to collide. An attacker can therefore return a DNSKEY set carrying many RRSIGs that all collide with trusted keynodes, multiplying the number of expensive public-key verifications performed per fetch (O(signatures x keynodes)). This is the classic DNSSEC validation resource-exhaustion pattern; the implementation must cap the number of signature verifications attempted before this loop is safe."
+    },
+    {
+      "file": "corpus/train/train_0070_cwe327.c",
+      "lines": "130-131",
+      "code": "\t\t\tif (dst_key_alg(dstkey) == sig.algorithm &&\n\t\t\t    dst_key_id(dstkey) == sig.keyid)",
+      "explanation": "Candidate keys are pre-selected purely by dst_key_alg(dstkey) == sig.algorithm && dst_key_id(dstkey) == sig.keyid before any cryptographic check. Both sig.algorithm and sig.keyid are decoded straight from the attacker-supplied RRSIG. Key id is a non-cryptographic 16-bit tag, so an attacker who wants to maximize verification attempts crafts RRSIGs whose keyid/algorithm match as many trusted keynodes as possible, feeding the amplification of the nested loop above. The match is only a cheap pre-filter, not a security decision, but it is the lever that decides how many costly verifications run."
+    },
+    {
+      "file": "corpus/train/train_0070_cwe327.c",
+      "lines": "273-276",
+      "code": "\t\t\tisc_buffer_init(&keyb, key_buf, sizeof(key_buf));\n\t\t\tdns_rdata_fromstruct(&keydatarr, zone->rdclass,\n\t\t\t\t\t     dns_rdatatype_keydata,\n\t\t\t\t\t     &keydata, &keyb);",
+      "explanation": "keydata is re-serialized into the fixed 4096-byte key_buf via isc_buffer_init(&keyb, key_buf, sizeof(key_buf)) followed by dns_rdata_fromstruct(...), and the return value of dns_rdata_fromstruct is not checked. The same unchecked pattern repeats at lines 492-495 and 511-514. If the encoded KEYDATA (which embeds the public key derived from an attacker-supplied DNSKEY) does not fit, dns_rdata_fromstruct returns ISC_R_NOSPACE and leaves keydatarr not pointing at a complete record; the code nonetheless passes keydatarr to update_one_rr(DNS_DIFFOP_ADD), potentially writing a truncated or uninitialized rdata into the managed-keys database. The invariant is that the serialization result must be checked (or the buffer proven large enough) before the rdata is consumed."
+    },
+    {
+      "file": "corpus/train/train_0070_cwe327.c",
+      "lines": "115-116",
+      "code": "\t\tresult = dns_rdata_tostruct(&sigrr, &sig, NULL);\n\t\tRUNTIME_CHECK(result == ISC_R_SUCCESS);",
+      "explanation": "dns_rdata_tostruct decodes attacker-influenced wire rdata into the sig struct and its result is enforced with RUNTIME_CHECK(result == ISC_R_SUCCESS), which aborts the process on failure. The same abort-on-failure guard is applied to network-derived decode/compute results at lines 207-208, 316-317, 324-325, 332-333, 503-504 and 524-525. If any DNSKEY/RRSIG/KEYDATA record that made it into a rdataset can still fail structural decoding or tag computation, a remote peer can turn a parse failure into an assertion-driven termination of named (denial of service). The invariant is that these results must be graceful-error paths, not assertions, for any data that crossed the network trust boundary."
+    },
+    {
+      "file": "corpus/train/train_0070_cwe327.c",
+      "lines": "529-531",
+      "code": "\t\tif (secure && !deletekey) {\n\t\t\tINSIST(newkey || updatekey);\n\t\t\tset_refreshkeytimer(zone, &keydata, now, false);",
+      "explanation": "After the DNSKEY state machine, INSIST(newkey || updatekey) asserts that a secure, non-deleted key ended up flagged either new or update. This assertion encodes an assumption about the reachable combinations of revoked/secure/addhd/removehd. If an unforeseen combination of attacker-influenced flags and stored hold-down values reaches this point with neither flag set, named aborts. Reachable assertions on network-derived state are a denial-of-service surface; the invariant is that every attacker-reachable branch of the state machine leaves the flags in a state this INSIST accepts."
+    },
+    {
+      "file": "corpus/train/train_0070_cwe327.c",
+      "lines": "148-156",
+      "code": "\t\t\t\tif (result == ISC_R_SUCCESS) {\n\t\t\t\t\tkfetch->dnskeyset.trust =\n\t\t\t\t\t\tdns_trust_secure;\n\t\t\t\t\tkfetch->dnskeysigset.trust =\n\t\t\t\t\t\tdns_trust_secure;\n\t\t\t\t\tsecure = true;\n\t\t\t\t\tinitial = dns_keynode_initial(keynode);\n\t\t\t\t\tdns_keynode_trust(keynode);\n\t\t\t\t\tbreak;",
+      "explanation": "Trust promotion hinges on the single 'secure' boolean set here after one successful dns_dnssec_verify, combined with the addhd/removehd timers in the state machine below. Because the DNSKEY set, its flags (KSK/REVOKE), and its key tags are all attacker-influenced, any weakness in the verify step or a key-tag/algorithm confusion that selects the wrong keynode would let an attacker steer which keys are added to, removed from (dns_view_untrust), or promoted as trust anchors. This is a trust-anchor-integrity contract: the implementation must ensure that 'secure' is only true after a cryptographically sound verification bound to the correct key, or an attacker can manipulate the managed-keys set."
+    },
+    {
+      "file": "corpus/train/train_0070_cwe327.c",
+      "lines": "67",
+      "code": "\tzone->refreshkeycount--;",
+      "explanation": "zone->refreshkeycount-- decrements an unsigned refresh counter with no lower-bound guard. If keyfetch_done is ever entered more times than there were outstanding key fetches (e.g. a duplicated or spurious fetch-done event), the counter underflows to a huge value, so alldone never becomes true and DNS_ZONEFLG_REFRESHING is never cleared, wedging the zone's refresh state machine. The invariant is that this callback runs exactly once per issued fetch."
+    }
+  ],
+  "summary": "This callback verifies and acts on DNSKEY/RRSIG records fetched from untrusted authoritative servers to maintain RFC 5011 trust anchors. The sharpest risks are a nested O(signatures x keynodes) verification loop driven by attacker-controlled RRSIG counts and 16-bit key tags with dns_dnssec_verify called at maxbits=0 (validation resource exhaustion / risky crypto), several abort-on-failure assertions on network-derived decode results (reachable-assertion DoS), and an unchecked dns_rdata_fromstruct into a fixed 4 KiB key_buf.",
+  "reviewed_anchors": [
+    {
+      "anchor": "keyfetch_done(isc_task_t *task, isc_event_t *event) [line 2]",
+      "disposition": "dismissed",
+      "reason": "Callback signature; task is UNUSED, event is validated by INSIST — the hostile data is reached indirectly through kfetch, reviewed below."
+    },
+    {
+      "anchor": "char namebuf[DNS_NAME_FORMATSIZE] [line 21]",
+      "disposition": "dismissed",
+      "reason": "Only written via dns_name_format(..., sizeof(namebuf)) which is size-bounded; log-only, no overflow contract."
+    },
+    {
+      "anchor": "unsigned char key_buf[4096] [line 22]",
+      "disposition": "finding",
+      "reason": "Fixed-size serialization target; dns_rdata_fromstruct results into it are unchecked (see finding)."
+    },
+    {
+      "anchor": "int pending = 0 [line 26]",
+      "disposition": "dismissed",
+      "reason": "Counter that only gates fail_secure(); bounded by iteration count, no overflow of interest."
+    },
+    {
+      "anchor": "INSIST(event != NULL && ev_type == DNS_EVENT_FETCHDONE); INSIST(ev_arg != NULL) [lines 31-32]",
+      "disposition": "dismissed",
+      "reason": "Guards on framework-supplied event, not attacker wire data; correct defensive assertion."
+    },
+    {
+      "anchor": "zone->refreshkeycount-- [line 67]",
+      "disposition": "finding",
+      "reason": "Unsigned decrement without lower-bound guard; underflow wedges refresh state (low-severity finding)."
+    },
+    {
+      "anchor": "RRSIG validation loop dns_rdataset_first/next(&kfetch->dnskeysigset) [lines 107-173]",
+      "disposition": "finding",
+      "reason": "Nested O(signatures x keynodes) verification over attacker-controlled sets — validation resource exhaustion."
+    },
+    {
+      "anchor": "dns_rdata_tostruct + RUNTIME_CHECK [lines 115-116, 207-208, 316-317, 324-325, 332-333, 503-504, 524-525]",
+      "disposition": "finding",
+      "reason": "Abort-on-failure assertions on network-derived decode/tag results — reachable-assertion DoS."
+    },
+    {
+      "anchor": "dst_key_alg==sig.algorithm && dst_key_id==sig.keyid [lines 130-131]",
+      "disposition": "finding",
+      "reason": "Attacker-controlled 16-bit key-tag/algorithm pre-filter that governs how many verifications run (amplification lever)."
+    },
+    {
+      "anchor": "dns_dnssec_verify(..., false, 0, ...) [lines 133-140]",
+      "disposition": "finding",
+      "reason": "maxbits=0 disables the key-size/work cap when verifying untrusted DNSKEY material."
+    },
+    {
+      "anchor": "'secure' boolean + trust promotion [lines 148-156]",
+      "disposition": "finding",
+      "reason": "Sole gate for trust-anchor add/remove/promote decisions over attacker-influenced keys (latent trust-integrity contract)."
+    },
+    {
+      "anchor": "dns_dnssec_verify ignoretime argument = false [line 135]",
+      "disposition": "dismissed",
+      "reason": "false correctly enforces signature validity times; no weakening here."
+    },
+    {
+      "anchor": "initializing = initializing && (keydata.addhd == 0) [line 220]",
+      "disposition": "dismissed",
+      "reason": "Derived from local managed-keys DB state; controls the 30-day waiver but is not attacker wire data."
+    },
+    {
+      "anchor": "matchkey(&kfetch->dnskeyset/keydataset, ...) [lines 222, 329]",
+      "disposition": "dismissed",
+      "reason": "Set-membership helper; correctness depends on its implementation (not shown), no direct memory contract at this site."
+    },
+    {
+      "anchor": "keydata.addhd / keydata.removehd hold-down timer logic [lines 220-283, 335-439]",
+      "disposition": "dismissed",
+      "reason": "RFC 5011 timer arithmetic against 'now'; a logic/state concern folded into the trust-integrity finding, not a distinct memory-safety anchor."
+    },
+    {
+      "anchor": "isc_buffer_init(&keyb,...)+dns_rdata_fromstruct [lines 273-276, 492-495, 511-514]",
+      "disposition": "finding",
+      "reason": "Serialization return value ignored; NOSPACE would yield an invalid rdata consumed by update_one_rr."
+    },
+    {
+      "anchor": "dnskeyset state machine (revoked/newkey/updatekey/deletekey/trustkey) [lines 303-533]",
+      "disposition": "finding",
+      "reason": "Reaches INSIST(newkey || updatekey) — reachable assertion on unforeseen flag combinations."
+    },
+    {
+      "anchor": "dns_view_untrust(zone->view, keyname, &dnskey, mctx) [lines 352-353]",
+      "disposition": "dismissed",
+      "reason": "Untrust action reached only on a validated revoked KSK; captured by the trust-integrity finding rather than a separate issue."
+    },
+    {
+      "anchor": "fail_secure(zone, keyname) when pending != 0 [lines 544-545]",
+      "disposition": "dismissed",
+      "reason": "Fail-safe behaviour (installs null key so queries fail); reduces risk rather than adding it."
+    },
+    {
+      "anchor": "INSIST(zone->irefs > 0); zone->irefs-- [lines 586-587]",
+      "disposition": "dismissed",
+      "reason": "Reference-count invariant on internal zone state; correct defensive assertion, not attacker-reachable via wire data."
+    },
+    {
+      "anchor": "dns_name_free(keyname, mctx); isc_mem_put(mctx, kfetch, sizeof(dns_keyfetch_t)) [lines 600-601]",
+      "disposition": "dismissed",
+      "reason": "Standard teardown of objects owned by this callback; single-exit cleanup, no double-free visible in the shown code."
+    },
+    {
+      "anchor": "INSIST(ver == NULL) [line 614]",
+      "disposition": "dismissed",
+      "reason": "Post-condition assertion on internal version handle; not attacker-controlled."
+    }
+  ],
+  "findings": [
+    {
+      "title": "Unbounded signature-verification work over attacker-controlled RRSIG/keynode sets",
+      "anchor": "for (result = dns_rdataset_first(&kfetch->dnskeysigset); ...) with inner dns_keytable_find/nextkeynode loop",
+      "file": "corpus/train/train_0070_cwe327.c",
+      "line": "107-173",
+      "code": "\tfor (result = dns_rdataset_first(&kfetch->dnskeysigset);\n\t     result == ISC_R_SUCCESS;\n\t     result = dns_rdataset_next(&kfetch->dnskeysigset))\n\t{",
+      "bug_class": "DNSSEC validation resource exhaustion (algorithmic complexity)",
+      "cwe": "CWE-834",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0070_cwe327.c",
+      "invariant": "The total number of dns_dnssec_verify calls per fetch must be capped independently of the attacker-supplied count of RRSIGs and of colliding key tags.",
+      "failure_mode": "A malicious/compromised authoritative server (or on-path spoofer) returns a DNSKEY response with many RRSIGs whose 16-bit key tags and algorithms are forced to match many trusted keynodes. The outer loop over dnskeysigset and the inner loop over matching keynodes multiply into O(signatures x keynodes) expensive public-key verifications per fetch, exhausting resolver CPU (DNSSEC validation DoS).",
+      "cve_analog": "CVE-2023-50387",
+      "what_to_confirm": "Whether an upstream cap limits the number of signatures/keynodes considered, or the number of dns_dnssec_verify invocations, before this nested loop runs."
+    },
+    {
+      "title": "Untrusted DNSKEY signatures verified with maxbits=0 (no key-size/work cap)",
+      "anchor": "dns_dnssec_verify(keyname, &kfetch->dnskeyset, dstkey, false, 0, zone->view->mctx, &sigrr, dns_fixedname_name(&fixed))",
+      "file": "corpus/train/train_0070_cwe327.c",
+      "line": "133-140",
+      "code": "\t\t\t\tresult = dns_dnssec_verify(keyname,\n\t\t\t\t\t\t\t   &kfetch->dnskeyset,\n\t\t\t\t\t\t\t   dstkey, false,\n\t\t\t\t\t\t\t   0,\n\t\t\t\t\t\t\t   zone->view->mctx,\n\t\t\t\t\t\t\t   &sigrr,\n\t\t\t\t\t\t\t   dns_fixedname_name(\n\t\t\t\t\t\t\t   &fixed));",
+      "bug_class": "Risky cryptographic verification without strength/size bound",
+      "cwe": "CWE-327",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0070_cwe327.c",
+      "invariant": "Verification of untrusted DNSKEY material must enforce a maximum key/exponent size (nonzero maxbits) and/or a minimum-strength policy so that attacker-chosen parameters cannot force excessive work or accept weak keys.",
+      "failure_mode": "maxbits is passed as 0, disabling the cap on the amount of key/signature material processed. Because the DNSKEY set and RRSIGs are attacker-influenced, an oversized modulus/exponent inflates per-verification cost, compounding the nested-loop amplification; no minimum-strength gate is applied at this call site.",
+      "cve_analog": "",
+      "what_to_confirm": "What maxbits=0 means in this BIND version's dst_context_verify path and whether any minimum-key-size policy is enforced elsewhere before trust is granted."
+    },
+    {
+      "title": "Unchecked dns_rdata_fromstruct into fixed 4096-byte key_buf",
+      "anchor": "isc_buffer_init(&keyb, key_buf, sizeof(key_buf)); dns_rdata_fromstruct(&keydatarr, ..., &keydata, &keyb)",
+      "file": "corpus/train/train_0070_cwe327.c",
+      "line": "273-276",
+      "code": "\t\t\tisc_buffer_init(&keyb, key_buf, sizeof(key_buf));\n\t\t\tdns_rdata_fromstruct(&keydatarr, zone->rdclass,\n\t\t\t\t\t     dns_rdatatype_keydata,\n\t\t\t\t\t     &keydata, &keyb);",
+      "bug_class": "Unchecked return value leading to use of invalid/uninitialized rdata",
+      "cwe": "CWE-252",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0070_cwe327.c",
+      "invariant": "The result of dns_rdata_fromstruct must be checked (or key_buf proven large enough for any KEYDATA) before keydatarr is passed to update_one_rr.",
+      "failure_mode": "key_buf is a fixed 4096-byte buffer and the return of dns_rdata_fromstruct is ignored here and again at lines 492-495 and 511-514. If serialization of a KEYDATA carrying an attacker-derived public key returns ISC_R_NOSPACE, keydatarr is left incomplete/uninitialized yet is still handed to update_one_rr(DNS_DIFFOP_ADD), writing a corrupt or partially-initialized record into the managed-keys database.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether dns_rdata_fromstruct can return NOSPACE for a maximally-sized KEYDATA and, if so, that the resulting keydatarr is never consumed without a success check."
+    },
+    {
+      "title": "Reachable assertions on network-derived rdata decode/tag results",
+      "anchor": "RUNTIME_CHECK(result == ISC_R_SUCCESS) after dns_rdata_tostruct / compute_tag",
+      "file": "corpus/train/train_0070_cwe327.c",
+      "line": "115-116",
+      "code": "\t\tresult = dns_rdata_tostruct(&sigrr, &sig, NULL);\n\t\tRUNTIME_CHECK(result == ISC_R_SUCCESS);",
+      "bug_class": "Reachable assertion / abort (denial of service)",
+      "cwe": "CWE-617",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0070_cwe327.c",
+      "invariant": "Decode and tag-computation of any data that crossed the network trust boundary must fail gracefully (error path), never via an abort-on-failure assertion.",
+      "failure_mode": "dns_rdata_tostruct/compute_tag are applied to attacker-influenced DNSKEY/RRSIG/KEYDATA records and their result is enforced with RUNTIME_CHECK at lines 115-116, 207-208, 316-317, 324-325, 332-333, 503-504 and 524-525. A record that enters a rdataset but still fails structural decode/tag computation would terminate named, giving a remote peer an assertion-driven denial of service.",
+      "cve_analog": "CVE-2018-5745",
+      "what_to_confirm": "Whether any attacker-reachable DNSKEY/RRSIG/KEYDATA encoding can make these decode/compute calls return non-success after passing rdataset admission."
+    },
+    {
+      "title": "Latent trust-anchor manipulation gated only on the 'secure' boolean",
+      "anchor": "kfetch->dnskeyset.trust = dns_trust_secure; ... secure = true; (and the DNSKEY state machine)",
+      "file": "corpus/train/train_0070_cwe327.c",
+      "line": "148-156",
+      "code": "\t\t\t\tif (result == ISC_R_SUCCESS) {\n\t\t\t\t\tkfetch->dnskeyset.trust =\n\t\t\t\t\t\tdns_trust_secure;\n\t\t\t\t\tkfetch->dnskeysigset.trust =\n\t\t\t\t\t\tdns_trust_secure;\n\t\t\t\t\tsecure = true;\n\t\t\t\t\tinitial = dns_keynode_initial(keynode);\n\t\t\t\t\tdns_keynode_trust(keynode);\n\t\t\t\t\tbreak;",
+      "bug_class": "Improper verification of cryptographic signature enabling trust-state manipulation",
+      "cwe": "CWE-347",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "'secure' may be set true only after a cryptographically sound verification bound to the correct key; add/remove/promote of trust anchors must follow strictly from that.",
+      "failure_mode": "All downstream trust-anchor decisions — adding keys, calling dns_view_untrust to remove them, and promoting them via trust_key — hinge on the single 'secure' flag and the addhd/removehd timers. Since the DNSKEY set, its KSK/REVOKE flags, and its key tags are attacker-influenced, any weakness in dns_dnssec_verify or a key-tag/algorithm confusion selecting the wrong keynode could let an attacker steer which keys become or cease to be trust anchors.",
+      "cve_analog": "",
+      "what_to_confirm": "That dns_dnssec_verify binds the verified DNSKEY set to the specific matched keynode and that no path sets 'secure' without a successful bound verification."
+    },
+    {
+      "title": "Reachable INSIST(newkey || updatekey) in the DNSKEY state machine",
+      "anchor": "if (secure && !deletekey) { INSIST(newkey || updatekey); ... }",
+      "file": "corpus/train/train_0070_cwe327.c",
+      "line": "529-531",
+      "code": "\t\tif (secure && !deletekey) {\n\t\t\tINSIST(newkey || updatekey);\n\t\t\tset_refreshkeytimer(zone, &keydata, now, false);",
+      "bug_class": "Reachable assertion / abort (denial of service)",
+      "cwe": "CWE-617",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0070_cwe327.c",
+      "invariant": "Every attacker-reachable combination of revoked/secure/addhd/removehd must leave the flags such that newkey or updatekey is set whenever secure && !deletekey.",
+      "failure_mode": "The INSIST encodes an assumption about which flag combinations the preceding state machine can produce. An unforeseen mix of attacker-influenced DNSKEY flags and stored hold-down values that reaches this point with neither newkey nor updatekey set aborts named.",
+      "cve_analog": "",
+      "what_to_confirm": "Enumerate the state-machine branches (lines 335-479) to prove newkey or updatekey is always set on the secure, non-delete path."
+    },
+    {
+      "title": "Unsigned refreshkeycount decrement without lower-bound guard",
+      "anchor": "zone->refreshkeycount--",
+      "file": "corpus/train/train_0070_cwe327.c",
+      "line": "67",
+      "code": "\tzone->refreshkeycount--;",
+      "bug_class": "Integer underflow of a counter (state wedge)",
+      "cwe": "CWE-191",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0070_cwe327.c",
+      "invariant": "keyfetch_done must run exactly once per issued key fetch so the counter never decrements below zero.",
+      "failure_mode": "If the callback ever runs more times than fetches were issued (duplicate/spurious fetch-done), the counter underflows, alldone never becomes true, and DNS_ZONEFLG_REFRESHING is never cleared, leaving the zone stuck in a refreshing state.",
+      "cve_analog": "",
+      "what_to_confirm": "That each dns_keyfetch_t triggers keyfetch_done exactly once and refreshkeycount cannot be decremented past zero."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm whether an upstream cap limits the number of RRSIGs/keynodes or dns_dnssec_verify calls per fetch (nested-loop amplification).",
+    "Determine what maxbits=0 means in dns_dnssec_verify for this BIND version and whether any minimum-key-size policy gates trust.",
+    "Verify dns_rdata_fromstruct results at lines 273-276, 492-495, 511-514 are actually safe (key_buf large enough or NOSPACE handled) before keydatarr is used by update_one_rr.",
+    "Prove that no attacker-reachable DNSKEY/RRSIG/KEYDATA encoding can make the RUNTIME_CHECK'd dns_rdata_tostruct/compute_tag calls fail after rdataset admission.",
+    "Enumerate the DNSKEY state machine (lines 335-533) to prove INSIST(newkey || updatekey) at line 530 is unreachable in the failing combination.",
+    "Confirm keyfetch_done runs exactly once per issued fetch so refreshkeycount cannot underflow at line 67.",
+    "Confirm that 'secure' is only ever set after a verification bound to the correct keynode, so trust-anchor add/remove/promote cannot be steered by key-tag/algorithm confusion."
+  ]
+}

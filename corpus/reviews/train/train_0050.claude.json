@@ -1,0 +1,222 @@
+{
+  "subsystem": "HexChat IRC client — IRCv3 capability negotiation. The function inbound_cap_ls() is the handler invoked when the IRC server sends a 'CAP LS' reply advertising the capabilities (extensions) it supports. It parses that server-supplied capability list, decides which caps to request (including SASL), builds a 'CAP REQ :...' command in a stack buffer, emits UI signals, and writes the request back to the server.",
+  "provenance": "Identified by the API surface and idioms: GLib types (gboolean, gsize, char**), GLib string helpers g_strsplit/g_strlcat/g_strfreev/g_strchomp/g_strcmp0, the G_N_ELEMENTS macro, the server*/message_tags_data* types, the EMIT_SIGNAL_TIMESTAMP macro with XP_TE_CAPLIST/XP_TE_CAPREQ signal ids, LOGIN_SASL/LOGIN_SASLEXTERNAL login methods, supported_caps[], and tcp_sendf/tcp_send_len. These are all HexChat's src/common/inbound.c symbols. The header comment 'sample: primevul_c_test_0169_fixed' marks it as the PATCHED revision of a PrimeVul sample (cwe22 tag in the filename).",
+  "trust_boundary": "The parameter extensions_str is the raw parameter string of a CAP LS numeric received over the network from the IRC server. A malicious or compromised server (or a MITM on an unencrypted IRC connection) fully controls its contents and length: arbitrary bytes, arbitrarily many space-separated tokens, and arbitrarily long individual tokens. nick and tags_data also originate from server/wire data. serv->password, serv->loginmethod, serv->have_cert are local client state (user configuration), not attacker-controlled, but their consistency is a contract. supported_caps[] is a compile-time client constant. The hostile inputs are therefore extensions_str and the token array derived from it, plus tags_data.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0050_cwe22.c",
+      "lines": "1-4",
+      "code": "/* sample: primevul_c_test_0169_fixed */\ninbound_cap_ls (server *serv, char *nick, char *extensions_str,\n\t\t\t\t\t const message_tags_data *tags_data)\n{",
+      "explanation": "Definition of inbound_cap_ls. serv is the connection/context object for this IRC server; nick is the client's current nick; extensions_str is the space-separated list of capabilities the server advertised in its CAP LS reply; tags_data carries IRCv3 message-tag metadata (notably a server-supplied timestamp). The header comment tags this as the 'fixed' revision of a PrimeVul test case, so the interesting question is whether the historical bug in this routine has actually been remediated. The return type is elided in the sample but is void in the upstream code."
+    },
+    {
+      "file": "corpus/train/train_0050_cwe22.c",
+      "lines": "5-9",
+      "code": "\tchar buffer[256];\t/* buffer for requesting capabilities and emitting the signal */\n\tgboolean want_cap = FALSE; /* format the CAP REQ string based on previous capabilities being requested or not */\n\tgboolean want_sasl = FALSE; /* CAP END shouldn't be sent when SASL is requested, it needs further responses */\n\tchar **extensions;\n\tint i;",
+      "explanation": "Local state. buffer is a FIXED 256-byte stack array that will hold the assembled 'CAP REQ :<caps>' string — this is the destination that any attacker-influenced concatenation must be bounded against. want_cap records whether at least one recognized capability was queued for request (controls whether a CAP REQ is actually sent). want_sasl records whether SASL was requested, which suppresses the immediate CAP END (SASL needs a further handshake). extensions will point to the tokenized capability array; i is the loop index. The 256-byte fixed size versus attacker-controlled content is the central memory-safety contract of the whole function."
+    },
+    {
+      "file": "corpus/train/train_0050_cwe22.c",
+      "lines": "11-12",
+      "code": "\tEMIT_SIGNAL_TIMESTAMP (XP_TE_CAPLIST, serv->server_session, nick,\n\t\t\t\t\t\t\t\t  extensions_str, NULL, NULL, 0, tags_data->timestamp);",
+      "explanation": "Fires the XP_TE_CAPLIST UI/text event so the raw advertised capability list is shown to the user and passed to plugins. It dereferences serv->server_session (the session/window for this server) and reads tags_data->timestamp (a server-supplied time). The full unparsed extensions_str is handed to the signal machinery here before any processing, and nick is passed as an argument. This is a pass-through of untrusted strings into the event system."
+    },
+    {
+      "file": "corpus/train/train_0050_cwe22.c",
+      "lines": "14",
+      "code": "\textensions = g_strsplit (extensions_str, \" \", 0);",
+      "explanation": "Tokenizes the server-supplied capability list on ASCII space into a NULL-terminated array of freshly allocated strings. The limit argument 0 means 'no limit' — the server decides how many tokens are produced and how long each one is. GLib allocates this array and each token on the heap; g_strfreev later frees it. Every element of extensions is attacker-controlled data."
+    },
+    {
+      "file": "corpus/train/train_0050_cwe22.c",
+      "lines": "16",
+      "code": "\tstrcpy (buffer, \"CAP REQ :\");",
+      "explanation": "Seeds the output buffer with the fixed IRC command prefix 'CAP REQ :'. This is a strcpy, but its source is a compile-time string literal of exactly 9 characters (plus the NUL), copied into a 256-byte destination, so it cannot overflow. It also establishes the invariant that the first 9 bytes of buffer are the prefix, which the later 'buffer + 9' access relies on."
+    },
+    {
+      "file": "corpus/train/train_0050_cwe22.c",
+      "lines": "18-22",
+      "code": "\tfor (i=0; extensions[i]; i++)\n\t{\n\t\tconst char *extension = extensions[i];\n\t\tgsize x;",
+      "explanation": "Iterates over every token the server advertised until the NULL terminator that g_strsplit placed at the end of the array. extension aliases the current attacker-controlled token; x is an inner loop counter for the supported-caps scan. There is no cap on i, so a server can force arbitrarily many iterations, but each iteration only appends via bounded g_strlcat calls (below)."
+    },
+    {
+      "file": "corpus/train/train_0050_cwe22.c",
+      "lines": "24-32",
+      "code": "\t\tif (!g_strcmp0 (extension, \"sasl\") &&\n\t\t\t((serv->loginmethod == LOGIN_SASL && strlen (serv->password) != 0)\n\t\t\t\t|| (serv->loginmethod == LOGIN_SASLEXTERNAL && serv->have_cert)))\n\t\t{\n\t\t\twant_cap = TRUE;\n\t\t\twant_sasl = TRUE;\n\t\t\tg_strlcat (buffer, \"sasl \", sizeof(buffer));\n\t\t\tcontinue;\n\t\t}",
+      "explanation": "Special-cases the 'sasl' capability. It is only requested when the client is actually configured for SASL: either loginmethod is LOGIN_SASL and a non-empty password is set, or loginmethod is LOGIN_SASLEXTERNAL and a client certificate is present. If so it sets want_cap and want_sasl and appends 'sasl ' to the buffer using g_strlcat bounded by sizeof(buffer), then continues to the next token. The bound sizeof(buffer) is the key safety property: g_strlcat will never write past the 256-byte array and NUL-terminates within it. Note strlen(serv->password) is evaluated whenever loginmethod==LOGIN_SASL."
+    },
+    {
+      "file": "corpus/train/train_0050_cwe22.c",
+      "lines": "34-42",
+      "code": "\t\tfor (x = 0; x < G_N_ELEMENTS(supported_caps); ++x)\n\t\t{\n\t\t\tif (!g_strcmp0 (extension, supported_caps[x]))\n\t\t\t{\n\t\t\t\tg_strlcat (buffer, extension, sizeof(buffer));\n\t\t\t\tg_strlcat (buffer, \" \", sizeof(buffer));\n\t\t\t\twant_cap = TRUE;\n\t\t\t}\n\t\t}",
+      "explanation": "For every non-sasl token, scans the client's own whitelist supported_caps[] (its length computed statically via G_N_ELEMENTS). Only if the server's token exactly matches a known/supported capability is it appended to the request buffer, followed by a space separator, and want_cap set. Both appends use g_strlcat bounded by sizeof(buffer). Because only whitelisted capability names are appended, the set of strings that can enter the buffer is effectively constrained to short known tokens; even so, the bound is what guarantees safety rather than the whitelist, since a server could advertise the same supported cap many times."
+    },
+    {
+      "file": "corpus/train/train_0050_cwe22.c",
+      "lines": "45",
+      "code": "\tg_strfreev (extensions);",
+      "explanation": "Frees the token array and every token string produced by g_strsplit. This is the correct cleanup and happens exactly once, before the buffer is used for emitting/sending — the tokens are no longer referenced after this point (buffer already holds copies), so there is no use-after-free of the token data."
+    },
+    {
+      "file": "corpus/train/train_0050_cwe22.c",
+      "lines": "47-54",
+      "code": "\tif (want_cap)\n\t{\n\t\t/* buffer + 9 = emit buffer without \"CAP REQ :\" */\n\t\tEMIT_SIGNAL_TIMESTAMP (XP_TE_CAPREQ, serv->server_session,\n\t\t\t\t\t\t\t\t\t  buffer + 9, NULL, NULL, NULL, 0,\n\t\t\t\t\t\t\t\t\t  tags_data->timestamp);\n\t\ttcp_sendf (serv, \"%s\\r\\n\", g_strchomp (buffer));\n\t}",
+      "explanation": "If at least one capability was queued, emit the XP_TE_CAPREQ UI event showing only the capability list — buffer + 9 skips the fixed 9-byte 'CAP REQ :' prefix that strcpy wrote at line 16. Then g_strchomp trims trailing whitespace in place and tcp_sendf sends the full 'CAP REQ :<caps>\\r\\n' line to the server. The 'buffer + 9' pointer is valid because buffer always begins with the 9-char prefix and is NUL-terminated within 256 bytes."
+    },
+    {
+      "file": "corpus/train/train_0050_cwe22.c",
+      "lines": "55-60",
+      "code": "\tif (!want_sasl)\n\t{\n\t\t/* if we use SASL, CAP END is dealt via raw numerics */\n\t\tserv->sent_capend = TRUE;\n\t\ttcp_send_len (serv, \"CAP END\\r\\n\", 9);\n\t}",
+      "explanation": "If SASL was NOT requested, immediately finish capability negotiation by marking serv->sent_capend and sending a fixed-length 'CAP END\\r\\n' (9 bytes, a compile-time constant length matching the literal). When SASL was requested, CAP END is deferred until the SASL exchange completes (handled elsewhere via numerics). The send uses an explicit constant length over a constant string, so it is safe."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0050_cwe22.c",
+      "lines": "30",
+      "code": "\t\t\tg_strlcat (buffer, \"sasl \", sizeof(buffer));",
+      "explanation": "This is the historically vulnerable append site (together with lines 38-39), and it is where the classic stack-buffer-overflow (CWE-121/CWE-787) in this routine lived in the pre-fix version, which used unbounded g_strcat/strcat into the 256-byte buffer while concatenating server-controlled capability tokens. In THIS revision every concatenation of attacker-influenced data uses g_strlcat with the correct bound sizeof(buffer), which caps the total written length at 255 bytes plus a NUL and never writes out of bounds. The remaining behavioural effect of a hostile server advertising an enormous capability list is silent TRUNCATION of the CAP REQ (a functional/logic issue), not memory corruption. The invariant the implementation must keep is exactly the one shown: every append into buffer must pass sizeof(buffer) as the third g_strlcat argument — a regression to strcat/g_strcat here would reintroduce the overflow."
+    },
+    {
+      "file": "corpus/train/train_0050_cwe22.c",
+      "lines": "38-39",
+      "code": "\t\t\t\tg_strlcat (buffer, extension, sizeof(buffer));\n\t\t\t\tg_strlcat (buffer, \" \", sizeof(buffer));",
+      "explanation": "extension is a raw server-supplied token, and this is the second bounded append of attacker data into the fixed buffer. It is reached only when the token exactly matches a whitelisted supported_caps[] entry, so in practice only short known names are appended; but a malicious server can advertise the same supported capability hundreds of times to drive many appends. Because both calls pass sizeof(buffer), the cumulative writes stay within the 256-byte array and are NUL-terminated — no overflow. The only attacker-visible consequence is a truncated/garbled outbound CAP REQ. If a maintainer ever appended extension without the whitelist gate or without the sizeof bound, this would become a remote stack overflow driven purely by the CAP LS reply."
+    },
+    {
+      "file": "corpus/train/train_0050_cwe22.c",
+      "lines": "24-26",
+      "code": "\t\tif (!g_strcmp0 (extension, \"sasl\") &&\n\t\t\t((serv->loginmethod == LOGIN_SASL && strlen (serv->password) != 0)\n\t\t\t\t|| (serv->loginmethod == LOGIN_SASLEXTERNAL && serv->have_cert)))",
+      "explanation": "strlen (serv->password) is evaluated whenever the server advertises 'sasl' and serv->loginmethod == LOGIN_SASL. If the client is configured for SASL login but serv->password is a NULL pointer (never set / cleared), strlen dereferences NULL and crashes (CWE-476). The trigger is partly attacker-influenced: the server chooses whether 'sasl' appears in CAP LS, but the NULL password is a local-state precondition, so this is a latent robustness bug rather than a remotely-guaranteed crash. The implementation must guarantee serv->password is non-NULL whenever loginmethod==LOGIN_SASL (or the condition should short-circuit on a NULL check before strlen)."
+    },
+    {
+      "file": "corpus/train/train_0050_cwe22.c",
+      "lines": "12",
+      "code": "\t\t\t\t\t\t\t\t  extensions_str, NULL, NULL, 0, tags_data->timestamp);",
+      "explanation": "tags_data->timestamp is dereferenced here and again at line 52 without a NULL check on tags_data. IRCv3 message-tag data is derived from the wire; if a caller can reach inbound_cap_ls with tags_data == NULL (e.g. a CAP LS line lacking message tags on a code path that passes NULL), this is a NULL-pointer dereference (CWE-476). This is latent — it depends on the caller's contract that tags_data is always a valid pointer (HexChat typically passes a stack address of a zeroed message_tags_data), so confirm no call path supplies NULL."
+    },
+    {
+      "file": "corpus/train/train_0050_cwe22.c",
+      "lines": "16",
+      "code": "\tstrcpy (buffer, \"CAP REQ :\");",
+      "explanation": "This is the one remaining unbounded string function in the routine. It is safe today because the source is a fixed 9-byte string literal into a 256-byte buffer, so it can never overflow, and it establishes the 9-byte prefix that 'buffer + 9' (line 51) depends on. The residual risk is purely hygiene/regression: if the literal were ever changed to something derived from a variable or lengthened past 255 bytes, strcpy would overflow with no bound (CWE-120). The invariant is that the argument stays a compile-time constant shorter than sizeof(buffer); a snprintf/g_strlcpy form would make that self-documenting."
+    },
+    {
+      "file": "corpus/train/train_0050_cwe22.c",
+      "lines": "14",
+      "code": "\textensions = g_strsplit (extensions_str, \" \", 0);",
+      "explanation": "The split limit of 0 means the server controls the token count with no cap, and the outer loop (line 18) iterates over all of them. There is no memory-safety issue because each append is bounded, but an abusive server can force a large allocation (one heap string per token) and many loop iterations — a minor denial-of-service / resource pressure vector (CWE-400) bounded by the IRC line-length limit the transport enforces. Confirm the read layer caps the CAP LS line length so extensions_str cannot be pathologically large."
+    },
+    {
+      "file": "corpus/train/train_0050_cwe22.c",
+      "lines": "51",
+      "code": "\t\t\t\t\t\t\t\t\t  buffer + 9, NULL, NULL, NULL, 0,",
+      "explanation": "The pointer arithmetic buffer + 9 assumes buffer always begins with the exact 9-character 'CAP REQ :' prefix. This holds because line 16 unconditionally strcpy's that literal before any other write and the buffer is 256 bytes, so buffer + 9 stays in bounds and points at a valid (possibly NUL) byte — no out-of-bounds read. The coupling is fragile: it is only correct as long as the prefix at line 16 stays exactly 9 bytes. If the seed prefix length and this offset ever diverge, the emitted string would start mid-token or read past intended content."
+    }
+  ],
+  "summary": "This is the PATCHED HexChat inbound_cap_ls() IRCv3 CAP-LS handler. The historically remotely-exploitable stack buffer overflow (unbounded strcat of server-advertised capability tokens into a 256-byte stack buffer) has been correctly remediated: every append of attacker-controlled data now uses g_strlcat bounded by sizeof(buffer), and the only remaining strcpy copies a fixed literal. No memory-corruption bug remains in the shown code. Residual issues are low-severity and latent: a possible NULL dereference of serv->password when SASL is configured without a password, a NULL-tags_data dereference risk, silent truncation of the CAP REQ under a hostile advertisement, and a fragile fixed-offset (buffer + 9) coupling.",
+  "reviewed_anchors": [
+    {"anchor": "inbound_cap_ls(server*, char* nick, char* extensions_str, const message_tags_data*) signature (lines 2-3)", "disposition": "finding", "reason": "extensions_str and tags_data are server-controlled; the entry point defines the trust boundary for the whole routine."},
+    {"anchor": "char buffer[256] (line 5)", "disposition": "finding", "reason": "Fixed-size stack destination for attacker-influenced concatenation; the central memory-safety contract, now bounded by g_strlcat."},
+    {"anchor": "gboolean want_cap (line 6)", "disposition": "dismissed", "reason": "Local boolean controlling whether CAP REQ is sent; no size/bounds contract."},
+    {"anchor": "gboolean want_sasl (line 7)", "disposition": "dismissed", "reason": "Local boolean gating CAP END; no memory contract."},
+    {"anchor": "char **extensions (line 8) / g_strsplit(..., 0) (line 14)", "disposition": "finding", "reason": "Attacker controls token count and length; unbounded split is a minor resource/DoS vector though appends are bounded."},
+    {"anchor": "EMIT_SIGNAL_TIMESTAMP(...) (lines 11-12)", "disposition": "finding", "reason": "Dereferences tags_data->timestamp and serv->server_session; latent NULL-deref if tags_data is NULL."},
+    {"anchor": "strcpy(buffer, \"CAP REQ :\") (line 16)", "disposition": "finding", "reason": "Only remaining unbounded copy; safe because source is a fixed literal, but a hygiene/regression flag and the basis of the buffer+9 offset."},
+    {"anchor": "for (i=0; extensions[i]; i++) (line 18)", "disposition": "dismissed", "reason": "NULL-terminated iteration over the split array; correct, appends inside are bounded."},
+    {"anchor": "strlen(serv->password) (line 25) / serv->loginmethod / LOGIN_SASL / LOGIN_SASLEXTERNAL / serv->have_cert (lines 25-26)", "disposition": "finding", "reason": "strlen on a possibly-NULL password when SASL configured is a latent NULL-pointer dereference."},
+    {"anchor": "g_strlcat(buffer, \"sasl \", sizeof(buffer)) (line 30)", "disposition": "finding", "reason": "Historical overflow site; now bounded — documents the fix and the invariant that must be preserved."},
+    {"anchor": "G_N_ELEMENTS(supported_caps) / supported_caps[x] (lines 34, 36)", "disposition": "dismissed", "reason": "Compile-time client whitelist iterated by static element count; not attacker-controlled and correctly bounded."},
+    {"anchor": "g_strlcat(buffer, extension, sizeof(buffer)) and g_strlcat(buffer, \" \", sizeof(buffer)) (lines 38-39)", "disposition": "finding", "reason": "Bounded append of attacker-controlled token; safe now, the key contract to preserve against regression."},
+    {"anchor": "g_strfreev(extensions) (line 45)", "disposition": "dismissed", "reason": "Correct single free of the token array after buffer already holds copies; no use-after-free/leak."},
+    {"anchor": "buffer + 9 (line 51)", "disposition": "finding", "reason": "Fixed-offset pointer arithmetic coupled to the 9-byte prefix; in-bounds today but fragile."},
+    {"anchor": "tcp_sendf(serv, \"%s\\r\\n\", g_strchomp(buffer)) (line 53)", "disposition": "dismissed", "reason": "Sends the NUL-terminated, bounded buffer with a fixed format; no memory contract violated (content is truncated at worst)."},
+    {"anchor": "serv->sent_capend / tcp_send_len(serv, \"CAP END\\r\\n\", 9) (lines 58-59)", "disposition": "dismissed", "reason": "Constant string with a matching constant length; no bounds issue."}
+  ],
+  "findings": [
+    {
+      "title": "Latent NULL-pointer dereference of serv->password when SASL is configured without a password",
+      "anchor": "strlen (serv->password) inside the sasl branch condition",
+      "file": "corpus/train/train_0050_cwe22.c",
+      "line": "25",
+      "code": "\t\t\t((serv->loginmethod == LOGIN_SASL && strlen (serv->password) != 0)",
+      "bug_class": "NULL-pointer dereference",
+      "cwe": "CWE-476",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0050_cwe22.c",
+      "invariant": "serv->password must be a valid (non-NULL) C string whenever serv->loginmethod == LOGIN_SASL; otherwise the code must NULL-check before calling strlen.",
+      "failure_mode": "When the server advertises the 'sasl' capability and the client's loginmethod is LOGIN_SASL but serv->password is NULL (never configured or cleared), strlen(NULL) dereferences a NULL pointer and crashes the client. The server chooses whether 'sasl' appears, but the NULL precondition is local state, so this is a latent robustness defect rather than a guaranteed remote crash.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether serv->password is guaranteed non-NULL (e.g. always initialized to an empty allocated string) whenever loginmethod==LOGIN_SASL, across all code paths that set loginmethod."
+    },
+    {
+      "title": "tags_data dereferenced without NULL check",
+      "anchor": "tags_data->timestamp",
+      "file": "corpus/train/train_0050_cwe22.c",
+      "line": "12",
+      "code": "\t\t\t\t\t\t\t\t  extensions_str, NULL, NULL, 0, tags_data->timestamp);",
+      "bug_class": "NULL-pointer dereference",
+      "cwe": "CWE-476",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "Every caller of inbound_cap_ls must pass a non-NULL tags_data; the function performs no NULL check before reading tags_data->timestamp (lines 12 and 52).",
+      "failure_mode": "If any dispatch path reaches inbound_cap_ls with tags_data == NULL (a CAP LS line without IRCv3 message tags handled by a caller that passes NULL), the read of tags_data->timestamp dereferences NULL and crashes. Impact depends entirely on the caller contract; HexChat normally passes the address of a zeroed message_tags_data, so this is latent.",
+      "cve_analog": "",
+      "what_to_confirm": "That all inbound-CAP dispatch call sites pass a valid message_tags_data pointer (never NULL) for CAP LS lines."
+    },
+    {
+      "title": "Silent truncation of server CAP REQ under a hostile capability advertisement (bounded, non-corrupting)",
+      "anchor": "g_strlcat(buffer, extension, sizeof(buffer)) / g_strlcat(buffer, \"sasl \", sizeof(buffer))",
+      "file": "corpus/train/train_0050_cwe22.c",
+      "line": "30,38-39",
+      "code": "\t\t\tg_strlcat (buffer, \"sasl \", sizeof(buffer));",
+      "bug_class": "Improper input validation / silent truncation (formerly stack buffer overflow, now mitigated)",
+      "cwe": "CWE-20",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0050_cwe22.c",
+      "invariant": "Every concatenation of attacker-influenced data into the 256-byte buffer must pass sizeof(buffer) to g_strlcat (as shown); no strcat/g_strcat/sprintf regression may be introduced. This invariant is currently upheld — the historical overflow is fixed.",
+      "failure_mode": "A malicious server can advertise a very long capability list (or repeat a whitelisted cap many times); g_strlcat safely caps total output at 255 bytes + NUL, so there is NO memory corruption, but the outbound CAP REQ is silently truncated and may drop capabilities the client intended to request. The pre-patch version used unbounded concatenation here and was a remote stack buffer overflow (CWE-121/CWE-787); this revision demonstrates the correct bounded fix.",
+      "cve_analog": "",
+      "what_to_confirm": "That no maintenance change reverts any of these appends to strcat/g_strcat/sprintf, and that truncation of the CAP REQ has no protocol-state hazard downstream."
+    },
+    {
+      "title": "Fragile fixed-offset emit relies on the exact 9-byte prefix",
+      "anchor": "buffer + 9 in the XP_TE_CAPREQ emit",
+      "file": "corpus/train/train_0050_cwe22.c",
+      "line": "51",
+      "code": "\t\t\t\t\t\t\t\t\t  buffer + 9, NULL, NULL, NULL, 0,",
+      "bug_class": "Fragile pointer arithmetic (hard-coded offset)",
+      "cwe": "CWE-125",
+      "severity": "info",
+      "where_it_lives": "corpus/train/train_0050_cwe22.c",
+      "invariant": "The literal written at line 16 must be exactly 9 bytes ('CAP REQ :') so that buffer + 9 begins at the capability list; the offset and the prefix length must stay in lockstep.",
+      "failure_mode": "buffer + 9 is in-bounds and correct today because strcpy unconditionally seeds the 9-char prefix into a 256-byte buffer. If the seed literal is ever changed without updating the '+ 9' offset, the emitted signal string would start mid-token (or, if the prefix shrank below 9 with a very short buffer, could read unintended bytes). No current out-of-bounds read; flagged as a maintainability/robustness hazard.",
+      "cve_analog": "",
+      "what_to_confirm": "That the strcpy prefix at line 16 and the '+ 9' offset are kept consistent (ideally via a named constant for the prefix length)."
+    },
+    {
+      "title": "Unbounded token split allows resource pressure from a hostile server",
+      "anchor": "g_strsplit (extensions_str, \" \", 0)",
+      "file": "corpus/train/train_0050_cwe22.c",
+      "line": "14",
+      "code": "\textensions = g_strsplit (extensions_str, \" \", 0);",
+      "bug_class": "Uncontrolled resource consumption",
+      "cwe": "CWE-400",
+      "severity": "info",
+      "where_it_lives": "corpus/train/train_0050_cwe22.c",
+      "invariant": "The transport/read layer must cap the length of a single IRC line (and hence extensions_str) so the token count and per-token allocations stay bounded.",
+      "failure_mode": "With limit 0 the server controls how many tokens are produced and how large each is; every token is a heap allocation and drives a loop iteration. Bounded appends mean no overflow, but an abusive server can inflate memory and CPU proportional to the line length. Impact is limited by whatever maximum line length the IRC read path enforces.",
+      "cve_analog": "",
+      "what_to_confirm": "That the code path feeding extensions_str enforces the IRC 512-byte (or configured) line-length limit before this function runs."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm every append into buffer uses g_strlcat with sizeof(buffer) and that no build/config path reintroduces strcat/g_strcat/sprintf here (this is the fix that closes the historical stack overflow).",
+    "Verify serv->password is always non-NULL whenever serv->loginmethod == LOGIN_SASL, or add a NULL check before strlen at line 25.",
+    "Verify all callers of inbound_cap_ls pass a non-NULL tags_data (lines 12 and 52 dereference tags_data->timestamp with no guard).",
+    "Confirm the read/transport layer caps CAP LS line length so g_strsplit(extensions_str, \" \", 0) cannot produce pathologically many/large tokens.",
+    "Keep the line-16 prefix literal and the 'buffer + 9' offset in sync (prefer a named length constant) so the XP_TE_CAPREQ emit always starts at the capability list.",
+    "Confirm supported_caps[] is a compile-time client whitelist (not writable from the network) so the append gate at line 36 cannot be widened by an attacker.",
+    "Check that silent truncation of the CAP REQ under an oversized advertisement has no downstream protocol-state or CAP END sequencing hazard."
+  ]
+}

@@ -1,0 +1,180 @@
+{
+  "subsystem": "AMD Display Core (DC) display-driver resource management. The function dce112_create_resource_pool is a constructor/factory that allocates and initializes a DCE 1.1.2 (Display Controller Engine) resource pool object for the amdgpu kernel driver. Its role is to hand the higher-level DC code a fully built struct resource_pool describing the hardware pipes/engines available for a given display configuration.",
+  "provenance": "Identified from naming and Linux-kernel idioms: the dce112_/dce110_ prefixes and the struct names struct resource_pool, struct dce110_resource_pool, and struct dc are the AMD DisplayCore (drivers/gpu/drm/amd/display/dc) resource-pool factory family; kzalloc(..., GFP_KERNEL) is the Linux kernel slab allocator; BREAK_TO_DEBUGGER() is the DC-specific debug macro (dc/dc_debug or os_types). The sample banner 'primevul_c_train_2659_vuln' and the file name train_0300_cwe401.c further indicate this excerpt was selected as a memory-leak (CWE-401) example, but the review is conducted on the code's merits.",
+  "trust_boundary": "This is kernel-mode driver initialization code, not a network wire parser, so the immediate attacker surface is narrow. Inputs are num_virtual_links (a uint8_t, ultimately derived from the requested display/stream topology) and dc (a driver-internal context pointer). Neither is directly attacker-supplied over a wire here; the security-relevant boundary is the KERNEL ALLOCATION LIFETIME contract: the function takes ownership of a kzalloc'd object and must guarantee that object is either handed back to the caller or freed on every exit path. A missed free is a kernel memory leak reachable by repeatedly triggering resource-pool creation (e.g. repeated modeset/hotplug), a low-privilege denial-of-service primitive.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0300_cwe401.c",
+      "lines": "2-4",
+      "code": "struct resource_pool *dce112_create_resource_pool(\n\tuint8_t num_virtual_links,\n\tstruct dc *dc)",
+      "explanation": "This is the public factory signature. It returns a struct resource_pool * (the generic base type the rest of DC operates on), and takes num_virtual_links, an 8-bit unsigned count of virtual link/stream endpoints to provision, plus dc, the opaque display-core device context. The uint8_t width caps num_virtual_links at 255. The function name embeds the ASIC revision dce112, so this builds the DCE 1.1.2 flavor of the pool. The return contract is pointer-or-NULL: a non-NULL result is a live, owned object; NULL means construction failed."
+    },
+    {
+      "file": "corpus/train/train_0300_cwe401.c",
+      "lines": "6-7",
+      "code": "struct dce110_resource_pool *pool =\n\t\tkzalloc(sizeof(struct dce110_resource_pool), GFP_KERNEL);",
+      "explanation": "The concrete, revision-specific object struct dce110_resource_pool is heap-allocated and zero-initialized with kzalloc using GFP_KERNEL (sleeping allocation, allowed here because this runs in process context during modeset init). sizeof(struct dce110_resource_pool) fixes the allocation size at the full concrete type, which embeds a struct resource_pool base member. From this point pool OWNS a heap allocation, and the function is responsible for its lifetime until it either returns it to the caller or frees it."
+    },
+    {
+      "file": "corpus/train/train_0300_cwe401.c",
+      "lines": "9-10",
+      "code": "if (!pool)\n\t\treturn NULL;",
+      "explanation": "Standard allocation-failure guard: if kzalloc returned NULL (out of memory), the function returns NULL immediately. This path is clean because no resource has been acquired yet, so there is nothing to release. This correctly propagates the pointer-or-NULL contract to the caller."
+    },
+    {
+      "file": "corpus/train/train_0300_cwe401.c",
+      "lines": "12-13",
+      "code": "if (construct(num_virtual_links, dc, pool))\n\t\treturn &pool->base;",
+      "explanation": "The heavy lifting is delegated to construct(num_virtual_links, dc, pool), a helper (not shown) that populates the freshly zeroed pool: wiring up clock sources, transform/DPP engines, stream encoders, DACs, and per-link virtual-link structures according to num_virtual_links and the capabilities in dc. construct returns a boolean-style success indicator. On success the function returns &pool->base, the address of the embedded generic struct resource_pool base member; the caller receives that interior pointer and is expected to recover the concrete object (via container_of) when destroying it. Ownership transfers to the caller on this path."
+    },
+    {
+      "file": "corpus/train/train_0300_cwe401.c",
+      "lines": "15-16",
+      "code": "BREAK_TO_DEBUGGER();\n\treturn NULL;",
+      "explanation": "This is the construct-failure path (reached when construct returned false). BREAK_TO_DEBUGGER() is a DC diagnostic macro that traps into the debugger on debug builds and is a no-op otherwise; it does NOT free memory or unwind state. The function then returns NULL to signal failure to the caller. Note what is absent: pool, which was successfully kzalloc'd at lines 6-7, is neither returned nor freed on this path."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0300_cwe401.c",
+      "lines": "12-16",
+      "code": "if (construct(num_virtual_links, dc, pool))\n\t\treturn &pool->base;\n\n\tBREAK_TO_DEBUGGER();\n\treturn NULL;",
+      "explanation": "MEMORY LEAK on the construct-failure path (CWE-401). pool was allocated with kzalloc at lines 6-7 and is fully owned by this function. When construct(...) returns false, control falls through to BREAK_TO_DEBUGGER() and then return NULL WITHOUT any kfree(pool). BREAK_TO_DEBUGGER() is purely diagnostic and frees nothing. Every time construction fails, the entire struct dce110_resource_pool allocation is orphaned and unreclaimable. The invariant that must hold is: on every exit path that does NOT return the object to the caller, the object must be freed (the failure path must call kfree(pool) before returning NULL). An attacker or fault-injector who can repeatedly drive resource-pool creation to fail (e.g. via repeated display hotplug/modeset under conditions that make construct fail, or under memory pressure that makes an internal sub-allocation in construct fail) can leak kernel slab memory unboundedly, a denial-of-service. This is the classic 'error path forgets to free' kernel leak."
+    },
+    {
+      "file": "corpus/train/train_0300_cwe401.c",
+      "lines": "12-13",
+      "code": "if (construct(num_virtual_links, dc, pool))\n\t\treturn &pool->base;",
+      "explanation": "PARTIAL-CONSTRUCTION cleanup contract (latent, in construct()). construct() receives the pre-allocated pool and populates many sub-objects; if it acquires sub-allocations (clock sources, engines, encoders) and then fails midway, whoever it is that owns cleanup must release those sub-objects. The failure path here (lines 15-16) does not even free the top-level pool, let alone invoke a pool destructor, so if construct() does NOT internally unwind its own partial allocations before returning false, the leak is larger than a single object. The invariant: construct() must be all-or-nothing (roll back everything it allocated on failure), OR this caller must call the pool destroy routine on failure. What to confirm: whether construct() cleans up partial state, since the caller demonstrably does not."
+    },
+    {
+      "file": "corpus/train/train_0300_cwe401.c",
+      "lines": "2-4",
+      "code": "struct resource_pool *dce112_create_resource_pool(\n\tuint8_t num_virtual_links,\n\tstruct dc *dc)",
+      "explanation": "UNVALIDATED INPUTS forwarded to construct() (latent, low risk). num_virtual_links is a uint8_t (0-255) passed straight into construct() with no bound check here, and dc is not NULL-checked before use. If construct() uses num_virtual_links to size or index per-virtual-link arrays without its own bounds enforcement, an oversized value could drive an out-of-bounds write (CWE-787) or over-allocation; if dc is NULL and construct() dereferences it, a NULL dereference (CWE-476) results. These are contracts on construct(), not defects visible in this excerpt, but this factory performs no validation of either parameter before delegating. The invariant: construct() must validate num_virtual_links against the hardware pipe count and tolerate/reject a NULL dc."
+    },
+    {
+      "file": "corpus/train/train_0300_cwe401.c",
+      "lines": "13",
+      "code": "return &pool->base;",
+      "explanation": "INTERIOR-POINTER ownership subtlety (info). The function returns &pool->base, a pointer to an embedded member, not the head of the kzalloc'd block. This is only safe if base is the first member of struct dce110_resource_pool (so the returned pointer equals the allocation base) OR if every destroy path recovers the concrete object via container_of(ptr, struct dce110_resource_pool, base) before calling kfree. If any caller naively kfree()s the returned struct resource_pool * and base is not at offset 0, the pointer passed to the allocator would not match the allocation, corrupting the slab (CWE-763-style free of non-heap/mid-object pointer). The invariant to confirm: the destroy routine uses container_of, and base's offset within dce110_resource_pool."
+    }
+  ],
+  "summary": "A small AMD DisplayCore resource-pool factory with one genuine defect: on the construct() failure path (lines 12-16) the kzalloc'd pool from lines 6-7 is neither returned nor freed, a kernel memory leak (CWE-401) reachable by repeatedly forcing construction to fail. Remaining items are latent contracts on the not-shown construct() (partial-cleanup, input validation) and an interior-pointer ownership note; the allocation-failure guard itself is correct.",
+  "reviewed_anchors": [
+    {
+      "anchor": "dce112_create_resource_pool(uint8_t num_virtual_links, struct dc *dc) — function signature (lines 2-4)",
+      "disposition": "finding",
+      "reason": "Pointer-or-NULL factory owning a heap allocation; forwards unvalidated num_virtual_links/dc to construct()."
+    },
+    {
+      "anchor": "num_virtual_links (uint8_t parameter, line 3)",
+      "disposition": "finding",
+      "reason": "8-bit count (0-255) passed unchecked into construct(); latent OOB/over-allocation if construct sizes per-link arrays from it."
+    },
+    {
+      "anchor": "dc (struct dc * parameter, line 4)",
+      "disposition": "dismissed",
+      "reason": "Driver-internal context pointer; not NULL-checked here but any NULL-deref would live inside construct(); folded into the input-validation finding, no separate contract in this excerpt."
+    },
+    {
+      "anchor": "pool = kzalloc(sizeof(struct dce110_resource_pool), GFP_KERNEL) (lines 6-7)",
+      "disposition": "finding",
+      "reason": "Heap allocation whose lifetime this function owns; it is leaked on the construct-failure exit."
+    },
+    {
+      "anchor": "if (!pool) return NULL; (lines 9-10)",
+      "disposition": "dismissed",
+      "reason": "Correct allocation-failure guard; nothing acquired yet so returning NULL leaks nothing."
+    },
+    {
+      "anchor": "construct(num_virtual_links, dc, pool) (line 12)",
+      "disposition": "finding",
+      "reason": "Delegated initializer; its failure return is the trigger for the top-level leak and it carries a partial-cleanup contract."
+    },
+    {
+      "anchor": "return &pool->base; (line 13)",
+      "disposition": "finding",
+      "reason": "Returns an interior pointer to an embedded base member; safe only if base is at offset 0 or destroy uses container_of."
+    },
+    {
+      "anchor": "BREAK_TO_DEBUGGER(); (line 15)",
+      "disposition": "dismissed",
+      "reason": "Diagnostic-only macro (debug trap / no-op); frees no memory, so it is not itself a defect but marks the leaking path."
+    },
+    {
+      "anchor": "return NULL; (line 16, failure path)",
+      "disposition": "finding",
+      "reason": "Failure exit that returns NULL without kfree(pool) — the site of the memory leak."
+    }
+  ],
+  "findings": [
+    {
+      "title": "Memory leak of kzalloc'd resource pool on construct() failure path",
+      "anchor": "BREAK_TO_DEBUGGER(); return NULL; (no kfree(pool)) after construct() returns false",
+      "file": "corpus/train/train_0300_cwe401.c",
+      "line": "12-16",
+      "code": "if (construct(num_virtual_links, dc, pool))\n\t\treturn &pool->base;\n\n\tBREAK_TO_DEBUGGER();\n\treturn NULL;",
+      "bug_class": "Memory leak on error path (missing free)",
+      "cwe": "CWE-401",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0300_cwe401.c",
+      "invariant": "Every exit path that does not transfer ownership of pool to the caller must free it: the construct-failure branch must call kfree(pool) (or the pool destroy routine) before returning NULL.",
+      "failure_mode": "When construct(num_virtual_links, dc, pool) returns false, the function executes BREAK_TO_DEBUGGER() (a diagnostic no-op that frees nothing) and returns NULL, leaving the struct dce110_resource_pool allocated at lines 6-7 orphaned with no remaining reference. Repeatedly forcing construction failures (e.g. via repeated modeset/hotplug under memory pressure that makes an internal sub-allocation in construct fail) leaks kernel slab memory unboundedly, a denial-of-service.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm that no code path after construct() failure frees pool; the fix is to add kfree(pool); before return NULL at lines 15-16."
+    },
+    {
+      "title": "construct() partial-initialization cleanup not guaranteed by caller",
+      "anchor": "if (construct(num_virtual_links, dc, pool))",
+      "file": "corpus/train/train_0300_cwe401.c",
+      "line": "12",
+      "code": "if (construct(num_virtual_links, dc, pool))",
+      "bug_class": "Resource leak of sub-objects on partial construction (latent)",
+      "cwe": "CWE-401",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "construct() must roll back every sub-allocation (clock sources, engines, encoders, per-virtual-link state) it made before returning false, OR this caller must invoke the pool destructor on failure; otherwise partial state leaks in addition to the top-level pool.",
+      "failure_mode": "If construct() allocates sub-objects and then fails midway, and it does not itself unwind them, those sub-objects leak because the caller's failure path (lines 15-16) frees nothing at all. The size of the leak then exceeds one struct dce110_resource_pool.",
+      "cve_analog": "",
+      "what_to_confirm": "Inspect construct() for all-or-nothing cleanup on its false-return paths."
+    },
+    {
+      "title": "num_virtual_links / dc forwarded to construct() without validation",
+      "anchor": "dce112_create_resource_pool(uint8_t num_virtual_links, struct dc *dc)",
+      "file": "corpus/train/train_0300_cwe401.c",
+      "line": "2-4",
+      "code": "struct resource_pool *dce112_create_resource_pool(\n\tuint8_t num_virtual_links,\n\tstruct dc *dc)",
+      "bug_class": "Missing input validation (latent OOB / NULL-deref in callee)",
+      "cwe": "CWE-20",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "construct() must bound num_virtual_links (0-255) against the actual hardware pipe/link count before using it to size or index per-virtual-link arrays, and must tolerate or reject a NULL dc.",
+      "failure_mode": "This factory performs no bound check on the 8-bit num_virtual_links and no NULL check on dc before delegating. If construct() indexes per-link arrays with num_virtual_links it could write out of bounds (CWE-787); if it dereferences a NULL dc it faults (CWE-476). No such defect is visible in this excerpt, but the contract is unenforced here.",
+      "cve_analog": "",
+      "what_to_confirm": "Check whether construct() validates num_virtual_links and dc before use."
+    },
+    {
+      "title": "Interior pointer &pool->base returned; free must use container_of",
+      "anchor": "return &pool->base;",
+      "file": "corpus/train/train_0300_cwe401.c",
+      "line": "13",
+      "code": "return &pool->base;",
+      "bug_class": "Interior-pointer ownership / potential free of mid-object pointer (latent)",
+      "cwe": "CWE-763",
+      "severity": "info",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "The destroy path must recover the concrete allocation via container_of(ptr, struct dce110_resource_pool, base) before kfree, unless base is the first member (offset 0) so the returned pointer equals the kzalloc base.",
+      "failure_mode": "The caller receives &pool->base, not the allocation head. If a destroy routine kfree()s the returned struct resource_pool * directly and base is not at offset 0, the allocator receives a mid-object pointer, corrupting the slab. Not triggerable from this excerpt alone.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm base's offset within struct dce110_resource_pool and that the destroy routine uses container_of."
+    }
+  ],
+  "audit_checklist": [
+    "Add kfree(pool) (or the pool destroy call) on the construct()-failure path before return NULL at lines 15-16 to close the CWE-401 leak.",
+    "Verify construct() unwinds all sub-allocations it made on every false-return path (all-or-nothing initialization).",
+    "Confirm construct() bounds num_virtual_links against the hardware pipe/link count before using it to size or index arrays.",
+    "Confirm dc is validated (or guaranteed non-NULL by contract) before construct() dereferences it.",
+    "Confirm the resource-pool destroy routine recovers the concrete object via container_of on struct dce110_resource_pool.base before kfree, or that base is at offset 0."
+  ]
+}

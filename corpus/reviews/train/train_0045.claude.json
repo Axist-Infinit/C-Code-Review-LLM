@@ -1,0 +1,200 @@
+{
+  "subsystem": "ClamAV libclamav hash-signature matcher. cli_hm_scan() looks up a computed file/region content hash (MD5/SHA1/SHA256) of a given byte size in the engine's size-bucketed hash-matcher tables (root->hm.sizehashes[type]) and, if a matching malware hash is found, returns CL_VIRUS and reports the virus name. It is the hot path that decides whether scanned data matches a hash-based signature.",
+  "provenance": "Identified by the ClamAV naming conventions and API surface: the cli_ prefix, cli_hm_scan (hash-matcher scan), enum CLI_HASH_TYPE, struct cli_matcher, struct cli_sz_hash, cli_htu32_find/cli_htu32_element (ClamAV's uint32 hashtable), the global hashlen[] table, hm_cmp, and the CL_CLEAN / CL_VIRUS return codes are all libclamav internals (matcher-hash.c / matcher.h family). The header banner names the sample corpus/train/train_0045_cwe189.c (CWE-189 numeric-errors category).",
+  "trust_boundary": "The scanned object is attacker-controlled: an adversary supplies the file/stream ClamAV scans, which determines both `size` (the length of the region being hashed) and `digest` (its content hash). Both flow into this function untrusted. `root` and the loaded szh->items / szh->hash_array / szh->virusnames come from the signature database (trusted at load), but the CONTROL FLOW of the binary search below is steered entirely by attacker-controlled `digest` comparisons, so an attacker chooses which array indices the search visits. That is the hostile surface here.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0045_cwe189.c",
+      "lines": "2",
+      "code": "int cli_hm_scan(const unsigned char *digest, uint32_t size, const char **virname, const struct cli_matcher *root, enum CLI_HASH_TYPE type) {",
+      "explanation": "Entry point. `digest` is a pointer to the raw hash bytes computed over the scanned data; `size` is the 32-bit length of the region that was hashed (ClamAV keys hash signatures by object size so that a size+hash pair is matched); `virname` is an out-parameter that receives the matched virus name string; `root` is the matcher context holding the signature tables; `type` selects which hash algorithm/table to use (MD5, SHA1, SHA256, ...). It returns CL_CLEAN, CL_VIRUS, or (implicitly) an error code."
+    },
+    {
+      "file": "corpus/train/train_0045_cwe189.c",
+      "lines": "3-6",
+      "code": "const struct cli_htu32_element *item;\n    unsigned int keylen;\n    struct cli_sz_hash *szh;\n    size_t l, r;",
+      "explanation": "Locals for the lookup: `item` is the hashtable entry located for this `size`; `keylen` is the per-hash byte length for `type` (16 for MD5, 20 for SHA1, 32 for SHA256); `szh` points at the size-bucket's sorted hash array structure; `l` and `r` are the low/high indices of the binary search over that sorted array, declared as size_t (unsigned)."
+    },
+    {
+      "file": "corpus/train/train_0045_cwe189.c",
+      "lines": "8-9",
+      "code": "if(!digest || !size || size == 0xffffffff || !root || !root->hm.sizehashes[type].capacity)\n\treturn CL_CLEAN;",
+      "explanation": "Input gate. It rejects a NULL digest, a zero size, the sentinel size 0xffffffff (reserved to mean \"any/unknown size\"), a NULL root, and an empty size-hash table (capacity 0) for the requested `type`. In all of those cases it declares the object clean. Note this checks `capacity` (allocation slots of the hashtable), which is NOT the same as the number of hashes `szh->items` used by the search below."
+    },
+    {
+      "file": "corpus/train/train_0045_cwe189.c",
+      "lines": "11-13",
+      "code": "item = cli_htu32_find(&root->hm.sizehashes[type], size);\n    if(!item)\n\treturn CL_CLEAN;",
+      "explanation": "Looks up the size bucket: `cli_htu32_find` searches the uint32-keyed hashtable for an entry whose key equals `size`. If no bucket exists for this object size, there can be no size+hash match, so it returns CL_CLEAN. A non-NULL `item` means there is a set of malware hashes registered for exactly this object size."
+    },
+    {
+      "file": "corpus/train/train_0045_cwe189.c",
+      "lines": "15-16",
+      "code": "szh = (struct cli_sz_hash *)item->data.as_ptr;\n    keylen = hashlen[type];",
+      "explanation": "The bucket payload is stored in the hashtable element as a type-punned pointer (`item->data.as_ptr`) and is cast back to `struct cli_sz_hash *`. `szh` holds the sorted array of `szh->items` hashes (`szh->hash_array`, a flat byte array of items*keylen bytes) and a parallel `szh->virusnames[]` array. `keylen = hashlen[type]` fetches the fixed byte width of one hash for this algorithm from the global `hashlen[]` table; it is the stride used to index the flat hash array."
+    },
+    {
+      "file": "corpus/train/train_0045_cwe189.c",
+      "lines": "18-19",
+      "code": "l = 0;\n    r = szh->items;",
+      "explanation": "Initializes the binary search window. `l` starts at index 0. Crucially `r` is set to `szh->items`, the COUNT of hashes in the bucket, not the last valid index (`items - 1`). The sorted array occupies valid element indices 0 .. items-1, so `r` is initialized one past the end of the array."
+    },
+    {
+      "file": "corpus/train/train_0045_cwe189.c",
+      "lines": "20-22",
+      "code": "while(l <= r) {\n\tsize_t c = (l + r) / 2;\n\tint res = hm_cmp(digest, &szh->hash_array[keylen * c], keylen);",
+      "explanation": "The binary search loop, using an INCLUSIVE upper bound (`l <= r`). Each iteration picks the midpoint `c` and compares the scanned `digest` against the stored hash at flat offset `keylen * c` for `keylen` bytes via `hm_cmp` (memcmp-like: negative if digest sorts before the stored hash, positive if after, zero on equality). Because `r` began at `items` and the condition is `<=`, `c` can legally take the value `items`."
+    },
+    {
+      "file": "corpus/train/train_0045_cwe189.c",
+      "lines": "24-29",
+      "code": "if(res < 0) {\n\t    if(!c)\n\t\tbreak;\n\t    r = c - 1;\n\t} else if(res > 0)\n\t    l = c + 1;",
+      "explanation": "Standard bisection narrowing. If the digest sorts before the midpoint (res<0) the search moves left by setting `r = c - 1`; the `if(!c) break;` guard correctly prevents `c - 1` from underflowing the unsigned `r` to SIZE_MAX when `c` is 0. If the digest sorts after the midpoint (res>0) the search moves right by setting `l = c + 1`. Repeatedly taking the res>0 branch is what drives `l` (and thus `c`) toward and past the end of the array."
+    },
+    {
+      "file": "corpus/train/train_0045_cwe189.c",
+      "lines": "30-34",
+      "code": "else {\n\t    if(virname)\n\t\t*virname = szh->virusnames[c];\n\t    return CL_VIRUS;\n\t}",
+      "explanation": "The match branch: when hm_cmp returns 0 the stored hash equals the scanned digest, so the object is flagged. If the caller passed a `virname` out-pointer, it is set to the parallel `szh->virusnames[c]` string, and CL_VIRUS is returned. The virus-name index `c` is the SAME index used for the hash comparison, so if `c` was out of range at the comparison it is equally out of range here."
+    },
+    {
+      "file": "corpus/train/train_0045_cwe189.c",
+      "lines": "36-37",
+      "code": "return CL_CLEAN;\n}",
+      "explanation": "If the loop exits without an equality match (window collapses), the object is reported clean."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0045_cwe189.c",
+      "lines": "19-20",
+      "code": "r = szh->items;\n    while(l <= r) {",
+      "explanation": "Off-by-one binary-search bound. Valid element indices are 0 .. szh->items-1, but the right bound is initialized to `szh->items` and combined with an inclusive `l <= r` loop test. The correct forms are `r = items - 1` with `l <= r`, or `r = items` with `l < r`; this code mixes the two, so the midpoint `c` can equal `szh->items`. Reachability: starting l=0, r=items, a digest that compares greater than every stored hash drives `l` upward (l = c + 1) until l = r = items, at which point c = (items+items)/2 = items — one element past the array. Because the attacker controls the scanned bytes and hence `digest`, they can deterministically steer the search off the end by supplying content whose hash sorts after the largest stored hash in that size bucket. The implementation invariant that must hold is: c must always be strictly less than szh->items before it indexes hash_array or virusnames."
+    },
+    {
+      "file": "corpus/train/train_0045_cwe189.c",
+      "lines": "22",
+      "code": "int res = hm_cmp(digest, &szh->hash_array[keylen * c], keylen);",
+      "explanation": "Out-of-bounds heap read. When `c == szh->items` (per the off-by-one above), `&szh->hash_array[keylen * c]` points exactly at the first byte past the end of the flat hash array (offset keylen*items into a keylen*items-byte buffer), and hm_cmp reads `keylen` bytes (16/20/32) from there. This is a remotely triggerable out-of-bounds read of adjacent heap memory on every scan of a crafted object whose size matches a populated bucket and whose hash sorts high. Minimum impact is a crash/DoS if the read crosses an unmapped page; because the comparison result then influences control flow, it can also act as an oracle over adjacent heap contents. The implementation must reject c >= items before dereferencing."
+    },
+    {
+      "file": "corpus/train/train_0045_cwe189.c",
+      "lines": "31-32",
+      "code": "if(virname)\n\t\t*virname = szh->virusnames[c];",
+      "explanation": "Out-of-bounds read escalating to a wild pointer dereference. If the out-of-bounds bytes read at line 22 happen to equal the digest (hm_cmp returns 0), the code takes the match branch and loads `szh->virusnames[c]` with c == items — one pointer past the end of the virusnames array. That out-of-bounds `char*` (attacker-adjacent heap contents) is handed back through `*virname` and CL_VIRUS is returned; the caller subsequently treats it as a NUL-terminated virus-name string and prints/logs it, dereferencing an uncontrolled pointer. This converts the OOB read into a potential arbitrary-address read / crash / information disclosure. The invariant is identical: c must be a valid in-range index before virusnames[c] is used."
+    },
+    {
+      "file": "corpus/train/train_0045_cwe189.c",
+      "lines": "22",
+      "code": "int res = hm_cmp(digest, &szh->hash_array[keylen * c], keylen);",
+      "explanation": "Unsigned multiplication in the offset. `keylen * c` is computed in the width of `c` (size_t) — safe on 64-bit for realistic bucket sizes, but if `keylen` (unsigned int) is promoted and `szh->items` were ever attacker-influenced to an extreme value at DB-load time, `keylen * c` could wrap and produce an in-bounds-looking offset pointing anywhere. This is a latent concern subordinate to the off-by-one; the implementation should bound szh->items at load and keep the stride multiplication in size_t. Lower likelihood because items comes from the signature database, not directly from the scanned file."
+    },
+    {
+      "file": "corpus/train/train_0045_cwe189.c",
+      "lines": "8-16",
+      "code": "if(!digest || !size || size == 0xffffffff || !root || !root->hm.sizehashes[type].capacity)\n\treturn CL_CLEAN;",
+      "explanation": "Unvalidated enum index `type`. `type` (enum CLI_HASH_TYPE) indexes `root->hm.sizehashes[type]` (lines 8 and 11) and the global `hashlen[type]` (line 16) with no bounds check in this function. If a caller ever passes a `type` outside the declared enum range, all three become out-of-bounds reads and `keylen` becomes garbage that then drives the stride at line 22. This is a defense-in-depth contract: the function trusts its caller to pass an in-range CLI_HASH_TYPE; if that guarantee is ever broken the array indexing is unsafe. Confirm every call site constrains `type` to the valid enumerators."
+    },
+    {
+      "file": "corpus/train/train_0045_cwe189.c",
+      "lines": "15",
+      "code": "szh = (struct cli_sz_hash *)item->data.as_ptr;",
+      "explanation": "Unchecked type-punned pointer. `item->data.as_ptr` is cast to `struct cli_sz_hash *` and immediately dereferenced (szh->items at line 19) with no NULL check. If a bucket can be inserted with a NULL/other-typed payload (or `data` was populated as a scalar rather than a pointer), this is a NULL/invalid-pointer dereference. Low risk assuming the loader always stores a valid cli_sz_hash pointer for size buckets, but the assumption is unstated here."
+    },
+    {
+      "file": "corpus/train/train_0045_cwe189.c",
+      "lines": "20-21",
+      "code": "while(l <= r) {\n\tsize_t c = (l + r) / 2;",
+      "explanation": "Midpoint `(l + r) / 2` can in principle overflow size_t if both bounds approach SIZE_MAX, producing a wrong (small) midpoint. In practice l and r are bounded by szh->items (a signature count), so this cannot be reached here and is noted only for completeness — the safe idiom is `l + (r - l) / 2`. Dismissed as non-exploitable given realistic bucket sizes."
+    }
+  ],
+  "summary": "cli_hm_scan contains a classic off-by-one binary-search bug: the right bound is initialized to szh->items (the element count) instead of items-1 while the loop uses an inclusive `l <= r` test, so an attacker-chosen scanned object whose hash sorts above the largest stored hash in its size bucket drives the midpoint index to exactly szh->items — one past the end of both szh->hash_array (out-of-bounds heap read at line 22) and szh->virusnames (out-of-bounds pointer read at line 32 that can be dereferenced downstream). This is a remotely triggerable out-of-bounds read (CWE-125) with crash/DoS and potential information-disclosure impact.",
+  "reviewed_anchors": [
+    {"anchor": "cli_hm_scan(const unsigned char *digest, uint32_t size, const char **virname, const struct cli_matcher *root, enum CLI_HASH_TYPE type) [line 2]", "disposition": "finding", "reason": "Entry point taking attacker-controlled digest/size; type used unchecked as an array index (see type finding)."},
+    {"anchor": "digest (const unsigned char *) [line 2]", "disposition": "dismissed", "reason": "NULL-checked at line 8; its bytes only drive comparisons, not memory sizing, so it is not itself a buffer-overflow source (it steers the search index, which is captured by the off-by-one finding)."},
+    {"anchor": "size (uint32_t) [line 2]", "disposition": "dismissed", "reason": "Validated at line 8 (non-zero, not 0xffffffff) and used only as a hashtable key, not for arithmetic on a buffer."},
+    {"anchor": "type (enum CLI_HASH_TYPE) [line 2]", "disposition": "finding", "reason": "Used unchecked to index sizehashes[type] (lines 8,11) and hashlen[type] (line 16); out-of-range value is an OOB read."},
+    {"anchor": "guard: !root->hm.sizehashes[type].capacity [line 8]", "disposition": "dismissed", "reason": "Reasonable NULL/empty gate; but note it checks capacity, not items, so it does not bound the search (relevant to the off-by-one finding)."},
+    {"anchor": "cli_htu32_find(&root->hm.sizehashes[type], size) [line 11]", "disposition": "dismissed", "reason": "Result NULL-checked at line 12; lookup itself carries no OOB contract here."},
+    {"anchor": "item->data.as_ptr cast to struct cli_sz_hash * [line 15]", "disposition": "finding", "reason": "Type-punned pointer dereferenced without a NULL check; latent NULL/invalid-pointer deref."},
+    {"anchor": "keylen = hashlen[type] [line 16]", "disposition": "finding", "reason": "Global array indexed by unchecked type; also becomes the stride for the flat hash array — folded into the type finding."},
+    {"anchor": "r = szh->items [line 19]", "disposition": "finding", "reason": "Right bound set to the count, not last index; the core off-by-one."},
+    {"anchor": "while(l <= r) [line 20]", "disposition": "finding", "reason": "Inclusive test combined with r=items lets midpoint reach items — the OOB trigger."},
+    {"anchor": "c = (l + r) / 2 [line 21]", "disposition": "dismissed", "reason": "Midpoint-overflow idiom is theoretically imperfect but l,r are bounded by a signature count, so not reachable."},
+    {"anchor": "hm_cmp(digest, &szh->hash_array[keylen * c], keylen) [line 22]", "disposition": "finding", "reason": "Reads keylen bytes at index c; when c==items this is an out-of-bounds heap read."},
+    {"anchor": "if(!c) break; r = c - 1 [lines 25-27]", "disposition": "dismissed", "reason": "Correctly guards the unsigned underflow of r; this part is safe."},
+    {"anchor": "l = c + 1 [line 29]", "disposition": "dismissed", "reason": "Standard right-move; safe in isolation but is the mechanism that pushes c to items given the bad initial bound."},
+    {"anchor": "*virname = szh->virusnames[c] [line 32]", "disposition": "finding", "reason": "Parallel-array read at the same out-of-range index c; OOB pointer read that is later dereferenced."}
+  ],
+  "findings": [
+    {
+      "title": "Off-by-one binary-search bound causes out-of-bounds read of hash_array (and virusnames)",
+      "anchor": "r = szh->items; while(l <= r) { ... hm_cmp(digest, &szh->hash_array[keylen * c], keylen)",
+      "file": "corpus/train/train_0045_cwe189.c",
+      "line": "19-22",
+      "code": "r = szh->items;\n    while(l <= r) {\n\tsize_t c = (l + r) / 2;\n\tint res = hm_cmp(digest, &szh->hash_array[keylen * c], keylen);",
+      "bug_class": "Out-of-bounds read (off-by-one binary-search bound)",
+      "cwe": "CWE-125",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0045_cwe189.c",
+      "invariant": "The midpoint index c must be strictly less than szh->items before it is used to index szh->hash_array or szh->virusnames. Achieve this with r = szh->items - 1 (with the existing l <= r test) or by switching to an exclusive r = szh->items with a l < r test.",
+      "failure_mode": "Because r is initialized to the element COUNT szh->items while the loop uses an inclusive l <= r test, the midpoint c can reach szh->items. An attacker supplies a scanned object whose size matches a populated bucket and whose content hash sorts after every stored hash; each comparison takes the res>0 branch (l = c + 1) until l = r = items, making c = items. hm_cmp then reads keylen (16/20/32) bytes at &hash_array[keylen*items], one full element past the end of the array — a remotely triggerable out-of-bounds heap read. Impact: crash/DoS on an unmapped page, and (via the comparison result) a heap-content oracle.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm szh->items is the element count and hash_array holds exactly items*keylen bytes, so index items is genuinely past the end; confirm no caller pre-shrinks r; confirm hm_cmp reads keylen bytes unconditionally."
+    },
+    {
+      "title": "Out-of-bounds virusnames[] read leads to wild char* returned as virus name",
+      "anchor": "*virname = szh->virusnames[c]",
+      "file": "corpus/train/train_0045_cwe189.c",
+      "line": "31-33",
+      "code": "if(virname)\n\t\t*virname = szh->virusnames[c];\n\t    return CL_VIRUS;",
+      "bug_class": "Out-of-bounds read escalating to uncontrolled pointer dereference",
+      "cwe": "CWE-125",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0045_cwe189.c",
+      "invariant": "virusnames[c] must only be read for an in-range c (< szh->items); the value returned through *virname must be a valid signature-name pointer, never adjacent heap memory.",
+      "failure_mode": "If the out-of-bounds bytes read at line 22 (c == items) coincidentally equal the scanned digest, hm_cmp returns 0 and the match branch loads szh->virusnames[items] — a pointer read one past the end of the parallel names array. That out-of-bounds char* (attacker-adjacent heap data) is handed to the caller as the virus name and CL_VIRUS is returned; the caller then treats it as a NUL-terminated string and prints/logs it, dereferencing an uncontrolled pointer. Impact escalates from OOB read to arbitrary-address read / crash / information disclosure. Fixing the bound (finding 1) closes this too.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm virusnames has exactly szh->items entries and that the returned pointer is consumed as a string by callers (cli_scan* / logging), making an OOB entry a live pointer dereference."
+    },
+    {
+      "title": "Unvalidated CLI_HASH_TYPE index into sizehashes[] and hashlen[]",
+      "anchor": "root->hm.sizehashes[type] / hashlen[type]",
+      "file": "corpus/train/train_0045_cwe189.c",
+      "line": "8-16",
+      "code": "if(!digest || !size || size == 0xffffffff || !root || !root->hm.sizehashes[type].capacity)\n\treturn CL_CLEAN;\n\n    item = cli_htu32_find(&root->hm.sizehashes[type], size);\n    if(!item)\n\treturn CL_CLEAN;\n\n    szh = (struct cli_sz_hash *)item->data.as_ptr;\n    keylen = hashlen[type];",
+      "bug_class": "Improper validation of array index (enum used as index without bounds check)",
+      "cwe": "CWE-129",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0045_cwe189.c",
+      "invariant": "type must be a valid CLI_HASH_TYPE enumerator so that sizehashes[type] and hashlen[type] stay within their fixed-size arrays; callers must guarantee this since the function does not.",
+      "failure_mode": "type is used to index sizehashes[] (lines 8, 11) and the global hashlen[] (line 16) with no range check. An out-of-range type (mis-set by a caller, or an enum widened over time) reads outside those arrays; the resulting garbage keylen then becomes the stride multiplier at line 22, compounding into further OOB access. This is a defense-in-depth/latent issue rather than a directly attacker-reachable one, since type is chosen by internal call sites, not the scanned file.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify every cli_hm_scan call site passes type within [0, CLI_HASH_AVAIL_TYPES) and that hashlen[] and hm.sizehashes[] are sized to cover the full enum."
+    },
+    {
+      "title": "Type-punned bucket pointer dereferenced without NULL check",
+      "anchor": "szh = (struct cli_sz_hash *)item->data.as_ptr;",
+      "file": "corpus/train/train_0045_cwe189.c",
+      "line": "15-19",
+      "code": "szh = (struct cli_sz_hash *)item->data.as_ptr;\n    keylen = hashlen[type];\n\n    l = 0;\n    r = szh->items;",
+      "bug_class": "NULL / invalid pointer dereference",
+      "cwe": "CWE-476",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0045_cwe189.c",
+      "invariant": "Every size-bucket hashtable entry must store a valid, correctly-typed struct cli_sz_hash* in data.as_ptr; a NULL or scalar payload must not reach szh->items.",
+      "failure_mode": "item->data.as_ptr is cast and immediately dereferenced at line 19 (szh->items) with no NULL check. If a bucket can be created with a NULL or non-pointer data payload (loader bug, or a hashtable used to store scalar values elsewhere), this crashes on a NULL/invalid dereference. Low risk under the assumption the signature loader always populates size buckets with a valid cli_sz_hash pointer, but that contract is not verified here.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the DB loader always sets data.as_ptr to a heap-allocated cli_sz_hash for size buckets, and that cli_htu32_find cannot return an entry with a scalar/NULL data union member."
+    }
+  ],
+  "audit_checklist": [
+    "Fix the binary-search bound: initialize r = szh->items - 1 (keep l <= r) or use r = szh->items with l < r, and add an explicit c < szh->items assertion before every hash_array/virusnames access.",
+    "Confirm szh->hash_array is exactly szh->items*keylen bytes and szh->virusnames has exactly szh->items entries, so index==items is provably out of bounds.",
+    "Trace callers of cli_hm_scan to confirm the *virname pointer is consumed as a NUL-terminated string (print/log), establishing the OOB-name deref impact.",
+    "Verify all call sites pass a bounds-checked enum CLI_HASH_TYPE and that hashlen[] and hm.sizehashes[] cover every enumerator.",
+    "Confirm szh (item->data.as_ptr) is guaranteed non-NULL and correctly typed for size buckets before dereference.",
+    "Consider the empty-bucket edge case: if a bucket with szh->items == 0 can be reached (capacity check at line 8 checks capacity, not items), c==0 already reads hash_array[0] out of bounds.",
+    "Fuzz cli_hm_scan with objects whose hashes sort just above the largest stored hash per size bucket, under ASan, to catch the one-past-the-end read."
+  ]
+}

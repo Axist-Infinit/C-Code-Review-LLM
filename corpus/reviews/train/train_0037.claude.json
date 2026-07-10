@@ -1,0 +1,205 @@
+{
+  "subsystem": "Linux kernel TCP output path — the tcp_fragment() helper in net/ipv4/tcp_output.c. It splits a single transmit sk_buff into two consecutive segments at byte offset `len`, fixing up sequence numbers, TCP header flags, memory accounting, TSO segment counts, and re-linking the new segment into either the write queue or the retransmit queue. It is invoked during output segmentation and, critically, during retransmission/SACK processing when the stack must re-fragment already-queued data.",
+  "provenance": "Identified from the function name tcp_fragment and its kernel-internal vocabulary: struct sock/sk_buff/tcp_sock, tcp_sk(), TCP_SKB_CB(), sk_stream_alloc_skb(), skb_headlen()/skb_unclone()/skb_split(), tcp_set_skb_tso_segs()/tcp_skb_pcount(), the enum tcp_queue with TCP_FRAG_IN_RTX_QUEUE, and the SNMP counter LINUX_MIB_TCPWQUEUETOOBIG. This is GPL-2.0 Linux kernel source from net/ipv4/tcp_output.c. The in-file banner `/* sample: primevul_c_train_3367_fixed */` and the presence of the sk_wmem_queued/sk_sndbuf guard at lines 19-22 identify this as the PATCHED variant of the tcp_fragment() memory-limit fix (CVE-2019-11478, the TCP \"SACK slowness\" resource-exhaustion issue).",
+  "trust_boundary": "The socket carries data driven by a remote peer. Although tcp_fragment() runs on the transmit side, the NUMBER of times it is called and the fragment boundary `len` are influenced by incoming ACK/SACK segments: a hostile peer can advertise a small MSS and dribble selective acknowledgements that force the stack to repeatedly re-fragment the retransmit queue into many tiny skbs. The hostile inputs are therefore (a) the frequency of tcp_fragment() calls and (b) the offsets `len`/`mss_now` derived from peer-controlled MSS and SACK blocks. Socket-owned state (sk_wmem_queued, sk_sndbuf, skb->len) is trusted, but the guard at lines 19-22 exists precisely because the call rate is attacker-driven.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0037_cwe400.c",
+      "lines": "2-4",
+      "code": "int tcp_fragment(struct sock *sk, enum tcp_queue tcp_queue,\n\t\t struct sk_buff *skb, u32 len,\n\t\t unsigned int mss_now, gfp_t gfp)",
+      "explanation": "Function signature. `sk` is the owning TCP socket; `tcp_queue` selects which queue the resulting second segment is inserted into (write queue vs. retransmit queue, per the enum tcp_queue whose TCP_FRAG_IN_RTX_QUEUE member appears at line 80). `skb` is the buffer being split. `len` (u32) is the attacker-influenced split offset: the number of leading bytes that remain in the original skb. `mss_now` is the current maximum segment size used to recompute TSO segment counts. `gfp` are the allocation flags for the new skb. The function returns 0 on success or a negative errno."
+    },
+    {
+      "file": "corpus/train/train_0037_cwe400.c",
+      "lines": "6-10",
+      "code": "struct tcp_sock *tp = tcp_sk(sk);\n\tstruct sk_buff *buff;\n\tint nsize, old_factor;\n\tint nlen;\n\tu8 flags;",
+      "explanation": "Locals. `tp` is the tcp_sock view of the socket (used at line 69 for snd_nxt). `buff` will hold the newly allocated second segment. `nsize` (signed int) is the linear (head) byte count to allocate for the new skb; `nlen` (signed int) is the trailing byte count moved out of the original skb; `old_factor` caches the original TSO segment count. `flags` (u8) snapshots the TCP header flag byte so PSH/FIN can be re-distributed. Note that nsize/nlen are SIGNED while the skb length primitives they derive from are UNSIGNED — see the what_could_go_wrong walkthrough."
+    },
+    {
+      "file": "corpus/train/train_0037_cwe400.c",
+      "lines": "12-13",
+      "code": "if (WARN_ON(len > skb->len))\n\t\treturn -EINVAL;",
+      "explanation": "Precondition check. The split offset `len` must not exceed the total bytes in the skb (skb->len). WARN_ON evaluates the condition, and if true emits a kernel warning + backtrace AND returns non-zero, so the `if` both logs and rejects with -EINVAL. This establishes the key invariant `len <= skb->len` that all subsequent arithmetic relies on."
+    },
+    {
+      "file": "corpus/train/train_0037_cwe400.c",
+      "lines": "15-17",
+      "code": "nsize = skb_headlen(skb) - len;\n\tif (nsize < 0)\n\t\tnsize = 0;",
+      "explanation": "Computes how many bytes of LINEAR (non-paged) head data must go into the new skb. skb_headlen() returns the linear portion (skb->len - skb->data_len). If the split point `len` lies beyond the linear region, skb_headlen(skb) - len is negative (the split happens entirely in the paged/fragment area) and nsize is clamped to 0, meaning the new head is allocated empty and all moved data lives in shared page fragments. The subtraction is unsigned-minus-unsigned assigned to a signed int, then range-checked."
+    },
+    {
+      "file": "corpus/train/train_0037_cwe400.c",
+      "lines": "19-22",
+      "code": "if (unlikely((sk->sk_wmem_queued >> 1) > sk->sk_sndbuf)) {\n\t\tNET_INC_STATS(sock_net(sk), LINUX_MIB_TCPWQUEUETOOBIG);\n\t\treturn -ENOMEM;\n\t}",
+      "explanation": "This is the SECURITY FIX. Before allocating another skb, the function rejects the fragmentation if the amount of memory already queued on the socket (sk_wmem_queued) is more than twice the send-buffer budget (sk_sndbuf). Each fragmentation allocates a fresh skb and increases sk_wmem_queued (line 32), so without this gate a peer that forces endless re-fragmentation of the retransmit queue could drive unbounded kernel memory growth and CPU spent walking ever-longer queues. On rejection it bumps the LINUX_MIB_TCPWQUEUETOOBIG SNMP counter and returns -ENOMEM. This guard is the mitigation for the TCP SACK resource-exhaustion class (CVE-2019-11478)."
+    },
+    {
+      "file": "corpus/train/train_0037_cwe400.c",
+      "lines": "24-30",
+      "code": "if (skb_unclone(skb, gfp))\n\t\treturn -ENOMEM;\n\n\t/* Get a new skb... force flag on. */\n\tbuff = sk_stream_alloc_skb(sk, nsize, gfp, true);\n\tif (!buff)\n\t\treturn -ENOMEM; /* We'll just try again later. */",
+      "explanation": "skb_unclone() makes sure the original skb's data is privately owned (not shared with a clone) before it is mutated by the split; failure returns -ENOMEM. sk_stream_alloc_skb() then allocates the second segment `buff` with `nsize` bytes of linear headroom-adjusted space, `force=true` to allocate even under memory pressure. A NULL result is handled by returning -ENOMEM (caller retries later). Both allocations are correctly null/error checked."
+    },
+    {
+      "file": "corpus/train/train_0037_cwe400.c",
+      "lines": "32-36",
+      "code": "sk->sk_wmem_queued += buff->truesize;\n\tsk_mem_charge(sk, buff->truesize);\n\tnlen = skb->len - len - nsize;\n\tbuff->truesize += nlen;\n\tskb->truesize -= nlen;",
+      "explanation": "Memory accounting. The new skb's truesize is added to the socket's queued-memory counter and charged against the socket memory budget. `nlen = skb->len - len - nsize` computes the trailing byte count that will migrate from the original skb into `buff` beyond the linear head already accounted (skb->len minus the bytes kept in the original (len) minus the new linear head (nsize)). The two truesize adjustments move the byte-weight from the old skb to the new one so accounting stays balanced after skb_split() at line 50."
+    },
+    {
+      "file": "corpus/train/train_0037_cwe400.c",
+      "lines": "39-47",
+      "code": "TCP_SKB_CB(buff)->seq = TCP_SKB_CB(skb)->seq + len;\n\tTCP_SKB_CB(buff)->end_seq = TCP_SKB_CB(skb)->end_seq;\n\tTCP_SKB_CB(skb)->end_seq = TCP_SKB_CB(buff)->seq;\n\n\t/* PSH and FIN should only be set in the second packet. */\n\tflags = TCP_SKB_CB(skb)->tcp_flags;\n\tTCP_SKB_CB(skb)->tcp_flags = flags & ~(TCPHDR_FIN | TCPHDR_PSH);\n\tTCP_SKB_CB(buff)->tcp_flags = flags;\n\tTCP_SKB_CB(buff)->sacked = TCP_SKB_CB(skb)->sacked;",
+      "explanation": "Sequence-number and flag fixup. The new second segment `buff` starts at seq = original_seq + len and inherits the original's end_seq; the original skb's end_seq is trimmed to buff's start seq, splitting the sequence space cleanly at `len`. The TCP flag byte is snapshotted; FIN and PSH are cleared from the first (original) segment and left on the second (buff), since those markers belong only to the trailing packet. The SACK-state byte is copied to the new segment so retransmit bookkeeping is preserved."
+    },
+    {
+      "file": "corpus/train/train_0037_cwe400.c",
+      "lines": "48-55",
+      "code": "tcp_skb_fragment_eor(skb, buff);\n\n\tskb_split(skb, buff, len);\n\n\tbuff->ip_summed = CHECKSUM_PARTIAL;\n\n\tbuff->tstamp = skb->tstamp;\n\ttcp_fragment_tstamp(skb, buff);",
+      "explanation": "tcp_skb_fragment_eor() propagates end-of-record (MSG_EOR) marking to the correct half. skb_split(skb, buff, len) is the actual data-movement step: it moves the bytes at offset >= len (both linear and paged fragments) from `skb` into `buff`, relying on the invariant len <= skb->len established at line 12 and on nsize/nlen computed above. buff is marked CHECKSUM_PARTIAL (hardware will complete the checksum). Timestamps are copied and tcp_fragment_tstamp() fixes up any tx timestamp ownership."
+    },
+    {
+      "file": "corpus/train/train_0037_cwe400.c",
+      "lines": "57-64",
+      "code": "old_factor = tcp_skb_pcount(skb);\n\n\t/* Fix up tso_factor for both original and new SKB.  */\n\ttcp_set_skb_tso_segs(skb, mss_now);\n\ttcp_set_skb_tso_segs(buff, mss_now);\n\n\t/* Update delivered info for the new segment */\n\tTCP_SKB_CB(buff)->tx = TCP_SKB_CB(skb)->tx;",
+      "explanation": "Caches the original TSO segment count (pcount) before the split, then recomputes the GSO/TSO segment counts for both halves against the current MSS. tcp_skb_pcount()/tcp_set_skb_tso_segs() operate on a 16-bit gso_segs field; recomputing here keeps each skb's segment count consistent with its now-smaller payload. The tx delivery-accounting struct is copied to the new segment."
+    },
+    {
+      "file": "corpus/train/train_0037_cwe400.c",
+      "lines": "69-75",
+      "code": "if (!before(tp->snd_nxt, TCP_SKB_CB(buff)->end_seq)) {\n\t\tint diff = old_factor - tcp_skb_pcount(skb) -\n\t\t\ttcp_skb_pcount(buff);\n\n\t\tif (diff)\n\t\t\ttcp_adjust_pcount(sk, skb, diff);\n\t}",
+      "explanation": "If the fragmented data has already been transmitted (snd_nxt is at or beyond buff's end_seq, i.e. this is a re-fragmentation of in-flight/retransmit data), the in-flight packet counters must be corrected. `diff` is the change in total segment count caused by the split (old count minus the two new counts). If non-zero, tcp_adjust_pcount() updates packets_out and related counters so congestion-control accounting stays correct."
+    },
+    {
+      "file": "corpus/train/train_0037_cwe400.c",
+      "lines": "78-84",
+      "code": "__skb_header_release(buff);\n\ttcp_insert_write_queue_after(skb, buff, sk, tcp_queue);\n\tif (tcp_queue == TCP_FRAG_IN_RTX_QUEUE)\n\t\tlist_add(&buff->tcp_tsorted_anchor, &skb->tcp_tsorted_anchor);\n\n\treturn 0;\n}",
+      "explanation": "Finalizes linkage. __skb_header_release() releases the header reference so the skb can be queued. tcp_insert_write_queue_after() inserts `buff` immediately after `skb` in whichever queue `tcp_queue` names. If the split occurred in the retransmit queue, buff is also added to the time-sorted (tcp_tsorted) list so RACK/loss-detection ordering is maintained. Returns 0 for success."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0037_cwe400.c",
+      "lines": "19-22",
+      "code": "if (unlikely((sk->sk_wmem_queued >> 1) > sk->sk_sndbuf)) {\n\t\tNET_INC_STATS(sock_net(sk), LINUX_MIB_TCPWQUEUETOOBIG);\n\t\treturn -ENOMEM;\n\t}",
+      "explanation": "PRIMARY CONTEXT: this guard is the fix for the SACK resource-exhaustion attack (CVE-2019-11478). Without it, a remote peer advertising a tiny MSS and streaming selective ACKs forces the retransmit queue to be re-fragmented into an unbounded number of small skbs, each adding to sk_wmem_queued (line 32) and lengthening every subsequent queue walk — a remote, low-cost kernel memory + CPU exhaustion DoS. Here the guard IS present, so the headline vulnerability is mitigated. The residual concern is that the test is UNCONDITIONAL on the queue type (see the finding): the upstream refinement (commit b617158dc096) later added `&& tcp_queue != TCP_FRAG_IN_WRITE_QUEUE`, because rejecting a legitimate first-time fragmentation of write-queue data (e.g. during MTU probing or normal output when sk_wmem_queued transiently exceeds 2*sk_sndbuf) can stall an otherwise healthy connection. As shown, the guard can over-reject write-queue fragmentation, an availability regression."
+    },
+    {
+      "file": "corpus/train/train_0037_cwe400.c",
+      "lines": "12-13",
+      "code": "if (WARN_ON(len > skb->len))\n\t\treturn -EINVAL;",
+      "explanation": "The len<=skb->len contract is enforced with WARN_ON. Functionally this both warns and returns -EINVAL, so the dangerous case is rejected. The residual risk is operational: on a kernel booted with panic_on_warn=1 (common in hardened/CI fleets), any path that can drive len>skb->len turns a warning into a full kernel panic — a denial of service. Because `len` is derived from segmentation/SACK arithmetic elsewhere, the invariant to confirm is that no caller can ever pass len>skb->len; if it can, WARN_ON is the wrong primitive (a silent -EINVAL would be safer) for an attacker-influenceable value."
+    },
+    {
+      "file": "corpus/train/train_0037_cwe400.c",
+      "lines": "15-17",
+      "code": "nsize = skb_headlen(skb) - len;\n\tif (nsize < 0)\n\t\tnsize = 0;",
+      "explanation": "skb_headlen() is unsigned; `len` is u32; their difference is computed in UNSIGNED arithmetic and only THEN assigned to signed int nsize. When len > skb_headlen(skb) the unsigned result is a large value near UINT_MAX. This relies on the implementation-defined narrowing to a negative int (true on Linux/gcc for the value ranges here) so that the `if (nsize < 0)` clamp fires. The invariant the implementation must uphold is that this narrowing yields a detectable-negative value and that nsize is never used before the clamp — otherwise nsize could be a huge positive allocation size passed to sk_stream_alloc_skb() at line 28. In practice this is safe on the kernel's target ABIs, but it is a signed/unsigned hygiene hazard worth confirming."
+    },
+    {
+      "file": "corpus/train/train_0037_cwe400.c",
+      "lines": "34-36",
+      "code": "nlen = skb->len - len - nsize;\n\tbuff->truesize += nlen;\n\tskb->truesize -= nlen;",
+      "explanation": "`nlen` is computed from three unsigned/derived quantities (skb->len, len, nsize) into a signed int and then feeds truesize accounting on both skbs. Correctness depends on len<=skb->len (line 12) AND nsize<=skb->len-len; if any of those invariants were violated, nlen could go negative and the truesize adjustments would corrupt the socket memory accounting (buff->truesize under-counted, skb->truesize inflated), which downstream skews sk_wmem_queued and can defeat the very memory guard at lines 19-22. This is not exploitable as shown given the upstream invariants hold, but it is the accounting-integrity contract the implementation must keep."
+    },
+    {
+      "file": "corpus/train/train_0037_cwe400.c",
+      "lines": "57-71",
+      "code": "old_factor = tcp_skb_pcount(skb);\n\n\t/* Fix up tso_factor for both original and new SKB.  */\n\ttcp_set_skb_tso_segs(skb, mss_now);\n\ttcp_set_skb_tso_segs(buff, mss_now);",
+      "explanation": "LATENT / related-CVE context (implementation not shown). The TSO segment count lives in a 16-bit field; a companion Linux flaw (CVE-2019-11477, \"SACK panic\") was a BUG_ON reachable when crafted SACK sequences pushed the recomputed pcount past 16 bits. tcp_set_skb_tso_segs() at lines 60-61 is exactly where each half's pcount is recomputed from the peer-influenced mss_now, and the diff arithmetic at lines 70-71 assumes those counts are sane. This function does not itself cap the payload/segment count, so its safety depends on the callee tcp_set_skb_tso_segs()/skb GSO limits enforcing the 16-bit bound. Confirm that path is the patched one."
+    }
+  ],
+  "summary": "This is the PATCHED tcp_fragment() from the Linux TCP output path: the sk_wmem_queued/sk_sndbuf guard at lines 19-22 mitigates the SACK-driven memory/CPU exhaustion DoS (CVE-2019-11478), and length/allocation error paths are correctly checked. Residual issues are lower severity: the memory guard lacks the later write-queue exemption (can over-reject legitimate fragmentation → connection stall), a WARN_ON on an attacker-influenceable length can panic under panic_on_warn, and several signed nsize/nlen computations derive from unsigned skb lengths and rely on upstream invariants for accounting integrity.",
+  "reviewed_anchors": [
+    {"anchor": "tcp_fragment(sk, tcp_queue, skb, len, mss_now, gfp) signature (lines 2-4)", "disposition": "finding", "reason": "Entry point; `len` is the attacker-influenced split offset and `tcp_queue` selects the guard-affected queue."},
+    {"anchor": "u32 len parameter", "disposition": "finding", "reason": "Peer-influenced split offset; validated only by WARN_ON at line 12."},
+    {"anchor": "unsigned int mss_now parameter", "disposition": "finding", "reason": "Peer-influenced MSS feeds tcp_set_skb_tso_segs recompute (pcount 16-bit overflow class); latent, callee-enforced."},
+    {"anchor": "enum tcp_queue tcp_queue parameter / TCP_FRAG_IN_RTX_QUEUE (line 80)", "disposition": "finding", "reason": "Queue selector; the memory guard should but does not exempt TCP_FRAG_IN_WRITE_QUEUE."},
+    {"anchor": "int nsize (lines 8,15-17)", "disposition": "finding", "reason": "Signed target of an unsigned subtraction skb_headlen-len; relies on narrowing + clamp."},
+    {"anchor": "int nlen (lines 9,34)", "disposition": "finding", "reason": "Signed truesize delta from unsigned skb->len-len-nsize; accounting integrity depends on invariants."},
+    {"anchor": "u8 flags (lines 10,44-46)", "disposition": "dismissed", "reason": "Local snapshot of tcp_flags used only for PSH/FIN redistribution; no untrusted-size or buffer contract."},
+    {"anchor": "WARN_ON(len > skb->len) (lines 12-13)", "disposition": "finding", "reason": "Length gate; correct rejection but panic-on-warn DoS on attacker-influenceable value."},
+    {"anchor": "sk_wmem_queued>>1 > sk_sndbuf guard (lines 19-22)", "disposition": "finding", "reason": "The CVE-2019-11478 resource-exhaustion mitigation; present but lacks write-queue exemption."},
+    {"anchor": "LINUX_MIB_TCPWQUEUETOOBIG counter (line 20)", "disposition": "dismissed", "reason": "SNMP statistic bump; observability only, no security contract."},
+    {"anchor": "skb_unclone(skb, gfp) (lines 24-25)", "disposition": "dismissed", "reason": "COW break before mutation; error-checked, no residual contract."},
+    {"anchor": "sk_stream_alloc_skb(sk, nsize, gfp, true) (line 28)", "disposition": "dismissed", "reason": "Allocation with clamped nsize; NULL-checked at line 29."},
+    {"anchor": "sk->sk_wmem_queued += buff->truesize / sk_mem_charge (lines 32-33)", "disposition": "dismissed", "reason": "Standard socket memory charge; correctness tied to nlen finding, not independently unsafe."},
+    {"anchor": "TCP_SKB_CB seq/end_seq fixup (lines 39-41)", "disposition": "dismissed", "reason": "Sequence-space split arithmetic bounded by len<=skb->len; no buffer/overflow surface."},
+    {"anchor": "tcp_flags PSH/FIN redistribution (lines 44-47)", "disposition": "dismissed", "reason": "Flag masking with fixed constants; no length or memory contract."},
+    {"anchor": "skb_split(skb, buff, len) (line 50)", "disposition": "dismissed", "reason": "Data move bounded by the len<=skb->len invariant and nsize/nlen; callee performs its own bounds handling."},
+    {"anchor": "buff->ip_summed = CHECKSUM_PARTIAL (line 52)", "disposition": "dismissed", "reason": "Sets HW checksum offload flag; no untrusted input."},
+    {"anchor": "tcp_set_skb_tso_segs(skb/buff, mss_now) (lines 60-61)", "disposition": "finding", "reason": "Recomputes 16-bit pcount from peer MSS; latent SACK-panic (CVE-2019-11477) class enforced in callee."},
+    {"anchor": "diff = old_factor - pcount(skb) - pcount(buff); tcp_adjust_pcount (lines 69-74)", "disposition": "dismissed", "reason": "Counter reconciliation guarded by before(); depends on sane pcount from prior anchor."},
+    {"anchor": "__skb_header_release / tcp_insert_write_queue_after / list_add (lines 78-81)", "disposition": "dismissed", "reason": "Queue linkage; ordering-only, no untrusted-size contract."}
+  ],
+  "findings": [
+    {
+      "title": "Memory-exhaustion guard omits write-queue exemption (over-strict rejection → connection stall)",
+      "anchor": "if (unlikely((sk->sk_wmem_queued >> 1) > sk->sk_sndbuf))",
+      "file": "corpus/train/train_0037_cwe400.c",
+      "line": "19-22",
+      "code": "if (unlikely((sk->sk_wmem_queued >> 1) > sk->sk_sndbuf)) {\n\t\tNET_INC_STATS(sock_net(sk), LINUX_MIB_TCPWQUEUETOOBIG);\n\t\treturn -ENOMEM;\n\t}",
+      "bug_class": "Uncontrolled resource consumption mitigation applied too broadly (availability regression)",
+      "cwe": "CWE-400",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0037_cwe400.c (and the full net/ipv4/tcp_output.c implementation, not fully provided)",
+      "invariant": "The guard must throttle attacker-driven re-fragmentation of the RETRANSMIT queue while still permitting a legitimate, one-off fragmentation of WRITE-queue data even when sk_wmem_queued transiently exceeds 2*sk_sndbuf.",
+      "failure_mode": "As written the test fires for any queue type. During normal output or MTU probing, sk_wmem_queued can legitimately sit above 2*sk_sndbuf momentarily; rejecting the write-queue fragment with -ENOMEM prevents the segment from being sent and can stall or hang the connection. The upstream refinement added `&& tcp_queue != TCP_FRAG_IN_WRITE_QUEUE` to exempt that path. Missing that clause is an availability regression, not a memory-safety hole.",
+      "cve_analog": "CVE-2019-11478",
+      "what_to_confirm": "Whether the production build includes the `tcp_queue != TCP_FRAG_IN_WRITE_QUEUE` qualifier (commit b617158dc096); if absent, verify that legitimate write-queue fragmentation cannot be starved under transient memory pressure."
+    },
+    {
+      "title": "WARN_ON on attacker-influenceable length can be escalated to kernel panic",
+      "anchor": "if (WARN_ON(len > skb->len))",
+      "file": "corpus/train/train_0037_cwe400.c",
+      "line": "12-13",
+      "code": "if (WARN_ON(len > skb->len))\n\t\treturn -EINVAL;",
+      "bug_class": "Reachable assertion / warning on hostile-influenced input (DoS under panic_on_warn)",
+      "cwe": "CWE-617",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0037_cwe400.c",
+      "invariant": "The len<=skb->len precondition should be guaranteed by callers; a value that can be steered by peer-influenced SACK/segmentation arithmetic must not be able to reach a WARN_ON.",
+      "failure_mode": "WARN_ON both logs a backtrace and returns true, so the case is rejected with -EINVAL functionally. However, on kernels with sysctl panic_on_warn=1, triggering the warning panics the machine. If any code path lets peer-influenced arithmetic drive len>skb->len, this becomes a remote DoS; the safer form for an untrusted-influenced value is a silent -EINVAL.",
+      "cve_analog": "",
+      "what_to_confirm": "Trace every caller to prove len is always <= skb->len; if not strictly guaranteed, confirm the invariant is enforced without WARN_ON on hardened kernels."
+    },
+    {
+      "title": "Signed nsize/nlen derived from unsigned skb lengths rely on narrowing and prior invariants",
+      "anchor": "nsize = skb_headlen(skb) - len; ... nlen = skb->len - len - nsize;",
+      "file": "corpus/train/train_0037_cwe400.c",
+      "line": "15-34",
+      "code": "nsize = skb_headlen(skb) - len;\n\tif (nsize < 0)\n\t\tnsize = 0;",
+      "bug_class": "Signed/unsigned conversion hygiene on size arithmetic",
+      "cwe": "CWE-191",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0037_cwe400.c",
+      "invariant": "skb_headlen(skb)-len must narrow to a negative int when len exceeds the linear head so the clamp fires, and skb->len-len-nsize must stay non-negative so truesize accounting (lines 35-36) is not corrupted.",
+      "failure_mode": "The subtractions are performed in unsigned arithmetic and only then assigned to signed ints. Safety depends on the implementation-defined narrowing producing a detectable negative value (holds on the kernel's target ABIs) and on the len<=skb->len / nsize<=skb->len-len invariants. If those held false, nsize could become a huge allocation request (line 28) or nlen negative, corrupting sk_wmem_queued accounting and undermining the guard at lines 19-22.",
+      "cve_analog": "",
+      "what_to_confirm": "That nsize is always clamped before use and that nlen cannot go negative given the guaranteed len/skb->len relationship; confirm skb_headlen's return width vs int on all supported architectures."
+    },
+    {
+      "title": "TSO segment-count recompute from peer MSS is the SACK-panic surface (latent, callee-enforced)",
+      "anchor": "tcp_set_skb_tso_segs(skb, mss_now); tcp_set_skb_tso_segs(buff, mss_now);",
+      "file": "corpus/train/train_0037_cwe400.c",
+      "line": "60-61",
+      "code": "tcp_set_skb_tso_segs(skb, mss_now);\n\ttcp_set_skb_tso_segs(buff, mss_now);",
+      "bug_class": "Integer overflow of 16-bit segment count leading to BUG_ON/panic (in callee)",
+      "cwe": "CWE-190",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided) — tcp_set_skb_tso_segs()/GSO limits in net/ipv4/tcp_output.c",
+      "invariant": "The recomputed per-skb segment count must remain within the 16-bit gso_segs field; the payload/segment count must be capped so a tiny peer-advertised MSS cannot push pcount past its bound.",
+      "failure_mode": "mss_now is influenced by the peer's advertised MSS. Historically, crafted SACK sequences combined with a very small MSS could push the TSO segment count past 16 bits and hit a BUG_ON, panicking the kernel (SACK panic). tcp_fragment() itself does not cap this; safety is delegated to tcp_set_skb_tso_segs()/skb GSO limits. This finding is latent — flagged because the contract is dangerous — and is safe only if the callee is the patched, capped version.",
+      "cve_analog": "CVE-2019-11477",
+      "what_to_confirm": "That tcp_set_skb_tso_segs() and the skb GSO path enforce the 16-bit segment cap for small MSS values (tcp: limit payload size of sacked skbs, commit 3b4929f65b0d)."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm the memory guard at lines 19-22 carries the `&& tcp_queue != TCP_FRAG_IN_WRITE_QUEUE` qualifier (commit b617158dc096) so legitimate write-queue fragmentation is not starved.",
+    "Verify every caller guarantees len <= skb->len so the WARN_ON at line 12 is truly unreachable, especially on panic_on_warn kernels.",
+    "Check that tcp_set_skb_tso_segs()/GSO limits cap the 16-bit segment count for small peer-advertised MSS (CVE-2019-11477 fix present).",
+    "Confirm nsize is always clamped (lines 16-17) before use at line 28 and that nlen (line 34) cannot go negative given len<=skb->len and nsize<=skb->len-len.",
+    "Trace that sk_wmem_queued/truesize accounting (lines 32-36) stays balanced so the exhaustion guard at lines 19-22 cannot be defeated by accounting drift.",
+    "Verify skb_unclone (line 24) and sk_stream_alloc_skb (line 28) failures unwind cleanly with no partial state or leaked charge.",
+    "Confirm skb_split (line 50) bounds all data movement to the split offset and that CHECKSUM_PARTIAL handoff is correct for both halves."
+  ]
+}

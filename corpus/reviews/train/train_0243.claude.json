@@ -1,0 +1,145 @@
+{
+  "subsystem": "HarfBuzz OpenType font shaping engine — the horizontal/vertical metrics accelerator initializer. This is the parameterized `init()` of the `hmtx`/`vmtx` metrics accelerator (`hb-ot-hmtx-table.hh`, struct `hb_ot_hmtxvmtx_accelerator_t` / `accelerator_t`). It is called once per face with either the horizontal tag pair (`hhea`,`hmtx`) or the vertical tag pair (`vhea`,`vmtx`) and pre-computes `num_metrics`, `num_advances`, and a locked pointer into the metrics table so that per-glyph advance lookups are O(1).",
+  "provenance": "Identified by HarfBuzz-specific types and idioms: `hb_face_t`, `hb_tag_t`, `hb_blob_t`, `face->get_num_glyphs()`, `face->reference_table()`, `OT::Sanitizer<T>::sanitize`/`lock_instance`, `hb_blob_get_length`, `hb_blob_destroy`, `hb_blob_get_empty`, and the `OT::_hea`/`OT::_mtx` template placeholders (the codebase parameterizes this file so a single body serves both hhea/hmtx and vhea/vmtx). `numberOfLongMetrics` is the `numberOfHMetrics`/`numberOfVMetrics` field of the `hhea`/`vhea` table. The header banner `train_0243_cwe703.cpp` and the in-source tag `primevul_train_3242_fixed` indicate this is a PrimeVul-derived sample presented as the post-fix revision; I review it blind on its merits.",
+  "trust_boundary": "The `hb_face_t *face` wraps an untrusted font file (downloaded webfont, document-embedded font, user-supplied file). The two blobs obtained via `face->reference_table()` — the `hhea`/`vhea` table and the `hmtx`/`vmtx` table — are raw attacker-controlled bytes. Every scalar read out of them is hostile: `_hea->numberOfLongMetrics` (a 16-bit on-wire field, 0..65535) and the byte length/content of the metrics blob. `face->get_num_glyphs()` is also font-derived (from `maxp`, a uint16, 0..65535). The only sanity gate before the pointer is locked is `OT::Sanitizer<T>::sanitize` (a bounds/type check on the blob) plus the explicit size comparison on lines 15-16. Nothing outside the font is trusted here except `default_advance_`, a caller-supplied fallback scalar.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0243_cwe703.cpp",
+      "lines": "1-5",
+      "code": "/* sample: primevul_train_3242_fixed */\n  inline void init (hb_face_t *face,\n\t\t    hb_tag_t _hea_tag, hb_tag_t _mtx_tag,\n\t\t    unsigned int default_advance_)\n  {",
+      "explanation": "Member function `init` of the metrics accelerator. `face` is the HarfBuzz face object that owns the parsed font tables. `_hea_tag` and `_mtx_tag` are 4-byte OpenType table tags: for horizontal metrics they are `hhea` and `hmtx`, for vertical they are `vhea` and `vmtx`. Passing the pair as parameters lets one code body serve both directions. `default_advance_` is a fallback advance value the accelerator returns when a glyph has no metrics entry (typically the font's units-per-em). The function has no return value; it populates member state (`default_advance`, `num_metrics`, `num_advances`, `blob`, `table`) consulted later by the per-glyph `get_advance()` accessor (not shown in this snippet)."
+    },
+    {
+      "file": "corpus/train/train_0243_cwe703.cpp",
+      "lines": "6-7",
+      "code": "this->default_advance = default_advance_;\n    this->num_metrics = face->get_num_glyphs ();",
+      "explanation": "`default_advance` is stored verbatim from the caller. `num_metrics` is set to the total number of glyphs in the face (`get_num_glyphs()`, ultimately the `numGlyphs` uint16 from the `maxp` table, so 0..65535). `num_metrics` is the upper bound the downstream accessor uses to decide whether a glyph id is in range at all; it is one of the two operands of the size check on line 16."
+    },
+    {
+      "file": "corpus/train/train_0243_cwe703.cpp",
+      "lines": "9-12",
+      "code": "hb_blob_t *_hea_blob = OT::Sanitizer<OT::_hea>::sanitize (face->reference_table (_hea_tag));\n    const OT::_hea *_hea = OT::Sanitizer<OT::_hea>::lock_instance (_hea_blob);\n    this->num_advances = _hea->numberOfLongMetrics;\n    hb_blob_destroy (_hea_blob);",
+      "explanation": "The `hhea`/`vhea` table is fetched as a raw blob, run through `Sanitizer<_hea>::sanitize` (which is expected to verify the blob is at least `sizeof(_hea)` bytes and to neutralize/empty it otherwise), then `lock_instance` casts the blob data to a `const _hea *`. The single field read is `numberOfLongMetrics` — the count of full (advance + side-bearing) records at the front of the metrics table — stored into `num_advances`. Crucially, the value is copied into the member BEFORE `hb_blob_destroy(_hea_blob)` releases the reference, so the later use of `num_advances` does not dereference freed memory; the `_hea` pointer itself is dead after line 12 and is not touched again. `num_advances` is now an attacker-controlled 16-bit value, 0..65535."
+    },
+    {
+      "file": "corpus/train/train_0243_cwe703.cpp",
+      "lines": "14",
+      "code": "this->blob = OT::Sanitizer<OT::_mtx>::sanitize (face->reference_table (_mtx_tag));",
+      "explanation": "The `hmtx`/`vmtx` metrics table itself is fetched and sanitized, and the resulting blob is retained in `this->blob` (the accelerator keeps this reference alive for the lifetime of the face because per-glyph lookups index directly into it). Unlike the hhea blob, this one is not destroyed here — it is the backing store for `this->table` locked on line 22. The on-wire layout of this blob is `num_advances` × 4-byte `longMetric` records followed by `(num_metrics - num_advances)` × 2-byte side-bearing entries, i.e. an expected size of `2*(num_advances + num_metrics)` bytes."
+    },
+    {
+      "file": "corpus/train/train_0243_cwe703.cpp",
+      "lines": "15-21",
+      "code": "if (unlikely (!this->num_advances ||\n\t\t  2 * (this->num_advances + this->num_metrics) > hb_blob_get_length (this->blob)))\n    {\n      this->num_metrics = this->num_advances = 0;\n      hb_blob_destroy (this->blob);\n      this->blob = hb_blob_get_empty ();\n    }",
+      "explanation": "This is the security gate. It rejects the metrics table in two cases: (a) `num_advances == 0` (a degenerate/hostile hhea that would make `num_advances - 1` underflow in the accessor's clamp), and (b) the actual blob length is smaller than the layout-implied minimum `2*(num_advances + num_metrics)` bytes. On rejection it zeroes both counts and swaps `blob` for the shared empty blob, so the accessor will see `num_metrics == 0` and return the default advance for every glyph. Because `num_advances` and `num_metrics` are both bounded by 65535, `2*(num_advances + num_metrics)` peaks near 262140 and cannot overflow 32-bit `unsigned int`, so the comparison is arithmetically sound."
+    },
+    {
+      "file": "corpus/train/train_0243_cwe703.cpp",
+      "lines": "22-23",
+      "code": "this->table = OT::Sanitizer<OT::_mtx>::lock_instance (this->blob);\n  }",
+      "explanation": "Locks the (validated, or empty) metrics blob and casts it to the `_mtx` table pointer stored in `this->table`. If the size check failed, `this->blob` is now the empty blob and `table` points at a zero-length buffer, but since `num_metrics` was set to 0 the accessor short-circuits before indexing. On success, `table` points at a buffer proven to hold at least `2*(num_advances + num_metrics)` bytes, which the accessor relies on when it computes byte offsets `4*index` into the leading `longMetric` array."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0243_cwe703.cpp",
+      "lines": "15-16",
+      "code": "if (unlikely (!this->num_advances ||\n\t\t  2 * (this->num_advances + this->num_metrics) > hb_blob_get_length (this->blob)))",
+      "explanation": "LATENT / contract on the (not-shown) accessor. The gate proves `2*(num_advances + num_metrics) <= blob_length`, but that does NOT prove `4*num_advances <= blob_length`. When a hostile `hhea` sets `numberOfLongMetrics` (`num_advances`) LARGER than the glyph count (`num_metrics`) — e.g. `num_advances = 60000`, `num_metrics = 3` — the accepted lower bound is only `2*(60003) = 120006` bytes, while an index up to `num_advances-1` into the 4-byte `longMetric` array would need `4*60000 = 240000` bytes. The 4-byte-record region is only safe up to index `num_metrics-1`. HarfBuzz's real `get_advance()` is safe ONLY because it first does `if (glyph >= num_metrics) return default; if (glyph >= num_advances) glyph = num_advances-1;`, which clamps the effective index below BOTH counts (so it never exceeds `num_metrics` in the `num_advances > num_metrics` case). The invariant the implementation MUST keep: every read of `table->longMetric[i]` must use an index `i < num_metrics` (equivalently, clamp glyph to `num_metrics` BEFORE clamping to `num_advances`). Any consumer that indexes the metrics array up to `num_advances-1` without the `num_metrics` clamp is an out-of-bounds read (CWE-125). `init()` itself does not enforce `num_advances <= num_metrics`, so the safety of this design lives entirely in the accessor's clamp order."
+    },
+    {
+      "file": "corpus/train/train_0243_cwe703.cpp",
+      "lines": "15-16",
+      "code": "if (unlikely (!this->num_advances ||\n\t\t  2 * (this->num_advances + this->num_metrics) > hb_blob_get_length (this->blob)))",
+      "explanation": "The `!this->num_advances` disjunct is load-bearing, not cosmetic. If it were removed while the accessor kept its `if (glyph >= num_advances) glyph = num_advances - 1;` clamp, then a font with `numberOfLongMetrics == 0` would compute `glyph = 0u - 1 = 0xFFFFFFFF`, turning the metrics lookup into a wild out-of-bounds read at offset `4*0xFFFFFFFF` (integer underflow → OOB, CWE-191 leading to CWE-125). The invariant: `num_advances` must be guaranteed non-zero before it can appear as `num_advances - 1` anywhere downstream. Any refactor that drops this zero-check or reorders it after the length comparison reintroduces the underflow."
+    },
+    {
+      "file": "corpus/train/train_0243_cwe703.cpp",
+      "lines": "9-11",
+      "code": "hb_blob_t *_hea_blob = OT::Sanitizer<OT::_hea>::sanitize (face->reference_table (_hea_tag));\n    const OT::_hea *_hea = OT::Sanitizer<OT::_hea>::lock_instance (_hea_blob);\n    this->num_advances = _hea->numberOfLongMetrics;",
+      "explanation": "LATENT — depends on the `Sanitizer<_hea>` guarantee. `numberOfLongMetrics` is dereferenced through `_hea` with no explicit length check at this site; correctness rests entirely on `sanitize()` having verified the `hhea`/`vhea` blob is at least `sizeof(_hea)` bytes and, on failure, having emptied the blob such that `lock_instance` yields a pointer into a buffer large enough for the field. If `sanitize` can return an empty/short blob while `lock_instance` still returns a non-null pointer into a zero-length allocation, the read of `numberOfLongMetrics` over-reads past the buffer (CWE-125), or dereferences a near-null/empty pointer (CWE-476). The invariant to confirm: `Sanitizer<_hea>::sanitize` + `lock_instance` never return a readable pointer for a blob smaller than `offsetof(_hea, numberOfLongMetrics) + sizeof(numberOfLongMetrics)`."
+    },
+    {
+      "file": "corpus/train/train_0243_cwe703.cpp",
+      "lines": "6-7",
+      "code": "this->default_advance = default_advance_;\n    this->num_metrics = face->get_num_glyphs ();",
+      "explanation": "Non-issue worth stating for the training target: `num_metrics` is taken from `get_num_glyphs()` and feeds the line-16 sum. In OpenType `numGlyphs` is a uint16 (<= 65535), so `num_advances + num_metrics <= 131070` and `2 * (...)` cannot wrap 32-bit `unsigned int`. Only if a future variant sourced `num_metrics` or `num_advances` from a 32-bit or larger field would the doubled sum be at risk of integer overflow (CWE-190) that could make an oversized table pass the `<=` check. Under the current 16-bit-bounded inputs this arithmetic is safe — do not treat it as an overflow bug."
+    },
+    {
+      "file": "corpus/train/train_0243_cwe703.cpp",
+      "lines": "11-12",
+      "code": "this->num_advances = _hea->numberOfLongMetrics;\n    hb_blob_destroy (_hea_blob);",
+      "explanation": "Object-lifetime check (dismissed as correct, but flagged because the ordering is safety-critical): the scalar `numberOfLongMetrics` is copied into `this->num_advances` on line 11 BEFORE `hb_blob_destroy` drops the blob reference on line 12, and the `_hea` pointer is never dereferenced again. If a later edit moved the destroy above the field read, or introduced a second read of `_hea->...` after line 12, it would be a use-after-free (CWE-416) since `_hea` aliases the blob's storage. The invariant: all reads through `_hea` must precede `hb_blob_destroy(_hea_blob)`."
+    }
+  ],
+  "summary": "This is the post-fix revision of the HarfBuzz hmtx/vmtx metrics accelerator initializer, and as shown it is defensively correct: it copies the 16-bit `numberOfLongMetrics` before freeing the hhea blob, rejects `num_advances == 0`, and validates the metrics blob against the layout-implied minimum `2*(num_advances + num_metrics)` with no integer overflow. The residual risk is entirely latent and contractual: `init()` validates blob size but does not enforce `num_advances <= num_metrics`, so out-of-bounds safety of a hostile `numberOfLongMetrics` depends on the (not-shown) `get_advance()` accessor clamping every glyph index to `num_metrics` before indexing the 4-byte `longMetric` array, and on `Sanitizer<_hea>` guaranteeing the hhea minimum size.",
+  "reviewed_anchors": [
+    {"anchor": "init(hb_face_t*, hb_tag_t _hea_tag, hb_tag_t _mtx_tag, unsigned int default_advance_) — signature", "disposition": "finding", "reason": "Entry point that ingests attacker-controlled tables; parameterized over horizontal/vertical tag pairs."},
+    {"anchor": "default_advance_ parameter / this->default_advance (line 6)", "disposition": "dismissed", "reason": "Opaque caller-supplied fallback scalar; not a buffer, not attacker-controlled, no size contract."},
+    {"anchor": "this->num_metrics = face->get_num_glyphs() (line 7)", "disposition": "finding", "reason": "One operand of the line-16 size check and the required upper clamp for glyph indexing; safety of the num_advances>num_metrics case hinges on it."},
+    {"anchor": "OT::Sanitizer<OT::_hea>::sanitize(face->reference_table(_hea_tag)) (line 9)", "disposition": "dismissed", "reason": "Sanitize is the trust gate itself; its correctness is captured by the lock_instance/field-read finding rather than a separate one."},
+    {"anchor": "OT::Sanitizer<OT::_hea>::lock_instance(_hea_blob) (line 10)", "disposition": "finding", "reason": "Casts possibly-short blob to _hea*; the subsequent field read depends on the sanitizer's minimum-size guarantee (potential OOB/NULL deref)."},
+    {"anchor": "this->num_advances = _hea->numberOfLongMetrics (line 11)", "disposition": "finding", "reason": "Attacker-controlled 16-bit count; drives both the size check and downstream metrics indexing; central hostile value."},
+    {"anchor": "hb_blob_destroy(_hea_blob) (line 12)", "disposition": "dismissed", "reason": "Lifetime is correct — the only field read precedes the destroy and _hea is not reused; noted in walkthrough as an ordering invariant."},
+    {"anchor": "this->blob = OT::Sanitizer<OT::_mtx>::sanitize(...) (line 14)", "disposition": "dismissed", "reason": "Blob reference is validated by the line 15-16 check before use; retained deliberately as the metrics backing store."},
+    {"anchor": "size check: 2 * (num_advances + num_metrics) > hb_blob_get_length(blob) (lines 15-16)", "disposition": "finding", "reason": "Validates blob size but does not bound 4*num_advances when num_advances > num_metrics; correctness delegated to accessor clamp order."},
+    {"anchor": "!this->num_advances zero-guard (line 15)", "disposition": "finding", "reason": "Load-bearing guard preventing num_advances-1 underflow in the downstream clamp; must not be removed or reordered."},
+    {"anchor": "reset block: num_metrics = num_advances = 0; hb_blob_destroy; blob = hb_blob_get_empty() (lines 18-20)", "disposition": "dismissed", "reason": "Safe failure path — zeroed counts make the accessor short-circuit to default advance; empty blob is a valid zero-length store."},
+    {"anchor": "this->table = OT::Sanitizer<OT::_mtx>::lock_instance(this->blob) (line 22)", "disposition": "dismissed", "reason": "Points at either a size-validated blob or the empty blob (guarded by num_metrics==0); no unbounded read introduced here."}
+  ],
+  "findings": [
+    {
+      "title": "Size gate does not bound the longMetric array when numberOfLongMetrics exceeds numGlyphs (accessor must clamp to num_metrics first)",
+      "anchor": "2 * (this->num_advances + this->num_metrics) > hb_blob_get_length (this->blob)",
+      "file": "corpus/train/train_0243_cwe703.cpp",
+      "line": "15-16",
+      "code": "if (unlikely (!this->num_advances ||\n\t\t  2 * (this->num_advances + this->num_metrics) > hb_blob_get_length (this->blob)))",
+      "bug_class": "Out-of-bounds read (unvalidated attacker count vs fixed-record array)",
+      "cwe": "CWE-125",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided) — the accelerator's get_advance() accessor",
+      "invariant": "Every index into the leading 4-byte longMetric array must satisfy index < num_metrics; the accessor must clamp a glyph id to num_metrics BEFORE clamping it to num_advances, because init() proves only 2*(num_advances+num_metrics) <= blob_length and NOT 4*num_advances <= blob_length.",
+      "failure_mode": "A crafted font sets hhea numberOfLongMetrics (num_advances) much larger than maxp numGlyphs (num_metrics), e.g. num_advances=60000, num_metrics=3. The blob need only be 120006 bytes to pass, but an index up to num_advances-1 into the 4-byte record region would require 240000 bytes. If any consumer indexes the metrics array up to num_advances-1 without first bounding by num_metrics, it reads out of bounds — an information leak of adjacent heap memory. HarfBuzz's shipped accessor avoids this by clamping to num_metrics first; the contract must be preserved.",
+      "cve_analog": "",
+      "what_to_confirm": "Read get_advance()/get_side_bearing(): confirm the sequence is `if (glyph >= num_metrics) return default; if (glyph >= num_advances) glyph = num_advances-1;` so the effective index is always < num_metrics, and that no code path indexes longMetric[] up to num_advances-1 unconditionally."
+    },
+    {
+      "title": "num_advances==0 guard is load-bearing against num_advances-1 underflow",
+      "anchor": "!this->num_advances",
+      "file": "corpus/train/train_0243_cwe703.cpp",
+      "line": "15",
+      "code": "if (unlikely (!this->num_advances ||",
+      "bug_class": "Unsigned integer underflow enabling out-of-bounds read",
+      "cwe": "CWE-191",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0243_cwe703.cpp (guard present here); triggered in implementation (file not provided)",
+      "invariant": "num_advances must be non-zero before it is ever used as `num_advances - 1`; this zero-check must remain and must be evaluated before that subtraction is reachable.",
+      "failure_mode": "If this disjunct were removed or reordered, a font with numberOfLongMetrics==0 would let the accessor's `if (glyph >= num_advances) glyph = num_advances - 1;` evaluate `0u - 1 = 0xFFFFFFFF`, producing a wild out-of-bounds read at byte offset 4*0xFFFFFFFF. Present code is correct; this is a fragility/regression-surface note.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm no other init path or accessor computes num_advances-1 without a preceding non-zero guarantee, and that this check cannot be short-circuited away."
+    },
+    {
+      "title": "numberOfLongMetrics dereferenced through possibly-short hhea blob relies solely on Sanitizer minimum-size guarantee",
+      "anchor": "this->num_advances = _hea->numberOfLongMetrics;",
+      "file": "corpus/train/train_0243_cwe703.cpp",
+      "line": "10-11",
+      "code": "const OT::_hea *_hea = OT::Sanitizer<OT::_hea>::lock_instance (_hea_blob);\n    this->num_advances = _hea->numberOfLongMetrics;",
+      "bug_class": "Out-of-bounds read / near-null dereference of unvalidated table pointer",
+      "cwe": "CWE-125",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided) — OT::Sanitizer<OT::_hea>::sanitize/lock_instance",
+      "invariant": "Sanitizer<_hea>::sanitize must guarantee the hhea/vhea blob is at least sizeof(_hea) bytes (covering numberOfLongMetrics), or must yield a pointer/length such that reading numberOfLongMetrics cannot exceed the allocation.",
+      "failure_mode": "A truncated hhea/vhea table (shorter than the offset of numberOfLongMetrics). If sanitize can pass through or empty the blob while lock_instance still returns a readable non-null pointer into a smaller-than-field buffer, the field read over-reads (CWE-125) or dereferences an empty/near-null buffer (CWE-476). No explicit length check exists at this call site; the safety is entirely delegated to the sanitizer.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify Sanitizer<_hea>::sanitize enforces min_size >= offsetof(_hea, numberOfLongMetrics)+2 and that lock_instance on a failed/empty blob returns a pointer into a buffer at least that large (or that the empty-blob path cannot reach this read)."
+    }
+  ],
+  "audit_checklist": [
+    "Read get_advance()/get_side_bearing(): confirm glyph is clamped to num_metrics BEFORE being clamped to num_advances, so no index into the 4-byte longMetric array ever reaches num_advances-1 when num_advances > num_metrics.",
+    "Confirm the size gate 2*(num_advances+num_metrics) matches the actual on-wire hmtx/vmtx layout (num_advances 4-byte records + (num_metrics-num_advances) 2-byte side bearings) and that no accessor reads side bearings past index num_metrics-1.",
+    "Verify num_advances and num_metrics are both bounded to 16-bit ranges at their sources (hhea numberOfHMetrics/numberOfVMetrics and maxp numGlyphs) so 2*(sum) cannot overflow unsigned int.",
+    "Confirm the !num_advances guard cannot be removed or reordered without reintroducing the num_advances-1 underflow; check every downstream use of num_advances-1.",
+    "Verify Sanitizer<_hea>::sanitize enforces a minimum size covering numberOfLongMetrics and that lock_instance never returns a readable pointer into a shorter-than-field buffer.",
+    "Confirm _hea is not dereferenced after hb_blob_destroy(_hea_blob) on line 12 (no use-after-free of the hhea blob), and that this->blob's reference is held for the accelerator's full lifetime backing this->table."
+  ]
+}

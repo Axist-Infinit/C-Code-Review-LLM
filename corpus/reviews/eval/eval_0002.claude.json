@@ -1,0 +1,441 @@
+{
+  "subsystem": "Linux kernel ELF binary loader — load_elf_binary(), the binfmt handler that parses and maps an ELF executable (and its optional PT_INTERP dynamic loader) into a new process address space during execve().",
+  "provenance": "Identified by the exact function signature `static int load_elf_binary(struct linux_binprm *bprm)` and kernel-internal APIs/types: struct linux_binprm, struct elfhdr/elf_phdr, kmalloc(GFP_KERNEL), kernel_read, open_exec, flush_old_exec, setup_new_exec, install_exec_creds, set_binfmt(&elf_format), start_thread, current->mm, and ELF constants (ELFMAG/SELFMAG, ET_EXEC/ET_DYN, PT_INTERP/PT_LOAD/PT_GNU_STACK, ELF_ET_DYN_BASE). This is fs/binfmt_elf.c. The sample banner (primevul_c_train_2475) and filename (cwe362) indicate a race-condition-labeled training sample.",
+  "trust_boundary": "The entire ELF image is untrusted: an unprivileged local user invokes execve() on an attacker-crafted file. bprm->buf (copied into loc->elf_ex at line 31), the whole program-header table read by load_elf_phdrs, and every phdr field (p_type, p_offset, p_filesz, p_memsz, p_vaddr, p_flags), plus e_type/e_phnum/e_entry and the interpreter path and the interpreter file's own ELF header/phdrs, are all attacker-controlled. The interpreter is resolved from an attacker-embedded pathname, so path resolution and file identity are also across the trust boundary. Everything runs in kernel context, so failures are privilege escalation or DoS, not mere userspace crashes.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/eval/eval_0002_cwe362.c",
+      "lines": "2-22",
+      "code": "static int load_elf_binary(struct linux_binprm *bprm)\n{\n\tstruct file *interpreter = NULL; /* to shut gcc up */\n \tunsigned long load_addr = 0, load_bias = 0;\n\tint load_addr_set = 0;\n\tchar * elf_interpreter = NULL;\n\tunsigned long error;\n\tstruct elf_phdr *elf_ppnt, *elf_phdata, *interp_elf_phdata = NULL;\n\tunsigned long elf_bss, elf_brk;\n\tint retval, i;\n\tunsigned long elf_entry;\n\tunsigned long interp_load_addr = 0;\n\tunsigned long start_code, end_code, start_data, end_data;\n\tunsigned long reloc_func_desc __maybe_unused = 0;\n\tint executable_stack = EXSTACK_DEFAULT;\n\tstruct pt_regs *regs = current_pt_regs();\n\tstruct {\n\t\tstruct elfhdr elf_ex;\n\t\tstruct elfhdr interp_elf_ex;\n\t} *loc;\n\tstruct arch_elf_state arch_state = INIT_ARCH_ELF_STATE;",
+      "explanation": "This is the core Linux binfmt handler `load_elf_binary`, invoked from the exec path when the kernel decides a file is an ELF binary. Its only input is `bprm` (a struct linux_binprm) which carries the file being executed and the first page of that file already read into `bprm->buf`. The locals describe the whole load: `load_addr`/`load_bias` are the base and randomization offset of the mapping, `elf_interpreter` will hold the path of a PT_INTERP dynamic loader, `elf_phdata`/`elf_ppnt`/`interp_elf_phdata` point at parsed program-header arrays, and `elf_bss`/`elf_brk`/`start_code`/`end_code`/`start_data`/`end_data` accumulate the final memory layout that will be stored into `current->mm`. `executable_stack` is decided from a PT_GNU_STACK header. The anonymous `struct { elfhdr elf_ex; elfhdr interp_elf_ex; } *loc` bundles the main binary's ELF header and the interpreter's ELF header into one heap allocation."
+    },
+    {
+      "file": "corpus/eval/eval_0002_cwe362.c",
+      "lines": "24-31",
+      "code": "\tloc = kmalloc(sizeof(*loc), GFP_KERNEL);\n\tif (!loc) {\n\t\tretval = -ENOMEM;\n\t\tgoto out_ret;\n\t}\n\n\t/* Get the exec-header */\n\tloc->elf_ex = *((struct elfhdr *)bprm->buf);",
+      "explanation": "`loc` is allocated on the kernel heap and NULL-checked (returning -ENOMEM on failure). Line 31 then copies `sizeof(struct elfhdr)` bytes out of `bprm->buf` into `loc->elf_ex` by casting the raw first-page buffer to `struct elfhdr *` and dereferencing. `bprm->buf` is a fixed-size buffer (BINPRM_BUF_SIZE) that the exec machinery pre-filled with the first bytes of the attacker-supplied executable, so from here on `loc->elf_ex` is fully attacker-controlled binary content: e_ident, e_type, e_machine, e_phnum, e_phoff, e_entry, etc."
+    },
+    {
+      "file": "corpus/eval/eval_0002_cwe362.c",
+      "lines": "33-43",
+      "code": "\tretval = -ENOEXEC;\n\t/* First of all, some simple consistency checks */\n\tif (memcmp(loc->elf_ex.e_ident, ELFMAG, SELFMAG) != 0)\n\t\tgoto out;\n\n\tif (loc->elf_ex.e_type != ET_EXEC && loc->elf_ex.e_type != ET_DYN)\n\t\tgoto out;\n\tif (!elf_check_arch(&loc->elf_ex))\n\t\tgoto out;\n\tif (!bprm->file->f_op->mmap)\n\t\tgoto out;",
+      "explanation": "These are the gatekeeping validation checks before any parsing. Line 35 confirms the four-byte ELF magic (`ELFMAG`, length `SELFMAG`) at the start of e_ident, rejecting non-ELF files with -ENOEXEC. Line 38 requires the object be either a fixed-position executable (ET_EXEC) or a position-independent/shared object (ET_DYN); other e_type values (ET_REL, ET_CORE) are rejected. `elf_check_arch` (line 40) verifies e_machine matches the running CPU. Line 42 requires the backing file's f_op to support mmap, since the loader maps segments directly. Any failure jumps to `out`, which frees `loc` and returns."
+    },
+    {
+      "file": "corpus/eval/eval_0002_cwe362.c",
+      "lines": "45-56",
+      "code": "\telf_phdata = load_elf_phdrs(&loc->elf_ex, bprm->file);\n\tif (!elf_phdata)\n\t\tgoto out;\n\n\telf_ppnt = elf_phdata;\n\telf_bss = 0;\n\telf_brk = 0;\n\n\tstart_code = ~0UL;\n\tend_code = 0;\n\tstart_data = 0;\n\tend_data = 0;",
+      "explanation": "`load_elf_phdrs` (a helper not shown) allocates and reads the program-header table described by `loc->elf_ex.e_phoff`/`e_phnum` from the file into `elf_phdata`, returning NULL on any error (bad count, short read, allocation failure). `elf_ppnt` is set to the first entry so the following loops can walk the array. The layout accumulators are seeded: `start_code` is set to all-ones so the first `if (k < start_code)` will lower it, while the ends and bss/brk start at zero. Everything read here (each phdr's p_type, p_offset, p_filesz, p_memsz, p_vaddr, p_flags) is attacker-controlled."
+    },
+    {
+      "file": "corpus/eval/eval_0002_cwe362.c",
+      "lines": "58-73",
+      "code": "\tfor (i = 0; i < loc->elf_ex.e_phnum; i++) {\n\t\tif (elf_ppnt->p_type == PT_INTERP) {\n\t\t\t/* This is the program interpreter used for\n\t\t\t * shared libraries - for now assume that this\n\t\t\t * is an a.out format binary\n\t\t\t */\n\t\t\tretval = -ENOEXEC;\n\t\t\tif (elf_ppnt->p_filesz > PATH_MAX ||\n\t\t\t    elf_ppnt->p_filesz < 2)\n\t\t\t\tgoto out_free_ph;\n\n\t\t\tretval = -ENOMEM;\n\t\t\telf_interpreter = kmalloc(elf_ppnt->p_filesz,\n\t\t\t\t\t\t  GFP_KERNEL);\n\t\t\tif (!elf_interpreter)\n\t\t\t\tgoto out_free_ph;",
+      "explanation": "The first pass over the program headers looks for a PT_INTERP entry, which names a dynamic loader path embedded in the binary. `p_filesz` is the attacker-supplied byte length of that path. Lines 65-66 bound it: reject if greater than PATH_MAX or less than 2, so the subsequent allocation is between 2 and PATH_MAX bytes. Line 70 allocates exactly `p_filesz` bytes for the path string and NULL-checks it. This bounds check is the key invariant that makes the following copy and the `p_filesz - 1` index safe."
+    },
+    {
+      "file": "corpus/eval/eval_0002_cwe362.c",
+      "lines": "75-91",
+      "code": "\t\tretval = kernel_read(bprm->file, elf_ppnt->p_offset,\n\t\t\t\t\t     elf_interpreter,\n\t\t\t\t\t     elf_ppnt->p_filesz);\n\t\t\tif (retval != elf_ppnt->p_filesz) {\n\t\t\t\tif (retval >= 0)\n\t\t\t\t\tretval = -EIO;\n\t\t\t\tgoto out_free_interp;\n\t\t\t}\n\t\t\t/* make sure path is NULL terminated */\n\t\t\tretval = -ENOEXEC;\n\t\t\tif (elf_interpreter[elf_ppnt->p_filesz - 1] != '\\0')\n\t\t\t\tgoto out_free_interp;\n\n\t\t\tinterpreter = open_exec(elf_interpreter);\n\t\t\tretval = PTR_ERR(interpreter);\n\t\t\tif (IS_ERR(interpreter))\n\t\t\t\tgoto out_free_interp;",
+      "explanation": "`kernel_read` copies exactly `p_filesz` bytes from file offset `p_offset` into the freshly-allocated `elf_interpreter` buffer. The `retval != p_filesz` check rejects short reads. Because the buffer is exactly `p_filesz` bytes, the destination is exactly sized, and line 85 then requires the last byte (`elf_interpreter[p_filesz - 1]`) to be a NUL so the string is safely terminated before being used as a path (`p_filesz >= 2` guarantees the index is valid). `open_exec(elf_interpreter)` resolves that attacker-named path and opens the interpreter file with exec semantics (deny-write), storing the file pointer in `interpreter`; IS_ERR handles lookup/permission failures."
+    },
+    {
+      "file": "corpus/eval/eval_0002_cwe362.c",
+      "lines": "93-113",
+      "code": "\t\t/*\n\t\t\t * If the binary is not readable then enforce\n\t\t\t * mm->dumpable = 0 regardless of the interpreter's\n\t\t\t * permissions.\n\t\t\t */\n\t\t\twould_dump(bprm, interpreter);\n\n\t\t\t/* Get the exec headers */\n\t\t\tretval = kernel_read(interpreter, 0,\n\t\t\t\t\t     (void *)&loc->interp_elf_ex,\n\t\t\t\t\t     sizeof(loc->interp_elf_ex));\n\t\t\tif (retval != sizeof(loc->interp_elf_ex)) {\n\t\t\t\tif (retval >= 0)\n\t\t\t\t\tretval = -EIO;\n\t\t\t\tgoto out_free_dentry;\n\t\t\t}\n\n\t\t\tbreak;\n\t\t}\n\t\telf_ppnt++;\n\t}",
+      "explanation": "`would_dump` records that if the interpreter (or binary) is not readable the resulting process must be marked non-dumpable, a ptrace/coredump safety measure. Line 101 reads the interpreter file's own ELF header (from offset 0, `sizeof(struct elfhdr)` bytes) into `loc->interp_elf_ex`; this fills the second ELF header in the `loc` struct with attacker-controlled interpreter content. A short read is rejected. On finding the first PT_INTERP the loop `break`s; otherwise `elf_ppnt++` advances to the next program header. Note the loop consults only the first PT_INTERP."
+    },
+    {
+      "file": "corpus/eval/eval_0002_cwe362.c",
+      "lines": "115-132",
+      "code": "\telf_ppnt = elf_phdata;\n\tfor (i = 0; i < loc->elf_ex.e_phnum; i++, elf_ppnt++)\n\t\tswitch (elf_ppnt->p_type) {\n\t\tcase PT_GNU_STACK:\n\t\t\tif (elf_ppnt->p_flags & PF_X)\n\t\t\t\texecutable_stack = EXSTACK_ENABLE_X;\n\t\t\telse\n\t\t\t\texecutable_stack = EXSTACK_DISABLE_X;\n\t\t\tbreak;\n\n\t\tcase PT_LOPROC ... PT_HIPROC:\n\t\t\tretval = arch_elf_pt_proc(&loc->elf_ex, elf_ppnt,\n\t\t\t\t\t\t  bprm->file, false,\n\t\t\t\t\t\t  &arch_state);\n\t\t\tif (retval)\n\t\t\t\tgoto out_free_dentry;\n\t\t\tbreak;\n\t\t}",
+      "explanation": "A second pass over the main binary's program headers handles two special types. PT_GNU_STACK (line 118) lets the binary request an executable or non-executable stack via its PF_X flag, setting `executable_stack` accordingly — an attacker-controlled security-relevant decision (it can request an executable stack). The `PT_LOPROC ... PT_HIPROC` range (a GCC case-range) forwards processor-specific headers to `arch_elf_pt_proc`, which can accumulate architecture state or reject the ELF; a nonzero return aborts to the dentry-cleanup path."
+    },
+    {
+      "file": "corpus/eval/eval_0002_cwe362.c",
+      "lines": "134-162",
+      "code": "\t/* Some simple consistency checks for the interpreter */\n\tif (elf_interpreter) {\n\t\tretval = -ELIBBAD;\n\t\t/* Not an ELF interpreter */\n\t\tif (memcmp(loc->interp_elf_ex.e_ident, ELFMAG, SELFMAG) != 0)\n\t\t\tgoto out_free_dentry;\n\t\t/* Verify the interpreter has a valid arch */\n\t\tif (!elf_check_arch(&loc->interp_elf_ex))\n\t\t\tgoto out_free_dentry;\n\n\t\t/* Load the interpreter program headers */\n\t\tinterp_elf_phdata = load_elf_phdrs(&loc->interp_elf_ex,\n\t\t\t\t\t\t   interpreter);\n\t\tif (!interp_elf_phdata)\n\t\t\tgoto out_free_dentry;\n\n\t\t/* Pass PT_LOPROC..PT_HIPROC headers to arch code */\n\t\telf_ppnt = interp_elf_phdata;\n\t\tfor (i = 0; i < loc->interp_elf_ex.e_phnum; i++, elf_ppnt++)\n\t\t\tswitch (elf_ppnt->p_type) {\n\t\t\tcase PT_LOPROC ... PT_HIPROC:\n\t\t\t\tretval = arch_elf_pt_proc(&loc->interp_elf_ex,\n\t\t\t\t\t\t\t  elf_ppnt, interpreter,\n\t\t\t\t\t\t\t  true, &arch_state);\n\t\t\t\tif (retval)\n\t\t\t\t\tgoto out_free_dentry;\n\t\t\t\tbreak;\n\t\t\t}\n\t}",
+      "explanation": "When an interpreter was found, its header (read at line 101) is validated: ELF magic (line 138) and architecture (line 141), rejecting with -ELIBBAD. Then `load_elf_phdrs` reads the interpreter's program-header table from the interpreter file into `interp_elf_phdata`, and a loop forwards the interpreter's processor-specific headers to `arch_elf_pt_proc` (this time with `is_interp = true`). Crucially, the interpreter's ELF header used for these checks was captured earlier from a separately-opened, by-name file; the file identity established here is what will later be mapped."
+    },
+    {
+      "file": "corpus/eval/eval_0002_cwe362.c",
+      "lines": "164-178",
+      "code": "\t/*\n\t * Allow arch code to reject the ELF at this point, whilst it's\n\t * still possible to return an error to the code that invoked\n\t * the exec syscall.\n\t */\n\tretval = arch_check_elf(&loc->elf_ex,\n\t\t\t\t!!interpreter, &loc->interp_elf_ex,\n\t\t\t\t&arch_state);\n\tif (retval)\n\t\tgoto out_free_dentry;\n\n\t/* Flush all traces of the currently running executable */\n\tretval = flush_old_exec(bprm);\n\tif (retval)\n\t\tgoto out_free_dentry;",
+      "explanation": "`arch_check_elf` is the last architecture hook that can reject the binary while a clean error return is still possible. Line 176's `flush_old_exec(bprm)` is the point of no return: it tears down the calling process's old address space, signal handlers and mmaps. After this call succeeds, the original program is gone, so any later failure cannot restore it — the task will be killed rather than returned to. The comment above `arch_check_elf` explicitly acknowledges this ordering constraint."
+    },
+    {
+      "file": "corpus/eval/eval_0002_cwe362.c",
+      "lines": "180-198",
+      "code": "\tSET_PERSONALITY2(loc->elf_ex, &arch_state);\n\tif (elf_read_implies_exec(loc->elf_ex, executable_stack))\n\t\tcurrent->personality |= READ_IMPLIES_EXEC;\n\n\tif (!(current->personality & ADDR_NO_RANDOMIZE) && randomize_va_space)\n\t\tcurrent->flags |= PF_RANDOMIZE;\n\n\tsetup_new_exec(bprm);\n\n\t/* Do this so that we can load the interpreter, if need be.  We will\n\t   change some of these later */\n\tretval = setup_arg_pages(bprm, randomize_stack_top(STACK_TOP),\n\t\t\t\t executable_stack);\n\tif (retval < 0)\n\t\tgoto out_free_dentry;\n\n\tcurrent->mm->start_stack = bprm->p;",
+      "explanation": "The new process personality is applied from the ELF header and arch state. `elf_read_implies_exec` may set READ_IMPLIES_EXEC based on the attacker-chosen `executable_stack`, weakening W^X. ASLR is enabled by setting PF_RANDOMIZE unless disabled. `setup_new_exec` commits the new executable identity, and `setup_arg_pages` sets up the initial stack (with a randomized top) using the executable-stack decision. `current->mm->start_stack` records the argument-block pointer."
+    },
+    {
+      "file": "corpus/eval/eval_0002_cwe362.c",
+      "lines": "200-235",
+      "code": "\tfor(i = 0, elf_ppnt = elf_phdata;\n\t    i < loc->elf_ex.e_phnum; i++, elf_ppnt++) {\n\t\tint elf_prot = 0, elf_flags;\n\t\tunsigned long k, vaddr;\n\t\tunsigned long total_size = 0;\n\n\t\tif (elf_ppnt->p_type != PT_LOAD)\n\t\t\tcontinue;\n\n\t\tif (unlikely (elf_brk > elf_bss)) {\n\t\t\tunsigned long nbyte;\n\n\t\t\t/* There was a PT_LOAD segment with p_memsz > p_filesz\n\t\t\t   before this one. Map anonymous pages, if needed,\n\t\t\t   and clear the area.  */\n\t\t\tretval = set_brk(elf_bss + load_bias,\n\t\t\t\t\t elf_brk + load_bias);\n\t\t\tif (retval)\n\t\t\t\tgoto out_free_dentry;\n\t\t\tnbyte = ELF_PAGEOFFSET(elf_bss);\n\t\t\tif (nbyte) {\n\t\t\t\tnbyte = ELF_MIN_ALIGN - nbyte;\n\t\t\t\tif (nbyte > elf_brk - elf_bss)\n\t\t\t\t\tnbyte = elf_brk - elf_bss;\n\t\t\t\tif (clear_user((void __user *)elf_bss +\n\t\t\t\t\t\t\tload_bias, nbyte)) {\n\t\t\t\t\t/*\n\t\t\t\t\t * This bss-zeroing can fail if the ELF\n\t\t\t\t\t * file specifies odd protections. So\n\t\t\t\t\t * we don't check the return value\n\t\t\t\t\t */\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t}",
+      "explanation": "This is the main segment-mapping loop; `total_size` is reset to 0 each iteration. Non-PT_LOAD headers are skipped. When a previous PT_LOAD had a memory size larger than its file size (`elf_brk > elf_bss`), the gap must be backed by zeroed anonymous pages: `set_brk` maps the bss/brk range (biased by load_bias) and `clear_user` zeroes the partial page from `elf_bss` up to the next page boundary, clamped to `elf_brk - elf_bss`. The `elf_brk - elf_bss` subtraction is safe here because it is guarded by `elf_brk > elf_bss`. The clear_user return is intentionally ignored (comment)."
+    },
+    {
+      "file": "corpus/eval/eval_0002_cwe362.c",
+      "lines": "237-264",
+      "code": "\t\tif (elf_ppnt->p_flags & PF_R)\n\t\t\telf_prot |= PROT_READ;\n\t\tif (elf_ppnt->p_flags & PF_W)\n\t\t\telf_prot |= PROT_WRITE;\n\t\tif (elf_ppnt->p_flags & PF_X)\n\t\t\telf_prot |= PROT_EXEC;\n\n\t\telf_flags = MAP_PRIVATE | MAP_DENYWRITE | MAP_EXECUTABLE;\n\n\t\tvaddr = elf_ppnt->p_vaddr;\n\t\tif (loc->elf_ex.e_type == ET_EXEC || load_addr_set) {\n\t\t\telf_flags |= MAP_FIXED;\n\t\t} else if (loc->elf_ex.e_type == ET_DYN) {\n\t\t\t/* Try and get dynamic programs out of the way of the\n\t\t\t * default mmap base, as well as whatever program they\n\t\t\t * might try to exec.  This is because the brk will\n\t\t\t * follow the loader, and is not movable.  */\n\t\t\tload_bias = ELF_ET_DYN_BASE - vaddr;\n\t\t\tif (current->flags & PF_RANDOMIZE)\n\t\t\t\tload_bias += arch_mmap_rnd();\n\t\t\tload_bias = ELF_PAGESTART(load_bias);\n\t\t\ttotal_size = total_mapping_size(elf_phdata,\n\t\t\t\t\t\t\tloc->elf_ex.e_phnum);\n\t\t\tif (!total_size) {\n\t\t\t\tretval = -EINVAL;\n\t\t\t\tgoto out_free_dentry;\n\t\t\t}\n\t\t}",
+      "explanation": "The per-segment protection is derived from the attacker's p_flags (PF_R/W/X -> PROT_READ/WRITE/EXEC). `vaddr` is the segment's requested virtual address. For ET_EXEC (or after the base is fixed) the mapping is MAP_FIXED at the requested address. For ET_DYN (PIE/shared) the first segment computes `load_bias = ELF_ET_DYN_BASE - vaddr`, adds randomization when PF_RANDOMIZE, page-aligns, and computes `total_size = total_mapping_size(...)` — the full span of all PT_LOAD segments — rejecting a zero span. This total_size reservation exists specifically to prevent PIE segments from colliding with the stack/mmap area; it is the mitigation for the historical PIE-vs-stack corruption bug."
+    },
+    {
+      "file": "corpus/eval/eval_0002_cwe362.c",
+      "lines": "266-283",
+      "code": "\t\terror = elf_map(bprm->file, load_bias + vaddr, elf_ppnt,\n\t\t\t\telf_prot, elf_flags, total_size);\n\t\tif (BAD_ADDR(error)) {\n\t\t\tretval = IS_ERR((void *)error) ?\n\t\t\t\tPTR_ERR((void*)error) : -EINVAL;\n\t\t\tgoto out_free_dentry;\n\t\t}\n\n\t\tif (!load_addr_set) {\n\t\t\tload_addr_set = 1;\n\t\t\tload_addr = (elf_ppnt->p_vaddr - elf_ppnt->p_offset);\n\t\t\tif (loc->elf_ex.e_type == ET_DYN) {\n\t\t\t\tload_bias += error -\n\t\t\t\t             ELF_PAGESTART(load_bias + vaddr);\n\t\t\t\tload_addr += load_bias;\n\t\t\t\treloc_func_desc = load_bias;\n\t\t\t}\n\t\t}",
+      "explanation": "`elf_map` performs the actual mmap of this segment into the new address space at `load_bias + vaddr`, honoring `total_size` for the first ET_DYN segment. BAD_ADDR/IS_ERR catches mapping failures. On the first successfully mapped segment, `load_addr` is set to `p_vaddr - p_offset` (the base such that file offset 0 lands correctly). For ET_DYN, `load_bias` is refined using the actual returned mapping address `error` minus the page-start of the intended address, then folded into `load_addr` and `reloc_func_desc`. Both `p_vaddr` and `p_offset` are attacker-controlled unsigned values feeding this subtraction."
+    },
+    {
+      "file": "corpus/eval/eval_0002_cwe362.c",
+      "lines": "284-314",
+      "code": "\t\tk = elf_ppnt->p_vaddr;\n\t\tif (k < start_code)\n\t\t\tstart_code = k;\n\t\tif (start_data < k)\n\t\t\tstart_data = k;\n\n\t\t/*\n\t\t * Check to see if the section's size will overflow the\n\t\t * allowed task size. Note that p_filesz must always be\n\t\t * <= p_memsz so it is only necessary to check p_memsz.\n\t\t */\n\t\tif (BAD_ADDR(k) || elf_ppnt->p_filesz > elf_ppnt->p_memsz ||\n\t\t    elf_ppnt->p_memsz > TASK_SIZE ||\n\t\t    TASK_SIZE - elf_ppnt->p_memsz < k) {\n\t\t\t/* set_brk can never work. Avoid overflows. */\n\t\t\tretval = -EINVAL;\n\t\t\tgoto out_free_dentry;\n\t\t}\n\n\t\tk = elf_ppnt->p_vaddr + elf_ppnt->p_filesz;\n\n\t\tif (k > elf_bss)\n\t\t\telf_bss = k;\n\t\tif ((elf_ppnt->p_flags & PF_X) && end_code < k)\n\t\t\tend_code = k;\n\t\tif (end_data < k)\n\t\t\tend_data = k;\n\t\tk = elf_ppnt->p_vaddr + elf_ppnt->p_memsz;\n\t\tif (k > elf_brk)\n\t\t\telf_brk = k;",
+      "explanation": "After mapping, the layout accumulators are updated. `k = p_vaddr` lowers `start_code`/raises `start_data`. Lines 295-297 are the crucial overflow guard: reject if the address is bad, if `p_filesz > p_memsz` (inconsistent), if `p_memsz > TASK_SIZE`, or if `TASK_SIZE - p_memsz < k` (segment would run past the task's address space). Because `p_memsz > TASK_SIZE` is rejected first, the `TASK_SIZE - p_memsz` subtraction cannot underflow, and `p_vaddr + p_memsz` cannot overflow past TASK_SIZE. Then `k = p_vaddr + p_filesz` updates elf_bss/end_code/end_data, and `k = p_vaddr + p_memsz` updates elf_brk. These per-segment guards are what keep the arithmetic below in-bounds."
+    },
+    {
+      "file": "corpus/eval/eval_0002_cwe362.c",
+      "lines": "316-335",
+      "code": "\tloc->elf_ex.e_entry += load_bias;\n\telf_bss += load_bias;\n\telf_brk += load_bias;\n\tstart_code += load_bias;\n\tend_code += load_bias;\n\tstart_data += load_bias;\n\tend_data += load_bias;\n\n\t/* Calling set_brk effectively mmaps the pages that we need\n\t * for the bss and break sections.  We must do this before\n\t * mapping in the interpreter, to make sure it doesn't wind\n\t * up getting placed where the bss needs to go.\n\t */\n\tretval = set_brk(elf_bss, elf_brk);\n\tif (retval)\n\t\tgoto out_free_dentry;\n\tif (likely(elf_bss != elf_brk) && unlikely(padzero(elf_bss))) {\n\t\tretval = -EFAULT; /* Nobody gets to see this, but.. */\n\t\tgoto out_free_dentry;\n\t}",
+      "explanation": "All accumulated addresses, including the entry point `e_entry`, are shifted by the final `load_bias` so they refer to the actual mapped locations. `set_brk(elf_bss, elf_brk)` maps the program's bss/brk region before the interpreter is loaded so the loader is not placed on top of it. `padzero(elf_bss)` zero-fills the trailing partial page of bss; its failure yields -EFAULT. All of `elf_bss`/`elf_brk`/`e_entry` derive from attacker-controlled p_vaddr/p_memsz values but were bounds-checked to TASK_SIZE in the loop above."
+    },
+    {
+      "file": "corpus/eval/eval_0002_cwe362.c",
+      "lines": "337-368",
+      "code": "\tif (elf_interpreter) {\n\t\tunsigned long interp_map_addr = 0;\n\n\t\telf_entry = load_elf_interp(&loc->interp_elf_ex,\n\t\t\t\t\t    interpreter,\n\t\t\t\t\t    &interp_map_addr,\n\t\t\t\t\t    load_bias, interp_elf_phdata);\n\t\tif (!IS_ERR((void *)elf_entry)) {\n\t\t\t/*\n\t\t\t * load_elf_interp() returns relocation\n\t\t\t * adjustment\n\t\t\t */\n\t\t\tinterp_load_addr = elf_entry;\n\t\t\telf_entry += loc->interp_elf_ex.e_entry;\n\t\t}\n\t\tif (BAD_ADDR(elf_entry)) {\n\t\t\tretval = IS_ERR((void *)elf_entry) ?\n\t\t\t\t\t(int)elf_entry : -EINVAL;\n\t\t\tgoto out_free_dentry;\n\t\t}\n\t\treloc_func_desc = interp_load_addr;\n\n\t\tallow_write_access(interpreter);\n\t\tfput(interpreter);\n\t\tkfree(elf_interpreter);\n\t} else {\n\t\telf_entry = loc->elf_ex.e_entry;\n\t\tif (BAD_ADDR(elf_entry)) {\n\t\t\tretval = -EINVAL;\n\t\t\tgoto out_free_dentry;\n\t\t}\n\t}",
+      "explanation": "If an interpreter was requested, `load_elf_interp` maps the interpreter's segments (using the previously-validated `interp_elf_ex` header and `interp_elf_phdata`) and returns the relocation adjustment; the program entry becomes that adjustment plus the interpreter's own `e_entry`. BAD_ADDR validates the final entry. On success the interpreter file is released (`allow_write_access` + `fput`) and the path buffer freed. Without an interpreter, `elf_entry` is just the main binary's `e_entry`, BAD_ADDR-checked. Note `elf_entry += interp_elf_ex.e_entry` adds an attacker-controlled interpreter entry offset, mitigated only by the subsequent BAD_ADDR check."
+    },
+    {
+      "file": "corpus/eval/eval_0002_cwe362.c",
+      "lines": "370-408",
+      "code": "\tkfree(interp_elf_phdata);\n\tkfree(elf_phdata);\n\n\tset_binfmt(&elf_format);\n\n#ifdef ARCH_HAS_SETUP_ADDITIONAL_PAGES\n\tretval = arch_setup_additional_pages(bprm, !!elf_interpreter);\n\tif (retval < 0)\n\t\tgoto out;\n#endif /* ARCH_HAS_SETUP_ADDITIONAL_PAGES */\n\n\tinstall_exec_creds(bprm);\n\tretval = create_elf_tables(bprm, &loc->elf_ex,\n\t\t\t  load_addr, interp_load_addr);\n\tif (retval < 0)\n\t\tgoto out;\n\t/* N.B. passed_fileno might not be initialized? */\n\tcurrent->mm->end_code = end_code;\n\tcurrent->mm->start_code = start_code;\n\tcurrent->mm->start_data = start_data;\n\tcurrent->mm->end_data = end_data;\n\tcurrent->mm->start_stack = bprm->p;\n\n\tif ((current->flags & PF_RANDOMIZE) && (randomize_va_space > 1)) {\n\t\tcurrent->mm->brk = current->mm->start_brk =\n\t\t\tarch_randomize_brk(current->mm);\n#ifdef compat_brk_randomized\n\t\tcurrent->brk_randomized = 1;\n#endif\n\t}\n\n\tif (current->personality & MMAP_PAGE_ZERO) {\n\t\terror = vm_mmap(NULL, 0, PAGE_SIZE, PROT_READ | PROT_EXEC,\n\t\t\t\tMAP_FIXED | MAP_PRIVATE, 0);\n\t}",
+      "explanation": "The program-header arrays are freed. `set_binfmt` records the ELF format for this process. `arch_setup_additional_pages` maps the vDSO. `install_exec_creds(bprm)` commits the new credentials (this is where a setuid/setgid transition actually takes effect). `create_elf_tables` builds argv/envp/auxv on the new stack. The final `current->mm` fields are stored from the accumulated layout, brk is randomized when requested, and MMAP_PAGE_ZERO (SVr4 emulation) may map page 0 read+exec. Note `install_exec_creds` happens only after all the untrusted parsing/mapping above has already run in the new address space."
+    },
+    {
+      "file": "corpus/eval/eval_0002_cwe362.c",
+      "lines": "410-441",
+      "code": "\tELF_PLAT_INIT(regs, reloc_func_desc);\n#endif\n\n\tstart_thread(regs, elf_entry, bprm->p);\n\tretval = 0;\nout:\n\tkfree(loc);\nout_ret:\n\treturn retval;\n\n\t/* error cleanup */\nout_free_dentry:\n\tkfree(interp_elf_phdata);\n\tallow_write_access(interpreter);\n\tif (interpreter)\n\t\tfput(interpreter);\nout_free_interp:\n\tkfree(elf_interpreter);\nout_free_ph:\n\tkfree(elf_phdata);\n\tgoto out;",
+      "explanation": "`ELF_PLAT_INIT` does any arch-specific register setup, then `start_thread(regs, elf_entry, bprm->p)` sets the initial instruction pointer to the (validated) entry and stack pointer, and execution of the new program begins. Success returns 0 after freeing `loc`. The error-cleanup ladder frees the interpreter phdrs, releases the interpreter file (`allow_write_access`/`fput`, guarded by `if (interpreter)`), frees the interpreter path buffer and the main phdr array, and falls through to `out`. This is a goto-based unwinding scheme where the entry label depends on how far initialization progressed."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/eval/eval_0002_cwe362.c",
+      "lines": "88-108",
+      "code": "interpreter = open_exec(elf_interpreter);\n\t\t\tretval = PTR_ERR(interpreter);\n\t\t\tif (IS_ERR(interpreter))\n\t\t\t\tgoto out_free_interp;",
+      "explanation": "TOCTOU / race window (CWE-362). The interpreter is resolved from an attacker-embedded pathname via `open_exec` (line 88), its ELF header is read and validated (lines 101, 138-142), and only much later (line 340 `load_elf_interp`) are its actual segments mapped. The identity/contents used for validation and the contents used for the final mapping are separated by a large amount of work; if the interpreter file (or a path component / symlink target) can be replaced between validation and load, the header checks (magic, arch, phdrs) can describe a different object than the one executed. The implementation must hold a stable reference to the exact opened inode and map from that same `struct file` (which open_exec's deny-write is meant to enforce) so the validated bytes and mapped bytes cannot diverge; confirm no revalidation gap and that path resolution is not repeated."
+    },
+    {
+      "file": "corpus/eval/eval_0002_cwe362.c",
+      "lines": "276",
+      "code": "\t\tload_addr = (elf_ppnt->p_vaddr - elf_ppnt->p_offset);",
+      "explanation": "Unsigned wrap in base-address computation (CWE-191). Both `p_vaddr` and `p_offset` are attacker-controlled unsigned longs read from the program header. If `p_offset > p_vaddr`, the subtraction wraps to a near-maximal value, producing a wild `load_addr` that is later handed to `create_elf_tables` as AT_PHDR/load base and used in address math. The visible per-segment guard at lines 295-297 bounds `p_vaddr + p_memsz` against TASK_SIZE but does NOT constrain the `p_vaddr - p_offset` relationship. The invariant the implementation must uphold is that `p_offset <= p_vaddr` for the first PT_LOAD (or that a wrapped load_addr is rejected/ignored); confirm downstream consumers of `load_addr` are robust to this and that no mapping uses the wrapped value directly."
+    },
+    {
+      "file": "corpus/eval/eval_0002_cwe362.c",
+      "lines": "254-263",
+      "code": "\t\tload_bias = ELF_ET_DYN_BASE - vaddr;\n\t\t\tif (current->flags & PF_RANDOMIZE)\n\t\t\t\tload_bias += arch_mmap_rnd();\n\t\t\tload_bias = ELF_PAGESTART(load_bias);\n\t\t\ttotal_size = total_mapping_size(elf_phdata,\n\t\t\t\t\t\t\tloc->elf_ex.e_phnum);\n\t\t\tif (!total_size) {\n\t\t\t\tretval = -EINVAL;\n\t\t\t\tgoto out_free_dentry;\n\t\t\t}",
+      "explanation": "PIE segment placement vs. stack/mmap collision (CWE-787 latent, CVE-2017-1000253 family). For ET_DYN binaries `load_bias` is derived from `ELF_ET_DYN_BASE - vaddr` plus randomization; a hostile PIE with a large or crafted first-segment `p_vaddr`, combined with segments that do not increase monotonically, historically let the mapped image overlap the stack region, corrupting it and enabling privilege escalation. This code already contains the mitigation — reserving the full span via `total_size = total_mapping_size(...)` and mapping the whole region with the first segment — so the invariant is that `total_mapping_size` correctly covers ALL PT_LOAD segments (min vaddr..max vaddr+memsz, page aligned) and that `elf_map` honors `total_size` as a reservation. Confirm total_mapping_size does not itself overflow on crafted e_phnum/p_vaddr and that every subsequent segment maps inside the reserved span."
+    },
+    {
+      "file": "corpus/eval/eval_0002_cwe362.c",
+      "lines": "58-59",
+      "code": "\tfor (i = 0; i < loc->elf_ex.e_phnum; i++) {\n\t\tif (elf_ppnt->p_type == PT_INTERP) {",
+      "explanation": "Program-header count trust (CWE-125 / CWE-190, latent in load_elf_phdrs). Three loops (lines 58, 116, 202-203) iterate `elf_ppnt` from `elf_phdata` up to `loc->elf_ex.e_phnum`, an attacker-controlled 16-bit count. Safety depends entirely on the un-shown `load_elf_phdrs` having allocated exactly `e_phnum * sizeof(struct elf_phdr)` entries and read that many, with no `e_phnum * sizeof` multiplication overflow and a cap (ELF_MIN_ALIGN/PN_XNUM handling). If the allocated array is smaller than `e_phnum`, every loop walks off the end (out-of-bounds read of p_type/p_flags/p_vaddr). The invariant: the array length used by these loops must equal the number of entries `load_elf_phdrs` actually allocated and validated; confirm the count is bounded and the allocation size cannot overflow."
+    },
+    {
+      "file": "corpus/eval/eval_0002_cwe362.c",
+      "lines": "350",
+      "code": "\t\telf_entry += loc->interp_elf_ex.e_entry;",
+      "explanation": "Attacker-controlled entry offset (CWE-20 mitigated by BAD_ADDR). `loc->interp_elf_ex.e_entry` comes straight from the interpreter file header and is added to the relocation base returned by `load_elf_interp`; the sum becomes the initial instruction pointer passed to `start_thread` (line 424). The only guard is the `BAD_ADDR(elf_entry)` check at line 352, which rejects addresses at/above TASK_SIZE but does not guarantee the entry lands inside an executable mapping. The invariant is that the final `elf_entry` must point into a mapped, executable page; confirm BAD_ADDR plus the mapping logic fully constrain it and that the addition cannot wrap below TASK_SIZE to bypass the check."
+    },
+    {
+      "file": "corpus/eval/eval_0002_cwe362.c",
+      "lines": "176",
+      "code": "\tretval = flush_old_exec(bprm);\n\tif (retval)\n\t\tgoto out_free_dentry;",
+      "explanation": "Point-of-no-return ordering (robustness / DoS). `flush_old_exec` destroys the calling process's original address space; every failure path after it (`goto out_free_dentry` at lines 220, 262, 271, 331, 334, 355, and the arch/create_elf_tables paths) can no longer return an error to a live original process — the task is killed instead. An attacker who crafts an ELF that passes the pre-flush checks but fails a post-flush step (bad interpreter segment, create_elf_tables failure) forces a guaranteed process death rather than a clean -ENOEXEC. The invariant is that all rejectable conditions be validated BEFORE `flush_old_exec`; confirm nothing that fails after the flush was checkable earlier."
+    },
+    {
+      "file": "corpus/eval/eval_0002_cwe362.c",
+      "lines": "183-184",
+      "code": "\tif (elf_read_implies_exec(loc->elf_ex, executable_stack))\n\t\tcurrent->personality |= READ_IMPLIES_EXEC;",
+      "explanation": "Attacker-driven W^X weakening (CWE-20). `executable_stack` was set purely from the binary's PT_GNU_STACK PF_X flag (lines 119-122), and here it can trigger READ_IMPLIES_EXEC, making all readable mappings executable and defeating a core exploit-mitigation. This is by-design ELF behavior, but it means a hostile binary chooses its own memory-protection posture. The invariant is policy, not memory safety: confirm that PT_GNU_STACK-requested executable stacks are subject to any applicable LSM/seccomp/`noexec`/`READ_IMPLIES_EXEC` restrictions rather than being unconditionally honored."
+    },
+    {
+      "file": "corpus/eval/eval_0002_cwe362.c",
+      "lines": "432-436",
+      "code": "out_free_dentry:\n\tkfree(interp_elf_phdata);\n\tallow_write_access(interpreter);\n\tif (interpreter)\n\t\tfput(interpreter);",
+      "explanation": "Cleanup-path pointer hygiene (info / defensive). The `out_free_dentry` label calls `allow_write_access(interpreter)` before the `if (interpreter)` NULL guard on the next line; `interpreter` is initialized to NULL (line 4) and reached from many gotos at different progress points. The code relies on `allow_write_access(NULL)` being safe and on kfree(NULL) being safe for `interp_elf_phdata`/`elf_interpreter`. Confirm `allow_write_access(NULL)` is a safe no-op (the fput is guarded but the allow_write_access call is not) and that no double-free arises when the success path already freed `interp_elf_phdata`/`elf_interpreter` before jumping to a label that would free them again (it does not, but verify)."
+    }
+  ],
+  "summary": "This is the kernel ELF loader parsing a fully attacker-controlled binary in kernel context. The shown code has solid per-segment bounds checks (the TASK_SIZE/p_memsz guard) and the total_mapping_size PIE mitigation, but the highest-value surfaces are latent in un-shown helpers and in ordering: a TOCTOU window between interpreter header validation and interpreter mapping (CWE-362), the PIE placement/stack-collision family (CVE-2017-1000253), an unsigned p_vaddr-p_offset wrap, and trust in load_elf_phdrs upholding the e_phnum array contract.",
+  "reviewed_anchors": [
+    {
+      "anchor": "loc = kmalloc(sizeof(*loc), GFP_KERNEL) (line 24) and struct { elfhdr elf_ex; elfhdr interp_elf_ex; } *loc (18-21)",
+      "disposition": "dismissed",
+      "reason": "Fixed sizeof allocation, NULL-checked at 25; holds two ELF headers, no length/count contract itself."
+    },
+    {
+      "anchor": "loc->elf_ex = *((struct elfhdr *)bprm->buf) (line 31)",
+      "disposition": "dismissed",
+      "reason": "Copies fixed sizeof(elfhdr) from the pre-filled BINPRM_BUF_SIZE buffer; source is untrusted content but the copy length is fixed and within buf."
+    },
+    {
+      "anchor": "e_ident / ELFMAG / SELFMAG memcmp (line 35, 138)",
+      "disposition": "dismissed",
+      "reason": "Magic-cookie validation gate; present and correct for both main and interp headers."
+    },
+    {
+      "anchor": "loc->elf_ex.e_type / ET_EXEC / ET_DYN (line 38, 247, 249, 277)",
+      "disposition": "finding",
+      "reason": "Drives ET_DYN load_bias path (PIE placement) — covered by PIE collision finding."
+    },
+    {
+      "anchor": "loc->elf_ex.e_phnum (16-bit count; lines 58, 116, 203, 259)",
+      "disposition": "finding",
+      "reason": "Attacker-controlled loop bound over elf_phdata; array-size contract lives in load_elf_phdrs — phdr-count finding."
+    },
+    {
+      "anchor": "elf_ppnt->p_type / PT_INTERP / PT_LOAD / PT_GNU_STACK / PT_LOPROC..PT_HIPROC",
+      "disposition": "dismissed",
+      "reason": "Enumerated type selectors; switch/if dispatch is bounded, no direct memory-size contract beyond the loop bound already flagged."
+    },
+    {
+      "anchor": "elf_ppnt->p_filesz vs PATH_MAX and <2 (lines 65-66) and kmalloc(p_filesz) (70)",
+      "disposition": "dismissed",
+      "reason": "Properly bounded (2..PATH_MAX) before allocation and before the p_filesz-1 index; the length-vs-buffer contract is satisfied."
+    },
+    {
+      "anchor": "kernel_read(bprm->file, p_offset, elf_interpreter, p_filesz) (75-77)",
+      "disposition": "dismissed",
+      "reason": "Destination buffer is exactly p_filesz bytes; short-read checked; p_offset is a file offset, not a memory bound."
+    },
+    {
+      "anchor": "elf_interpreter[elf_ppnt->p_filesz - 1] != '\\\\0' (line 85)",
+      "disposition": "dismissed",
+      "reason": "p_filesz>=2 guarantees index in range and buffer is p_filesz bytes; correct NUL-termination guard."
+    },
+    {
+      "anchor": "open_exec(elf_interpreter) then later load_elf_interp (88, 340)",
+      "disposition": "finding",
+      "reason": "Validate-header-now / map-later separation on a by-name interpreter — TOCTOU race finding (CWE-362)."
+    },
+    {
+      "anchor": "kernel_read(interpreter, 0, &loc->interp_elf_ex, sizeof(...)) (101-103)",
+      "disposition": "dismissed",
+      "reason": "Reads fixed sizeof(elfhdr) into a fixed-size struct field; short read checked."
+    },
+    {
+      "anchor": "executable_stack from PT_GNU_STACK PF_X (118-122) feeding elf_read_implies_exec (183)",
+      "disposition": "finding",
+      "reason": "Attacker chooses executable stack / READ_IMPLIES_EXEC — W^X-weakening policy finding."
+    },
+    {
+      "anchor": "arch_elf_pt_proc / arch_check_elf / arch_state (126, 155, 169)",
+      "disposition": "dismissed",
+      "reason": "Arch hooks that can only reject; return values are checked and abort cleanly."
+    },
+    {
+      "anchor": "flush_old_exec(bprm) (line 176)",
+      "disposition": "finding",
+      "reason": "Point of no return; post-flush failures kill the task — ordering finding."
+    },
+    {
+      "anchor": "elf_prot from p_flags PF_R/PF_W/PF_X (237-242)",
+      "disposition": "dismissed",
+      "reason": "Standard flag-to-PROT translation; the security-relevant executable-stack case is flagged separately."
+    },
+    {
+      "anchor": "load_bias = ELF_ET_DYN_BASE - vaddr; total_size = total_mapping_size(...) (254-263)",
+      "disposition": "finding",
+      "reason": "PIE placement / stack-collision surface (CVE-2017-1000253 family); mitigation present but load_bias math is attacker-influenced."
+    },
+    {
+      "anchor": "elf_map(bprm->file, load_bias + vaddr, elf_ppnt, elf_prot, elf_flags, total_size) (266)",
+      "disposition": "dismissed",
+      "reason": "Mapping helper; failures caught by BAD_ADDR/IS_ERR at 268; segment bounds enforced by the TASK_SIZE guard at 295-297."
+    },
+    {
+      "anchor": "load_addr = (elf_ppnt->p_vaddr - elf_ppnt->p_offset) (line 276)",
+      "disposition": "finding",
+      "reason": "Unsigned subtraction of two attacker fields can wrap — CWE-191 finding."
+    },
+    {
+      "anchor": "BAD_ADDR overflow guard: p_filesz>p_memsz, p_memsz>TASK_SIZE, TASK_SIZE-p_memsz<k (295-297)",
+      "disposition": "dismissed",
+      "reason": "This IS the protective check; ordering prevents the TASK_SIZE-p_memsz underflow and p_vaddr+p_memsz overflow — correctly written."
+    },
+    {
+      "anchor": "k = p_vaddr + p_filesz (303) and k = p_vaddr + p_memsz (311)",
+      "disposition": "dismissed",
+      "reason": "Both sums are bounded by the immediately-preceding TASK_SIZE guard, so no overflow reaches elf_bss/elf_brk."
+    },
+    {
+      "anchor": "set_brk(elf_bss, elf_brk) (217, 329) and elf_brk - elf_bss (224-225)",
+      "disposition": "dismissed",
+      "reason": "Subtraction guarded by elf_brk > elf_bss; set_brk return checked (except the intentionally-ignored clear_user)."
+    },
+    {
+      "anchor": "loc->elf_ex.e_entry += load_bias (316) / elf_entry += interp_elf_ex.e_entry (350) / start_thread(...elf_entry) (424)",
+      "disposition": "finding",
+      "reason": "Attacker-controlled entry point folded into IP; BAD_ADDR is the only gate — entry-offset finding."
+    },
+    {
+      "anchor": "padzero(elf_bss) (332)",
+      "disposition": "dismissed",
+      "reason": "bss page-fill; failure returns -EFAULT and aborts; no attacker length contract."
+    },
+    {
+      "anchor": "load_elf_interp(&loc->interp_elf_ex, interpreter, &interp_map_addr, load_bias, interp_elf_phdata) (340)",
+      "disposition": "finding",
+      "reason": "Consumes the separately-validated interpreter header/phdrs and maps them — part of the TOCTOU race surface."
+    },
+    {
+      "anchor": "install_exec_creds(bprm) (381) ordering vs create_elf_tables (382)",
+      "disposition": "dismissed",
+      "reason": "Creds installed after mapping; failures here goto out (post-flush) but no privilege granted before install; robustness only, covered by flush ordering note."
+    },
+    {
+      "anchor": "kfree cleanup ladder: out_free_dentry/out_free_interp/out_free_ph (432-441)",
+      "disposition": "finding",
+      "reason": "allow_write_access(interpreter) precedes the NULL guard; multi-entry goto cleanup — defensive-hygiene finding."
+    },
+    {
+      "anchor": "MMAP_PAGE_ZERO vm_mmap(NULL,0,PAGE_SIZE,...) (401-407)",
+      "disposition": "dismissed",
+      "reason": "SVr4 page-0 emulation gated on personality; not attacker-reachable without that personality and return unused by design."
+    }
+  ],
+  "findings": [
+    {
+      "title": "TOCTOU race between interpreter ELF-header validation and interpreter mapping",
+      "anchor": "interpreter = open_exec(elf_interpreter) ... load_elf_interp(&loc->interp_elf_ex, interpreter, ...)",
+      "file": "corpus/eval/eval_0002_cwe362.c",
+      "line": "88-108, 340-343",
+      "code": "interpreter = open_exec(elf_interpreter);\n\t\t\tretval = PTR_ERR(interpreter);\n\t\t\tif (IS_ERR(interpreter))\n\t\t\t\tgoto out_free_interp;",
+      "bug_class": "Race condition / time-of-check-to-time-of-use on the interpreter file",
+      "cwe": "CWE-362",
+      "severity": "high",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "The exact bytes validated in interp_elf_ex/interp_elf_phdata (magic, arch, program headers) must be the exact bytes mapped by load_elf_interp — i.e. all reads/maps must go through the single stable struct file returned by open_exec, with deny-write held, and the path must never be re-resolved.",
+      "failure_mode": "An attacker names an interpreter path; the header is read and validated at lines 101/138-142 while the segments are only mapped much later at line 340. If the file behind the path (or a symlink/mount component) can be swapped, or if load_elf_interp re-opens by name, the executed loader differs from the validated one, bypassing the ELF/arch checks and enabling execution of unvalidated code in the new process image.",
+      "cve_analog": "",
+      "what_to_confirm": "That open_exec applies deny_write_access to the interpreter inode and that load_elf_interp maps from that same struct file (never re-resolving elf_interpreter), so no revalidation gap exists."
+    },
+    {
+      "title": "PIE (ET_DYN) load_bias placement can collide with the stack",
+      "anchor": "load_bias = ELF_ET_DYN_BASE - vaddr; total_size = total_mapping_size(elf_phdata, loc->elf_ex.e_phnum)",
+      "file": "corpus/eval/eval_0002_cwe362.c",
+      "line": "254-263",
+      "code": "load_bias = ELF_ET_DYN_BASE - vaddr;\n\t\t\tif (current->flags & PF_RANDOMIZE)\n\t\t\t\tload_bias += arch_mmap_rnd();\n\t\t\tload_bias = ELF_PAGESTART(load_bias);\n\t\t\ttotal_size = total_mapping_size(elf_phdata,\n\t\t\t\t\t\t\tloc->elf_ex.e_phnum);\n\t\t\tif (!total_size) {\n\t\t\t\tretval = -EINVAL;\n\t\t\t\tgoto out_free_dentry;\n\t\t\t}",
+      "bug_class": "Out-of-bounds mapping / memory-region overlap for position-independent executables",
+      "cwe": "CWE-787",
+      "severity": "high",
+      "where_it_lives": "implementation (file not provided) — total_mapping_size() and elf_map()",
+      "invariant": "total_mapping_size() must compute the full page-aligned span from the minimum p_vaddr to the maximum p_vaddr+p_memsz across ALL PT_LOAD segments without overflow, and elf_map() must reserve that whole span so no later segment (or the stack/mmap base) can be placed inside the PIE image.",
+      "failure_mode": "A crafted ET_DYN binary with hostile first-segment p_vaddr and non-monotonic segment addresses historically let the mapped image overlap the process stack, corrupting it for local privilege escalation. This code carries the total_size reservation mitigation, so the residual risk is an incorrect or overflowing total_mapping_size (e.g. on crafted e_phnum/p_vaddr) that under-reserves the span.",
+      "cve_analog": "CVE-2017-1000253",
+      "what_to_confirm": "That total_mapping_size covers min..max of every PT_LOAD with no integer overflow on attacker e_phnum/p_vaddr/p_memsz, and that elf_map honors total_size as a contiguous reservation."
+    },
+    {
+      "title": "Unsigned wrap computing load_addr from p_vaddr - p_offset",
+      "anchor": "load_addr = (elf_ppnt->p_vaddr - elf_ppnt->p_offset)",
+      "file": "corpus/eval/eval_0002_cwe362.c",
+      "line": "276",
+      "code": "load_addr = (elf_ppnt->p_vaddr - elf_ppnt->p_offset);",
+      "bug_class": "Integer underflow producing a wild base address",
+      "cwe": "CWE-191",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided) — consumers of load_addr, e.g. create_elf_tables()",
+      "invariant": "For the first PT_LOAD, p_offset must be <= p_vaddr (the file-to-vaddr base must be non-negative), or a wrapped load_addr must be rejected before use.",
+      "failure_mode": "p_vaddr and p_offset are attacker-controlled unsigned longs; if p_offset > p_vaddr the subtraction wraps to ~0-scale, and load_addr (passed to create_elf_tables as the AT_PHDR/base for auxv) becomes bogus. The per-segment TASK_SIZE guard at 295-297 does not constrain this relationship, so the wrapped value flows downstream unchecked.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether any code dereferences or maps using load_addr directly, and whether the first-segment invariant p_offset<=p_vaddr is enforced anywhere before this line."
+    },
+    {
+      "title": "Program-header count (e_phnum) trusted across three walk loops",
+      "anchor": "for (i = 0; i < loc->elf_ex.e_phnum; i++) over elf_phdata",
+      "file": "corpus/eval/eval_0002_cwe362.c",
+      "line": "58, 116, 202-203",
+      "code": "for (i = 0; i < loc->elf_ex.e_phnum; i++) {\n\t\tif (elf_ppnt->p_type == PT_INTERP) {",
+      "bug_class": "Out-of-bounds read / count-times-size allocation overflow (latent in load_elf_phdrs)",
+      "cwe": "CWE-125",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided) — load_elf_phdrs()",
+      "invariant": "The elf_phdata array must contain exactly loc->elf_ex.e_phnum validated entries; load_elf_phdrs must bound e_phnum, compute e_phnum*sizeof(struct elf_phdr) without overflow, and read that many entries or fail.",
+      "failure_mode": "If load_elf_phdrs allocated fewer than e_phnum entries (or the size multiplication overflowed), each of the three loops here walks elf_ppnt past the allocation, reading attacker-influenced heap memory as p_type/p_flags/p_vaddr and driving mapping decisions from out-of-bounds data.",
+      "cve_analog": "",
+      "what_to_confirm": "That load_elf_phdrs caps e_phnum, guards the count*size multiplication, and returns NULL on any short read so these loops never exceed the allocated array."
+    },
+    {
+      "title": "Attacker-controlled interpreter entry offset folded into the initial IP",
+      "anchor": "elf_entry += loc->interp_elf_ex.e_entry; ... start_thread(regs, elf_entry, bprm->p)",
+      "file": "corpus/eval/eval_0002_cwe362.c",
+      "line": "350, 424",
+      "code": "elf_entry += loc->interp_elf_ex.e_entry;",
+      "bug_class": "Insufficient validation of a control-flow target",
+      "cwe": "CWE-20",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0002_cwe362.c",
+      "invariant": "The final elf_entry passed to start_thread must lie inside a mapped, executable page of the loaded image/interpreter, and the addition must not wrap below TASK_SIZE to slip past BAD_ADDR.",
+      "failure_mode": "interp_elf_ex.e_entry is read from the interpreter header; added to the relocation base it becomes the initial instruction pointer. The only gate is BAD_ADDR(elf_entry) at line 352 (rejects >= TASK_SIZE), which does not prove the target is mapped/executable; a crafted entry within range but outside any executable mapping yields an immediate fault rather than a memory-safety break, but relies wholly on BAD_ADDR for its bound.",
+      "cve_analog": "",
+      "what_to_confirm": "That BAD_ADDR plus the interpreter mapping fully constrain elf_entry to executable memory and that the e_entry addition cannot integer-wrap."
+    },
+    {
+      "title": "Un-rejectable failures after flush_old_exec kill the process",
+      "anchor": "retval = flush_old_exec(bprm)",
+      "file": "corpus/eval/eval_0002_cwe362.c",
+      "line": "176",
+      "code": "retval = flush_old_exec(bprm);\n\tif (retval)\n\t\tgoto out_free_dentry;",
+      "bug_class": "Ordering: validation after point-of-no-return (denial of service)",
+      "cwe": "CWE-20",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0002_cwe362.c",
+      "invariant": "Every condition that should reject the binary must be checked before flush_old_exec destroys the caller's old address space; nothing that can fail post-flush should have been checkable pre-flush.",
+      "failure_mode": "After line 176 the original program is gone, so failures at load_elf_interp, create_elf_tables, arch_setup_additional_pages, set_brk, or padzero (all goto out/out_free_dentry) cannot return an error to a live process — the task is SIGKILLed. A crafted ELF that passes pre-flush checks but fails a post-flush step forces guaranteed process death.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether any post-flush failure (bad interpreter segment, create_elf_tables) reflects a condition that could have been validated before flush_old_exec."
+    },
+    {
+      "title": "Binary-chosen executable stack / READ_IMPLIES_EXEC weakens W^X",
+      "anchor": "if (elf_read_implies_exec(loc->elf_ex, executable_stack)) current->personality |= READ_IMPLIES_EXEC;",
+      "file": "corpus/eval/eval_0002_cwe362.c",
+      "line": "119-122, 183-184",
+      "code": "if (elf_read_implies_exec(loc->elf_ex, executable_stack))\n\t\tcurrent->personality |= READ_IMPLIES_EXEC;",
+      "bug_class": "Attacker-influenced security-policy downgrade",
+      "cwe": "CWE-20",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0002_cwe362.c",
+      "invariant": "A PT_GNU_STACK-requested executable stack must remain subject to system policy (noexec mounts, LSM, seccomp) rather than being unconditionally honored, and READ_IMPLIES_EXEC must only apply where the platform ABI intends it.",
+      "failure_mode": "executable_stack is set purely from the binary's PT_GNU_STACK PF_X flag (lines 119-122); it then can enable READ_IMPLIES_EXEC, making readable mappings executable and defeating a core exploit mitigation entirely at the binary's discretion.",
+      "cve_analog": "",
+      "what_to_confirm": "That elf_read_implies_exec/executable-stack handling is gated by applicable LSM/mount/policy restrictions and not blindly trusted."
+    },
+    {
+      "title": "allow_write_access(interpreter) precedes its NULL guard in cleanup",
+      "anchor": "out_free_dentry: allow_write_access(interpreter); if (interpreter) fput(interpreter);",
+      "file": "corpus/eval/eval_0002_cwe362.c",
+      "line": "432-436",
+      "code": "out_free_dentry:\n\tkfree(interp_elf_phdata);\n\tallow_write_access(interpreter);\n\tif (interpreter)\n\t\tfput(interpreter);",
+      "bug_class": "Cleanup-path pointer hygiene",
+      "cwe": "CWE-476",
+      "severity": "info",
+      "where_it_lives": "corpus/eval/eval_0002_cwe362.c",
+      "invariant": "Every cleanup helper called on the multi-entry error ladder must tolerate the not-yet-initialized state: allow_write_access must be safe on the NULL interpreter (interpreter=NULL until line 88), and kfree(NULL) must be safe for interp_elf_phdata/elf_interpreter.",
+      "failure_mode": "out_free_dentry is reachable from gotos taken before interpreter is opened; allow_write_access(interpreter) runs before the if(interpreter) guard, so it must accept NULL. If it dereferences the file, an early-path failure would NULL-deref; the fput is guarded but the allow_write_access is not.",
+      "cve_analog": "",
+      "what_to_confirm": "That allow_write_access(NULL) is a safe no-op and that no label frees interp_elf_phdata/elf_interpreter after the success path already freed them."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm load_elf_interp maps the interpreter from the same struct file returned by open_exec (deny-write held) and never re-resolves elf_interpreter by name — close the validate-then-map TOCTOU window.",
+    "Verify total_mapping_size() spans min(p_vaddr)..max(p_vaddr+p_memsz) over all PT_LOAD with no integer overflow on crafted e_phnum/p_vaddr/p_memsz, and that elf_map reserves that whole region for ET_DYN.",
+    "Verify load_elf_phdrs caps e_phnum, guards the e_phnum*sizeof(struct elf_phdr) multiplication against overflow, and fails on short reads so the three e_phnum loops never exceed the allocation.",
+    "Check whether load_addr = p_vaddr - p_offset can wrap and whether any consumer (create_elf_tables/auxv) uses the wrapped value; enforce p_offset<=p_vaddr for the first PT_LOAD.",
+    "Confirm the final elf_entry passed to start_thread is constrained to a mapped executable page and that elf_entry += interp_elf_ex.e_entry cannot integer-wrap past BAD_ADDR.",
+    "Audit that no rejectable ELF condition is checked only after flush_old_exec (point of no return), to avoid attacker-forced process kills.",
+    "Confirm allow_write_access(NULL) is a safe no-op on the out_free_dentry early-entry path and that kfree(NULL) covers all cleanup-ladder frees with no double free.",
+    "Review whether PT_GNU_STACK executable-stack / READ_IMPLIES_EXEC honoring is subject to LSM/mount/seccomp policy rather than blindly trusted from the binary."
+  ]
+}

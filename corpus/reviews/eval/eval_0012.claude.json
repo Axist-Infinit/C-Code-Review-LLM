@@ -1,0 +1,174 @@
+{
+  "subsystem": "MongoDB server aggregation framework — ExpressionPow::evaluate, the implementation of the $pow aggregation-expression operator. It takes two operand sub-expressions (base and exponent), evaluates them against an input Document, coerces them to a numeric type, and returns base raised to the exponent as a BSON Value (Decimal128, double, long, or int depending on operand types and result magnitude).",
+  "provenance": "Identified from MongoDB-specific server types and idioms: Value / Document / BSONType, the uassert(code, msg, cond) assertion macro, str::stream(), typeName(), Decimal128 with .power()/.isZero()/.isNegative(), the BSON type enumerators NumberDecimal/NumberDouble/NumberLong, Value::coerceToDecimal()/coerceToDouble()/getLong(), Value::createIntOrLong(), and the vpOperand operand vector. This is src/mongo/db/pipeline/expression.cpp, class ExpressionPow. The in-file tag `sample: primevul_train_2761_vuln` and the file name (cwe835) are provenance-only labels and were not used to judge the code.",
+  "trust_boundary": "The two operands come from a client-supplied aggregation pipeline. A remote user issues an aggregate/find command whose BSON pipeline contains {$pow: [<base>, <exp>]}; the parser builds an expression tree and vpOperand[0]/vpOperand[1] evaluate to attacker-controlled Values. Therefore baseVal and expVal — and after coercion baseLong and expLong (line 132-133) — are fully hostile: the attacker chooses the numeric type (int/long/double/decimal), the base, and the exponent, including extreme magnitudes up to the 64-bit range. Only the numeric-type and non-(0,negative) checks gate the input before the integer power path runs.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/eval/eval_0012_cwe835.cpp",
+      "lines": "2-6",
+      "code": "Value ExpressionPow::evaluate(const Document& root) const {\n    Value baseVal = vpOperand[0]->evaluate(root);\n    Value expVal = vpOperand[1]->evaluate(root);\n    if (baseVal.nullish() || expVal.nullish())\n        return Value(BSONNULL);",
+      "explanation": "Entry point for the $pow operator. It recursively evaluates the two child expressions against the input document root, yielding the base and exponent Values. vpOperand is the operator's fixed operand vector (arity 2 is enforced at parse time). If either operand is nullish (BSON null or missing), $pow short-circuits and returns BSON null, matching MongoDB's null-propagation semantics. Both Values are attacker-controlled because the pipeline is user-supplied."
+    },
+    {
+      "file": "corpus/eval/eval_0012_cwe835.cpp",
+      "lines": "8-16",
+      "code": "    BSONType baseType = baseVal.getType();\n    BSONType expType = expVal.getType();\n\n    uassert(28762,\n            str::stream() << \"$pow's base must be numeric, not \" << typeName(baseType),\n            baseVal.numeric());\n    uassert(28763,\n            str::stream() << \"$pow's exponent must be numeric, not \" << typeName(expType),\n            expVal.numeric());",
+      "explanation": "Captures the concrete BSON types of the two operands, then enforces that both are numeric via uassert. uassert throws a user-facing error (does not crash the server) when the condition is false, so non-numeric inputs are rejected cleanly. After these gates, baseType/expType are known to be one of NumberDecimal, NumberDouble, NumberInt, or NumberLong. These are the only validation gates before the numeric computation begins — nothing here bounds the magnitude of the exponent."
+    },
+    {
+      "file": "corpus/eval/eval_0012_cwe835.cpp",
+      "lines": "18-20",
+      "code": "    auto checkNonZeroAndNeg = [](bool isZeroAndNeg) {\n        uassert(28764, \"$pow cannot take a base of 0 and a negative exponent\", !isZeroAndNeg);\n    };",
+      "explanation": "A helper lambda that raises a user error when its argument is true. It is used by each numeric branch to reject the mathematically undefined case pow(0, negative). It only guards the (base==0, exp<0) combination; it does not bound large positive exponents or the base==1/-1 cases that later drive the integer loop."
+    },
+    {
+      "file": "corpus/eval/eval_0012_cwe835.cpp",
+      "lines": "22-28",
+      "code": "    // If either argument is decimal, return a decimal.\n    if (baseType == NumberDecimal || expType == NumberDecimal) {\n        Decimal128 baseDecimal = baseVal.coerceToDecimal();\n        Decimal128 expDecimal = expVal.coerceToDecimal();\n        checkNonZeroAndNeg(baseDecimal.isZero() && expDecimal.isNegative());\n        return Value(baseDecimal.power(expDecimal));\n    }",
+      "explanation": "First dispatch branch: if either operand is a Decimal128, both are coerced to Decimal128 and the result is computed with Decimal128::power(). The 0^negative check runs first. Decimal128::power is a library routine with its own internal bounds, so this branch does not use the hand-rolled repeated-multiplication loop and is not part of the risky path."
+    },
+    {
+      "file": "corpus/eval/eval_0012_cwe835.cpp",
+      "lines": "30-38",
+      "code": "    // pow() will cast args to doubles.\n    double baseDouble = baseVal.coerceToDouble();\n    double expDouble = expVal.coerceToDouble();\n    checkNonZeroAndNeg(baseDouble == 0 && expDouble < 0);\n\n    // If either argument is a double, return a double.\n    if (baseType == NumberDouble || expType == NumberDouble) {\n        return Value(std::pow(baseDouble, expDouble));\n    }",
+      "explanation": "Second dispatch branch: the operands are coerced to double, the 0^negative check runs, and if either operand is a NumberDouble the result is computed with std::pow, which is O(1) and cannot loop. baseDouble/expDouble are also computed here for use in the integer path's fallback (line 139). Reaching past this point means both operands are integral BSON types (NumberInt or NumberLong)."
+    },
+    {
+      "file": "corpus/eval/eval_0012_cwe835.cpp",
+      "lines": "42-47",
+      "code": "    auto representableAsLong = [](long long base, long long exp) {\n        // If exp is greater than 63 and base is not -1, 0, or 1, the result will overflow.\n        // If exp is negative and the base is not -1 or 1, the result will be fractional.\n        if (exp < 0 || exp > 63) {\n            return std::abs(base) == 1 || base == 0;\n        }",
+      "explanation": "A predicate lambda deciding whether base^exp fits in a signed 64-bit long. Its first clause handles out-of-table exponents: for exp<0 or exp>63, the result fits in a long only when the base is -1, 0, or 1 (any other |base| either overflows for large exp or is fractional for negative exp). It returns true precisely for base in {-1,0,1}. Crucially, returning true here for a huge exp means the caller will fall through to the repeated-multiplication loop with that huge exp."
+    },
+    {
+      "file": "corpus/eval/eval_0012_cwe835.cpp",
+      "lines": "63-127",
+      "code": "        static const MinMax kBaseLimits[] = {\n            {std::numeric_limits<long long>::min(), std::numeric_limits<long long>::max()},  // 0\n            {std::numeric_limits<long long>::min(), std::numeric_limits<long long>::max()},\n            {-3037000499LL, 3037000499LL},\n            {-2097152, 2097151},\n            ...\n            {-2, 2},  // 60\n            {-2, 2},\n            {-2, 2},\n            {-2, 1}};",
+      "explanation": "For exponents in [0,63] (the in-range branch), a static 64-entry lookup table gives, per exponent, the minimum and maximum base whose power still fits in a signed 64-bit int. The table has exactly 64 rows (indices 0 through 63), matching the exponent range that reaches it. This precomputes the overflow limits so the code can decide long-representability without actually multiplying."
+    },
+    {
+      "file": "corpus/eval/eval_0012_cwe835.cpp",
+      "lines": "129-133",
+      "code": "        return base >= kBaseLimits[exp].min && base <= kBaseLimits[exp].max;\n    };\n\n    long long baseLong = baseVal.getLong();\n    long long expLong = expVal.getLong();",
+      "explanation": "In-range return: indexes kBaseLimits by exp and checks base against the per-exponent min/max. This index is safe because the earlier (exp<0||exp>63) branch already returned, so exp is guaranteed to be in [0,63] here. Then the actual integer operands are materialized: baseLong and expLong are read via getLong(), both fully attacker-controlled 64-bit values."
+    },
+    {
+      "file": "corpus/eval/eval_0012_cwe835.cpp",
+      "lines": "138-140",
+      "code": "    if (!representableAsLong(baseLong, expLong)) {\n        return Value(std::pow(baseLong, expLong));\n    }",
+      "explanation": "If the result cannot be represented as a long, fall back to the double std::pow (O(1)). Otherwise execution continues to the repeated-multiplication loop. Note the gating: to reach the loop, representableAsLong must have returned true — which for a large exp (>63) means base is exactly -1, 0, or 1."
+    },
+    {
+      "file": "corpus/eval/eval_0012_cwe835.cpp",
+      "lines": "142-147",
+      "code": "    long long result = 1;\n    // Use repeated multiplication, since pow() casts args to doubles which could result in loss of\n    // precision if arguments are very large.\n    for (int i = 0; i < expLong; i++) {\n        result *= baseLong;\n    }",
+      "explanation": "The exact-integer power is computed by multiplying baseLong into result expLong times, avoiding the precision loss of double casts. The loop counter i is declared as a 32-bit int, while the loop bound expLong is a 64-bit long long chosen by the attacker. This width mismatch is the core defect: i cannot represent values large enough to reach a large expLong."
+    },
+    {
+      "file": "corpus/eval/eval_0012_cwe835.cpp",
+      "lines": "149-152",
+      "code": "    if (baseType == NumberLong || expType == NumberLong) {\n        return Value(result);\n    }\n    return Value::createIntOrLong(result);",
+      "explanation": "Result typing: if either operand was a NumberLong, return a long Value; otherwise (both NumberInt) return an int if result fits, else a long, via createIntOrLong. This is post-processing of the computed result and is only reached after the loop terminates — which, per the finding below, it may never do."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/eval/eval_0012_cwe835.cpp",
+      "lines": "145-147",
+      "code": "    for (int i = 0; i < expLong; i++) {\n        result *= baseLong;\n    }",
+      "explanation": "Infinite loop / unbounded CPU (CWE-835). The counter i is a 32-bit int but the bound expLong is an attacker-controlled 64-bit long long. An attacker submits {$pow: [1, 5000000000]} (base 1, exponent ~5e9, which exceeds INT_MAX 2147483647). representableAsLong returns true for base 1 (line 46), so control reaches this loop with expLong = 5e9. i counts up to INT_MAX, and the next i++ is signed-integer overflow (UB) that in practice wraps to INT_MIN; because i is promoted to long long for the comparison, i < expLong stays true forever, so the loop never exits. The server thread spins at 100% CPU indefinitely, holding the operation and its resources — a remote, low-effort denial of service triggerable by any client permitted to run an aggregation. The invariant the implementation must uphold: the loop bound (exp) must be validated to fit the counter type (or the counter must be long long AND exp capped), so the loop is guaranteed to terminate for every accepted exponent. Note base -1 behaves identically (result just alternates), and base 0 yields result 0 but still loops."
+    },
+    {
+      "file": "corpus/eval/eval_0012_cwe835.cpp",
+      "lines": "45-47",
+      "code": "        if (exp < 0 || exp > 63) {\n            return std::abs(base) == 1 || base == 0;\n        }",
+      "explanation": "This is the enabling gate for the loop hang. By returning true for base in {-1,0,1} regardless of how large exp is, it deliberately routes those bases into the repeated-multiplication path with an unbounded exponent instead of the O(1) std::pow fallback. The intent is correctness (the result 1/0 is trivially representable as a long), but the consequence is that the only inputs that pass through here are exactly the ones that make the line 145 loop run exp times with no magnitude cap. Any fix must ensure that when exp exceeds the loop counter's range, the code takes a bounded path (e.g. compute 1/0/±1 directly, or use std::pow) rather than looping exp times."
+    },
+    {
+      "file": "corpus/eval/eval_0012_cwe835.cpp",
+      "lines": "145-145",
+      "code": "    for (int i = 0; i < expLong; i++) {",
+      "explanation": "Signed integer overflow (CWE-190, undefined behavior) is the concrete mechanism by which the loop fails to terminate. When expLong > INT_MAX, i eventually equals INT_MAX and i++ overflows a signed int, which is UB in C++. A compiler is entitled to assume this never happens and may optimize the loop in surprising ways; in the common wrap-around realization i becomes negative and the exit condition can never be satisfied. Even setting the infinite-loop case aside, for 63 < exp <= INT_MAX the loop still executes up to ~2.1 billion iterations, a large but finite CPU sink (excessive iteration). The counter must be widened to long long and the bound capped so overflow cannot occur."
+    },
+    {
+      "file": "corpus/eval/eval_0012_cwe835.cpp",
+      "lines": "46-46",
+      "code": "            return std::abs(base) == 1 || base == 0;",
+      "explanation": "Undefined behavior in std::abs on LLONG_MIN (CWE-190). base is an attacker-controlled long long; if base == std::numeric_limits<long long>::min() and exp is <0 or >63, std::abs(base) is evaluated on a value whose negation is not representable, which is undefined behavior for the integral std::abs. The comparison result (==1) would be false anyway, but the UB itself is a latent defect. The implementation should compare against magnitudes safely (e.g. base == 1 || base == -1 || base == 0) rather than calling std::abs on an unbounded signed input."
+    }
+  ],
+  "summary": "The $pow integer path contains a remotely triggerable denial of service (CWE-835): the repeated-multiplication loop at line 145 uses a 32-bit int counter against an attacker-controlled 64-bit exponent, and representableAsLong deliberately routes bases -1/0/1 with arbitrarily large exponents into that loop. An input like {$pow: [1, 5000000000]} makes the counter overflow and the loop never terminate, spinning a server thread at 100% CPU indefinitely. A secondary UB (std::abs on LLONG_MIN) is present but low-impact.",
+  "reviewed_anchors": [
+    {"anchor": "ExpressionPow::evaluate(const Document& root) const — function signature", "disposition": "dismissed", "reason": "Signature itself is safe; risk is in the body's integer loop, covered by the loop finding."},
+    {"anchor": "vpOperand[0] / vpOperand[1] operand access (lines 3-4)", "disposition": "dismissed", "reason": "Arity 2 is enforced at parse time; no out-of-bounds operand access in the shown code."},
+    {"anchor": "nullish() short-circuit + Value(BSONNULL) (lines 5-6)", "disposition": "dismissed", "reason": "Correct null propagation; no unsafe path."},
+    {"anchor": "uassert 28762 / 28763 numeric gates (lines 11-16)", "disposition": "dismissed", "reason": "Validation gate that rejects non-numeric operands cleanly via user error; no crash."},
+    {"anchor": "checkNonZeroAndNeg lambda + uassert 28764 (lines 18-20)", "disposition": "dismissed", "reason": "Correctly rejects 0^negative; does not itself introduce a bound violation."},
+    {"anchor": "Decimal branch: Decimal128::power (lines 23-27)", "disposition": "dismissed", "reason": "Delegates to Decimal128::power, an O(1) library routine with internal bounds; not the loop path."},
+    {"anchor": "Double branch: std::pow(baseDouble, expDouble) (lines 31-37)", "disposition": "dismissed", "reason": "O(1) library call; cannot loop or overflow a buffer."},
+    {"anchor": "representableAsLong lambda (lines 42-130)", "disposition": "finding", "reason": "Its exp<0||exp>63 clause returns true for base -1/0/1, routing unbounded exponents into the loop; and std::abs(base) is UB on LLONG_MIN."},
+    {"anchor": "std::abs(base) == 1 (line 46)", "disposition": "finding", "reason": "Undefined behavior when base == LLONG_MIN (CWE-190)."},
+    {"anchor": "static const MinMax kBaseLimits[] — 64-entry table (lines 63-127)", "disposition": "dismissed", "reason": "Table has exactly 64 rows matching exponents 0-63; correctly sized."},
+    {"anchor": "kBaseLimits[exp] index (line 129)", "disposition": "dismissed", "reason": "Index is bounded to [0,63] because the exp<0||exp>63 branch already returned; no OOB read."},
+    {"anchor": "baseLong = getLong() / expLong = getLong() (lines 132-133)", "disposition": "finding", "reason": "expLong is attacker-controlled and used as the 64-bit loop bound that overflows the 32-bit counter."},
+    {"anchor": "representableAsLong fallback to std::pow (lines 138-140)", "disposition": "dismissed", "reason": "Safe O(1) fallback; the danger is that the true branch bypasses it for base -1/0/1."},
+    {"anchor": "for (int i = 0; i < expLong; i++) { result *= baseLong; } (lines 145-147)", "disposition": "finding", "reason": "Primary defect: 32-bit counter vs 64-bit attacker-controlled bound -> non-terminating loop (CWE-835) and signed overflow (CWE-190)."},
+    {"anchor": "result *= baseLong (line 146)", "disposition": "dismissed", "reason": "For the values that reach the loop (base -1/0/1), |result| stays <=1, so no arithmetic overflow of result; the in-range table already bounds other cases."},
+    {"anchor": "return typing: Value(result) / Value::createIntOrLong(result) (lines 149-152)", "disposition": "dismissed", "reason": "Post-loop result typing only; reached only after loop terminates, no unsafe conversion."}
+  ],
+  "findings": [
+    {
+      "title": "Non-terminating $pow loop: 32-bit counter vs attacker-controlled 64-bit exponent",
+      "anchor": "for (int i = 0; i < expLong; i++)",
+      "file": "corpus/eval/eval_0012_cwe835.cpp",
+      "line": "145-147",
+      "code": "    for (int i = 0; i < expLong; i++) {\n        result *= baseLong;\n    }",
+      "bug_class": "Loop with unreachable exit condition (infinite loop / uncontrolled resource consumption)",
+      "cwe": "CWE-835",
+      "severity": "high",
+      "where_it_lives": "corpus/eval/eval_0012_cwe835.cpp",
+      "invariant": "The loop bound (the exponent) must be validated to fit within the loop counter's representable range, or the counter must be a 64-bit type AND the exponent capped, so that i < expLong is guaranteed to become false and the loop always terminates.",
+      "failure_mode": "A remote client submits an aggregation with two integer operands where base is 1 (or -1 or 0) and exp exceeds INT_MAX, e.g. {$pow: [1, 5000000000]}. representableAsLong returns true (line 46), so control reaches this loop with expLong ~5e9. The int counter i counts to INT_MAX; the next increment is signed overflow that wraps to a negative value, so the promoted comparison i < expLong is perpetually true and the loop never exits. One server worker thread spins at 100% CPU indefinitely, tying up the operation and its locks/resources — a low-effort remote denial of service. Even for 63 < exp <= INT_MAX the loop runs up to ~2.1 billion iterations (heavy CPU) before terminating.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm i is a 32-bit int and expLong is a 64-bit value derived directly from the user-supplied exponent, that no cap on exp is applied before this loop, and that base 1/-1/0 with exp>63 actually reach here (representableAsLong true branch)."
+    },
+    {
+      "title": "representableAsLong routes unbounded exponents for base -1/0/1 into the loop",
+      "anchor": "if (exp < 0 || exp > 63) { return std::abs(base) == 1 || base == 0; }",
+      "file": "corpus/eval/eval_0012_cwe835.cpp",
+      "line": "45-47",
+      "code": "        if (exp < 0 || exp > 63) {\n            return std::abs(base) == 1 || base == 0;\n        }",
+      "bug_class": "Missing magnitude bound enabling excessive/infinite iteration",
+      "cwe": "CWE-834",
+      "severity": "medium",
+      "where_it_lives": "corpus/eval/eval_0012_cwe835.cpp",
+      "invariant": "When the result is trivially representable (base in {-1,0,1}) but exp exceeds the safe iteration range, the code must compute the result in O(1) or take the std::pow fallback rather than reporting representableAsLong=true and looping exp times.",
+      "failure_mode": "This gate returns true for base in {-1,0,1} for ANY exp, including exp far larger than the loop counter can count to. Because a true return bypasses the O(1) std::pow fallback at line 139, these exact inputs are the ones funneled into the line-145 loop with an unbounded bound — directly enabling the CWE-835 hang. The result for these bases (1, 0, or ±1) could be computed with no loop at all.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify that base 1/-1/0 with a huge exp returns true here and that no separate short-circuit computes the result directly, forcing the repeated-multiplication loop."
+    },
+    {
+      "title": "Undefined behavior: std::abs on LLONG_MIN",
+      "anchor": "return std::abs(base) == 1 || base == 0;",
+      "file": "corpus/eval/eval_0012_cwe835.cpp",
+      "line": "46",
+      "code": "            return std::abs(base) == 1 || base == 0;",
+      "bug_class": "Integer overflow / undefined behavior (negation of INT/LLONG minimum)",
+      "cwe": "CWE-190",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0012_cwe835.cpp",
+      "invariant": "Magnitude comparisons on attacker-controlled signed integers must not call std::abs on a value whose negation is unrepresentable; test base == 1 || base == -1 || base == 0 directly instead.",
+      "failure_mode": "If base == std::numeric_limits<long long>::min() and exp is <0 or >63, std::abs(base) is undefined behavior because -LLONG_MIN is not representable. The comparison would be false regardless, but the UB is a latent defect that a compiler may exploit unpredictably.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the integral overload of std::abs is used on a long long that can equal LLONG_MIN and that no prior guard excludes that value."
+    }
+  ],
+  "audit_checklist": [
+    "Change the loop counter at line 145 to a 64-bit type (long long) so it can represent expLong, and cap the exponent before looping.",
+    "Ensure that base in {-1,0,1} with exp>63 (or exp negative) computes 1/0/±1 directly or via std::pow rather than entering the repeated-multiplication loop.",
+    "Verify there is an upper bound on the number of loop iterations for any accepted $pow input (no unbounded CPU on a single operation).",
+    "Replace std::abs(base) with explicit base == 1 || base == -1 || base == 0 to avoid UB on LLONG_MIN.",
+    "Confirm kBaseLimits is only indexed when exp is in [0,63] and the table has exactly 64 entries (it does) — no OOB read.",
+    "Add a regression test for {$pow: [1, N]} with N > INT_MAX to prove the operation terminates promptly.",
+    "Check that result *= baseLong cannot overflow for any input that reaches the loop (it holds because only base -1/0/1 with exp>63 arrive there)."
+  ]
+}

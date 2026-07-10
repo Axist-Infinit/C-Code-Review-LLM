@@ -1,0 +1,226 @@
+{
+  "subsystem": "libgcrypt CSPRNG entropy-pool mixing. This is mix_pool(), the core one-way transform of the standard (non-DRBG) random pool in random-csprng.c (historically random.c). It runs the pool through SHA-1 in overlapping BLOCKLEN-sized blocks so that after fresh entropy is stirred in, every byte of the pool depends on every other byte, and the extracted random bytes cannot be trivially inverted back to prior state.",
+  "provenance": "Identified from the libgcrypt-internal symbol namespace: gcry_assert, _gcry_sha1_mixblock_init, _gcry_sha1_mixblock, _gcry_sha1_hash_buffer, _gcry_burn_stack, the SHA1_CONTEXT typedef, and the global rndpool plus the pool geometry macros POOLSIZE/POOLBLOCKS/DIGESTLEN/BLOCKLEN. The DIGESTLEN==20 compile guard and the '#error must have a digest length of 20 for SHA-1' pin it to the SHA-1-based pool. The header comment 'sample: primevul_c_train_3084_vuln' is an out-of-band label and is ignored for the blind review.",
+  "trust_boundary": "mix_pool is an internal primitive: its single argument 'pool' is not directly attacker-controlled wire data — it is a static, pool_is_locked-protected buffer (rndpool) whose contents are a mix of prior state and gathered entropy. The security-relevant boundary is therefore twofold: (1) an OUTPUT boundary — bytes drawn from this pool are handed to callers/attackers as key material, so any predictability or state leakage in the mixing is a confidentiality problem; and (2) an internal CONTRACT boundary — hashbuf is aliased BLOCKLEN bytes past the end of 'pool', so the safety of every write depends on the caller having over-allocated the buffer, and on the pool geometry macros holding the assumed relationships (BLOCKLEN>DIGESTLEN, DIGESTLEN==20). The macros and the allocation of rndpool are not shown, so those are latent contracts.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0155_cwe200.c",
+      "lines": "1-3",
+      "code": "/* sample: primevul_c_train_3084_vuln */\nmix_pool(unsigned char *pool)\n{",
+      "explanation": "The function header for mix_pool. Note the return type is absent in the shown text (in upstream libgcrypt it is 'static void mix_pool'); the only parameter is 'unsigned char *pool', a pointer to the byte buffer to be stirred. The caller passes the global rndpool (or a transient help buffer). The leading comment is an external sample label, not part of the program, and carries no runtime meaning."
+    },
+    {
+      "file": "corpus/train/train_0155_cwe200.c",
+      "lines": "4-11",
+      "code": "  static unsigned char failsafe_digest[DIGESTLEN];\n  static int failsafe_digest_valid;\n\n  unsigned char *hashbuf = pool + POOLSIZE;\n  unsigned char *p, *pend;\n  int i, n;\n  SHA1_CONTEXT md;\n  unsigned int nburn;",
+      "explanation": "Declarations. failsafe_digest is a DIGESTLEN(=20)-byte STATIC buffer that persists across calls and holds a SHA-1 hash of the pool from a previous invocation; failsafe_digest_valid is a static flag saying whether it has been populated. hashbuf is a scratch pointer set to pool+POOLSIZE — i.e. it points just PAST the logical POOLSIZE bytes of the pool, into extra allocation that the caller is expected to have reserved; it is used as a BLOCKLEN-byte SHA-1 input block. p walks the pool; pend marks its end. i and n are loop counters. md is the SHA-1 working context. nburn receives the number of stack bytes SHA-1 used, for later scrubbing."
+    },
+    {
+      "file": "corpus/train/train_0155_cwe200.c",
+      "lines": "13-15",
+      "code": "#if DIGESTLEN != 20\n#error must have a digest length of 20 for SHA-1\n#endif",
+      "explanation": "A compile-time assertion that DIGESTLEN is exactly 20, the SHA-1 output size. The mixing hard-codes SHA-1 (via _gcry_sha1_mixblock), so this guard prevents building with a mismatched digest constant. It does NOT constrain BLOCKLEN, POOLSIZE, or POOLBLOCKS."
+    },
+    {
+      "file": "corpus/train/train_0155_cwe200.c",
+      "lines": "17-18",
+      "code": "  gcry_assert (pool_is_locked);\n  _gcry_sha1_mixblock_init (&md);",
+      "explanation": "gcry_assert(pool_is_locked) asserts the global pool mutex is held before touching shared state — this is the sole concurrency guard visible here. _gcry_sha1_mixblock_init initializes the SHA-1 context 'md' to its standard IV so the subsequent mixblock calls compress from a known start."
+    },
+    {
+      "file": "corpus/train/train_0155_cwe200.c",
+      "lines": "20-25",
+      "code": "  /* Loop over the pool.  */\n  pend = pool + POOLSIZE;\n  memcpy (hashbuf, pend - DIGESTLEN, DIGESTLEN );\n  memcpy (hashbuf+DIGESTLEN, pool, BLOCKLEN-DIGESTLEN);\n  nburn = _gcry_sha1_mixblock (&md, hashbuf);\n  memcpy (pool, hashbuf, DIGESTLEN);",
+      "explanation": "The seam/first mixing block. pend is set to the end of the logical pool. hashbuf is assembled as a full SHA-1 input block of BLOCKLEN bytes: its first DIGESTLEN(20) bytes are copied from the LAST 20 bytes of the pool (pend-DIGESTLEN), and the remaining BLOCKLEN-DIGESTLEN(=44) bytes are copied from the FRONT of the pool. This overlap deliberately couples the pool's tail to its head. _gcry_sha1_mixblock runs one SHA-1 compression over hashbuf and returns nburn. The resulting first 20 bytes of hashbuf are written back over pool[0..DIGESTLEN), advancing the running chained hash into the pool."
+    },
+    {
+      "file": "corpus/train/train_0155_cwe200.c",
+      "lines": "27-31",
+      "code": "  if (failsafe_digest_valid && pool == rndpool)\n    {\n      for (i=0; i < DIGESTLEN; i++)\n        pool[i] ^= failsafe_digest[i];\n    }",
+      "explanation": "Only when operating on the canonical rndpool and a prior failsafe digest exists, the first DIGESTLEN bytes just written are XORed with the stored failsafe_digest. This folds a hash of the previous pool generation into the new one so that even if the current entropy gathering is weak, the pool still depends on prior (unpredictable) state. It is a defense against a specific state-recovery/predictability weakness in this RNG family."
+    },
+    {
+      "file": "corpus/train/train_0155_cwe200.c",
+      "lines": "33-40",
+      "code": "  p = pool;\n  for (n=1; n < POOLBLOCKS; n++)\n    {\n      memcpy (hashbuf, p, DIGESTLEN);\n\n      p += DIGESTLEN;\n      if (p+DIGESTLEN+BLOCKLEN < pend)\n        memcpy (hashbuf+DIGESTLEN, p+DIGESTLEN, BLOCKLEN-DIGESTLEN);",
+      "explanation": "The main mixing loop iterates POOLBLOCKS-1 times, chaining SHA-1 across the whole pool. Each iteration copies DIGESTLEN bytes at the current position p into hashbuf[0..20) (this carries forward the digest of the previous block), then advances p by DIGESTLEN. The in-bounds fast path: if there is room (p+DIGESTLEN+BLOCKLEN < pend), it fills the rest of the block hashbuf[20..BLOCKLEN) by copying BLOCKLEN-DIGESTLEN(=44) bytes straight from p+DIGESTLEN. The guard is deliberately conservative — the actual read ends at p+BLOCKLEN, well short of the checked p+DIGESTLEN+BLOCKLEN — so the fast path cannot over-read the pool."
+    },
+    {
+      "file": "corpus/train/train_0155_cwe200.c",
+      "lines": "41-55",
+      "code": "      else\n        {\n          unsigned char *pp = p + DIGESTLEN;\n\n          for (i=DIGESTLEN; i < BLOCKLEN; i++ )\n            {\n              if ( pp >= pend )\n                pp = pool;\n              hashbuf[i] = *pp++;\n\t    }\n\t}\n\n      _gcry_sha1_mixblock (&md, hashbuf);\n      memcpy(p, hashbuf, DIGESTLEN);",
+      "explanation": "The wrap-around slow path for blocks near the pool tail. When the straight copy would run past pend, it fills hashbuf[DIGESTLEN..BLOCKLEN) byte-by-byte from pp starting at p+DIGESTLEN, and whenever pp reaches pend it wraps back to the pool start (pp=pool). This makes the mixing circular so the last blocks still depend on the front of the pool, and importantly it keeps every read in-bounds (the pp>=pend check runs before each dereference). After the block is assembled, _gcry_sha1_mixblock compresses it and the leading DIGESTLEN bytes are written back over pool at p, extending the chained one-way transform through the pool."
+    },
+    {
+      "file": "corpus/train/train_0155_cwe200.c",
+      "lines": "57-65",
+      "code": "  /* Our hash implementation does only leave small parts (64 bytes)\n     of the pool on the stack, so it is okay not to require secure\n     memory here.  Before we use this pool, it will be copied to the\n     help buffer anyway. */\n  if ( pool == rndpool)\n    {\n      _gcry_sha1_hash_buffer (failsafe_digest, pool, POOLSIZE);\n      failsafe_digest_valid = 1;\n    }",
+      "explanation": "After mixing, when working on the canonical rndpool, a fresh SHA-1 over the whole POOLSIZE pool is stored into the static failsafe_digest and the valid flag is set, so the NEXT mix_pool call can fold in this generation's hash (lines 27-31). The comment rationalizes not using secure (mlock'd, auto-wiped) memory for the scratch, claiming only ~64 bytes of pool ever sit on the stack. Per the review rules this in-code justification is untrusted narrative, not a guarantee: failsafe_digest is static, not stack, and is a digest OF the secret pool."
+    },
+    {
+      "file": "corpus/train/train_0155_cwe200.c",
+      "lines": "67-68",
+      "code": "  _gcry_burn_stack (nburn);\n}",
+      "explanation": "_gcry_burn_stack(nburn) overwrites nburn bytes of stack that the SHA-1 compressions used, to erase any residual pool-derived material left in stack frames, then the function returns. nburn was captured from the first _gcry_sha1_mixblock call; the loop's mixblock calls (line 53) discard their return value, so the burn depth is assumed identical across calls."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0155_cwe200.c",
+      "lines": "7",
+      "code": "  unsigned char *hashbuf = pool + POOLSIZE;",
+      "explanation": "hashbuf aliases the region STARTING at the end of the logical pool and is used as a full SHA-1 input block: line 22 writes hashbuf[0..DIGESTLEN), line 23 writes hashbuf[DIGESTLEN..BLOCKLEN), and lines 40/49 write up to hashbuf[BLOCKLEN-1]. The highest byte touched is pool[POOLSIZE + BLOCKLEN - 1]. This is an unguarded CONTRACT: the buffer passed as 'pool' MUST be allocated with at least POOLSIZE+BLOCKLEN bytes. In upstream libgcrypt rndpool is over-allocated exactly for this, but the invariant is invisible at this call site and there is no assert on it. If mix_pool is ever invoked on a buffer sized to POOLSIZE only (a refactor, a different caller, or the transient 'help buffer' the comment mentions), lines 22-54 perform an out-of-bounds WRITE of up to BLOCKLEN bytes past the allocation — memory corruption of adjacent (possibly secret) data. The implementation must guarantee every 'pool' argument carries BLOCKLEN bytes of trailing scratch."
+    },
+    {
+      "file": "corpus/train/train_0155_cwe200.c",
+      "lines": "25",
+      "code": "  memcpy (pool, hashbuf, DIGESTLEN);",
+      "explanation": "State-recovery / output-predictability of the CSPRNG (the labeled confidentiality concern). mix_pool is the ONLY one-way barrier between the pool's internal state and the bytes handed to callers. If the mixing does not make each output block depend unpredictably on unknown state — for example if extraction consumes the same bytes this function writes back at pool[0] (line 25) and at each p (line 54) without an additional stir before hand-out — an attacker who observes enough RNG output can reconstruct pool bytes and predict subsequent output. This is exactly the documented libgcrypt/GnuPG pool-mixing weakness: knowledge of prior output leaks ~160 bits of the generator's state. The failsafe_digest fold (lines 27-31, 61-65) is the mitigation for this class; its presence is direct evidence the authors were defending this contract. The implementation must ensure the pool is re-mixed after extraction and that no raw post-mix block is emitted without a further one-way step."
+    },
+    {
+      "file": "corpus/train/train_0155_cwe200.c",
+      "lines": "23",
+      "code": "  memcpy (hashbuf+DIGESTLEN, pool, BLOCKLEN-DIGESTLEN);",
+      "explanation": "The copy length BLOCKLEN-DIGESTLEN is an unsigned expression computed from two external macros. The only compile guard is DIGESTLEN==20 (lines 13-15); there is NO guard that BLOCKLEN > DIGESTLEN. If a future port or misconfiguration set BLOCKLEN < DIGESTLEN (or defined BLOCKLEN as a signed/smaller type), BLOCKLEN-DIGESTLEN wraps to a huge size_t and this memcpy — and the identical arithmetic at lines 40 and 45 — becomes a gigantic out-of-bounds read/write. For SHA-1 BLOCKLEN is 64 so today it is safe, but the invariant BLOCKLEN>DIGESTLEN is assumed, never asserted. The implementation should add a static assertion BLOCKLEN>DIGESTLEN alongside the existing DIGESTLEN check."
+    },
+    {
+      "file": "corpus/train/train_0155_cwe200.c",
+      "lines": "4",
+      "code": "  static unsigned char failsafe_digest[DIGESTLEN];",
+      "explanation": "failsafe_digest is a STATIC (process-lifetime) buffer holding a SHA-1 digest of the entire secret pool (written at line 63). It lives in ordinary, non-secure memory: it is never mlock'd against swap and is never wiped by _gcry_burn_stack (which only scrubs stack, line 67). A SHA-1 of the pool is not the pool, but it is derived secret material that can survive in a core dump or be paged to disk, weakening the same confidentiality property the surrounding secure-memory discipline tries to protect. The comment at lines 57-60 only justifies the stack scratch, not this persistent static. The implementation should treat failsafe_digest as sensitive (secure memory / explicit wipe) or document why the digest is non-sensitive."
+    },
+    {
+      "file": "corpus/train/train_0155_cwe200.c",
+      "lines": "17",
+      "code": "  gcry_assert (pool_is_locked);",
+      "explanation": "The only enforcement that the caller holds the pool lock before mix_pool mutates the shared rndpool and the shared static failsafe_digest is this assert. If gcry_assert is compiled to a no-op (release/NDEBUG-style build) and any caller path reaches mix_pool without the lock, two threads can mix or extract the pool concurrently, producing torn writes, duplicated/predictable output, and a data race on failsafe_digest_valid. The invariant to confirm is that the lock is enforced by construction on every call path, independent of whether asserts are active."
+    },
+    {
+      "file": "corpus/train/train_0155_cwe200.c",
+      "lines": "24-67",
+      "code": "  nburn = _gcry_sha1_mixblock (&md, hashbuf);",
+      "explanation": "nburn is captured only from the FIRST mixblock call; the loop calls at line 53 ignore their return values, and _gcry_burn_stack(nburn) at line 67 scrubs only that many stack bytes. This assumes every _gcry_sha1_mixblock invocation uses an identical stack depth. If a later block's compression used a deeper frame (it will not for a fixed SHA-1 impl, but the code relies on it), residual pool-derived bytes past nburn would be left un-scrubbed on the stack — a minor information-retention hazard. Confirm that mixblock stack usage is constant so a single nburn is a sound burn depth."
+    }
+  ],
+  "summary": "mix_pool is libgcrypt's SHA-1 entropy-pool stir and is memory-safe as written under its intended contract: the read paths are correctly bounded (the wrap-around loop guards every dereference, the fast path is conservatively bounded). The real risks are latent contracts the header/impl must uphold: hashbuf writes BLOCKLEN bytes past the logical pool and depends entirely on the caller over-allocating rndpool (out-of-bounds write if violated, CWE-787), and the mixing is the sole confidentiality barrier for CSPRNG output, matching the known libgcrypt pool-predictability/state-leak issue (CWE-200 / CVE-2016-6313). Secondary hardening gaps: no BLOCKLEN>DIGESTLEN compile guard, a secret-derived static digest in non-secure memory, and an assert-only lock guard.",
+  "reviewed_anchors": [
+    {"anchor": "mix_pool(unsigned char *pool) signature (line 2)", "disposition": "finding", "reason": "Sole input; safety of all writes hinges on pool being over-allocated by BLOCKLEN — a latent OOB-write contract."},
+    {"anchor": "hashbuf = pool + POOLSIZE (line 7)", "disposition": "finding", "reason": "Scratch block aliased past the logical pool; writes up to pool[POOLSIZE+BLOCKLEN-1]."},
+    {"anchor": "static failsafe_digest[DIGESTLEN] (line 4)", "disposition": "finding", "reason": "Persistent static holding a hash of the secret pool in non-secure, never-wiped memory."},
+    {"anchor": "static failsafe_digest_valid (line 5)", "disposition": "dismissed", "reason": "Boolean flag; only concern is the shared-state race already covered by the lock-assert finding."},
+    {"anchor": "DIGESTLEN constant (used lines 4,13,22,23,25,29,36,38,40,43,45,49,54)", "disposition": "dismissed", "reason": "Pinned to 20 by the #if guard; no unbounded arithmetic on its own."},
+    {"anchor": "POOLSIZE constant (lines 7,21,63)", "disposition": "dismissed", "reason": "Defines pool extent used consistently; not attacker-controlled and read paths respect pend."},
+    {"anchor": "BLOCKLEN constant / BLOCKLEN-DIGESTLEN (lines 23,39,40,45)", "disposition": "finding", "reason": "Unsigned subtraction with no BLOCKLEN>DIGESTLEN compile guard; underflows to huge memcpy size if misconfigured."},
+    {"anchor": "POOLBLOCKS constant (line 34)", "disposition": "dismissed", "reason": "Loop bound; iteration count only, read/write positions independently bounded by pend/wrap."},
+    {"anchor": "rndpool global (lines 27,61)", "disposition": "dismissed", "reason": "Identity check selecting canonical-pool-only behavior; no direct memory hazard at these sites."},
+    {"anchor": "pool_is_locked / gcry_assert (line 17)", "disposition": "finding", "reason": "Assert-only concurrency guard; no-op under NDEBUG leaves the shared pool race-exposed."},
+    {"anchor": "#if DIGESTLEN != 20 / #error (lines 13-15)", "disposition": "dismissed", "reason": "Correct compile-time guard; its gap (missing BLOCKLEN check) is captured as a separate finding."},
+    {"anchor": "First-block memcpy pair (lines 22-23)", "disposition": "dismissed", "reason": "Reads last 20 and first 44 bytes of pool — in-bounds; write target is the hashbuf-contract finding."},
+    {"anchor": "Fast-path guard p+DIGESTLEN+BLOCKLEN < pend (lines 39-40)", "disposition": "dismissed", "reason": "Conservative: actual read ends at p+BLOCKLEN < checked bound, so no over-read."},
+    {"anchor": "Wrap-around else loop (lines 43-51)", "disposition": "dismissed", "reason": "pp>=pend check precedes every dereference and wraps to pool; all reads in-bounds."},
+    {"anchor": "memcpy(pool,hashbuf,DIGESTLEN) / memcpy(p,hashbuf,DIGESTLEN) writeback (lines 25,54)", "disposition": "finding", "reason": "Post-mix bytes written back are the CSPRNG's one-way barrier; predictability/state-leak surface."},
+    {"anchor": "nburn / _gcry_burn_stack (lines 11,24,67)", "disposition": "finding", "reason": "Single burn depth captured from first mixblock only; assumes constant SHA-1 stack usage."},
+    {"anchor": "SHA1_CONTEXT md (line 10) + _gcry_sha1_mixblock_init/_mixblock (lines 18,24,53)", "disposition": "dismissed", "reason": "Opaque SHA-1 context; no buffer/length exposed here to attack."}
+  ],
+  "findings": [
+    {
+      "title": "hashbuf scratch block written BLOCKLEN bytes past the logical pool — relies on unasserted over-allocation",
+      "anchor": "unsigned char *hashbuf = pool + POOLSIZE;",
+      "file": "corpus/train/train_0155_cwe200.c",
+      "line": "7",
+      "code": "unsigned char *hashbuf = pool + POOLSIZE;",
+      "bug_class": "Out-of-bounds write (buffer-end scratch aliasing, unenforced allocation contract)",
+      "cwe": "CWE-787",
+      "severity": "high",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "Every buffer passed as 'pool' must be allocated with at least POOLSIZE + BLOCKLEN bytes, because hashbuf=pool+POOLSIZE is written as a full BLOCKLEN-byte SHA-1 block (highest byte pool[POOLSIZE+BLOCKLEN-1]) at lines 22-23, 40 and 49.",
+      "failure_mode": "If mix_pool is ever called on a buffer sized to only POOLSIZE (a new caller, a refactor, or the 'help buffer' the comment mentions), the memcpys through hashbuf overflow the allocation by up to BLOCKLEN bytes, corrupting adjacent — potentially secret — heap/BSS memory. There is no runtime check tying 'pool' to the required over-allocation, so the safety is invisible at the call boundary.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm rndpool and every other argument ever passed to mix_pool are allocated with POOLSIZE+BLOCKLEN bytes, and add a static/asserted guarantee of the trailing scratch size."
+    },
+    {
+      "title": "CSPRNG output predictability / internal-state leakage across the mixing barrier",
+      "anchor": "memcpy (pool, hashbuf, DIGESTLEN);",
+      "file": "corpus/train/train_0155_cwe200.c",
+      "line": "25",
+      "code": "memcpy (pool, hashbuf, DIGESTLEN);",
+      "bug_class": "Information exposure via predictable CSPRNG state (weak/one-way mixing before output)",
+      "cwe": "CWE-200",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "The pool must be re-mixed after extraction and no post-mix block may be emitted to a caller without a further one-way transform, so that observing RNG output cannot reveal the pool bytes written back at pool[0] (line 25) and at each p (line 54).",
+      "failure_mode": "mix_pool is the only one-way barrier between pool state and emitted key material. If extraction hands out bytes derived from the same positions this function writes back without an extra stir, an attacker who collects enough output can reconstruct pool state and predict subsequent output (the documented libgcrypt/GnuPG ~160-bit prediction weakness). The failsafe_digest fold (lines 27-31, 61-65) is the authors' mitigation for exactly this class, confirming the contract is real.",
+      "cve_analog": "CVE-2016-6313",
+      "what_to_confirm": "Verify the extraction path re-mixes the pool before/after handing out bytes and never returns a raw post-mix block, and that the failsafe_digest fold is actually reached on the rndpool path."
+    },
+    {
+      "title": "failsafe_digest: hash of the secret pool kept in persistent, non-secure, never-wiped static memory",
+      "anchor": "static unsigned char failsafe_digest[DIGESTLEN];",
+      "file": "corpus/train/train_0155_cwe200.c",
+      "line": "4",
+      "code": "static unsigned char failsafe_digest[DIGESTLEN];",
+      "bug_class": "Sensitive data in non-secure memory (not mlock'd, not scrubbed)",
+      "cwe": "CWE-200",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0155_cwe200.c",
+      "invariant": "Material derived from the secret pool should reside in secure (locked, auto-wiped) memory or be explicitly cleared; residuals must not survive in swap or core dumps.",
+      "failure_mode": "failsafe_digest is written with a SHA-1 of the whole pool at line 63 and lives for the process lifetime in ordinary static storage. _gcry_burn_stack (line 67) scrubs only stack, not this static, and the comment at 57-60 justifies only the stack scratch. The digest can be paged to disk or captured in a core dump, exposing secret-derived data and weakening the pool's confidentiality guarantees.",
+      "cve_analog": "",
+      "what_to_confirm": "Check whether failsafe_digest is placed in secure memory or wiped, and whether leaking a SHA-1 of the pool is considered acceptable in the RNG threat model."
+    },
+    {
+      "title": "No compile guard that BLOCKLEN > DIGESTLEN — unsigned underflow in copy length if misconfigured",
+      "anchor": "memcpy (hashbuf+DIGESTLEN, pool, BLOCKLEN-DIGESTLEN);",
+      "file": "corpus/train/train_0155_cwe200.c",
+      "line": "23",
+      "code": "memcpy (hashbuf+DIGESTLEN, pool, BLOCKLEN-DIGESTLEN);",
+      "bug_class": "Unsigned integer underflow in size argument (config-dependent)",
+      "cwe": "CWE-191",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0155_cwe200.c",
+      "invariant": "BLOCKLEN must be strictly greater than DIGESTLEN for BLOCKLEN-DIGESTLEN (lines 23, 40, 45) to be a small positive copy length.",
+      "failure_mode": "The only compile guard is DIGESTLEN==20 (lines 13-15); BLOCKLEN is unconstrained. If a port or misdefinition made BLOCKLEN<=DIGESTLEN, the unsigned expression BLOCKLEN-DIGESTLEN wraps to a near-SIZE_MAX length and these memcpys become massive out-of-bounds transfers. For SHA-1 (BLOCKLEN=64) it is safe today, but the invariant is assumed rather than asserted.",
+      "cve_analog": "",
+      "what_to_confirm": "Add and verify a static assertion BLOCKLEN>DIGESTLEN next to the DIGESTLEN check; confirm the actual BLOCKLEN macro value."
+    },
+    {
+      "title": "Pool-lock enforced only by assert — race on shared pool if asserts are compiled out",
+      "anchor": "gcry_assert (pool_is_locked);",
+      "file": "corpus/train/train_0155_cwe200.c",
+      "line": "17",
+      "code": "gcry_assert (pool_is_locked);",
+      "bug_class": "Missing concurrency enforcement (assert-only guard)",
+      "cwe": "CWE-667",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "The pool mutex must be held on every path that reaches mix_pool, enforced by construction rather than only by an assertion that may be disabled.",
+      "failure_mode": "If gcry_assert becomes a no-op in a release build and any caller reaches mix_pool without the lock, concurrent mixing/extraction races on rndpool and on the shared statics failsafe_digest/failsafe_digest_valid, yielding torn writes, duplicated or predictable output, and undefined behavior on the shared flag.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm all call paths acquire the pool lock independently of assert being active."
+    },
+    {
+      "title": "Single burn depth assumed — nburn captured only from the first mixblock call",
+      "anchor": "nburn = _gcry_sha1_mixblock (&md, hashbuf);",
+      "file": "corpus/train/train_0155_cwe200.c",
+      "line": "24",
+      "code": "nburn = _gcry_sha1_mixblock (&md, hashbuf);",
+      "bug_class": "Incomplete secret scrubbing (assumed-constant stack depth)",
+      "cwe": "CWE-459",
+      "severity": "info",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "Every _gcry_sha1_mixblock call must use the same stack depth so that _gcry_burn_stack(nburn) at line 67 scrubs all pool-derived stack residue.",
+      "failure_mode": "nburn is taken only from the first mixblock (line 24); the loop calls at line 53 discard their return values. If any later compression used a deeper frame, residual pool bytes beyond nburn would be left un-scrubbed on the stack. For a fixed SHA-1 implementation the depth is constant, so this is latent/informational.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify _gcry_sha1_mixblock stack usage is invariant across calls so one nburn is a sufficient burn depth."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm rndpool and any other 'pool' argument are allocated with POOLSIZE + BLOCKLEN bytes; hashbuf=pool+POOLSIZE is written a full BLOCKLEN-byte block (line 7,22-23,40,49).",
+    "Verify the RNG extraction path re-mixes the pool and never emits a raw post-mix block, closing the CVE-2016-6313-class predictability window (lines 25,54).",
+    "Check that BLOCKLEN > DIGESTLEN is statically asserted so BLOCKLEN-DIGESTLEN cannot underflow (lines 23,40,45).",
+    "Ensure the static failsafe_digest (a hash of the secret pool) is in secure memory or explicitly wiped, not just left in BSS (lines 4,63).",
+    "Confirm the pool lock is held by construction on every call path, not only via gcry_assert(pool_is_locked) (line 17).",
+    "Confirm _gcry_sha1_mixblock stack usage is constant so the single nburn burn depth scrubs all residue (lines 24,53,67).",
+    "Re-check the wrap-around loop bounds (pp>=pend guard, lines 45-49) and the fast-path guard (line 39) remain correct if pool geometry macros change."
+  ]
+}

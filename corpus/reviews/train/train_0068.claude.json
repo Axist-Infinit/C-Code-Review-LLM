@@ -1,0 +1,260 @@
+{
+  "subsystem": "RSA-PSS (PKCS#1 v2.1, RFC 8017 / FIPS 186-4) signature-padding encoder from wolfSSL / wolfCrypt. RsaPad_PSS() is the EMSA-PSS-ENCODE routine: given a message hash it builds the encoded message EM = maskedDB || H || 0xbc into the caller-supplied pkcsBlock buffer, which is then RSA-signed by the caller.",
+  "provenance": "Identified by wolfCrypt naming and types: the function name RsaPad_PSS; wolfSSL scalar typedefs 'byte' and 'word32'; WC_RNG, 'enum wc_HashType', wc_HashGetDigestSize(), wc_RNG_GenerateBlock(), wc_Hash(); the wolfSSL allocation macros XMALLOC/XFREE/XMEMSET/XMEMCPY with DYNAMIC_TYPE_RSA_BUFFER; the wolfSSL error codes MEMORY_E, BAD_FUNC_ARG, PSS_SALTLEN_E; the wolfSSL feature macros WOLFSSL_PSS_LONG_SALT, WOLFSSL_PSS_SALT_LEN_DISCOVER, WOLFSSL_NO_MALLOC, WOLFSSL_STATIC_MEMORY, WOLFSSL_SHA512; and the constants RSA_MAX_SIZE, WC_MAX_DIGEST_SIZE, RSA_PSS_PAD_SZ, RSA_PSS_SALT_LEN_DEFAULT/DISCOVER, RSA_PSS_SALT_MAX_SZ, RSA_PSS_PAD_TERM. The header banner names corpus/train/train_0068_cwe310.c and the in-band tag on line 1 reads 'primevul_c_train_2184_vuln'.",
+  "trust_boundary": "This is a SIGNING/encoding path, not a wire parser: the data it processes (the message hash 'input'/'inputLen', the destination 'pkcsBlock'/'pkcsBlockLen', 'saltLen', 'bits', hash type, MGF id, RNG) originate from the local RSA private-key signer, not from a remote peer. The inputs are therefore semi-trusted API parameters rather than adversary-shaped network bytes. The security contract to review is that the caller (or a higher-level API such as wc_RsaPSS_Sign) may pass an inconsistent (pkcsBlockLen, hLen, saltLen, bits) tuple — e.g. an emLen only slightly larger than hLen+saltLen, an out-of-range saltLen, or a mismatched inputLen — and the routine must not write outside pkcsBlock or the salt scratch buffer for ANY parameter tuple it accepts. Fields treated as hostile-by-contract: pkcsBlockLen, saltLen, bits, inputLen.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0068_cwe310.c",
+      "lines": "2-9",
+      "code": "static int RsaPad_PSS(const byte* input, word32 inputLen, byte* pkcsBlock,\n        word32 pkcsBlockLen, WC_RNG* rng, enum wc_HashType hType, int mgf,\n        int saltLen, int bits, void* heap)\n{\n    int   ret = 0;\n    int   hLen, i, o, maskLen, hiBits;\n    byte* m;\n    byte* s;",
+      "explanation": "The entry point for PSS encoding. 'input'/'inputLen' is the message hash mHash to be padded; 'pkcsBlock'/'pkcsBlockLen' is the caller-owned output buffer that will receive the encoded message EM (its length pkcsBlockLen is emLen = ceil((bits-1)/8), derived from the RSA modulus size 'bits'); 'rng' supplies the random salt; 'hType' selects the hash and thus hLen; 'mgf' selects the mask-generation function; 'saltLen' is the requested salt length (or a sentinel like RSA_PSS_SALT_LEN_DEFAULT/DISCOVER); 'heap' is the wolfSSL allocator context. Locals: 'ret' accumulates error codes, 'hLen' the digest size, 'maskLen' the DB/dbMask length, 'hiBits' the number of significant bits in the leftmost EM octet, 'o' an offset into the salt buffer, 'm' and 's' are cursor/base pointers over the M' scratch region. Note hLen/i/o/maskLen/hiBits are signed int while inputLen/pkcsBlockLen are unsigned word32 — the mixing of signedness matters later."
+    },
+    {
+      "file": "corpus/train/train_0068_cwe310.c",
+      "lines": "10-18",
+      "code": "#if defined(WOLFSSL_PSS_LONG_SALT) || defined(WOLFSSL_PSS_SALT_LEN_DISCOVER)\n    #if defined(WOLFSSL_NO_MALLOC) && !defined(WOLFSSL_STATIC_MEMORY)\n        byte salt[RSA_MAX_SIZE/8 + RSA_PSS_PAD_SZ];\n    #else\n        byte* salt = NULL;\n    #endif\n#else\n    byte salt[WC_MAX_DIGEST_SIZE];\n#endif",
+      "explanation": "The salt storage is chosen at compile time. When long-salt or salt-length-discovery is enabled AND malloc is disabled, 'salt' is a fixed stack buffer sized RSA_MAX_SIZE/8 + RSA_PSS_PAD_SZ (the biggest possible M' = 8-byte pad + hash + salt for the largest RSA key). When long/discover is enabled with an allocator, 'salt' is a heap pointer allocated later. Otherwise (the common build) 'salt' is a fixed stack buffer of exactly WC_MAX_DIGEST_SIZE bytes — this is the tightest fixed buffer in the function and its size assumes saltLen never exceeds one digest length."
+    },
+    {
+      "file": "corpus/train/train_0068_cwe310.c",
+      "lines": "20-24",
+      "code": "#if defined(WOLFSSL_PSS_LONG_SALT) || defined(WOLFSSL_PSS_SALT_LEN_DISCOVER)\n    if (pkcsBlockLen > RSA_MAX_SIZE/8) {\n        return MEMORY_E;\n    }\n#endif",
+      "explanation": "Only in the long-salt / discover configuration does the code upper-bound pkcsBlockLen against RSA_MAX_SIZE/8, which caps the size of the later malloc and the M' scratch. Crucially, in the DEFAULT (non-long) build this bound is compiled out, so pkcsBlockLen is not checked against any maximum here and is only constrained by the relational guard on line 71."
+    },
+    {
+      "file": "corpus/train/train_0068_cwe310.c",
+      "lines": "26-31",
+      "code": "hLen = wc_HashGetDigestSize(hType);\n    if (hLen < 0)\n        return hLen;\n    if ((int)inputLen != hLen) {\n        return BAD_FUNC_ARG;\n    }",
+      "explanation": "Resolves the digest size for hType and rejects an unknown hash (negative return). Then it enforces that the provided message-hash length equals the digest size: '(int)inputLen != hLen'. This ties inputLen to hLen, so from here on inputLen == hLen holds. The cast (int)inputLen is a narrowing of a word32 to int; benign for realistic hash lengths but relevant to sign hygiene."
+    },
+    {
+      "file": "corpus/train/train_0068_cwe310.c",
+      "lines": "33-40",
+      "code": "hiBits = (bits - 1) & 0x7;\n    if (hiBits == 0) {\n        /* Per RFC8017, set the leftmost 8emLen - emBits bits of the\n           leftmost octet in DB to zero.\n        */\n        *(pkcsBlock++) = 0;\n        pkcsBlockLen--;\n    }",
+      "explanation": "emBits = bits-1. hiBits is the number of significant bits in the top EM octet. When emBits is a whole number of bytes (hiBits==0) the leading EM octet must be 0x00; the code writes that zero byte, advances pkcsBlock past it, and decrements pkcsBlockLen so the rest of the routine operates on the remaining emLen-1 bytes. This is a pointer-bump/length-shrink that all subsequent bounds implicitly depend on."
+    },
+    {
+      "file": "corpus/train/train_0068_cwe310.c",
+      "lines": "42-50",
+      "code": "if (saltLen == RSA_PSS_SALT_LEN_DEFAULT) {\n        saltLen = hLen;\n        #ifdef WOLFSSL_SHA512\n            /* See FIPS 186-4 section 5.5 item (e). */\n            if (bits == 1024 && hLen == WC_SHA512_DIGEST_SIZE) {\n                saltLen = RSA_PSS_SALT_MAX_SZ;\n            }\n        #endif\n    }",
+      "explanation": "Resolves the RSA_PSS_SALT_LEN_DEFAULT sentinel: normally the salt length equals the digest length (saltLen = hLen). A FIPS 186-4 special case for a 1024-bit modulus with SHA-512 clamps saltLen to RSA_PSS_SALT_MAX_SZ instead, because a full 64-byte salt would not fit alongside the 64-byte hash in a 128-byte emLen. This is the one default path where saltLen can be set to a value not equal to hLen without going through the explicit saltLen>hLen rejection below."
+    },
+    {
+      "file": "corpus/train/train_0068_cwe310.c",
+      "lines": "51-59",
+      "code": "#ifndef WOLFSSL_PSS_LONG_SALT\n    else if (saltLen > hLen) {\n        return PSS_SALTLEN_E;\n    }\n#endif\n#ifndef WOLFSSL_PSS_SALT_LEN_DISCOVER\n    else if (saltLen < RSA_PSS_SALT_LEN_DEFAULT) {\n        return PSS_SALTLEN_E;\n    }",
+      "explanation": "For a caller-supplied (non-sentinel) saltLen: unless long-salt is enabled, an upper bound of saltLen <= hLen is enforced (this is what keeps the default salt[WC_MAX_DIGEST_SIZE] buffer safe); and unless discover is enabled, a lower bound rejects saltLen values below the DEFAULT sentinel. These two gates are the primary domain checks on the attacker-relevant saltLen in the common build."
+    },
+    {
+      "file": "corpus/train/train_0068_cwe310.c",
+      "lines": "60-70",
+      "code": "#else\n    else if (saltLen == RSA_PSS_SALT_LEN_DISCOVER) {\n        saltLen = (int)pkcsBlockLen - hLen - 2;\n        if (saltLen < 0) {\n            return PSS_SALTLEN_E;\n        }\n    }\n    else if (saltLen < RSA_PSS_SALT_LEN_DISCOVER) {\n        return PSS_SALTLEN_E;\n    }\n#endif",
+      "explanation": "Salt-length-discovery mode: the maximum salt that fits is computed as saltLen = pkcsBlockLen - hLen - 2 (emLen - hLen - 2), rejected if it underflows to negative. This path only compiles when WOLFSSL_PSS_SALT_LEN_DISCOVER is defined, which also selects the malloc/long-salt scratch branch below (line 76), so the discovered (potentially large) saltLen is not fed into the small fixed salt[] buffer."
+    },
+    {
+      "file": "corpus/train/train_0068_cwe310.c",
+      "lines": "71-74",
+      "code": "if ((int)pkcsBlockLen - hLen < saltLen + 2) {\n        return PSS_SALTLEN_E;\n    }\n    maskLen = pkcsBlockLen - 1 - hLen;",
+      "explanation": "This is THE size guard: it enforces emLen - hLen >= saltLen + 2, i.e. pkcsBlockLen >= hLen + saltLen + 2, the RFC 8017 'emLen >= hLen + sLen + 2' constraint (the +2 covers the 0x01 separator in DB and the 0xbc trailer). maskLen = pkcsBlockLen - 1 - hLen is the DB / dbMask length (emLen - hLen - 1). Given the guard, maskLen >= saltLen+1 >= 1. Note: this check accounts for the DB structure but NOT for the 8-byte (RSA_PSS_PAD_SZ) zero prefix of M' that gets written into pkcsBlock in the default branch."
+    },
+    {
+      "file": "corpus/train/train_0068_cwe310.c",
+      "lines": "76-95",
+      "code": "#if defined(WOLFSSL_PSS_LONG_SALT) || defined(WOLFSSL_PSS_SALT_LEN_DISCOVER)\n    #if !defined(WOLFSSL_NO_MALLOC) || defined(WOLFSSL_STATIC_MEMORY)\n        salt = (byte*)XMALLOC(RSA_PSS_PAD_SZ + inputLen + saltLen, heap,\n                                                       DYNAMIC_TYPE_RSA_BUFFER);\n        if (salt == NULL) {\n            return MEMORY_E;\n        }\n    #endif\n    s = m = salt;\n    XMEMSET(m, 0, RSA_PSS_PAD_SZ);\n    m += RSA_PSS_PAD_SZ;\n    XMEMCPY(m, input, inputLen);\n    m += inputLen;\n    o = (int)(m - s);\n    if (saltLen > 0) {\n        ret = wc_RNG_GenerateBlock(rng, m, saltLen);\n        if (ret == 0) {\n            m += saltLen;\n        }\n    }",
+      "explanation": "Long-salt / discover branch. It allocates a scratch buffer of exactly RSA_PSS_PAD_SZ + inputLen + saltLen bytes (the M' size: 8-byte zero pad + hash + salt), with the NULL-check present. It then builds M' inside that dedicated buffer: 8 zero bytes, the message hash, then the random salt written directly into place by wc_RNG_GenerateBlock. 'o' records the offset of the salt within the buffer (8 + inputLen), used later to XOR the salt into DB. Here the salt scratch is a private allocation sized to fit, so pkcsBlock is not used as scratch."
+    },
+    {
+      "file": "corpus/train/train_0068_cwe310.c",
+      "lines": "96-110",
+      "code": "#else\n    s = m = pkcsBlock;\n    XMEMSET(m, 0, RSA_PSS_PAD_SZ);\n    m += RSA_PSS_PAD_SZ;\n    XMEMCPY(m, input, inputLen);\n    m += inputLen;\n    o = 0;\n    if (saltLen > 0) {\n        ret = wc_RNG_GenerateBlock(rng, salt, saltLen);\n        if (ret == 0) {\n            XMEMCPY(m, salt, saltLen);\n            m += saltLen;\n        }\n    }\n#endif",
+      "explanation": "Default (non-long) branch. Instead of a private buffer, it builds M' IN PLACE at the front of the caller's pkcsBlock: s=m=pkcsBlock, then 8 zero bytes (RSA_PSS_PAD_SZ), then inputLen hash bytes, then saltLen random bytes (generated into the fixed salt[] buffer and copied in). So M' occupies the first RSA_PSS_PAD_SZ + inputLen + saltLen = 8 + hLen + saltLen bytes of pkcsBlock. o=0 because the salt XOR later reads from the separate salt[] buffer. This reuse of pkcsBlock as M' scratch is the core spatial assumption of the routine."
+    },
+    {
+      "file": "corpus/train/train_0068_cwe310.c",
+      "lines": "111-120",
+      "code": "if (ret == 0) {\n        /* Put Hash at end of pkcsBlock - 1 */\n        ret = wc_Hash(hType, s, (word32)(m - s), pkcsBlock + maskLen, hLen);\n    }\n    if (ret == 0) {\n       /* Set the last eight bits or trailer field to the octet 0xbc */\n        pkcsBlock[pkcsBlockLen - 1] = RSA_PSS_PAD_TERM;\n\n        ret = RsaMGF(mgf, pkcsBlock + maskLen, hLen, pkcsBlock, maskLen, heap);\n    }",
+      "explanation": "H = Hash(M') is computed over (m - s) = 8 + inputLen + saltLen bytes starting at s, and written as hLen bytes at pkcsBlock + maskLen (the position of H in EM, right after maskedDB). The 0xbc trailer is placed at the final EM byte pkcsBlock[pkcsBlockLen-1]. Then RsaMGF generates dbMask of length maskLen from seed H (pkcsBlock+maskLen) and writes it over pkcsBlock[0..maskLen), overwriting the M' scratch that lived there in the default branch. Note wc_Hash reads (m - s) bytes out of pkcsBlock in the default branch, so the read length equals the M' length written earlier."
+    },
+    {
+      "file": "corpus/train/train_0068_cwe310.c",
+      "lines": "121-132",
+      "code": "if (ret == 0) {\n        /* Clear the first high bit when \"8emLen - emBits\" is non-zero.\n           where emBits = n modBits - 1 */\n        if (hiBits)\n            pkcsBlock[0] &= (1 << hiBits) - 1;\n\n        m = pkcsBlock + maskLen - saltLen - 1;\n        *(m++) ^= 0x01;\n        for (i = 0; i < saltLen; i++) {\n            m[i] ^= salt[o + i];\n        }\n    }",
+      "explanation": "Final maskedDB assembly. If hiBits!=0 the top octet's excess high bits are cleared per RFC 8017. Then DB = PS || 0x01 || salt is XORed into dbMask: m points to the 0x01 position at offset maskLen - saltLen - 1 (>=0 by the line-71 guard). '*(m++) ^= 0x01' folds in the 0x01 separator; the loop XORs the saltLen salt bytes read from salt[o..o+saltLen) into the tail of DB (indices up to maskLen-1). o is 0 for the default branch (salt = fixed buffer) or 8+inputLen for the long branch (salt = malloc buffer)."
+    },
+    {
+      "file": "corpus/train/train_0068_cwe310.c",
+      "lines": "134-142",
+      "code": "#if defined(WOLFSSL_PSS_LONG_SALT) || defined(WOLFSSL_PSS_SALT_LEN_DISCOVER)\n    #if !defined(WOLFSSL_NO_MALLOC) || defined(WOLFSSL_STATIC_MEMORY)\n        if (salt != NULL) {\n            XFREE(salt, heap, DYNAMIC_TYPE_RSA_BUFFER);\n        }\n    #endif\n#endif\n    return ret;\n}",
+      "explanation": "Cleanup: in the malloc long/discover configuration the scratch salt buffer is freed (guarded against NULL) and 'ret' is returned. In the default build there is nothing to free. The completed EM sits in the caller's pkcsBlock. Note the buffer is NOT zeroized before free, leaving the salt/M' material in freed heap memory."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0068_cwe310.c",
+      "lines": "97-108",
+      "code": "s = m = pkcsBlock;\n    XMEMSET(m, 0, RSA_PSS_PAD_SZ);\n    m += RSA_PSS_PAD_SZ;\n    XMEMCPY(m, input, inputLen);\n    m += inputLen;\n    o = 0;\n    if (saltLen > 0) {\n        ret = wc_RNG_GenerateBlock(rng, salt, saltLen);\n        if (ret == 0) {\n            XMEMCPY(m, salt, saltLen);\n            m += saltLen;\n        }\n    }",
+      "explanation": "Out-of-bounds WRITE of pkcsBlock in the default branch. The code writes M' = RSA_PSS_PAD_SZ(8) + inputLen(=hLen) + saltLen bytes into the front of pkcsBlock, so it needs pkcsBlockLen >= 8 + hLen + saltLen. But the only size guard (line 71) verifies pkcsBlockLen >= hLen + saltLen + 2 — it budgets the 0x01 and 0xbc bytes of DB, not the 8-byte hash prefix of M'. Any emLen in the window [hLen+saltLen+2, hLen+saltLen+7] passes the guard yet leaves 1..6 bytes of the M' scratch spilling past the end of the caller's buffer (a CWE-787 overflow of pkcsBlock). The invariant the implementation must uphold is emLen >= RSA_PSS_PAD_SZ + hLen + saltLen whenever pkcsBlock is used as M' scratch. Reachability is constrained: it requires a caller to pass an emLen only a few bytes above the minimum (an unusually small RSA modulus relative to the hash+salt), so this is a latent contract gap rather than a live remote overflow, but the size check is genuinely insufficient by 6 bytes."
+    },
+    {
+      "file": "corpus/train/train_0068_cwe310.c",
+      "lines": "113",
+      "code": "ret = wc_Hash(hType, s, (word32)(m - s), pkcsBlock + maskLen, hLen);",
+      "explanation": "Correlated out-of-bounds READ. In the default branch s = pkcsBlock and (m - s) = 8 + inputLen + saltLen, so wc_Hash reads the whole M' back out of pkcsBlock. If the same emLen-too-small condition as the previous finding holds, part of the M' that was written past the buffer end is now read back past the buffer end (CWE-125), hashing adjacent memory into H. Same invariant applies: the M' length must be bounded by the pkcsBlock allocation. This is the read-side twin of the write overflow and shares the same root cause (the 8-byte prefix omitted from the guard)."
+    },
+    {
+      "file": "corpus/train/train_0068_cwe310.c",
+      "lines": "42-48",
+      "code": "if (saltLen == RSA_PSS_SALT_LEN_DEFAULT) {\n        saltLen = hLen;\n        #ifdef WOLFSSL_SHA512\n            /* See FIPS 186-4 section 5.5 item (e). */\n            if (bits == 1024 && hLen == WC_SHA512_DIGEST_SIZE) {\n                saltLen = RSA_PSS_SALT_MAX_SZ;\n            }",
+      "explanation": "Latent fixed-buffer contract on the default salt[WC_MAX_DIGEST_SIZE] scratch. In the default (non-long) build the salt is written by wc_RNG_GenerateBlock(rng, salt, saltLen) into a WC_MAX_DIGEST_SIZE buffer (line 17/104). The saltLen<=hLen gate on line 52 keeps normal callers in bounds, but the DEFAULT-sentinel FIPS branch here assigns saltLen = RSA_PSS_SALT_MAX_SZ WITHOUT re-checking it against WC_MAX_DIGEST_SIZE. The safety of the salt[] buffer therefore depends on the compile-time invariant RSA_PSS_SALT_MAX_SZ <= WC_MAX_DIGEST_SIZE; if a build defines a salt-max larger than the max digest, this path overruns the fixed salt buffer (CWE-787). Confirm the two macros' relative values for every configured hash."
+    },
+    {
+      "file": "corpus/train/train_0068_cwe310.c",
+      "lines": "29-31",
+      "code": "if ((int)inputLen != hLen) {\n        return BAD_FUNC_ARG;\n    }",
+      "explanation": "Sign-conversion hygiene on length fields. inputLen and pkcsBlockLen are unsigned word32 but are repeatedly cast to signed int for comparisons: '(int)inputLen' here, '(int)pkcsBlockLen - hLen' on lines 62 and 71. In the default build pkcsBlockLen is never upper-bounded (the RSA_MAX_SIZE/8 check on line 21 is compiled out), so a caller passing pkcsBlockLen > INT_MAX makes (int)pkcsBlockLen negative. The line-71 guard then evaluates a negative left side < saltLen+2 and returns PSS_SALTLEN_E, which is fail-safe here; but relying on sign wrap for safety is fragile (CWE-197/CWE-195). Confirm all callers pass a sane emLen and consider bounding pkcsBlockLen in every build, not only the long-salt one."
+    },
+    {
+      "file": "corpus/train/train_0068_cwe310.c",
+      "lines": "34-40",
+      "code": "if (hiBits == 0) {\n        /* Per RFC8017, set the leftmost 8emLen - emBits bits of the\n           leftmost octet in DB to zero.\n        */\n        *(pkcsBlock++) = 0;\n        pkcsBlockLen--;\n    }",
+      "explanation": "Unchecked decrement of the unsigned length. When hiBits==0 the code writes one byte and does pkcsBlockLen--. If a caller ever passed pkcsBlockLen==0 with this path, the unsigned word32 wraps to 0xFFFFFFFF and the leading write *(pkcsBlock++)=0 already touches a zero-length buffer (CWE-191 followed by CWE-787). The subsequent line-71 guard would reject the wrapped value ((int)0xFFFFFFFF = -1), but the single leading byte has already been written before any length validation. The invariant is that pkcsBlockLen must be >= 1 before this block; confirm no caller can invoke RsaPad_PSS with emLen==0."
+    },
+    {
+      "file": "corpus/train/train_0068_cwe310.c",
+      "lines": "136-138",
+      "code": "if (salt != NULL) {\n            XFREE(salt, heap, DYNAMIC_TYPE_RSA_BUFFER);\n        }",
+      "explanation": "Sensitive-material lifetime. The malloc'd scratch buffer holds M' = pad||hash||salt, including the freshly generated random salt, and is freed without being zeroized. For a signing routine the salt is not long-term secret, but leaving M' bytes in freed heap is an information-hygiene weakness (CWE-244/CWE-226-style): a later allocation could read the residue. Confirm whether wolfSSL policy requires ForceZero() of RSA/PSS scratch before free; the fixed-buffer default branch similarly leaves M' residue in pkcsBlock, which is expected there since pkcsBlock becomes the output."
+    }
+  ],
+  "summary": "wolfCrypt RSA-PSS signature-padding encoder. Because it is a signing path, inputs are semi-trusted API parameters rather than remote bytes, so overall risk is moderate-to-low. The sharpest real issue is a spatial contract gap: in the default build the routine reuses pkcsBlock as M' scratch and writes RSA_PSS_PAD_SZ(8)+hLen+saltLen bytes, but the only size guard proves only emLen >= hLen+saltLen+2, so an emLen 1..6 bytes above the minimum overflows/over-reads the caller's buffer. Secondary latent items: the salt[WC_MAX_DIGEST_SIZE] buffer depends on the unchecked invariant RSA_PSS_SALT_MAX_SZ <= WC_MAX_DIGEST_SIZE, plus sign-conversion and pkcsBlockLen-- hygiene.",
+  "reviewed_anchors": [
+    {"anchor": "RsaPad_PSS(...) signature (lines 2-4)", "disposition": "finding", "reason": "Encoder that writes M'/EM into caller buffers; its length parameters carry the spatial contract."},
+    {"anchor": "input / inputLen (word32) — message-hash length", "disposition": "dismissed", "reason": "Pinned to hLen by the check on lines 29-31; not independently attacker-scaled."},
+    {"anchor": "pkcsBlock / pkcsBlockLen (word32) — output buffer and its length", "disposition": "finding", "reason": "Used as M' scratch; the line-71 guard omits the 8-byte pad prefix, allowing overflow/over-read."},
+    {"anchor": "byte salt[WC_MAX_DIGEST_SIZE] (line 17) — default fixed salt buffer", "disposition": "finding", "reason": "Size assumes saltLen<=hLen; the FIPS DEFAULT branch (lines 46-48) can set saltLen=RSA_PSS_SALT_MAX_SZ without re-checking against WC_MAX_DIGEST_SIZE."},
+    {"anchor": "byte salt[RSA_MAX_SIZE/8 + RSA_PSS_PAD_SZ] (line 12) — no-malloc long-salt buffer", "disposition": "dismissed", "reason": "Sized to full M' for the largest key; saltLen bounded by the line-71 guard and line-21 pkcsBlockLen cap, so 8+inputLen+saltLen fits."},
+    {"anchor": "byte* salt = NULL (line 14) + XMALLOC (lines 78-79)", "disposition": "dismissed", "reason": "Allocation is exactly RSA_PSS_PAD_SZ+inputLen+saltLen (M' size) and the NULL return is checked on lines 80-82; no unchecked-malloc deref."},
+    {"anchor": "pkcsBlockLen > RSA_MAX_SIZE/8 guard (lines 21-23)", "disposition": "dismissed", "reason": "Correct upper bound, but only compiled in the long/discover build; its absence in the default build is captured by the sign-conversion finding."},
+    {"anchor": "hLen = wc_HashGetDigestSize(hType); if (hLen < 0) (lines 26-28)", "disposition": "dismissed", "reason": "Negative/unknown-hash return is checked and propagated; hLen is non-negative thereafter."},
+    {"anchor": "(int)inputLen != hLen check (lines 29-31)", "disposition": "finding", "reason": "Correct equality gate but part of the word32->int sign-conversion pattern flagged for hygiene."},
+    {"anchor": "hiBits = (bits - 1) & 0x7; *(pkcsBlock++)=0; pkcsBlockLen-- (lines 33-40)", "disposition": "finding", "reason": "Writes a byte and decrements the unsigned length before any length validation; unsafe if emLen==0."},
+    {"anchor": "RSA_PSS_SALT_LEN_DEFAULT resolution + RSA_PSS_SALT_MAX_SZ (lines 42-50)", "disposition": "finding", "reason": "FIPS branch assigns saltLen=RSA_PSS_SALT_MAX_SZ without bounding it against WC_MAX_DIGEST_SIZE for the default salt buffer."},
+    {"anchor": "saltLen > hLen -> PSS_SALTLEN_E (line 52)", "disposition": "dismissed", "reason": "This upper bound is exactly what keeps salt[WC_MAX_DIGEST_SIZE] in range for explicit caller saltLen values."},
+    {"anchor": "saltLen < RSA_PSS_SALT_LEN_DEFAULT -> PSS_SALTLEN_E (line 57)", "disposition": "dismissed", "reason": "Lower-bound sentinel rejection; no memory contract."},
+    {"anchor": "saltLen = (int)pkcsBlockLen - hLen - 2; if (<0) reject (lines 62-65)", "disposition": "dismissed", "reason": "Discover-mode saltLen with underflow guard; feeds the malloc scratch branch, not the small fixed buffer."},
+    {"anchor": "(int)pkcsBlockLen - hLen < saltLen + 2 guard (lines 71-73)", "disposition": "finding", "reason": "The central size guard; enforces emLen>=hLen+saltLen+2 but not the +8 needed for the M' pad prefix in the default branch."},
+    {"anchor": "maskLen = pkcsBlockLen - 1 - hLen (line 74)", "disposition": "dismissed", "reason": "DB length; the line-71 guard runs first so maskLen>=1 and the later DB XOR (lines 127-131) stays within [0,maskLen)."},
+    {"anchor": "XMEMSET/XMEMCPY M' build, long branch (lines 85-88)", "disposition": "dismissed", "reason": "Writes into the private malloc/no-malloc buffer that is sized to the M' length; in bounds."},
+    {"anchor": "XMEMSET/XMEMCPY M' build, default branch (lines 98-100/106)", "disposition": "finding", "reason": "Writes 8+hLen+saltLen bytes into pkcsBlock; can exceed pkcsBlockLen per the primary finding."},
+    {"anchor": "o = (int)(m - s) / o = 0 and salt[o + i] (lines 89/102/130)", "disposition": "dismissed", "reason": "o is 8+inputLen for the malloc buffer (fits) and 0 for the fixed buffer; salt reads stay in bounds in both branches."},
+    {"anchor": "wc_RNG_GenerateBlock(rng, m/salt, saltLen) (lines 91/104)", "disposition": "dismissed", "reason": "Destination sized to hold saltLen in both branches given the saltLen bounds; return value checked before use."},
+    {"anchor": "wc_Hash(hType, s, (word32)(m - s), pkcsBlock + maskLen, hLen) (line 113)", "disposition": "finding", "reason": "Reads the whole M' (8+hLen+saltLen) back out of pkcsBlock; correlated over-read when emLen is too small."},
+    {"anchor": "pkcsBlock[pkcsBlockLen - 1] = RSA_PSS_PAD_TERM (line 117)", "disposition": "dismissed", "reason": "Writes the final EM byte; index pkcsBlockLen-1 is in range given the guard and non-zero length."},
+    {"anchor": "RsaMGF(mgf, pkcsBlock + maskLen, hLen, pkcsBlock, maskLen, heap) (line 119)", "disposition": "dismissed", "reason": "Generates maskLen bytes over [0,maskLen) using H seed; bounded by the same maskLen the guard validates."},
+    {"anchor": "pkcsBlock[0] &= (1 << hiBits) - 1 (lines 124-125)", "disposition": "dismissed", "reason": "Single-byte top-octet masking; in bounds and semantically per RFC 8017."},
+    {"anchor": "m = pkcsBlock + maskLen - saltLen - 1; *(m++) ^= 0x01; DB XOR loop (lines 127-131)", "disposition": "dismissed", "reason": "Offset >=0 by the line-71 guard and the loop writes up to index maskLen-1; stays inside DB."},
+    {"anchor": "XFREE without zeroization (lines 136-138)", "disposition": "finding", "reason": "M'/salt residue left in freed heap; information-hygiene weakness, low severity."},
+    {"anchor": "RSA_PSS_PAD_SZ constant", "disposition": "finding", "reason": "The 8-byte M' prefix that the line-71 size guard fails to account for; root of the primary overflow."}
+  ],
+  "findings": [
+    {
+      "title": "pkcsBlock reused as M' scratch overflows by the 8-byte pad prefix the size guard ignores",
+      "anchor": "s = m = pkcsBlock; XMEMSET(m, 0, RSA_PSS_PAD_SZ); ... XMEMCPY(m, input, inputLen); ... XMEMCPY(m, salt, saltLen);",
+      "file": "corpus/train/train_0068_cwe310.c",
+      "line": "97-108",
+      "code": "s = m = pkcsBlock;\n    XMEMSET(m, 0, RSA_PSS_PAD_SZ);\n    m += RSA_PSS_PAD_SZ;\n    XMEMCPY(m, input, inputLen);\n    m += inputLen;\n    o = 0;\n    if (saltLen > 0) {\n        ret = wc_RNG_GenerateBlock(rng, salt, saltLen);\n        if (ret == 0) {\n            XMEMCPY(m, salt, saltLen);\n            m += saltLen;\n        }\n    }",
+      "bug_class": "Out-of-bounds write (size guard undercounts the M' pad prefix)",
+      "cwe": "CWE-787",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0068_cwe310.c (default non-long build of RsaPad_PSS)",
+      "invariant": "When pkcsBlock is used as the M' scratch region, the implementation must ensure pkcsBlockLen (emLen) >= RSA_PSS_PAD_SZ + inputLen + saltLen (= 8 + hLen + saltLen), not merely emLen >= hLen + saltLen + 2.",
+      "failure_mode": "The line-71 guard only proves pkcsBlockLen >= hLen + saltLen + 2 (the DB 0x01 + 0xbc budget). The default branch then writes 8 + hLen + saltLen bytes of M' into the front of pkcsBlock. For any accepted emLen in [hLen+saltLen+2, hLen+saltLen+7] the write overruns the caller's buffer by 1..6 bytes (and line 113 reads them back). Trigger requires a caller passing an emLen within a few bytes of the minimum (an abnormally small RSA modulus relative to hash+salt), so real-world reachability is limited, but the guard is genuinely 6 bytes short of the amount written.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm every caller/minimum-key-size policy makes emLen >= 8 + hLen + saltLen; if not, the guard on line 71 must add RSA_PSS_PAD_SZ (or the M' must be built in a separate buffer as the long-salt branch already does)."
+    },
+    {
+      "title": "Correlated out-of-bounds read hashing M' back out of pkcsBlock",
+      "anchor": "ret = wc_Hash(hType, s, (word32)(m - s), pkcsBlock + maskLen, hLen);",
+      "file": "corpus/train/train_0068_cwe310.c",
+      "line": "113",
+      "code": "ret = wc_Hash(hType, s, (word32)(m - s), pkcsBlock + maskLen, hLen);",
+      "bug_class": "Out-of-bounds read (reads M' length that can exceed the buffer)",
+      "cwe": "CWE-125",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0068_cwe310.c (default non-long build)",
+      "invariant": "(m - s) bytes starting at s=pkcsBlock must lie entirely within the pkcsBlock allocation, i.e. RSA_PSS_PAD_SZ + inputLen + saltLen <= pkcsBlockLen.",
+      "failure_mode": "In the default branch s = pkcsBlock and (m - s) = 8 + inputLen + saltLen. Under the same emLen-too-small condition as the primary finding, wc_Hash reads M' bytes past the end of pkcsBlock into H, leaking adjacent memory into the (public) hash and potentially faulting. Same root cause as the write overflow; listed separately because it is a distinct read primitive.",
+      "cve_analog": "",
+      "what_to_confirm": "Same bound as the primary finding; verify the hash input length can never exceed the buffer holding s."
+    },
+    {
+      "title": "FIPS default-salt path can set saltLen above the fixed salt[WC_MAX_DIGEST_SIZE] buffer",
+      "anchor": "if (bits == 1024 && hLen == WC_SHA512_DIGEST_SIZE) { saltLen = RSA_PSS_SALT_MAX_SZ; }",
+      "file": "corpus/train/train_0068_cwe310.c",
+      "line": "42-48",
+      "code": "if (saltLen == RSA_PSS_SALT_LEN_DEFAULT) {\n        saltLen = hLen;\n        #ifdef WOLFSSL_SHA512\n            /* See FIPS 186-4 section 5.5 item (e). */\n            if (bits == 1024 && hLen == WC_SHA512_DIGEST_SIZE) {\n                saltLen = RSA_PSS_SALT_MAX_SZ;\n            }\n        #endif\n    }",
+      "bug_class": "Fixed-buffer overflow contingent on a compile-time constant relationship",
+      "cwe": "CWE-120",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0068_cwe310.c (default build, salt[WC_MAX_DIGEST_SIZE])",
+      "invariant": "RSA_PSS_SALT_MAX_SZ must be <= WC_MAX_DIGEST_SIZE, because wc_RNG_GenerateBlock(rng, salt, saltLen) (line 104) writes saltLen bytes into the WC_MAX_DIGEST_SIZE fixed buffer and this DEFAULT path bypasses the saltLen<=hLen gate on line 52.",
+      "failure_mode": "For the RSA_PSS_SALT_LEN_DEFAULT sentinel with 1024-bit SHA-512, saltLen becomes RSA_PSS_SALT_MAX_SZ with no subsequent check against WC_MAX_DIGEST_SIZE. If a wolfSSL configuration defines a PSS salt-max larger than the maximum digest size, the salt RNG fill overruns the fixed salt buffer on the stack. Latent: depends on the two macros' configured values.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify RSA_PSS_SALT_MAX_SZ <= WC_MAX_DIGEST_SIZE for all supported hash/curve configurations, or size salt[] to the salt-max rather than the digest-max."
+    },
+    {
+      "title": "word32 length fields cast to signed int; pkcsBlockLen unbounded in the default build",
+      "anchor": "if ((int)inputLen != hLen) ... if ((int)pkcsBlockLen - hLen < saltLen + 2)",
+      "file": "corpus/train/train_0068_cwe310.c",
+      "line": "29-31, 71",
+      "code": "if ((int)inputLen != hLen) {\n        return BAD_FUNC_ARG;\n    }",
+      "bug_class": "Signed/unsigned conversion of length fields",
+      "cwe": "CWE-197",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0068_cwe310.c",
+      "invariant": "All length comparisons must be performed without a lossy word32->int narrowing, and pkcsBlockLen should be upper-bounded in every build (not only the long/discover one, where line 21 caps it to RSA_MAX_SIZE/8).",
+      "failure_mode": "In the default build the RSA_MAX_SIZE/8 cap on line 21 is compiled out, so pkcsBlockLen is unbounded and is cast via '(int)pkcsBlockLen' on lines 62 and 71. A pkcsBlockLen > INT_MAX becomes negative, so the guard on line 71 returns PSS_SALTLEN_E — fail-safe here, but the code relies on implementation-defined signed conversion for its safety rather than an explicit range check. Not independently exploitable given trusted callers, flagged for hygiene.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm callers always pass emLen well under INT_MAX, and consider bounding pkcsBlockLen unconditionally and comparing lengths in unsigned arithmetic."
+    },
+    {
+      "title": "Leading zero byte written and unsigned pkcsBlockLen decremented before length validation",
+      "anchor": "*(pkcsBlock++) = 0; pkcsBlockLen--;",
+      "file": "corpus/train/train_0068_cwe310.c",
+      "line": "38-39",
+      "code": "*(pkcsBlock++) = 0;\n        pkcsBlockLen--;",
+      "bug_class": "Unsigned decrement / write before validation",
+      "cwe": "CWE-191",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0068_cwe310.c",
+      "invariant": "pkcsBlockLen must be >= 1 before the hiBits==0 branch, since it writes one byte and decrements the unsigned length before any size guard runs.",
+      "failure_mode": "If a caller ever passes emLen==0 with hiBits==0, the write '*(pkcsBlock++)=0' already touches a zero-length buffer and 'pkcsBlockLen--' wraps to 0xFFFFFFFF. The later line-71 guard would reject the wrapped value ((int)-1 < saltLen+2), so no further OOB occurs, but the single leading byte is written before validation. Requires a degenerate caller; low severity.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify no caller can reach RsaPad_PSS with pkcsBlockLen==0; optionally validate emLen>=1 before the hiBits block."
+    },
+    {
+      "title": "PSS scratch (M' / salt) freed without zeroization",
+      "anchor": "if (salt != NULL) { XFREE(salt, heap, DYNAMIC_TYPE_RSA_BUFFER); }",
+      "file": "corpus/train/train_0068_cwe310.c",
+      "line": "136-138",
+      "code": "if (salt != NULL) {\n            XFREE(salt, heap, DYNAMIC_TYPE_RSA_BUFFER);\n        }",
+      "bug_class": "Sensitive data residue in freed memory",
+      "cwe": "CWE-226",
+      "severity": "info",
+      "where_it_lives": "corpus/train/train_0068_cwe310.c (long/discover malloc build)",
+      "invariant": "Cryptographic scratch buffers holding intermediate padding material should be zeroized (ForceZero) before being freed if wolfSSL policy treats them as sensitive.",
+      "failure_mode": "The malloc'd buffer holds M' = pad||hash||salt including the freshly generated salt and is freed without wiping, leaving the material in reclaimable heap. For a signature encoder the salt is short-lived and public in the resulting signature, so impact is minimal, but it is inconsistent with defense-in-depth zeroization elsewhere in wolfCrypt.",
+      "cve_analog": "",
+      "what_to_confirm": "Check whether wolfSSL's threat model requires ForceZero of RSA/PSS scratch before free; if so, add it in both the malloc and fixed-buffer paths."
+    }
+  ],
+  "audit_checklist": [
+    "Prove pkcsBlockLen (emLen, after the hiBits==0 decrement) is always >= RSA_PSS_PAD_SZ + hLen + saltLen before the default branch writes M' into pkcsBlock; if callers can pass emLen only hLen+saltLen+2..+7, fix the line-71 guard to add RSA_PSS_PAD_SZ or build M' in a separate buffer.",
+    "Confirm the wc_Hash input length (m - s) can never exceed the allocation backing s in either branch.",
+    "Verify RSA_PSS_SALT_MAX_SZ <= WC_MAX_DIGEST_SIZE for all configured hashes, since the FIPS default-salt branch assigns saltLen from it without re-checking the fixed salt[] buffer.",
+    "Bound pkcsBlockLen against RSA_MAX_SIZE/8 in ALL builds (line 21 is currently long/discover-only) and avoid (int) narrowing of word32 length fields in the comparisons on lines 62 and 71.",
+    "Ensure no caller can invoke RsaPad_PSS with pkcsBlockLen==0 (the hiBits==0 path writes and decrements the unsigned length before validation).",
+    "Decide whether RSA/PSS scratch (the malloc'd M' buffer and the in-place pkcsBlock M') requires ForceZero before free/return per wolfSSL's sensitive-data policy.",
+    "Re-verify the DB XOR offset math (m = pkcsBlock + maskLen - saltLen - 1 and the salt[o+i] loop) stays within [0, maskLen) for the extreme accepted saltLen (including the discover-mode saltLen = emLen - hLen - 2)."
+  ]
+}

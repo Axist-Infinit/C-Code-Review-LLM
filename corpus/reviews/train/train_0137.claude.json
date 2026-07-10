@@ -1,0 +1,235 @@
+{
+  "subsystem": "TensorFlow core op kernel: the Compute() body of RaggedTensorToVariantOp, which serializes a (possibly batched) RaggedTensor into a Variant tensor. It reads the ragged tensor's row-partition splits (the 'rt_nested_splits' input list) plus a dense values tensor, packs them into a RaggedTensorVariant, and either emits a single scalar Variant (unbatched) or unbatches along the zeroth dimension and emits a rank-1 vector of Variants (batched).",
+  "provenance": "Identified from TensorFlow-specific identifiers: the OpKernel Compute(OpKernelContext* context) override signature, OP_REQUIRES_OK, OpInputList, context->input_list(\"rt_nested_splits\", ...), context->input(...), context->allocate_output(0, TensorShape({...}), ...), the RaggedTensorVariant class with set_values/mutable_nested_splits/append_splits, the UnbatchRaggedZerothDim<VALUE_TYPE, SPLIT_TYPE> helper, and Tensor::scalar<Variant>()/vec<Variant>(). This is the RaggedTensorToVariant kernel (tensorflow/core/kernels/ragged_tensor_to_variant_op.cc). The in-code banner 'sample: primevul_train_2143_vuln' marks it as a PrimeVul sample.",
+  "trust_boundary": "This is a graph op kernel: every input tensor is attacker-controllable. A model author (or anyone able to feed a SavedModel / GraphDef / tf.function trace) fully controls the number and contents of the 'rt_nested_splits' list, the dense values tensor, and their shapes and dtypes. The split tensors are ordinary user data — their length, their integer element values (row offsets), and even whether the list is empty are all hostile. The RaggedTensor contract (splits are monotonically non-decreasing, start at 0, end at nrows/values.dim0, list is non-empty for a batched ragged tensor) is NOT enforced by the wire format; it must be checked here or in the helpers this code calls.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0137_cwe476.cpp",
+      "lines": "2",
+      "code": "  void Compute(OpKernelContext* context) override {",
+      "explanation": "The entry point of the op kernel, overriding OpKernel::Compute. It runs once per op invocation with an OpKernelContext that carries all inputs, the allocator, and the mechanism for producing outputs. Everything reached from here processes user-supplied tensors, so this whole body sits on the attack surface. The kernel is templated on VALUE_TYPE and SPLIT_TYPE (visible later at line 28), meaning multiple concrete instantiations share this exact logic."
+    },
+    {
+      "file": "corpus/train/train_0137_cwe476.cpp",
+      "lines": "4-7",
+      "code": "    OpInputList ragged_nested_splits_in;\n    OP_REQUIRES_OK(context, context->input_list(\"rt_nested_splits\",\n                                                &ragged_nested_splits_in));\n    const int ragged_nested_splits_len = ragged_nested_splits_in.size();",
+      "explanation": "It fetches the variadic input list named 'rt_nested_splits' into an OpInputList. OP_REQUIRES_OK returns early (setting context status) if the list cannot be read. ragged_nested_splits_len is the count of split tensors — i.e. the ragged rank / number of nested row-partitions. Crucially this count is user-controlled and can be zero: a caller may pass an empty list. It is stored in a signed int, and it is also reused below as an input index (line 10) and a loop bound (line 13)."
+    },
+    {
+      "file": "corpus/train/train_0137_cwe476.cpp",
+      "lines": "8-12",
+      "code": "    RaggedTensorVariant batched_ragged_input;\n    // Read ragged_values input.\n    batched_ragged_input.set_values(context->input(ragged_nested_splits_len));\n    batched_ragged_input.mutable_nested_splits()->reserve(\n        ragged_nested_splits_len);",
+      "explanation": "A RaggedTensorVariant is constructed on the stack to hold the assembled ragged tensor. set_values() is given context->input(ragged_nested_splits_len): the dense values tensor is expected to be the single positional input that immediately follows the 'rt_nested_splits' list, so its index equals the list length. reserve(ragged_nested_splits_len) pre-sizes the nested_splits vector for the splits appended next. The values tensor is fully attacker-controlled in shape and dtype."
+    },
+    {
+      "file": "corpus/train/train_0137_cwe476.cpp",
+      "lines": "13-15",
+      "code": "    for (int i = 0; i < ragged_nested_splits_len; i++) {\n      batched_ragged_input.append_splits(ragged_nested_splits_in[i]);\n    }",
+      "explanation": "Each split tensor from the input list is appended, in order, to the RaggedTensorVariant's nested_splits. append_splits presumably just stores the tensor (a copy/handle) without validating its contents. After this loop, batched_ragged_input holds ragged_nested_splits_len split tensors plus the values tensor — a fully assembled but UNVALIDATED ragged tensor. No check enforces that the splits are non-decreasing, begin at 0, stay within the values length, or that at least one split exists. If the list was empty, the loop body never runs and nested_splits is empty."
+    },
+    {
+      "file": "corpus/train/train_0137_cwe476.cpp",
+      "lines": "17-24",
+      "code": "    if (!batched_input_) {\n      // Encode as a Scalar Variant Tensor.\n      Tensor* encoded_scalar;\n      OP_REQUIRES_OK(context, context->allocate_output(0, TensorShape({}),\n                                                       &encoded_scalar));\n      encoded_scalar->scalar<Variant>()() = std::move(batched_ragged_input);\n      return;\n    }",
+      "explanation": "batched_input_ is a kernel member flag (set at construction from an op attribute) selecting the two behaviors. When false, the whole ragged tensor is emitted as a single scalar Variant: it allocates output 0 with empty shape (a scalar), then move-assigns batched_ragged_input into the scalar Variant and returns immediately. The std::move leaves batched_ragged_input in a moved-from state, but the function returns on the next line, so it is never read again on this path — the move is safe here. This branch does not call UnbatchRaggedZerothDim, so it does not depend on the split contents."
+    },
+    {
+      "file": "corpus/train/train_0137_cwe476.cpp",
+      "lines": "26-29",
+      "code": "    // Unbatch the Ragged Tensor and encode the components.\n    std::vector<RaggedTensorVariant> unbatched_ragged_input;\n    OP_REQUIRES_OK(context, UnbatchRaggedZerothDim<VALUE_TYPE, SPLIT_TYPE>(\n                                batched_ragged_input, &unbatched_ragged_input));",
+      "explanation": "The batched path (batched_input_ == true). UnbatchRaggedZerothDim splits the ragged tensor along its outermost dimension into one RaggedTensorVariant per row, writing the results into unbatched_ragged_input. To do this it must read the OUTERMOST split tensor (nested_splits[0]) to learn the row boundaries, and it indexes the values / inner splits using those boundary integers. This is the security-critical helper: it consumes the unvalidated splits assembled above. Its safety hinges on there being at least one split and on those split integers being well-formed. OP_REQUIRES_OK returns early if the helper returns a non-OK Status, but a crash or OOB inside the helper happens before any Status is returned."
+    },
+    {
+      "file": "corpus/train/train_0137_cwe476.cpp",
+      "lines": "31-37",
+      "code": "    // Bundle the encoded scalar Variant Tensors into a rank-1 Variant Tensor.\n    Tensor* encoded_vector;\n    int output_size = unbatched_ragged_input.size();\n    OP_REQUIRES_OK(context,\n                   context->allocate_output(0, TensorShape({output_size}),\n                                            &encoded_vector));\n    auto encoded_vector_t = encoded_vector->vec<Variant>();",
+      "explanation": "output_size is the number of unbatched rows, stored (narrowed) from a size_t std::vector::size() into a signed int. It then allocates output 0 as a rank-1 Variant tensor of that length and obtains a flat vector accessor encoded_vector_t. TensorShape({output_size}) would reject a negative dimension, but the narrowing from size_t to int is still a latent hazard for pathological row counts."
+    },
+    {
+      "file": "corpus/train/train_0137_cwe476.cpp",
+      "lines": "38-40",
+      "code": "    for (int i = 0; i < output_size; i++) {\n      encoded_vector_t(i) = unbatched_ragged_input[i];\n    }",
+      "explanation": "Each unbatched RaggedTensorVariant row is copied into the corresponding slot of the output Variant vector. The loop bound output_size is exactly unbatched_ragged_input.size() (barring the int narrowing above), so the indexing into both the output accessor and the vector is in-bounds. This is a straightforward copy-out with no additional attacker leverage beyond what UnbatchRaggedZerothDim already produced."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0137_cwe476.cpp",
+      "lines": "4-7",
+      "code": "    OpInputList ragged_nested_splits_in;\n    OP_REQUIRES_OK(context, context->input_list(\"rt_nested_splits\",\n                                                &ragged_nested_splits_in));\n    const int ragged_nested_splits_len = ragged_nested_splits_in.size();",
+      "explanation": "PRIMARY RISK (null/OOB dereference). ragged_nested_splits_len is fully attacker-controlled and can be 0: nothing between here and the batched path (line 28) requires the 'rt_nested_splits' list to be non-empty. When the list is empty AND batched_input_ is true, batched_ragged_input carries zero nested splits (the loop at 13-15 never appends). UnbatchRaggedZerothDim then needs the outermost split, nested_splits[0], to know how to unbatch, and dereferences an empty splits vector — reading element [0] of an empty container, or calling .flat<SPLIT_TYPE>() on a null/absent tensor. The invariant that must hold is: reject when ragged_nested_splits_len < 1 (an OP_REQUIRES check) before entering the unbatch path, since a batched ragged tensor requires at least one row-partition. Absent that guard, an attacker crashes the process (denial of service) via a null pointer dereference / out-of-bounds read inside the helper."
+    },
+    {
+      "file": "corpus/train/train_0137_cwe476.cpp",
+      "lines": "13-15",
+      "code": "    for (int i = 0; i < ragged_nested_splits_len; i++) {\n      batched_ragged_input.append_splits(ragged_nested_splits_in[i]);\n    }",
+      "explanation": "UNVALIDATED SPLIT VALUES (out-of-bounds read). append_splits stores each split tensor verbatim with no check that the split integers form a valid row-partition. The RaggedTensor contract requires each splits tensor to be monotonically non-decreasing, to start at 0, and for the final entry (and every inner boundary) to stay within the length of the values tensor set at line 10. An attacker can supply splits like [0, 1000000] against a values tensor of length 5, or non-monotonic / negative offsets. UnbatchRaggedZerothDim (line 28) uses these integers directly to slice the values buffer, so a boundary larger than the values length, or a negative/decreasing boundary, drives an out-of-bounds read (and computes negative or huge slice sizes). The implementation must validate every splits tensor (0 == splits(0), monotonic, splits(last) == values.dim0 / inner sizes consistent) before unbatching."
+    },
+    {
+      "file": "corpus/train/train_0137_cwe476.cpp",
+      "lines": "10",
+      "code": "    batched_ragged_input.set_values(context->input(ragged_nested_splits_len));",
+      "explanation": "INPUT-INDEX / SHAPE ASSUMPTION. The values tensor is fetched positionally as input(ragged_nested_splits_len), assuming the op registration places exactly one dense-values input immediately after the splits list. That indexing invariant is normally guaranteed by the op def, so it is not directly attacker-steerable here. However the fetched values tensor's shape is not validated against the splits: UnbatchRaggedZerothDim assumes values.dim0 matches the outermost split's final boundary. A mismatch (e.g. a rank-0 or empty values tensor while splits claim rows) is another route to the same out-of-bounds read described above. The implementation must check that the values tensor rank/first-dimension is consistent with the outermost splits before slicing."
+    },
+    {
+      "file": "corpus/train/train_0137_cwe476.cpp",
+      "lines": "22",
+      "code": "      encoded_scalar->scalar<Variant>()() = std::move(batched_ragged_input);",
+      "explanation": "USE-AFTER-MOVE (analyzed, currently safe). std::move(batched_ragged_input) leaves the source in a valid-but-unspecified state (CWE-672 territory). This is safe as written ONLY because line 23 returns immediately, so batched_ragged_input is never read again on this branch, and the batched path at line 27+ is unreachable once this branch is taken. The hazard is latent for maintainers: if a future edit removes the early return or adds code after the move that touches batched_ragged_input, it becomes a genuine use-after-move. The invariant to preserve is 'no read of batched_ragged_input after this move'."
+    },
+    {
+      "file": "corpus/train/train_0137_cwe476.cpp",
+      "lines": "33",
+      "code": "    int output_size = unbatched_ragged_input.size();",
+      "explanation": "SIGNED NARROWING of a size_t. std::vector::size() returns size_t; assigning it to a signed int truncates on a very large number of unbatched rows, potentially yielding a negative or wrapped value. TensorShape({output_size}) would reject a negative dimension (turning it into an error rather than memory corruption), so the practical impact is bounded — but it is still a correctness/robustness defect and a latent integer issue worth hardening (use int64_t consistently). Reaching a >INT_MAX row count also requires enormous input, making this low severity relative to the empty-list and split-validation risks."
+    }
+  ],
+  "summary": "A TensorFlow RaggedTensorToVariant kernel that assembles a RaggedTensor from a fully attacker-controlled splits list plus a values tensor and never validates it before unbatching. The dominant risk is a missing 'at least one split' guard: an empty rt_nested_splits list on the batched path drives UnbatchRaggedZerothDim to dereference an empty/absent outermost split (null-pointer / OOB read, remotely triggerable DoS), compounded by no validation of split monotonicity/bounds against the values length (out-of-bounds read).",
+  "reviewed_anchors": [
+    {
+      "anchor": "void Compute(OpKernelContext* context) override (line 2)",
+      "disposition": "dismissed",
+      "reason": "Kernel entry signature; standard OpKernel override, no contract of its own beyond that all inputs it reaches are untrusted."
+    },
+    {
+      "anchor": "context->input_list(\"rt_nested_splits\", &ragged_nested_splits_in) / ragged_nested_splits_len (lines 4-7)",
+      "disposition": "finding",
+      "reason": "Attacker-controlled count that can be 0; drives an empty splits vector into UnbatchRaggedZerothDim — null/OOB deref."
+    },
+    {
+      "anchor": "context->input(ragged_nested_splits_len) / set_values (line 10)",
+      "disposition": "finding",
+      "reason": "Positional values-tensor fetch whose shape is not checked for consistency with the splits; contributes to OOB read."
+    },
+    {
+      "anchor": "mutable_nested_splits()->reserve(ragged_nested_splits_len) (lines 11-12)",
+      "disposition": "dismissed",
+      "reason": "reserve() only pre-allocates capacity for a user-bounded count; no overflow of a fixed buffer and no length-vs-buffer mismatch here."
+    },
+    {
+      "anchor": "for-loop append_splits(ragged_nested_splits_in[i]) (lines 13-15)",
+      "disposition": "finding",
+      "reason": "Stores each split tensor without validating monotonicity/start-zero/bounds against values — unvalidated ragged splits cause OOB reads in the helper."
+    },
+    {
+      "anchor": "if (!batched_input_) scalar-encode branch (lines 17-24)",
+      "disposition": "dismissed",
+      "reason": "Member-flag selected control flow; the scalar path does not touch split contents and returns cleanly."
+    },
+    {
+      "anchor": "allocate_output(0, TensorShape({}), &encoded_scalar) (lines 20-21)",
+      "disposition": "dismissed",
+      "reason": "Scalar output allocation with a compile-time empty shape; status-checked, no attacker-controlled size."
+    },
+    {
+      "anchor": "encoded_scalar->scalar<Variant>()() = std::move(batched_ragged_input) (line 22)",
+      "disposition": "finding",
+      "reason": "Move-from source; safe today because of the immediate return, but a latent use-after-move (CWE-672) for future edits — recorded as an info finding."
+    },
+    {
+      "anchor": "UnbatchRaggedZerothDim<VALUE_TYPE, SPLIT_TYPE>(batched_ragged_input, &unbatched_ragged_input) (lines 28-29)",
+      "disposition": "finding",
+      "reason": "The sink that consumes the unvalidated/empty splits; the null-deref and OOB-read impact both land here (implementation not provided)."
+    },
+    {
+      "anchor": "int output_size = unbatched_ragged_input.size() (line 33)",
+      "disposition": "finding",
+      "reason": "size_t -> int narrowing; latent signed overflow, though TensorShape rejects negative dims — low severity."
+    },
+    {
+      "anchor": "allocate_output(0, TensorShape({output_size}), &encoded_vector) (lines 34-36)",
+      "disposition": "dismissed",
+      "reason": "Output size comes from a trusted local vector length; TensorShape validates the dimension. Only relevant via the narrowing anchor above."
+    },
+    {
+      "anchor": "output copy loop encoded_vector_t(i) = unbatched_ragged_input[i] (lines 38-40)",
+      "disposition": "dismissed",
+      "reason": "Bound is exactly unbatched_ragged_input.size(); indexing into both containers is in-bounds, no attacker leverage beyond the helper's output."
+    }
+  ],
+  "findings": [
+    {
+      "title": "Missing non-empty check on rt_nested_splits allows null/OOB dereference when unbatching",
+      "anchor": "ragged_nested_splits_len = ragged_nested_splits_in.size(); ... UnbatchRaggedZerothDim(batched_ragged_input, ...)",
+      "file": "corpus/train/train_0137_cwe476.cpp",
+      "line": "4-29",
+      "code": "    const int ragged_nested_splits_len = ragged_nested_splits_in.size();\n    ...\n    OP_REQUIRES_OK(context, UnbatchRaggedZerothDim<VALUE_TYPE, SPLIT_TYPE>(\n                                batched_ragged_input, &unbatched_ragged_input));",
+      "bug_class": "NULL pointer dereference / out-of-bounds read from missing input validation (empty required list)",
+      "cwe": "CWE-476",
+      "severity": "high",
+      "where_it_lives": "implementation (file not provided) — UnbatchRaggedZerothDim in tensorflow/core/kernels/ragged_tensor_to_variant_op.cc",
+      "invariant": "On the batched path (batched_input_ == true) the code must reject inputs with ragged_nested_splits_len < 1 via an OP_REQUIRES check BEFORE constructing/unbatching, because unbatching a ragged tensor requires at least one row-partition (the outermost split).",
+      "failure_mode": "An attacker feeds an empty 'rt_nested_splits' input list to a batched RaggedTensorToVariant op. The append loop (13-15) never runs, so batched_ragged_input.nested_splits() is empty. UnbatchRaggedZerothDim reads the outermost split (nested_splits[0]) of an empty vector / absent tensor to compute row boundaries, dereferencing a null or out-of-range element before any Status is returned. Result: process crash / denial of service, reachable from any untrusted model or serving request.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm UnbatchRaggedZerothDim accesses nested_splits[0] (or splits(0)) without first checking the vector is non-empty, and that Compute() has no OP_REQUIRES(ragged_nested_splits_len > 0) guard before line 28."
+    },
+    {
+      "title": "Ragged splits appended without monotonicity/bounds validation → out-of-bounds read over values",
+      "anchor": "batched_ragged_input.append_splits(ragged_nested_splits_in[i]);",
+      "file": "corpus/train/train_0137_cwe476.cpp",
+      "line": "13-15",
+      "code": "    for (int i = 0; i < ragged_nested_splits_len; i++) {\n      batched_ragged_input.append_splits(ragged_nested_splits_in[i]);\n    }",
+      "bug_class": "Out-of-bounds read from unvalidated length-prefix/row-partition integers",
+      "cwe": "CWE-125",
+      "severity": "high",
+      "where_it_lives": "implementation (file not provided) — UnbatchRaggedZerothDim uses the stored splits to index the values tensor",
+      "invariant": "Each splits tensor must be validated before use: splits(0) == 0, values are monotonically non-decreasing, and the final/inner boundaries stay within the length of the values tensor (and inner split lengths are consistent). Only validated splits may drive slicing of the values buffer.",
+      "failure_mode": "The loop stores attacker-supplied split tensors verbatim. An attacker sets split boundaries that exceed the values length, are negative, or are non-monotonic (e.g. splits [0, 2^31] against a 5-element values tensor). UnbatchRaggedZerothDim slices values using these integers, reading out of bounds (information disclosure) or computing negative/huge slice sizes (crash). The kernel performs no such validation before unbatching.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm neither append_splits nor UnbatchRaggedZerothDim enforces splits monotonicity, a zero start, and an upper bound tied to values.dim0 before indexing the values tensor."
+    },
+    {
+      "title": "Values tensor shape not checked for consistency with outermost splits",
+      "anchor": "batched_ragged_input.set_values(context->input(ragged_nested_splits_len));",
+      "file": "corpus/train/train_0137_cwe476.cpp",
+      "line": "10",
+      "code": "    batched_ragged_input.set_values(context->input(ragged_nested_splits_len));",
+      "bug_class": "Missing input validation (shape mismatch between values and splits)",
+      "cwe": "CWE-20",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "The values tensor's first dimension must equal the final boundary of the outermost splits (and its rank must be >= 1) before UnbatchRaggedZerothDim slices it.",
+      "failure_mode": "The values tensor is taken positionally and stored without any rank/shape check against the splits. A caller supplies a values tensor whose dim0 is smaller than what the splits claim (or a rank-0/empty values tensor), and the unbatch step indexes past its end — an out-of-bounds read distinct from, but compounding, the unvalidated-splits finding.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm there is no check that values.dim_size(0) matches nested_splits[0].back() (and values rank >= 1) prior to unbatching."
+    },
+    {
+      "title": "size_t-to-int narrowing of unbatched row count",
+      "anchor": "int output_size = unbatched_ragged_input.size();",
+      "file": "corpus/train/train_0137_cwe476.cpp",
+      "line": "33",
+      "code": "    int output_size = unbatched_ragged_input.size();",
+      "bug_class": "Signed integer narrowing / potential overflow",
+      "cwe": "CWE-197",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0137_cwe476.cpp",
+      "invariant": "The unbatched row count must be represented in a type wide enough to hold std::vector::size() (int64_t) and must be non-negative before being used as a TensorShape dimension and loop bound.",
+      "failure_mode": "If unbatched_ragged_input.size() exceeds INT_MAX, the assignment to int truncates to a negative or wrapped value. TensorShape({output_size}) rejects a negative dimension, so this degrades to an error rather than memory corruption, but it is a latent correctness defect that requires an extremely large row count to reach.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm whether row counts can approach INT_MAX in practice; prefer int64_t for output_size and the loop index to remove the narrowing."
+    },
+    {
+      "title": "Latent use-after-move of batched_ragged_input",
+      "anchor": "encoded_scalar->scalar<Variant>()() = std::move(batched_ragged_input);",
+      "file": "corpus/train/train_0137_cwe476.cpp",
+      "line": "22",
+      "code": "      encoded_scalar->scalar<Variant>()() = std::move(batched_ragged_input);",
+      "bug_class": "Use-after-move (currently masked by immediate return)",
+      "cwe": "CWE-672",
+      "severity": "info",
+      "where_it_lives": "corpus/train/train_0137_cwe476.cpp",
+      "invariant": "After std::move(batched_ragged_input) the object is in a valid-but-unspecified state and must not be read again; the function must not fall through to code that touches it.",
+      "failure_mode": "As written this is safe because line 23 returns immediately and the batched path is unreachable on this branch. It becomes an active use-after-move only if a maintainer removes the return or inserts code that reads batched_ragged_input after the move. Recorded so the contract 'no read after move' is preserved.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the early return at line 23 remains the sole exit of this branch and no future edit reads batched_ragged_input after line 22."
+    }
+  ],
+  "audit_checklist": [
+    "Add OP_REQUIRES(context, ragged_nested_splits_len > 0, ...) (or the equivalent) before the batched path so an empty rt_nested_splits list cannot reach UnbatchRaggedZerothDim.",
+    "Verify UnbatchRaggedZerothDim guards against an empty nested_splits vector before accessing nested_splits[0] / splits(0).",
+    "Validate every splits tensor: first element == 0, monotonically non-decreasing, final/inner boundaries within the values tensor length; reject otherwise.",
+    "Check the values tensor rank (>= 1) and that values.dim_size(0) is consistent with the outermost splits before slicing.",
+    "Use int64_t for output_size and the row-copy loop index to eliminate the size_t-to-int narrowing.",
+    "Confirm the scalar branch's early return remains the only exit so the std::move at line 22 stays free of any later read of batched_ragged_input."
+  ]
+}

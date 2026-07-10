@@ -1,0 +1,281 @@
+{
+  "subsystem": "Constant-folding / literal-evaluation helper inside the Hermes JavaScript engine's IR optimizer. hermes::evalUnaryOperator takes a JavaScript unary operator kind (unary minus, typeof, logical not '!', and void) plus an SSA IR Literal operand, and, when the operand is a compile-time constant, returns a new folded Literal value (a number, string, boolean, NaN, negative zero, or undefined). It is the compile-time model of JavaScript's unary operator semantics used to replace UnaryOperatorInst instructions with constants during optimization.",
+  "provenance": "Identified from the fully-qualified name hermes::evalUnaryOperator (the Meta/Facebook Hermes engine namespace), the vendored LLVM fork spelling llvh::dyn_cast (Hermes ships LLVM under the 'llvh' namespace), the IR types UnaryOperatorInst::OpKind, IRBuilder, ValueKind, LiteralNumber, and the IRBuilder factory methods getLiteralNumber / getLiteralNaN / getLiteralNegativeZero / getLiteralString / getLiteralBool / getLiteralUndefined, plus the LLVM-style llvm_unreachable macro. The sample filename train_0119_cwe843.cpp and header comment '/* sample: primevul_test_0025_vuln */' further situate it as a Hermes optimizer source (e.g. lib/Optimizer / IR eval helpers).",
+  "trust_boundary": "The operand comes from the IR the compiler is optimizing, which is derived from attacker-authored JavaScript source: an attacker who can get JS compiled by Hermes (web content, a bundled RN app, a server evaluating untrusted JS) controls which literals and value kinds reach this fold. The security-relevant surface is not a byte buffer but a TYPE contract: the function is handed a Literal* and dispatches purely on operand->getKind(), so the runtime type tag chosen by earlier passes is what is trusted. If an upstream pass upcasts a Value that is not really the subclass its ValueKind implies (or passes a non-Literal such as the global object through a Literal* parameter), every getValue()/cast performed here operates on a mis-typed object — a type-confusion boundary. operand itself is a raw pointer with no null guard.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0119_cwe843.cpp",
+      "lines": "2-5",
+      "code": "Literal *hermes::evalUnaryOperator(\n    UnaryOperatorInst::OpKind kind,\n    IRBuilder &builder,\n    Literal *operand) {",
+      "explanation": "The function signature. It returns a Literal* (the folded constant, or nullptr when folding is impossible). 'kind' is the unary operator being modeled (an enum: MinusKind, TypeofKind, BangKind, VoidKind, ...). 'builder' is the IRBuilder used to materialize new Literal nodes in the module's constant pool. 'operand' is the single operand of the unary expression, statically typed as Literal* — the base class of all IR literal constants. The whole function assumes 'operand' is a valid, non-null Literal (or at least a Value whose ValueKind is one of the cases handled) and that its dynamic type matches the ValueKind it reports."
+    },
+    {
+      "file": "corpus/train/train_0119_cwe843.cpp",
+      "lines": "6-9",
+      "code": "  switch (kind) {\n    case UnaryOperatorInst::OpKind::MinusKind:\n      // Negate constant integers.\n      switch (operand->getKind()) {",
+      "explanation": "The outer dispatch on the operator kind. The first arm handles unary minus (JS '-x'). Immediately it performs an inner dispatch on operand->getKind() — this dereferences 'operand' and reads its runtime ValueKind tag. Note the comment claims it only negates 'constant integers', but Hermes LiteralNumber is a double; the arms below actually model the JS ToNumber-then-negate semantics for several literal kinds, not just integers."
+    },
+    {
+      "file": "corpus/train/train_0119_cwe843.cpp",
+      "lines": "10-15",
+      "code": "        case ValueKind::LiteralNumberKind:\n          if (auto *literalNum = llvh::dyn_cast<LiteralNumber>(operand)) {\n            auto V = -literalNum->getValue();\n            return builder.getLiteralNumber(V);\n          }\n          break;",
+      "explanation": "For a numeric literal operand, the code performs a CHECKED downcast with llvh::dyn_cast<LiteralNumber>(operand). If the cast succeeds it reads the double via getValue(), negates it, and returns a fresh LiteralNumber. This is the one place that defensively re-validates the dynamic type rather than trusting the ValueKind tag: if the tag said LiteralNumberKind but the object is not really a LiteralNumber, dyn_cast returns null and the code falls through to 'break' (line 15), ultimately returning nullptr (no fold). This is the correct pattern — the other arms do not repeat it."
+    },
+    {
+      "file": "corpus/train/train_0119_cwe843.cpp",
+      "lines": "16-17",
+      "code": "        case ValueKind::LiteralUndefinedKind:\n          return builder.getLiteralNaN();",
+      "explanation": "'-undefined' in JavaScript is ToNumber(undefined) = NaN, negated = NaN. The code returns a LiteralNaN. No cast of the operand is performed because the result depends only on the kind, not on any payload of the operand — so no type-confused field access happens here."
+    },
+    {
+      "file": "corpus/train/train_0119_cwe843.cpp",
+      "lines": "18-23",
+      "code": "        case ValueKind::LiteralBoolKind:\n          if (evalIsTrue(builder, operand)) {\n            return builder.getLiteralNumber(-1);\n          } else { // evalIsFalse(operand)\n            return builder.getLiteralNegativeZero();\n          }",
+      "explanation": "'-true' = -(1) = -1 and '-false' = -(0) = -0. The code asks the helper evalIsTrue(builder, operand) whether the boolean literal is true; if so it returns LiteralNumber(-1), otherwise it returns LiteralNegativeZero (-0, which must be distinguished from +0 in JS). Both branches of the if/else return, so although this case has no trailing 'break', control cannot fall through into the next case under the current logic."
+    },
+    {
+      "file": "corpus/train/train_0119_cwe843.cpp",
+      "lines": "24-25",
+      "code": "        case ValueKind::LiteralNullKind:\n          return builder.getLiteralNegativeZero();",
+      "explanation": "'-null' = -(ToNumber(null)) = -(0) = -0. Returns LiteralNegativeZero. Again payload-free — only the kind matters."
+    },
+    {
+      "file": "corpus/train/train_0119_cwe843.cpp",
+      "lines": "26-29",
+      "code": "        default:\n          break;\n      }\n      break;",
+      "explanation": "Any other operand kind under unary minus (e.g. a LiteralString, or any non-literal Value that leaked in) hits the inner default and breaks, then the outer 'break' exits the MinusKind arm, falling through to the terminal 'return nullptr'. This is a safe 'cannot fold' outcome — importantly the minus arm's default does NOT call llvm_unreachable, in contrast to the typeof arm below."
+    },
+    {
+      "file": "corpus/train/train_0119_cwe843.cpp",
+      "lines": "30-34",
+      "code": "    case UnaryOperatorInst::OpKind::TypeofKind:\n      switch (operand->getKind()) {\n        case ValueKind::GlobalObjectKind:\n        case ValueKind::LiteralNullKind:\n          return builder.getLiteralString(\"object\");",
+      "explanation": "The typeof arm. It again dereferences operand->getKind() and folds 'typeof x' to its result string. Both GlobalObjectKind and LiteralNullKind map to \"object\" (JS: typeof null === 'object', and the global object is an object). Critically, GlobalObjectKind is NOT a Literal subclass — its presence here proves that the Literal* parameter is, in practice, fed Values that are not literals at all. The fold is payload-free (returns a constant string) so no mis-typed field is read, but it documents that operand's static type is looser than 'a real Literal'."
+    },
+    {
+      "file": "corpus/train/train_0119_cwe843.cpp",
+      "lines": "35-42",
+      "code": "        case ValueKind::LiteralUndefinedKind:\n          return builder.getLiteralString(\"undefined\");\n        case ValueKind::LiteralBoolKind:\n          return builder.getLiteralString(\"boolean\");\n        case ValueKind::LiteralNumberKind:\n          return builder.getLiteralString(\"number\");\n        case ValueKind::LiteralStringKind:\n          return builder.getLiteralString(\"string\");",
+      "explanation": "The remaining typeof cases map each literal kind to its JS type string: undefined->\"undefined\", bool->\"boolean\", number->\"number\", string->\"string\". Each returns a constant LiteralString and reads nothing from the operand's payload, so these are type-safe regardless of the operand's true subclass."
+    },
+    {
+      "file": "corpus/train/train_0119_cwe843.cpp",
+      "lines": "43-46",
+      "code": "        default:\n          llvm_unreachable(\"Invalid literal kind.\");\n      }\n      break;",
+      "explanation": "The typeof inner default assumes the operand's kind is ALWAYS one of the enumerated literal kinds and marks the path unreachable. In assert-enabled builds llvm_unreachable aborts with the message; in release builds it lowers to __builtin_unreachable(), telling the optimizer this branch cannot occur. If an operand with an unenumerated ValueKind ever reaches here, release builds execute undefined behavior. Because JavaScript's typeof is total over all values, any value kind the compiler can produce but this switch does not list (a newly added literal kind such as BigInt, or a non-literal Value that slipped through as Literal*) lands in this default."
+    },
+    {
+      "file": "corpus/train/train_0119_cwe843.cpp",
+      "lines": "48-55",
+      "code": "    case UnaryOperatorInst::OpKind::BangKind:\n      if (evalIsTrue(builder, operand)) {\n        return builder.getLiteralBool(false);\n      }\n      if (evalIsFalse(builder, operand)) {\n        return builder.getLiteralBool(true);\n      }\n      break;",
+      "explanation": "Logical not ('!x'). If the operand is provably truthy it folds to false; if provably falsy it folds to true; otherwise (the operand's truthiness cannot be decided at compile time) it breaks and returns nullptr, declining the fold. Unlike the typeof arm, the undecidable case here is handled gracefully with a null return rather than llvm_unreachable."
+    },
+    {
+      "file": "corpus/train/train_0119_cwe843.cpp",
+      "lines": "57-58",
+      "code": "    case UnaryOperatorInst::OpKind::VoidKind:\n      return builder.getLiteralUndefined();",
+      "explanation": "'void x' always evaluates to undefined regardless of operand, so this arm unconditionally returns LiteralUndefined without inspecting operand at all — the only arm that never touches operand->getKind()."
+    },
+    {
+      "file": "corpus/train/train_0119_cwe843.cpp",
+      "lines": "60-65",
+      "code": "    default:\n      break;\n  }\n\n  return nullptr;\n}",
+      "explanation": "Any operator kind not modeled falls to the outer default and breaks, and the function returns nullptr. nullptr is the universal 'I could not fold this' sentinel; every caller must treat a null result as 'keep the original instruction'. A caller that dereferences the result without checking for null would fault, but that is a caller-side contract."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0119_cwe843.cpp",
+      "lines": "9",
+      "code": "      switch (operand->getKind()) {",
+      "explanation": "TYPE CONFUSION (the central hazard, CWE-843). The function trusts operand->getKind() as an oracle for the operand's real C++ type and then, in the arms that read payload, treats the object as that subclass. Only the MinusKind/LiteralNumberKind arm (line 11) re-validates with a checked dyn_cast; every other arm trusts the tag. The typeof arm's inclusion of GlobalObjectKind (line 32) is concrete evidence that non-Literal Values are passed through the Literal* parameter. If any upstream optimizer pass produces a Value whose ValueKind tag disagrees with its actual vtable/layout (a mis-upcast, a recycled/replaced instruction, or a Value kind that was never meant to reach this fold), then a payload-reading path such as -literalNum->getValue() would read a double out of an object that is not a LiteralNumber. The invariant the implementation must uphold: operand is genuinely the subclass its ValueKind names for every kind whose payload is dereferenced, and callers never pass a non-Literal Value as Literal* except for the payload-free kinds explicitly whitelisted here."
+    },
+    {
+      "file": "corpus/train/train_0119_cwe843.cpp",
+      "lines": "43-44",
+      "code": "        default:\n          llvm_unreachable(\"Invalid literal kind.\");",
+      "explanation": "UNREACHABLE-ASSUMED-EXHAUSTIVE (CWE-670 / CWE-843). typeof in JavaScript is defined for every value, but this switch enumerates a fixed set of ValueKinds and declares all others unreachable. If the operand's kind is a valid value kind not listed here — e.g. a literal type added later (BigInt), or a non-literal Value whose kind isn't one of the handled ones but which was routed here as a foldable typeof operand — control reaches the default. In an assert-enabled build this aborts (a remote/attacker-triggerable denial of service from crafted JS). In a release build llvm_unreachable becomes __builtin_unreachable(), which is undefined behavior: the compiler may fall through into whatever code follows or perform an unbounded jump, turning an unexpected-but-valid operand kind into memory-unsafe behavior. The safe pattern is the MinusKind arm's 'default: break;' (return nullptr / decline the fold), not llvm_unreachable. Invariant: the set of kinds reaching this default must be provably empty for all inputs the compiler can construct — which is fragile across engine evolution."
+    },
+    {
+      "file": "corpus/train/train_0119_cwe843.cpp",
+      "lines": "2-5",
+      "code": "Literal *hermes::evalUnaryOperator(\n    UnaryOperatorInst::OpKind kind,\n    IRBuilder &builder,\n    Literal *operand) {",
+      "explanation": "NULL POINTER DEREFERENCE (CWE-476). 'operand' is a raw pointer with no null check before the first dereference at operand->getKind() (lines 9 and 31). Every operator arm except VoidKind reads operand->getKind(). If any caller can reach this helper with a null operand (an unresolved use, a folded-away operand, an error path that still calls the folder), the function faults on the very first switch. Invariant: callers must guarantee operand != nullptr for all kinds except VoidKind; a defensive early 'if (!operand) return nullptr;' would remove the dependency on that external contract."
+    },
+    {
+      "file": "corpus/train/train_0119_cwe843.cpp",
+      "lines": "18-23",
+      "code": "        case ValueKind::LiteralBoolKind:\n          if (evalIsTrue(builder, operand)) {\n            return builder.getLiteralNumber(-1);\n          } else { // evalIsFalse(operand)\n            return builder.getLiteralNegativeZero();\n          }",
+      "explanation": "FALL-THROUGH FRAGILITY (CWE-484 / CWE-1077). This case has no terminating 'break'; it is currently safe only because both the if and the else return. If a future edit adds a non-returning branch (e.g. a guard that falls through when evalIsTrue/evalIsFalse are both inconclusive, mirroring the BangKind arm at lines 49-54), execution would fall through into the LiteralNullKind case at line 24 and mis-fold '-bool' as -0. The comment '// evalIsFalse(operand)' asserts an assumption (that not-true implies false) rather than testing it, so a bool-like operand for which evalIsTrue is false but which is not genuinely false would silently take the -0 branch. Invariant: every non-returning path in a switch case must end in an explicit break, and bool folding must not assume evalIsTrue == !evalIsFalse."
+    },
+    {
+      "file": "corpus/train/train_0119_cwe843.cpp",
+      "lines": "64",
+      "code": "  return nullptr;",
+      "explanation": "NULL-RESULT CONTRACT (CWE-476, caller-side / latent). Several reachable paths (MinusKind default, MinusKind LiteralNumber when dyn_cast fails, BangKind undecidable, unmodeled operator kinds) return nullptr to mean 'not folded'. This is correct here, but it places a hard obligation on every caller to null-check the result before using it as a replacement Value. A caller that assumes evalUnaryOperator always yields a constant (e.g. because it already checked the operand looked constant) and directly RAUWs or dereferences the null result would crash or, worse, install a null operand into the IR. Invariant: all call sites must treat nullptr as 'keep original instruction'."
+    }
+  ],
+  "summary": "A Hermes constant-folding helper that models JS unary operators on IR literals. Its security contract is a TYPE contract, not a buffer one: it dispatches on operand->getKind() and, except for the checked dyn_cast in the unary-minus/number arm, trusts that tag to match the operand's real type — a CWE-843 type-confusion surface, corroborated by the typeof arm accepting the non-literal GlobalObjectKind through a Literal* parameter. The typeof default's llvm_unreachable turns any unenumerated-but-valid operand kind into an abort (assert builds) or undefined behavior (release builds), and operand is dereferenced with no null guard. No memory-copy or length-arithmetic bug exists in the shown code; the risks are latent contracts the implementation and callers must uphold.",
+  "reviewed_anchors": [
+    {
+      "anchor": "Literal *hermes::evalUnaryOperator(UnaryOperatorInst::OpKind kind, IRBuilder &builder, Literal *operand) (signature, lines 2-5)",
+      "disposition": "finding",
+      "reason": "Raw Literal* operand dereferenced with no null check and dispatched on a trusted type tag — null-deref and type-confusion surface."
+    },
+    {
+      "anchor": "switch (kind) on UnaryOperatorInst::OpKind (line 6)",
+      "disposition": "dismissed",
+      "reason": "Enum dispatch with a safe outer 'default: break;' returning nullptr; unmodeled operators just decline to fold."
+    },
+    {
+      "anchor": "operand->getKind() dispatch under MinusKind (line 9)",
+      "disposition": "finding",
+      "reason": "Trusting the dynamic kind tag to select payload handling is the core type-confusion contract."
+    },
+    {
+      "anchor": "MinusKind / LiteralNumberKind: llvh::dyn_cast<LiteralNumber>(operand) + getValue() (lines 10-15)",
+      "disposition": "dismissed",
+      "reason": "Uses a CHECKED downcast; on mismatch it falls to break and returns nullptr, so this specific arm is type-safe (it is the model to emulate)."
+    },
+    {
+      "anchor": "MinusKind / LiteralUndefinedKind -> getLiteralNaN() (lines 16-17)",
+      "disposition": "dismissed",
+      "reason": "Payload-free fold based only on kind; reads nothing from a possibly mis-typed object."
+    },
+    {
+      "anchor": "MinusKind / LiteralBoolKind (lines 18-23)",
+      "disposition": "finding",
+      "reason": "Case has no trailing break (currently safe only because both branches return) and asserts evalIsTrue==!evalIsFalse via comment — fall-through fragility."
+    },
+    {
+      "anchor": "MinusKind / LiteralNullKind -> getLiteralNegativeZero() (lines 24-25)",
+      "disposition": "dismissed",
+      "reason": "Payload-free fold on kind only; correct JS semantics for -null = -0."
+    },
+    {
+      "anchor": "MinusKind inner default: break (lines 26-29)",
+      "disposition": "dismissed",
+      "reason": "Safe 'cannot fold' path returning nullptr; notably does NOT call llvm_unreachable."
+    },
+    {
+      "anchor": "operand->getKind() dispatch under TypeofKind (line 31)",
+      "disposition": "finding",
+      "reason": "Second trusted-tag dispatch; folded into the type-confusion finding."
+    },
+    {
+      "anchor": "TypeofKind / GlobalObjectKind case (line 32)",
+      "disposition": "finding",
+      "reason": "GlobalObject is not a Literal subclass; its presence proves non-Literal Values flow through the Literal* parameter — direct evidence for the type-confusion finding."
+    },
+    {
+      "anchor": "TypeofKind literal-string cases: undefined/boolean/number/string (lines 33-42)",
+      "disposition": "dismissed",
+      "reason": "Each returns a constant string and reads no operand payload; type-safe regardless of the operand's true subclass."
+    },
+    {
+      "anchor": "TypeofKind default: llvm_unreachable(\"Invalid literal kind.\") (lines 43-44)",
+      "disposition": "finding",
+      "reason": "Assumes an exhaustive kind set for a total operator; unenumerated valid kinds cause abort (assert) or UB (release)."
+    },
+    {
+      "anchor": "BangKind arm: evalIsTrue/evalIsFalse then break (lines 48-55)",
+      "disposition": "dismissed",
+      "reason": "Undecidable truthiness safely returns nullptr; no payload dereference, no unreachable assumption."
+    },
+    {
+      "anchor": "VoidKind -> getLiteralUndefined() (lines 57-58)",
+      "disposition": "dismissed",
+      "reason": "Unconditional constant; never inspects operand, so no risk."
+    },
+    {
+      "anchor": "Outer default: break (lines 60-61)",
+      "disposition": "dismissed",
+      "reason": "Falls through to the nullptr sentinel; safe handling of unmodeled operators."
+    },
+    {
+      "anchor": "return nullptr sentinel (line 64)",
+      "disposition": "finding",
+      "reason": "Correct here but imposes a null-check obligation on every caller; latent caller-side NULL-deref contract."
+    },
+    {
+      "anchor": "evalIsTrue(builder, operand) / evalIsFalse(builder, operand) helpers (lines 19, 49, 52)",
+      "disposition": "dismissed",
+      "reason": "Defined elsewhere; not shown, but they too consume the same trusted operand — covered by the type-confusion finding rather than a separate one."
+    },
+    {
+      "anchor": "IRBuilder factory calls getLiteralNumber/NaN/NegativeZero/String/Bool/Undefined",
+      "disposition": "dismissed",
+      "reason": "Constant-construction sinks with fixed-type arguments; no attacker-controlled length or buffer involved."
+    }
+  ],
+  "findings": [
+    {
+      "title": "Type confusion: operand dispatched on trusted ValueKind tag without downcast validation",
+      "anchor": "switch (operand->getKind()) and payload reads under MinusKind; GlobalObjectKind accepted via Literal* in TypeofKind",
+      "file": "corpus/train/train_0119_cwe843.cpp",
+      "line": "9-32",
+      "code": "      switch (operand->getKind()) {\n        case ValueKind::LiteralNumberKind:\n          if (auto *literalNum = llvh::dyn_cast<LiteralNumber>(operand)) {\n            auto V = -literalNum->getValue();\n            return builder.getLiteralNumber(V);\n          }\n          break;",
+      "bug_class": "Type confusion (access of resource using incompatible type)",
+      "cwe": "CWE-843",
+      "severity": "high",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "For every operand kind whose payload is dereferenced, the object's real C++ type MUST equal the subclass its ValueKind names; callers MUST only pass a non-Literal Value through the Literal* parameter for the payload-free kinds explicitly whitelisted here (e.g. GlobalObjectKind under typeof).",
+      "failure_mode": "Only the MinusKind/LiteralNumberKind arm re-validates with a checked dyn_cast; the other arms trust operand->getKind(). The typeof arm accepting ValueKind::GlobalObjectKind through a Literal* parameter demonstrates that non-Literal Values already reach this function. If any upstream pass upcasts a Value whose kind tag disagrees with its real layout, a payload-reading path (getValue(), or the helpers evalIsTrue/evalIsFalse) reads or interprets memory of the wrong type, yielding a mis-folded constant or a controlled out-of-type read that can be leveraged into memory corruption in the generated bytecode. Trigger: attacker-authored JavaScript that steers the optimizer into folding a unary op on a value whose IR kind tag is inconsistent with its object.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm that every code path reaching evalUnaryOperator passes a genuine Literal (or a whitelisted Value kind), and that evalIsTrue/evalIsFalse and getValue() never read subclass fields off an object whose ValueKind was set inconsistently; consider replacing tag-trust with dyn_cast in every payload-reading arm."
+    },
+    {
+      "title": "typeof default marks a total operator's fallthrough unreachable (abort / release-build UB)",
+      "anchor": "default: llvm_unreachable(\"Invalid literal kind.\");",
+      "file": "corpus/train/train_0119_cwe843.cpp",
+      "line": "43-44",
+      "code": "        default:\n          llvm_unreachable(\"Invalid literal kind.\");",
+      "bug_class": "Unreachable-code assumption on reachable input (assertion abort / undefined behavior)",
+      "cwe": "CWE-670",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0119_cwe843.cpp",
+      "invariant": "The set of operand ValueKinds that reach this default MUST be provably empty for every Value the compiler can construct; because typeof is total over JS values, the enumerated kind list here must stay exhaustive across all engine versions.",
+      "failure_mode": "An operand whose kind is valid but not enumerated (a newly added literal kind such as BigInt, or a non-literal Value routed here as a foldable typeof operand) reaches the default. In assert-enabled builds llvm_unreachable aborts the process — an attacker-triggerable denial of service from crafted JavaScript. In release builds it lowers to __builtin_unreachable(), i.e. undefined behavior, allowing the optimizer to fall through into adjacent code or perform an unbounded control transfer. The MinusKind arm's 'default: break;' (return nullptr) shows the safe pattern that this arm omits.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify the full set of ValueKinds a typeof operand can carry versus the cases listed (lines 32-42); replace llvm_unreachable with 'break;'/return nullptr so an unexpected kind declines to fold instead of aborting or invoking UB."
+    },
+    {
+      "title": "Unchecked null operand dereferenced on first switch",
+      "anchor": "Literal *operand parameter dereferenced at operand->getKind()",
+      "file": "corpus/train/train_0119_cwe843.cpp",
+      "line": "5-9",
+      "code": "    Literal *operand) {\n  switch (kind) {\n    case UnaryOperatorInst::OpKind::MinusKind:\n      // Negate constant integers.\n      switch (operand->getKind()) {",
+      "bug_class": "NULL pointer dereference",
+      "cwe": "CWE-476",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "Callers MUST guarantee operand != nullptr for every operator kind except VoidKind, which is the only arm that never dereferences operand.",
+      "failure_mode": "operand is a raw pointer with no null guard; every arm except VoidKind reads operand->getKind() (lines 9 and 31). If any caller reaches the folder with a null operand (unresolved use, an operand already folded away, an error path), the process faults on the first switch. Impact is a crash / DoS.",
+      "cve_analog": "",
+      "what_to_confirm": "Check all call sites for a possible null operand, or add an early 'if (!operand) return nullptr;' guard."
+    },
+    {
+      "title": "Missing break in LiteralBool minus case; truthiness assumed complementary",
+      "anchor": "case ValueKind::LiteralBoolKind (unary minus) with no trailing break",
+      "file": "corpus/train/train_0119_cwe843.cpp",
+      "line": "18-23",
+      "code": "        case ValueKind::LiteralBoolKind:\n          if (evalIsTrue(builder, operand)) {\n            return builder.getLiteralNumber(-1);\n          } else { // evalIsFalse(operand)\n            return builder.getLiteralNegativeZero();\n          }",
+      "bug_class": "Switch fall-through fragility / omitted default handling",
+      "cwe": "CWE-484",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0119_cwe843.cpp",
+      "invariant": "Every non-returning path within a switch case MUST terminate in an explicit break, and '-bool' folding must not assume evalIsTrue(operand) == !evalIsFalse(operand).",
+      "failure_mode": "The case relies on both if/else branches returning; there is no defensive break. The comment '// evalIsFalse(operand)' asserts rather than tests that not-true implies false. If a later edit introduces a non-returning path (as the BangKind arm at lines 49-54 legitimately has), control would fall through into the LiteralNullKind case at line 24 and mis-fold the result as -0. Low severity today, but a latent correctness/type trap.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm evalIsTrue and evalIsFalse are exact complements for LiteralBool operands, and add a trailing break to harden against future fall-through."
+    }
+  ],
+  "audit_checklist": [
+    "Trace every caller of hermes::evalUnaryOperator: confirm operand is a real Literal (or a whitelisted payload-free Value kind) and is never null except for VoidKind.",
+    "Confirm the null-result contract: every call site null-checks the returned Literal* before using it to replace an instruction.",
+    "Audit the typeof default (line 44): enumerate all ValueKinds a typeof operand can carry and confirm none can reach llvm_unreachable; replace with a graceful non-fold.",
+    "Verify evalIsTrue/evalIsFalse and LiteralNumber::getValue() never read subclass-specific fields off an object whose ValueKind may be inconsistent with its real type.",
+    "Check that no upstream pass upcasts a non-Literal Value to Literal* and routes it into a payload-reading arm (MinusKind/LiteralNumberKind, or the bool/number helpers).",
+    "Add an explicit break to the LiteralBoolKind minus case and confirm evalIsTrue/evalIsFalse are exact complements for booleans.",
+    "Confirm release-build lowering of llvm_unreachable and whether reaching it is genuinely impossible under all compilable JS inputs."
+  ]
+}

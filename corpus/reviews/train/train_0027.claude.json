@@ -1,0 +1,150 @@
+{
+  "subsystem": "SoundTouch audio time-stretching library \u2014 the TDStretch class (time-domain WSOLA pitch/tempo processor). This snippet is TDStretch::setChannels(), the setter that reconfigures the processor for a new channel count and re-initializes its internal overlap/FIFO buffers accordingly.",
+  "provenance": "Identified by naming, not by any provided SPDX/copyright banner. Every identifier here \u2014 the TDStretch class, setChannels(), the inputBuffer/outputBuffer FIFO members, overlapLength, setParameters(), the sampleRate member, and the verifyNumberOfChannels() guard \u2014 is the well-known public API of the SoundTouch library's TDStretch.cpp. The in-file banner comment 'sample: primevul_train_3521_fixed' and the containing filename 'train_0027_cwe617.cpp' indicate a PrimeVul-derived sample tagged to CWE-617 (Reachable Assertion), and the '_fixed' suffix indicates this is the post-patch variant. I reviewed it blind on its merits regardless of that label.",
+  "trust_boundary": "The single parameter numChannels is the untrusted input. In real deployments SoundTouch is driven from a media/decoder pipeline, so the channel count typically originates in an audio stream/container header (WAV fmt chunk, decoder output description, etc.) that an attacker can craft. It can therefore be zero, negative, or absurdly large. The sampleRate member consumed at line 13 is likewise externally influenced (set via setSampleRate from stream metadata). Everything the method does with these values \u2014 sizing FIFO buffers and recomputing overlap/window parameters \u2014 sits downstream of that boundary, so the correctness of the verifyNumberOfChannels() gate is the whole security story of this function.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0027_cwe617.cpp",
+      "lines": "2-3",
+      "code": "void TDStretch::setChannels(int numChannels)\n{",
+      "explanation": "Declares the member function TDStretch::setChannels taking a single signed int, numChannels. This is the public reconfiguration entry point that tells the time-stretch processor how many interleaved audio channels its input/output streams carry (1 = mono, 2 = stereo, etc.). Because the parameter is a plain signed int with no range annotation, the type alone permits negative values, zero, and values far larger than any sane channel count, so all validity must be enforced inside the body."
+    },
+    {
+      "file": "corpus/train/train_0027_cwe617.cpp",
+      "lines": "4-5",
+      "code": "    if (!verifyNumberOfChannels(numChannels) ||\n        (channels == numChannels)) return;",
+      "explanation": "The guard clause. It first calls verifyNumberOfChannels(numChannels): in SoundTouch this helper validates that the count is within the supported range (at least 1 and no more than the SOUNDTOUCH_MAX_CHANNELS ceiling) and signals failure for anything out of range. If validation fails (the '!' branch), the function returns immediately and leaves the object's existing configuration untouched \u2014 an invalid request is rejected rather than applied. The second short-circuited condition, (channels == numChannels), is an idempotence check: if the requested count already equals the current member 'channels', the method returns without doing redundant (and potentially destructive) re-initialization. This line is the entire trust gate for the function."
+    },
+    {
+      "file": "corpus/train/train_0027_cwe617.cpp",
+      "lines": "7",
+      "code": "    channels = numChannels;",
+      "explanation": "Having passed validation and confirmed the value actually changed, the method commits the new count to the member field 'channels'. From this point on, every internal computation that multiplies per-sample work by channel count (buffer strides, interleave offsets, sample-frame sizes) uses this value. Its trustworthiness is entirely inherited from the verifyNumberOfChannels() check above."
+    },
+    {
+      "file": "corpus/train/train_0027_cwe617.cpp",
+      "lines": "8-9",
+      "code": "    inputBuffer.setChannels(channels);\n    outputBuffer.setChannels(channels);",
+      "explanation": "Propagates the new channel count into the two FifoSampleBuffer members. setChannels on a FIFO buffer changes how the buffer interprets a 'sample' \u2014 a frame becomes channels*sizeof(sample) wide \u2014 and affects capacity/stride arithmetic and any resize the FIFO performs. Both the producer-side (inputBuffer) and consumer-side (outputBuffer) buffers are reconfigured to stay consistent with the processor. These calls are where an unvalidated channel count would first turn into concrete memory/stride arithmetic."
+    },
+    {
+      "file": "corpus/train/train_0027_cwe617.cpp",
+      "lines": "11-13",
+      "code": "    // re-init overlap/buffer\n    overlapLength=0;\n    setParameters(sampleRate);",
+      "explanation": "Final re-initialization block. overlapLength is reset to 0 so that the subsequent parameter recomputation forces a fresh allocation/setup of the overlap window rather than reusing stale sizing tied to the old channel count. setParameters(sampleRate) is then called with the object's current sampleRate member; in SoundTouch this recomputes the sequence, seek-window and overlap lengths from the sample rate and (re)allocates the internal mid-buffer / window tables. Passing sampleRate (rather than a fresh argument) means the re-init reuses whatever rate was previously configured, so this step's safety depends on sampleRate already holding a sane value and on setParameters tolerating overlapLength==0."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0027_cwe617.cpp",
+      "lines": "4-5",
+      "code": "    if (!verifyNumberOfChannels(numChannels) ||\n        (channels == numChannels)) return;",
+      "explanation": "verifyNumberOfChannels() is the ONLY thing standing between an attacker-influenced channel count (parsed from stream/container metadata) and the rest of the pipeline. This is a latent risk: the helper's body is not shown, so its correctness cannot be confirmed here. The historical SoundTouch bug in this exact code path was a Reachable Assertion (CWE-617): before this validation existed, an out-of-range numChannels flowed downstream until an assert() on the channel count fired, aborting the process (denial of service). The current form is the fix, but its soundness hinges on verifyNumberOfChannels correctly enforcing BOTH bounds \u2014 reject numChannels < 1 (zero/negative would make per-frame size zero or negative and can still trip a downstream assert) AND reject numChannels > SOUNDTOUCH_MAX_CHANNELS. An off-by-one (e.g. '>' vs '>=') or a missing upper bound would re-open the assertion/overflow path. Invariant: verifyNumberOfChannels must guarantee 1 <= numChannels <= SOUNDTOUCH_MAX_CHANNELS before line 7 commits the value."
+    },
+    {
+      "file": "corpus/train/train_0027_cwe617.cpp",
+      "lines": "7-9",
+      "code": "    channels = numChannels;\n    inputBuffer.setChannels(channels);\n    outputBuffer.setChannels(channels);",
+      "explanation": "This is where a channel count that slipped past the gate becomes memory arithmetic. FifoSampleBuffer::setChannels uses the count to compute the byte width of a sample frame and to drive capacity/stride math; an absurdly large channels value can overflow the size computation (channels * samples * sizeof(sample)) and yield an undersized allocation followed by out-of-bounds writes (CWE-787 / CWE-190), while a zero value produces a zero-width frame and division/assert hazards. This is latent \u2014 the FIFO implementation is not in view \u2014 but it is the concrete impact that verifyNumberOfChannels exists to prevent. Invariant: channels must already be range-checked (see line 4) so that all downstream frame-size multiplications stay small and positive."
+    },
+    {
+      "file": "corpus/train/train_0027_cwe617.cpp",
+      "lines": "13",
+      "code": "    setParameters(sampleRate);",
+      "explanation": "The re-init calls setParameters with the current sampleRate member, which is itself derived from stream metadata elsewhere. If sampleRate is 0 or otherwise invalid, setParameters' internal computations (sequence/seek/overlap lengths are functions of the sample rate) can divide by zero, compute a nonsensical overlap length, or trip an assertion \u2014 another reachable-abort path (CWE-617) that this function does not guard. overlapLength is deliberately zeroed on line 12 immediately before this call, so setParameters must tolerate the 0 sentinel and recompute a valid overlap; if it instead asserted overlapLength>0 up front it would abort. Invariant: sampleRate must be validated (non-zero, within supported range) at its own setter, and setParameters must treat overlapLength==0 as 'recompute', not as an invariant violation."
+    }
+  ],
+  "summary": "This is the patched form of a SoundTouch TDStretch reachable-assertion issue: an attacker-influenced channel count that used to reach a downstream assert()/abort is now gated by verifyNumberOfChannels() before being committed and propagated to the FIFO buffers. As shown, the function is well-formed and low risk; the only residual concerns are latent and live outside this snippet \u2014 the correctness of verifyNumberOfChannels' bounds, the FIFO frame-size arithmetic, and the validity of the sampleRate handed to setParameters.",
+  "reviewed_anchors": [
+    {
+      "anchor": "void TDStretch::setChannels(int numChannels) \u2014 signature, line 2",
+      "disposition": "finding",
+      "reason": "numChannels is a signed int with no intrinsic bound; it is the untrusted input and the entire attack surface of the function."
+    },
+    {
+      "anchor": "verifyNumberOfChannels(numChannels) \u2014 validation gate, line 4",
+      "disposition": "finding",
+      "reason": "Sole trust gate; latent correctness dependency \u2014 its body is not shown and a weak/off-by-one bound re-opens the reachable-assertion/overflow path."
+    },
+    {
+      "anchor": "(channels == numChannels) \u2014 idempotence early-return, line 5",
+      "disposition": "dismissed",
+      "reason": "Pure equality short-circuit to skip redundant re-init; carries no memory or bounds contract."
+    },
+    {
+      "anchor": "channels = numChannels; \u2014 member assignment, line 7",
+      "disposition": "finding",
+      "reason": "Commits the (validated) count that all downstream frame-size/stride arithmetic depends on; the point where an escaped bad value becomes state."
+    },
+    {
+      "anchor": "inputBuffer.setChannels(channels) / outputBuffer.setChannels(channels) \u2014 lines 8-9",
+      "disposition": "finding",
+      "reason": "Propagates the count into FIFO frame-width/capacity arithmetic where an unvalidated value would overflow the allocation size (latent, impl not shown)."
+    },
+    {
+      "anchor": "overlapLength = 0; \u2014 line 12",
+      "disposition": "dismissed",
+      "reason": "Deliberate sentinel forcing recomputation in setParameters; benign on its own, its only implication (must be tolerated as 0) is covered under the setParameters anchor."
+    },
+    {
+      "anchor": "setParameters(sampleRate) \u2014 re-init, line 13",
+      "disposition": "finding",
+      "reason": "Re-init driven by the externally-derived sampleRate member and the just-zeroed overlapLength; invalid rate or an overlapLength>0 assert is another reachable-abort path."
+    }
+  ],
+  "findings": [
+    {
+      "title": "Channel-count validation is the sole guard against a reachable assertion / abort (latent in verifyNumberOfChannels)",
+      "anchor": "if (!verifyNumberOfChannels(numChannels) || (channels == numChannels)) return;",
+      "file": "corpus/train/train_0027_cwe617.cpp",
+      "line": "4-5",
+      "code": "    if (!verifyNumberOfChannels(numChannels) ||\n        (channels == numChannels)) return;",
+      "bug_class": "Reachable assertion / uncontrolled abort via unvalidated channel count",
+      "cwe": "CWE-617",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "verifyNumberOfChannels must reject every out-of-range value before line 7 \u2014 specifically enforce 1 <= numChannels <= SOUNDTOUCH_MAX_CHANNELS (reject zero, negatives, and values above the ceiling) \u2014 so no downstream code path can reach an assert() on the channel count.",
+      "failure_mode": "If verifyNumberOfChannels omits a bound or has an off-by-one (e.g. allows 0, negatives, or values > SOUNDTOUCH_MAX_CHANNELS), an attacker-crafted channel count from stream metadata flows to line 7 and into the FIFO/parameter setup, ultimately tripping a channel-count assertion and aborting the process \u2014 a denial of service. This snippet is the patched variant; the finding is that the whole defense rests on this one unseen predicate.",
+      "cve_analog": "",
+      "what_to_confirm": "Read verifyNumberOfChannels(): confirm it returns false for numChannels < 1 and for numChannels > SOUNDTOUCH_MAX_CHANNELS, and that no downstream code assumes the value was already validated by a different caller."
+    },
+    {
+      "title": "New channel count feeds FIFO frame-size arithmetic without local bound (latent overflow)",
+      "anchor": "channels = numChannels; inputBuffer.setChannels(channels); outputBuffer.setChannels(channels);",
+      "file": "corpus/train/train_0027_cwe617.cpp",
+      "line": "7-9",
+      "code": "    channels = numChannels;\n    inputBuffer.setChannels(channels);\n    outputBuffer.setChannels(channels);",
+      "bug_class": "Integer overflow in size computation leading to out-of-bounds write",
+      "cwe": "CWE-190",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "By the time channels is assigned it must already be a small positive value, so that every FifoSampleBuffer frame-size product (channels * samples * sizeof(SAMPLETYPE)) stays within size_t and yields an allocation large enough for subsequent writes.",
+      "failure_mode": "Should a large value escape the line-4 gate, FifoSampleBuffer::setChannels multiplies it into per-frame byte sizes and capacity math; the product can overflow, producing an undersized buffer and later out-of-bounds writes, while a zero count yields a zero-width frame and division/assert hazards. Impact is bounded by the strength of verifyNumberOfChannels; this is the concrete memory consequence that gate protects against.",
+      "cve_analog": "",
+      "what_to_confirm": "Inspect FifoSampleBuffer::setChannels for overflow-safe frame-size math and confirm it too rejects or clamps a zero/negative channel count independently."
+    },
+    {
+      "title": "Re-init reuses externally-derived sampleRate and a zeroed overlapLength",
+      "anchor": "overlapLength=0; setParameters(sampleRate);",
+      "file": "corpus/train/train_0027_cwe617.cpp",
+      "line": "12-13",
+      "code": "    overlapLength=0;\n    setParameters(sampleRate);",
+      "bug_class": "Reachable assertion / divide-by-zero on invalid parameter",
+      "cwe": "CWE-617",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "sampleRate must be validated (non-zero, within supported range) at its own setter, and setParameters must treat overlapLength==0 as 'recompute a valid overlap' rather than asserting overlapLength>0 on entry.",
+      "failure_mode": "setParameters computes sequence/seek/overlap lengths as functions of the sample rate; a sampleRate of 0 (never set, or set from hostile metadata) can cause divide-by-zero or a nonsensical overlap and trip an assertion \u2014 another abort path. Because overlapLength was just zeroed, an entry-side assert on it would likewise abort. No validation of sampleRate happens in this function.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the sampleRate setter rejects 0/invalid rates and that setParameters tolerates overlapLength==0 and a not-yet-initialized rate without asserting or dividing by zero."
+    }
+  ],
+  "audit_checklist": [
+    "Read verifyNumberOfChannels() and confirm it enforces both bounds: numChannels >= 1 and numChannels <= SOUNDTOUCH_MAX_CHANNELS, with no off-by-one.",
+    "Confirm SOUNDTOUCH_MAX_CHANNELS is defined and that all channel-count asserts downstream are made unreachable by that gate (the CWE-617 fix intent).",
+    "Verify FifoSampleBuffer::setChannels performs overflow-safe frame-size arithmetic and independently rejects zero/negative channel counts.",
+    "Confirm the sampleRate setter validates non-zero, in-range rates before setChannels can call setParameters(sampleRate).",
+    "Confirm setParameters treats overlapLength==0 as a recompute sentinel and does not assert overlapLength>0 on entry.",
+    "Check that no other caller assigns TDStretch::channels while bypassing verifyNumberOfChannels()."
+  ]
+}

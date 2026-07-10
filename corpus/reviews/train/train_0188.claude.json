@@ -1,0 +1,238 @@
+{
+  "subsystem": "GPAC text/subtitle loader — the gf_text_get_utf8_line() helper that reads one line from a text/subtitle input file and normalizes it to UTF-8. It handles three input encodings: (a) raw bytes / already-UTF-8 (unicode_type <= 1), where high-bit bytes from legacy Windows code pages are re-encoded to UTF-8; and (b/c) UTF-16 (LE/BE, unicode_type 2/3), where the raw bytes are optionally byte-swapped and then passed through gf_utf8_wcstombs() to produce UTF-8. It is a low-level tokenizer used by GPAC's various text/subtitle importers (SRT, TTXT, WebVTT, etc.).",
+  "provenance": "Identified by the GPAC-specific naming and type conventions: the u32/s32/u16 fixed-width typedefs, the gf_ prefixed helpers gf_fgets/gf_fgetc/gf_utf8_wcstombs, the GPAC_BIG_ENDIAN configuration macro, and the function name gf_text_get_utf8_line which is the exact signature of GPAC's text loader (media_tools/text_import.c / load_text.c family). The sample banner 'primevul_c_test_0042_vuln' and the file name train_0188_cwe415.c are the harness's own labels and are treated as untrusted hints, not as ground truth — this code is reviewed blind on its merits.",
+  "trust_boundary": "The untrusted input is the file content read from txt_in via gf_fgets() at line 10 into the caller-owned buffer szLine (capacity lineSize). Text/subtitle files are attacker-controllable data (downloaded media, remote streams, user-supplied sidecar files), so every byte in szLine after the read is hostile: its length up to lineSize-1, the specific byte values that drive the UTF-8/UTF-16 decode branches, and the placement (or absence) of NUL terminators. lineSize itself is caller-supplied but is generally a large read size (e.g. thousands of bytes), and critically it is INDEPENDENT of the 1024-byte fixed scratch buffer szLineConv. The core hazard is the mismatch between the attacker-influenced line length and the fixed 1024-byte on-stack conversion buffer.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0188_cwe415.c",
+      "lines": "2-7",
+      "code": "char *gf_text_get_utf8_line(char *szLine, u32 lineSize, FILE *txt_in, s32 unicode_type)\n{\n\tu32 i, j, len;\n\tchar *sOK;\n\tchar szLineConv[1024];\n\tunsigned short *sptr;",
+      "explanation": "The function signature takes a caller-owned output buffer szLine with a declared capacity of lineSize bytes, a FILE* txt_in to read from, and unicode_type selecting the source encoding (<=1 = raw/UTF-8/legacy, 2 = UTF-16LE, 3 = UTF-16BE, roughly). The locals i and j are cursor indices (i indexes the source szLine, j indexes the destination), len holds the source string length, and sOK captures the gf_fgets return. The security-critical local is szLineConv[1024]: a fixed 1024-byte scratch buffer on the stack that is used as the conversion destination in BOTH code paths. Its size (1024) is a hard-coded constant that bears no relationship to lineSize, so any assumption that the converted text fits in 1024 bytes is an implicit, unchecked contract. sptr is a u16 cursor used to reinterpret szLine as UTF-16 for the wide-to-multibyte conversion.",
+      "explanation_note": ""
+    },
+    {
+      "file": "corpus/train/train_0188_cwe415.c",
+      "lines": "9-11",
+      "code": "\tmemset(szLine, 0, sizeof(char)*lineSize);\n\tsOK = gf_fgets(szLine, lineSize, txt_in);\n\tif (!sOK) return NULL;",
+      "explanation": "The output buffer is zero-filled for lineSize bytes, then one line is read from the file with gf_fgets bounded by lineSize. gf_fgets, like fgets, writes at most lineSize-1 bytes plus a NUL, so szLine is NUL-terminated within its capacity for the text path. A NULL return (EOF/error) short-circuits to NULL. After this point szLine holds attacker-controlled bytes whose length can be anywhere from 0 to lineSize-1. Note lineSize can be far larger than 1024 (callers commonly pass multi-kilobyte read buffers), which is the root of the buffer-size mismatch that follows.",
+      "explanation_note": ""
+    },
+    {
+      "file": "corpus/train/train_0188_cwe415.c",
+      "lines": "12-15",
+      "code": "\tif (unicode_type<=1) {\n\t\tj=0;\n\t\tlen = (u32) strlen(szLine);\n\t\tfor (i=0; i<len; i++) {",
+      "explanation": "The raw/legacy branch. len is computed with strlen over the attacker-controlled szLine, so len can be up to lineSize-1. The loop walks each source byte i from 0 to len-1, copying/transcoding into szLineConv at index j. Crucially the loop bound guards only the SOURCE index i against len; there is no bound at all on the DESTINATION index j against sizeof(szLineConv) (1024). Whenever len can exceed 1024 — which it can whenever lineSize > 1025 — j will run past the end of the 1024-byte buffer.",
+      "explanation_note": ""
+    },
+    {
+      "file": "corpus/train/train_0188_cwe415.c",
+      "lines": "16-22",
+      "code": "\t\t\tif (!unicode_type && (szLine[i] & 0x80)) {\n\t\t\t\t/*non UTF8 (likely some win-CP)*/\n\t\t\t\tif ((szLine[i+1] & 0xc0) != 0x80) {\n\t\t\t\t\tszLineConv[j] = 0xc0 | ( (szLine[i] >> 6) & 0x3 );\n\t\t\t\t\tj++;\n\t\t\t\t\tszLine[i] &= 0xbf;\n\t\t\t\t}",
+      "explanation": "For unicode_type == 0, any byte with the high bit set (>= 0x80) is treated as legacy Windows code-page data that must be widened to a 2-byte UTF-8 sequence. Line 18 looks one byte AHEAD (szLine[i+1]) to decide whether the following byte is a UTF-8 continuation. If it is NOT a continuation byte, the code emits a UTF-8 lead byte 0xC0|(top bits) into szLineConv[j] and increments j — but does NOT increment i in this branch, and the source byte itself is still copied later at line 54. So for one source byte this branch writes TWO destination bytes (the 0xC0 lead here at line 19, then the masked original at line 54), meaning j grows FASTER than i. This is the expansion that lets the destination cursor outrun even the source length.",
+      "explanation_note": ""
+    },
+    {
+      "file": "corpus/train/train_0188_cwe415.c",
+      "lines": "23-37",
+      "code": "\t\t\t\t/*UTF8 2 bytes char*/\n\t\t\t\telse if ( (szLine[i] & 0xe0) == 0xc0) {\n\t\t\t\t\tszLineConv[j] = szLine[i];\n\t\t\t\t\ti++;\n\t\t\t\t\tj++;\n\t\t\t\t}\n\t\t\t\t/*UTF8 3 bytes char*/\n\t\t\t\telse if ( (szLine[i] & 0xf0) == 0xe0) {\n\t\t\t\t\tszLineConv[j] = szLine[i];\n\t\t\t\t\ti++;\n\t\t\t\t\tj++;\n\t\t\t\t\tszLineConv[j] = szLine[i];\n\t\t\t\t\ti++;\n\t\t\t\t\tj++;\n\t\t\t\t}",
+      "explanation": "The 2- and 3-byte UTF-8 lead-byte cases. For an already-valid multi-byte lead they copy the lead byte(s) into szLineConv and advance both i and j. Note the 3-byte case advances i twice and j twice inside the branch, then the trailing line 54 copies szLine[i] and advances j once more — so these branches also write multiple destination bytes per iteration and repeatedly read szLine[i] after incrementing i, which can walk i past len (the for-condition i<len is only re-checked at the top of each iteration, never between the in-body i++ operations). This under-checks the source index bound and, again, offers no destination bound.",
+      "explanation_note": ""
+    },
+    {
+      "file": "corpus/train/train_0188_cwe415.c",
+      "lines": "38-53",
+      "code": "\t\t\t\t/*UTF8 4 bytes char*/\n\t\t\t\telse if ( (szLine[i] & 0xf8) == 0xf0) {\n\t\t\t\t\tszLineConv[j] = szLine[i];\n\t\t\t\t\ti++;\n\t\t\t\t\tj++;\n\t\t\t\t\tszLineConv[j] = szLine[i];\n\t\t\t\t\ti++;\n\t\t\t\t\tj++;\n\t\t\t\t\tszLineConv[j] = szLine[i];\n\t\t\t\t\ti++;\n\t\t\t\t\tj++;\n\t\t\t\t} else {\n\t\t\t\t\ti+=1;\n\t\t\t\t\tcontinue;\n\t\t\t\t}\n\t\t\t}",
+      "explanation": "The 4-byte UTF-8 lead case copies three bytes advancing i and j three times, then falls through to line 54 to copy a fourth — reading szLine[i] up to three times after i was advanced, with no re-check that i is still < len. The final else (a byte with the high bit set but matching none of the UTF-8 lead patterns) skips the byte (i+=1) and continues. Every branch here can advance i beyond len between iterations, causing reads of szLine bytes past the logical end of the line, and every branch except the continue writes to szLineConv[j] with no upper bound on j.",
+      "explanation_note": ""
+    },
+    {
+      "file": "corpus/train/train_0188_cwe415.c",
+      "lines": "54-60",
+      "code": "\t\t\tszLineConv[j] = szLine[i];\n\t\t\tj++;\n\t\t}\n\t\tszLineConv[j] = 0;\n\t\tstrcpy(szLine, szLineConv);\n\t\treturn sOK;\n\t}",
+      "explanation": "The common tail of every loop iteration: the current source byte is copied to szLineConv[j] and j is incremented. After the loop a terminating NUL is written at szLineConv[j] (line 57) and the whole converted buffer is copied back into szLine with strcpy (line 58). Two unbounded operations live here: (1) szLineConv[j] writes at line 54/57 with j potentially >= 1024 → stack overflow of szLineConv; and (2) strcpy(szLine, szLineConv) at line 58 writes the converted string — which can be LONGER than the original because of the legacy-byte widening — back into szLine, whose capacity is lineSize, with no length check. Both are classic unbounded copies.",
+      "explanation_note": ""
+    },
+    {
+      "file": "corpus/train/train_0188_cwe415.c",
+      "lines": "62-77",
+      "code": "#ifdef GPAC_BIG_ENDIAN\n\tif (unicode_type==3)\n#else\n\tif (unicode_type==2)\n#endif\n\t{\n\t\ti=0;\n\t\twhile (1) {\n\t\t\tchar c;\n\t\t\tif (!szLine[i] && !szLine[i+1]) break;\n\t\t\tc = szLine[i+1];\n\t\t\tszLine[i+1] = szLine[i];\n\t\t\tszLine[i] = c;\n\t\t\ti+=2;\n\t\t}\n\t}",
+      "explanation": "The UTF-16 byte-swap path (taken when the file endianness differs from the host). It swaps each pair of bytes in place to normalize UTF-16 to host order. The loop has NO index bound: it terminates only when it finds two consecutive zero bytes (szLine[i] && szLine[i+1] both zero). Because gf_fgets stops at a newline and UTF-16 text may not contain a UTF-16 NUL (a 00 00 pair) before the buffer ends — the comment at line 82 explicitly notes the trailing \\0 is often not read — this while(1) can walk i past lineSize, reading and WRITING szLine[i]/szLine[i+1] out of bounds. It also reads szLine[i+1] one past i on every iteration.",
+      "explanation_note": ""
+    },
+    {
+      "file": "corpus/train/train_0188_cwe415.c",
+      "lines": "78-84",
+      "code": "\tsptr = (u16 *)szLine;\n\ti = (u32) gf_utf8_wcstombs(szLineConv, 1024, (const unsigned short **) &sptr);\n\tszLineConv[i] = 0;\n\tstrcpy(szLine, szLineConv);\n\t/*this is ugly indeed: since input is UTF16-LE, there are many chances the gf_fgets never reads the \\0 after a \\n*/\n\tif (unicode_type==3) gf_fgetc(txt_in);\n\treturn sOK;",
+      "explanation": "The UTF-16 → UTF-8 conversion. szLine is reinterpreted as a u16* and passed to gf_utf8_wcstombs, which writes the multibyte result into szLineConv bounded by the 1024 argument and returns the number of bytes written into i. Line 80 then writes a NUL at szLineConv[i]. If gf_utf8_wcstombs fills the buffer completely and returns 1024, szLineConv[1024] is a one-past-the-end write (off-by-one stack overflow). gf_utf8_wcstombs can also return (u32)-1 on error in GPAC, which as an index would be an enormous OOB write. Line 81 again strcpy's the converted result back into szLine with no bound. Line 83 consumes one extra byte for the BE case. The return value sOK is the original gf_fgets pointer.",
+      "explanation_note": ""
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0188_cwe415.c",
+      "lines": "15-57",
+      "code": "\t\tfor (i=0; i<len; i++) {\n\t\t\tif (!unicode_type && (szLine[i] & 0x80)) {\n...\n\t\t\tszLineConv[j] = szLine[i];\n\t\t\tj++;\n\t\t}\n\t\tszLineConv[j] = 0;",
+      "explanation": "STACK BUFFER OVERFLOW (primary bug). The loop bounds only the source cursor i against len (up to lineSize-1), never the destination cursor j against sizeof(szLineConv)==1024. Whenever the input line is longer than 1024 bytes — trivially achievable if the caller passes lineSize > 1025, which is normal — the writes szLineConv[j]=... at lines 19/25/31/34/40/43/46/54 and the terminator at line 57 run past the end of the 1024-byte on-stack buffer, corrupting saved registers, the return address, and adjacent locals. Worse, the legacy-widening branch at lines 18-22 writes TWO destination bytes for one source byte (the injected 0xC0 lead plus the copy at line 54), so j can overflow even when len is only slightly above ~512, and even for lines shorter than 1024. An attacker crafts a text/subtitle file with a long line (or many high-bit bytes with unicode_type==0) and achieves a controlled stack smash → remote code execution. INVARIANT: every write to szLineConv must be gated by j < sizeof(szLineConv)-1, and the conversion must stop or truncate before overrun.",
+      "explanation_note": ""
+    },
+    {
+      "file": "corpus/train/train_0188_cwe415.c",
+      "lines": "58",
+      "code": "\t\tstrcpy(szLine, szLineConv);",
+      "explanation": "UNBOUNDED COPY BACK INTO szLine. strcpy copies the converted string into szLine with no size argument. Because the legacy-code-page widening (lines 18-22) can EXPAND the data (one input byte becomes two output bytes), the converted length can exceed the original strlen and, in principle, exceed lineSize. If the source already fills szLine near lineSize-1 and contains many high-bit bytes, the expanded szLineConv overflows szLine on copy-back — a second buffer overflow, this time of the caller's buffer. INVARIANT: the copy back must be bounded by lineSize (e.g. strncpy/strlcpy with sizeof/lineSize), and the expansion must be accounted for so the converted form is guaranteed to fit.",
+      "explanation_note": ""
+    },
+    {
+      "file": "corpus/train/train_0188_cwe415.c",
+      "lines": "79-80",
+      "code": "\ti = (u32) gf_utf8_wcstombs(szLineConv, 1024, (const unsigned short **) &sptr);\n\tszLineConv[i] = 0;",
+      "explanation": "OFF-BY-ONE / OOB WRITE ON THE NUL TERMINATOR. gf_utf8_wcstombs is told the destination is 1024 bytes and can legitimately write and return 1024; szLineConv[1024]=0 is then one past the end of the buffer — a stack overflow of a single byte at a fixed, exploitable offset. Additionally, GPAC's gf_utf8_wcstombs returns (u32)-1 (0xFFFFFFFF) on malformed UTF-16 input; the code casts the result to u32 and uses it directly as an index, so szLineConv[(u32)-1]=0 is a wild out-of-bounds write. INVARIANT: pass a size that leaves room for the terminator (1023), check the return for the error sentinel before using it as an index, and clamp i < 1024.",
+      "explanation_note": ""
+    },
+    {
+      "file": "corpus/train/train_0188_cwe415.c",
+      "lines": "69-76",
+      "code": "\t\twhile (1) {\n\t\t\tchar c;\n\t\t\tif (!szLine[i] && !szLine[i+1]) break;\n\t\t\tc = szLine[i+1];\n\t\t\tszLine[i+1] = szLine[i];\n\t\t\tszLine[i] = c;\n\t\t\ti+=2;\n\t\t}",
+      "explanation": "UNBOUNDED OOB READ/WRITE IN THE BYTE-SWAP LOOP. The loop terminates only on a 00 00 pair and has no bound against lineSize. UTF-16 text read by gf_fgets frequently lacks a UTF-16 NUL before the buffer ends (the author's own comment at line 82 admits the trailing \\0 is often not read), so the loop can scan and byte-swap past the end of szLine, reading and writing out of bounds until it happens upon two zero bytes elsewhere in memory. It also reads szLine[i+1] one byte beyond i on the final pair. INVARIANT: the swap loop must be bounded by lineSize (or the actual number of bytes read) and must not read/write beyond szLine[lineSize-1].",
+      "explanation_note": ""
+    },
+    {
+      "file": "corpus/train/train_0188_cwe415.c",
+      "lines": "18",
+      "code": "\t\t\t\tif ((szLine[i+1] & 0xc0) != 0x80) {",
+      "explanation": "OUT-OF-BOUNDS READ VIA LOOK-AHEAD AND UNGUARDED i-ADVANCES. Line 18 reads szLine[i+1]; combined with the multi-byte branches (lines 24-52) that advance i by 1-3 additional positions inside the loop body without re-checking i<len, i can point at or past len. Reads of szLine[i] and szLine[i+1] then occur past the intended line content. For a truncated multi-byte sequence at the very end of the buffer (a lead byte as the last byte), szLine[i+1] reads the NUL terminator (usually in-bounds since gf_fgets terminates), but the in-body i++ chains can read further. INVARIANT: bound i against len before every szLine[i]/szLine[i+1] access, and validate that a multi-byte sequence's continuation bytes are actually within the line before consuming them. This is a lower-severity information/robustness issue relative to the write overflows above.",
+      "explanation_note": ""
+    },
+    {
+      "file": "corpus/train/train_0188_cwe415.c",
+      "lines": "9",
+      "code": "\tmemset(szLine, 0, sizeof(char)*lineSize);",
+      "explanation": "CALLER-SUPPLIED SIZE TRUST. memset and the subsequent gf_fgets both trust lineSize to equal szLine's real capacity. If any caller passes a lineSize larger than the actual allocation, this memset itself overflows szLine before any parsing. This is a contract on callers rather than a bug visible here, but it is worth confirming because the same lineSize governs every bound the function relies on. INVARIANT: lineSize must exactly match the allocated size of szLine at every call site.",
+      "explanation_note": ""
+    }
+  ],
+  "summary": "gf_text_get_utf8_line() transcodes an attacker-controlled text/subtitle line into UTF-8 using a fixed 1024-byte on-stack scratch buffer (szLineConv) whose size is completely decoupled from the input length (lineSize). The dominant bug is a classic stack buffer overflow: the conversion loop bounds only the source index and lets the destination index j run past 1024 (aggravated by legacy-byte widening that writes two output bytes per input byte), giving an attacker a controlled stack smash from a crafted media file. Secondary defects include an unbounded strcpy copy-back into szLine, an off-by-one/wild NUL-terminator write after gf_utf8_wcstombs, and an unbounded UTF-16 byte-swap loop that reads/writes past the buffer.",
+  "reviewed_anchors": [
+    {"anchor": "gf_text_get_utf8_line(char *szLine, u32 lineSize, FILE *txt_in, s32 unicode_type) signature (line 2)", "disposition": "finding", "reason": "szLine/lineSize form a buffer+length pair whose length governs every bound; the function transcodes untrusted file bytes."},
+    {"anchor": "char szLineConv[1024]; (line 6)", "disposition": "finding", "reason": "Fixed-size stack buffer used as the conversion destination in both paths with no bound tied to lineSize — the central overflow surface."},
+    {"anchor": "u32 i, j, len; (line 4)", "disposition": "finding", "reason": "j is the unbounded destination cursor; len is derived from untrusted strlen; both drive out-of-bounds indexing."},
+    {"anchor": "unsigned short *sptr; and sptr=(u16*)szLine (lines 7,78)", "disposition": "dismissed", "reason": "Just an aliasing cursor for the wcstombs call; carries no independent bound, its hazards are covered by the wcstombs and byte-swap findings."},
+    {"anchor": "memset(szLine, 0, sizeof(char)*lineSize); (line 9)", "disposition": "finding", "reason": "Trusts caller-supplied lineSize as szLine's true capacity; a mismatched lineSize overflows before any parsing."},
+    {"anchor": "gf_fgets(szLine, lineSize, txt_in) (line 10)", "disposition": "dismissed", "reason": "Bounded read by lineSize with NUL termination — safe by itself; it is the source of untrusted data, not a bug site."},
+    {"anchor": "len = (u32) strlen(szLine); (line 14)", "disposition": "dismissed", "reason": "strlen over a NUL-terminated buffer is in-bounds; the danger is that len can exceed 1024, which is captured by the loop overflow finding."},
+    {"anchor": "for (i=0; i<len; i++) conversion loop (lines 15-56)", "disposition": "finding", "reason": "Bounds only source index i, never destination j against sizeof(szLineConv) — stack overflow."},
+    {"anchor": "szLine[i+1] look-ahead read (line 18)", "disposition": "finding", "reason": "Reads one past i and, with unguarded in-body i++ chains, can read past len — out-of-bounds read."},
+    {"anchor": "legacy widening write szLineConv[j]=0xc0|... (lines 19-21)", "disposition": "finding", "reason": "Writes two output bytes per input byte, so j outruns i — accelerates the szLineConv overflow (covered by the loop finding)."},
+    {"anchor": "multi-byte copy branches with in-body i++/j++ (lines 24-52)", "disposition": "finding", "reason": "Advance i multiple times without re-checking i<len and write multiple szLineConv[j] — feed both the OOB read and write findings."},
+    {"anchor": "szLineConv[j] = szLine[i]; and szLineConv[j] = 0; (lines 54,57)", "disposition": "finding", "reason": "Unbounded writes at the loop tail and terminator with j possibly >= 1024 — stack overflow."},
+    {"anchor": "strcpy(szLine, szLineConv); (line 58)", "disposition": "finding", "reason": "Unbounded copy of the (possibly expanded) converted string back into szLine — overflow of the caller buffer."},
+    {"anchor": "GPAC_BIG_ENDIAN / unicode_type==2/3 branch select (lines 62-67)", "disposition": "dismissed", "reason": "Compile-time endianness selection choosing which type triggers byte-swap; not itself a bug, it gates the byte-swap finding."},
+    {"anchor": "UTF-16 byte-swap while(1) loop (lines 69-76)", "disposition": "finding", "reason": "No index bound; terminates only on a 00 00 pair which may not exist within lineSize — out-of-bounds read/write."},
+    {"anchor": "gf_utf8_wcstombs(szLineConv, 1024, &sptr) (line 79)", "disposition": "finding", "reason": "Return value used unchecked as an index; can be 1024 or the (u32)-1 error sentinel — OOB write on the terminator."},
+    {"anchor": "szLineConv[i] = 0; (line 80)", "disposition": "finding", "reason": "Off-by-one when wcstombs returns 1024, wild write when it returns (u32)-1 — stack overflow."},
+    {"anchor": "strcpy(szLine, szLineConv); (line 81)", "disposition": "finding", "reason": "Second unbounded copy-back into szLine after UTF-16 conversion — overflow of the caller buffer (same class as line 58)."},
+    {"anchor": "if (unicode_type==3) gf_fgetc(txt_in); (line 83)", "disposition": "dismissed", "reason": "Consumes one extra byte to resync the stream; no memory-safety contract."},
+    {"anchor": "return sOK; (lines 59,84)", "disposition": "dismissed", "reason": "Returns the original gf_fgets pointer; no bug."}
+  ],
+  "findings": [
+    {
+      "title": "Stack buffer overflow of szLineConv[1024] in the UTF-8 conversion loop (destination index j is unbounded)",
+      "anchor": "for (i=0; i<len; i++) { ... szLineConv[j] = szLine[i]; j++; } szLineConv[j] = 0;",
+      "file": "corpus/train/train_0188_cwe415.c",
+      "line": "15-57",
+      "code": "\t\tfor (i=0; i<len; i++) {\n\t\t\tif (!unicode_type && (szLine[i] & 0x80)) {\n\t\t\t\tif ((szLine[i+1] & 0xc0) != 0x80) {\n\t\t\t\t\tszLineConv[j] = 0xc0 | ( (szLine[i] >> 6) & 0x3 );\n\t\t\t\t\tj++;\n\t\t\t\t\tszLine[i] &= 0xbf;\n\t\t\t\t}\n\t\t\t\t...\n\t\t\t}\n\t\t\tszLineConv[j] = szLine[i];\n\t\t\tj++;\n\t\t}\n\t\tszLineConv[j] = 0;",
+      "bug_class": "Stack-based buffer overflow (unbounded destination index)",
+      "cwe": "CWE-787",
+      "severity": "critical",
+      "where_it_lives": "corpus/train/train_0188_cwe415.c",
+      "invariant": "Every write to szLineConv[j] (including the terminator) must be guarded by j < sizeof(szLineConv)-1; the conversion must truncate or reject input that would expand past 1024 bytes, and szLineConv must be sized against lineSize rather than a fixed 1024.",
+      "failure_mode": "The loop bounds only the source cursor i against len (which can be up to lineSize-1, and lineSize is routinely > 1024), never the destination cursor j against the 1024-byte szLineConv. A crafted text/subtitle line longer than 1024 bytes drives j past the buffer end; the legacy-code-page path (lines 18-22) writes two output bytes per input byte, so overflow can occur even for shorter lines rich in high-bit bytes with unicode_type==0. The result is a controlled overwrite of the saved return address and adjacent stack state → memory corruption and likely remote code execution from a malicious media file.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm szLineConv is a fixed char[1024] and that no bound on j exists anywhere in the loop; confirm at least one caller passes lineSize > 1025 (or that lines with many high-bit bytes reach this path), which makes the overflow reachable."
+    },
+    {
+      "title": "Unbounded strcpy copy-back of the (expanded) converted string into caller buffer szLine",
+      "anchor": "strcpy(szLine, szLineConv);",
+      "file": "corpus/train/train_0188_cwe415.c",
+      "line": "58",
+      "code": "\t\tstrcpy(szLine, szLineConv);",
+      "bug_class": "Buffer copy without size check (CWE-120), destination szLine of capacity lineSize",
+      "cwe": "CWE-120",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0188_cwe415.c",
+      "invariant": "The copy back into szLine must be bounded by lineSize (strlcpy/strncpy with the true capacity), and the transcode must guarantee the converted form fits in lineSize despite legacy-byte expansion.",
+      "failure_mode": "strcpy copies szLineConv into szLine with no length argument. The unicode_type==0 widening turns single legacy bytes into 2-byte UTF-8 sequences, so the converted string can be longer than the original that filled szLine to near lineSize-1. When the expanded length exceeds lineSize, the copy-back overflows the caller's buffer. This is a second overflow independent of the szLineConv smash and also occurs at line 81 after UTF-16 conversion.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm szLineConv can hold more valid bytes than lineSize-1 for realistic inputs (e.g. an all-high-bit legacy line of length lineSize-1 expands to ~2*(lineSize-1)); confirm no truncation to lineSize happens before the strcpy."
+    },
+    {
+      "title": "Out-of-bounds NUL-terminator write after gf_utf8_wcstombs (off-by-one at 1024 / wild write on error sentinel)",
+      "anchor": "i = (u32) gf_utf8_wcstombs(szLineConv, 1024, ...); szLineConv[i] = 0;",
+      "file": "corpus/train/train_0188_cwe415.c",
+      "line": "79-80",
+      "code": "\ti = (u32) gf_utf8_wcstombs(szLineConv, 1024, (const unsigned short **) &sptr);\n\tszLineConv[i] = 0;",
+      "bug_class": "Off-by-one / out-of-bounds write (unchecked return used as index)",
+      "cwe": "CWE-787",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0188_cwe415.c",
+      "invariant": "Pass a buffer size that reserves room for the terminator (1023, not 1024), check gf_utf8_wcstombs's return for the (u32)-1 error value before using it, and clamp the index to < sizeof(szLineConv).",
+      "failure_mode": "gf_utf8_wcstombs is allowed to fill all 1024 bytes and return 1024, making szLineConv[1024]=0 a one-past-the-end stack write at a fixed offset. GPAC's gf_utf8_wcstombs also returns (u32)-1 on malformed UTF-16; cast to u32 and used as an index, szLineConv[0xFFFFFFFF]=0 is a wild out-of-bounds write. Both are reachable from crafted UTF-16 subtitle input.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm gf_utf8_wcstombs's contract: whether it can return exactly 1024 (fills buffer) and whether it returns (u32)-1 on error; verify neither case is guarded before the szLineConv[i]=0 write."
+    },
+    {
+      "title": "Unbounded out-of-bounds read/write in the UTF-16 byte-swap loop (no index bound, terminates only on 00 00)",
+      "anchor": "while (1) { if (!szLine[i] && !szLine[i+1]) break; ... i+=2; }",
+      "file": "corpus/train/train_0188_cwe415.c",
+      "line": "69-76",
+      "code": "\t\twhile (1) {\n\t\t\tchar c;\n\t\t\tif (!szLine[i] && !szLine[i+1]) break;\n\t\t\tc = szLine[i+1];\n\t\t\tszLine[i+1] = szLine[i];\n\t\t\tszLine[i] = c;\n\t\t\ti+=2;\n\t\t}",
+      "bug_class": "Out-of-bounds read and write (unbounded scan for terminator)",
+      "cwe": "CWE-125",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0188_cwe415.c",
+      "invariant": "Bound the swap loop by the number of bytes actually read (<= lineSize), never accessing szLine[i]/szLine[i+1] beyond the buffer, and do not rely on an in-band 00 00 pair for termination.",
+      "failure_mode": "The loop has no bound and stops only when it encounters two consecutive zero bytes. gf_fgets stops at a newline, so UTF-16 content frequently ends without a 00 00 pair inside the buffer (the code's own comment at line 82 acknowledges the trailing NUL is often missing). The loop then scans, reads, and byte-swaps memory past the end of szLine until it happens on two zeros elsewhere — out-of-bounds reads and in-place writes past the caller's buffer, corrupting adjacent memory. It also reads szLine[i+1] one byte past i.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm no caller guarantees a trailing 00 00 within lineSize; verify there is no separate length passed to bound this loop."
+    },
+    {
+      "title": "Out-of-bounds read from look-ahead and unguarded in-body index advances in the transcode loop",
+      "anchor": "if ((szLine[i+1] & 0xc0) != 0x80) ... (with i++ inside multi-byte branches)",
+      "file": "corpus/train/train_0188_cwe415.c",
+      "line": "18",
+      "code": "\t\t\t\tif ((szLine[i+1] & 0xc0) != 0x80) {",
+      "bug_class": "Out-of-bounds read (look-ahead past line end; source index not re-checked)",
+      "cwe": "CWE-125",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0188_cwe415.c",
+      "invariant": "Validate i+1 < len before reading szLine[i+1], and re-check i < len after every in-body i++ before dereferencing szLine[i]; do not consume continuation bytes that lie beyond the line.",
+      "failure_mode": "Line 18 reads szLine[i+1] as a look-ahead; the 2/3/4-byte branches (lines 24-52) then advance i one to three extra times inside the body without re-testing i<len, so subsequent szLine[i]/szLine[i+1] reads can occur past the end of the logical line. For a truncated multi-byte sequence at the buffer tail this reads bytes beyond the intended content. The NUL terminator usually keeps the read in-bounds within the allocation, so impact is information/robustness rather than a write, but it can misparse and, combined with the write overflows, worsen j growth.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm no i<len re-check exists between the in-body i++ operations and the following szLine[i] reads; determine whether szLine is always NUL-terminated at index len (bounding the worst read)."
+    },
+    {
+      "title": "Caller-supplied lineSize trusted as szLine capacity by memset and gf_fgets",
+      "anchor": "memset(szLine, 0, sizeof(char)*lineSize);",
+      "file": "corpus/train/train_0188_cwe415.c",
+      "line": "9",
+      "code": "\tmemset(szLine, 0, sizeof(char)*lineSize);",
+      "bug_class": "Missing input/contract validation (buffer size trust)",
+      "cwe": "CWE-20",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0188_cwe415.c",
+      "invariant": "lineSize must exactly equal the allocated size of szLine at every call site; the function has no way to verify this and must be able to trust the contract.",
+      "failure_mode": "memset zero-fills lineSize bytes and gf_fgets reads up to lineSize bytes; if any caller passes a lineSize larger than szLine's real allocation, the memset itself overflows before any parsing. This is a caller contract rather than a bug local to this function, but the same lineSize underpins every bound the code relies on, so it is worth confirming across call sites.",
+      "cve_analog": "",
+      "what_to_confirm": "Audit all callers to confirm lineSize is derived from sizeof/allocation of the szLine buffer and never exceeds it."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm szLineConv is a fixed char[1024] and that the transcode loop (lines 15-57) has no guard on j — this is the primary stack overflow; add j < sizeof(szLineConv)-1 bounding or size szLineConv to lineSize.",
+    "Check every call site's lineSize: if any passes > 1025 (typical), the szLineConv overflow is reachable; also verify lineSize never exceeds szLine's real allocation (line 9 memset).",
+    "Verify gf_utf8_wcstombs's return contract: can it return 1024 (buffer-full) or (u32)-1 (error)? Both make szLineConv[i]=0 (line 80) an out-of-bounds write.",
+    "Replace both strcpy(szLine, szLineConv) calls (lines 58, 81) with length-bounded copies against lineSize, accounting for legacy-byte expansion that can grow the string.",
+    "Bound the UTF-16 byte-swap while(1) loop (lines 69-76) by the number of bytes read; do not rely on an in-band 00 00 terminator that gf_fgets may never have read.",
+    "Add i+1 < len look-ahead guards (line 18) and re-check i < len after the in-body i++ chains (lines 24-52) before dereferencing szLine[i].",
+    "Note: despite the sample file name, there is NO double-free (CWE-415) in this function; the real defects are stack/heap buffer overflows and out-of-bounds accesses — do not report a double free that is not present."
+  ]
+}

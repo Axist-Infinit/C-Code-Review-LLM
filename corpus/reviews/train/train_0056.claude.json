@@ -1,0 +1,217 @@
+{
+  "subsystem": "virtiofsd / libfuse passthrough_ll privilege-separation setup: setup_namespaces() unshares PID/mount/network namespaces and forks so the FUSE server child runs sandboxed, remounts /proc, bind-mounts /proc/self/fd over /proc, and caches an O_PATH descriptor (lo->proc_self_fd) used for safe path resolution.",
+  "provenance": "Identified by the FUSE-specific symbols and idioms: struct lo_data and struct fuse_session parameters, fuse_log(FUSE_LOG_ERR, ...) logging, the lo->proc_self_fd member, and the setup_wait_parent_capabilities() helper. These are the passthrough_ll.c sandbox routine shipped with virtiofsd (QEMU) / libfuse's example passthrough server. The header banner names it corpus/train/train_0056_cwe269.c and the sample tag on line 1 is 'primevul_c_train_2180_fixed', i.e. the post-fix (hardened) revision. The Linux-specific unshare/CLONE_NEW*/prctl(PR_SET_PDEATHSIG)/mount API usage confirms a Linux container/namespace sandbox.",
+  "trust_boundary": "virtiofsd is a host-side daemon that services filesystem requests originating from a guest VM over the virtio-fs transport; the guest is untrusted and may be malicious, and a compromised virtiofsd would otherwise have host filesystem access. This function is the daemon's privilege-separation boundary: it moves the request-serving process into fresh PID, mount, and network namespaces (CLONE_NEWNET added specifically to cut off TCP/IP if the process is compromised) and restricts /proc to /proc/self/fd so guest-influenced path lookups cannot escape via '..'. The attacker does not control the arguments to this function directly, but the entire post-setup security of the daemon against a hostile guest depends on every step here succeeding, executing in the right order, and lo->proc_self_fd being honored by all later path resolution. The setup is correctly fail-closed (exit(1) on each error).",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0056_cwe269.c",
+      "lines": "2-4",
+      "code": "static void setup_namespaces(struct lo_data *lo, struct fuse_session *se)\n{\n    pid_t child;",
+      "explanation": "The function signature takes the daemon's global lo_data (which holds lo->proc_self_fd, populated at the end) and the fuse_session se (which exposes se->exited, the flag set by the FUSE signal handlers when the daemon is asked to terminate). It is static and void: it either succeeds or exits the process on any failure. The local pid_t child holds the result of the fork below and selects the parent-vs-child code path."
+    },
+    {
+      "file": "corpus/train/train_0056_cwe269.c",
+      "lines": "16-19",
+      "code": "    if (unshare(CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWNET) != 0) {\n        fuse_log(FUSE_LOG_ERR, \"unshare(CLONE_NEWPID | CLONE_NEWNS): %m\\n\");\n        exit(1);\n    }",
+      "explanation": "unshare() detaches the process from three kernel namespaces at once. CLONE_NEWNS gives a private mount namespace so the /proc remounts below do not affect the host mount table; CLONE_NEWNET moves the process into an empty network namespace so a compromised daemon cannot open new sockets or reach the network (the comment notes the needed UNIX domain sockets were already created before this point); CLONE_NEWPID creates a new PID namespace, but crucially CLONE_NEWPID only takes effect for *children* created after the call — the caller itself stays in the old PID namespace, which is why a fork() follows. Any failure is fatal (exit(1)), making the sandbox fail-closed."
+    },
+    {
+      "file": "corpus/train/train_0056_cwe269.c",
+      "lines": "21-25",
+      "code": "    child = fork();\n    if (child < 0) {\n        fuse_log(FUSE_LOG_ERR, \"fork() failed: %m\\n\");\n        exit(1);\n    }",
+      "explanation": "fork() is what actually enters the new PID namespace: the child becomes PID 1 of that namespace. A negative return is a fork failure and is fatal. After this point the parent (child > 0) and the child (child == 0) diverge: the parent becomes a supervisor that waits for and mirrors the child's exit, while the child continues on to finish the mount sandbox and return to run the FUSE server."
+    },
+    {
+      "file": "corpus/train/train_0056_cwe269.c",
+      "lines": "26-35",
+      "code": "    if (child > 0) {\n        pid_t waited;\n        int wstatus;\n\n        setup_wait_parent_capabilities();\n\n        /* The parent waits for the child */\n        do {\n            waited = waitpid(child, &wstatus, 0);\n        } while (waited < 0 && errno == EINTR && !se->exited);",
+      "explanation": "The parent branch. setup_wait_parent_capabilities() (not shown) adjusts the supervisor's capabilities for its limited waiting role. The parent then blocks in waitpid(child) to reap the sandboxed child. The do/while retries only when waitpid was interrupted (waited < 0 && errno == EINTR) and the session has not been asked to exit (!se->exited); on a successful reap (waited == child) or on any non-EINTR error the loop terminates. wstatus is declared here (line 28) and is intended to receive the child's exit status."
+    },
+    {
+      "file": "corpus/train/train_0056_cwe269.c",
+      "lines": "38-47",
+      "code": "        if (se->exited) {\n            exit(0);\n        }\n\n        if (WIFEXITED(wstatus)) {\n            exit(WEXITSTATUS(wstatus));\n        }\n\n        exit(1);\n    }",
+      "explanation": "After the wait loop the parent translates the outcome into its own exit code. If se->exited is set, the daemon was terminated by a signal handler (see fuse_signals.c) and the parent exits 0 cleanly. Otherwise, if the child exited normally (WIFEXITED), the parent propagates the child's exit status via WEXITSTATUS so the supervisor's exit code mirrors the real server's. Any other case (e.g. child killed by a signal) results in exit(1). The parent never falls through past this block."
+    },
+    {
+      "file": "corpus/train/train_0056_cwe269.c",
+      "lines": "50",
+      "code": "    prctl(PR_SET_PDEATHSIG, SIGTERM);",
+      "explanation": "Only the child reaches here. PR_SET_PDEATHSIG arranges for the kernel to send SIGTERM to this child when its parent (the supervisor thread) dies, so the sandboxed server does not linger as an orphan if the supervisor is killed. Note the return value is not checked and no re-check is done for a parent that may already have exited between fork() and this call."
+    },
+    {
+      "file": "corpus/train/train_0056_cwe269.c",
+      "lines": "56-59",
+      "code": "    if (mount(NULL, \"/\", NULL, MS_REC | MS_SLAVE, NULL) < 0) {\n        fuse_log(FUSE_LOG_ERR, \"mount(/, MS_REC|MS_SLAVE): %m\\n\");\n        exit(1);\n    }",
+      "explanation": "The child recursively changes the propagation of the root mount to MS_SLAVE. This opts the new mount namespace out of shared propagation: subsequent mount changes (the /proc remounts below) will not propagate back to the host/parent mount namespace, while still receiving mounts from it. Doing this BEFORE the /proc mounts is essential — otherwise the remount of /proc could leak into the host. Failure is fatal."
+    },
+    {
+      "file": "corpus/train/train_0056_cwe269.c",
+      "lines": "62-66",
+      "code": "    if (mount(\"proc\", \"/proc\", \"proc\",\n              MS_NODEV | MS_NOEXEC | MS_NOSUID | MS_RELATIME, NULL) < 0) {\n        fuse_log(FUSE_LOG_ERR, \"mount(/proc): %m\\n\");\n        exit(1);\n    }",
+      "explanation": "The child mounts a fresh procfs at /proc so that /proc reflects the new PID namespace rather than the host's. The flags harden the mount: MS_NODEV (no device nodes), MS_NOEXEC (no execution), MS_NOSUID (setuid/setgid bits ignored), MS_RELATIME (relaxed atime). This is standard defense-in-depth for a mounted procfs inside a sandbox. Failure is fatal."
+    },
+    {
+      "file": "corpus/train/train_0056_cwe269.c",
+      "lines": "74-77",
+      "code": "    if (mount(\"/proc/self/fd\", \"/proc\", NULL, MS_BIND, NULL) < 0) {\n        fuse_log(FUSE_LOG_ERR, \"mount(/proc/self/fd, MS_BIND): %m\\n\");\n        exit(1);\n    }",
+      "explanation": "This is the core path-escape hardening. It bind-mounts /proc/self/fd on top of /proc so that, from now on, the path /proc exposes only the process's own open file descriptors and nothing above it. As the comment explains, this prevents '..' from climbing out of /proc/self/fd into parent directories; because / was already made MS_SLAVE, this mount change stays local to the sandbox. The daemon later reopens files by their fd number under this restricted /proc, which is how it safely resolves guest-supplied paths. Failure is fatal."
+    },
+    {
+      "file": "corpus/train/train_0056_cwe269.c",
+      "lines": "80-84",
+      "code": "    lo->proc_self_fd = open(\"/proc\", O_PATH);\n    if (lo->proc_self_fd == -1) {\n        fuse_log(FUSE_LOG_ERR, \"open(/proc, O_PATH): %m\\n\");\n        exit(1);\n    }",
+      "explanation": "Finally the child opens the now-bind-mounted /proc (i.e. /proc/self/fd) as an O_PATH descriptor and stores it in lo->proc_self_fd for the lifetime of the daemon. O_PATH yields a handle usable only for *at() operations and fd-relative lookups, not for read/write, which is exactly what the passthrough layer needs to reopen guest file descriptors safely. If the open fails the process exits. On success the child returns to the caller and proceeds to run the FUSE event loop inside the fully-configured sandbox."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0056_cwe269.c",
+      "lines": "50",
+      "code": "    prctl(PR_SET_PDEATHSIG, SIGTERM);",
+      "explanation": "PR_SET_PDEATHSIG has two well-known hazards, and here the return value is discarded. First, the parent-death signal is delivered when the *thread* that called fork() terminates, and is keyed to that specific thread; if the supervising parent already exited in the window between fork() (line 21) and this prctl() call, the arming happens too late and the child never receives SIGTERM, so the sandboxed FUSE server can survive as an orphan and keep answering guest requests after its supervisor is gone. Second, if prctl() itself fails (for example under a restrictive seccomp policy or if unsupported), the death-signal linkage is silently never established because the error is ignored and no exit(1) guards it — unlike every other syscall in this function, which is fail-closed. The invariant the implementation must uphold is that the sandboxed child must not outlive its supervisor: prctl's result should be checked, and after arming, the code should re-verify the parent is still alive (e.g. getppid()) and self-terminate otherwise."
+    },
+    {
+      "file": "corpus/train/train_0056_cwe269.c",
+      "lines": "28-44",
+      "code": "        int wstatus;\n\n        setup_wait_parent_capabilities();\n\n        /* The parent waits for the child */\n        do {\n            waited = waitpid(child, &wstatus, 0);\n        } while (waited < 0 && errno == EINTR && !se->exited);\n\n        /* We were terminated by a signal, see fuse_signals.c */\n        if (se->exited) {\n            exit(0);\n        }\n\n        if (WIFEXITED(wstatus)) {\n            exit(WEXITSTATUS(wstatus));\n        }",
+      "explanation": "wstatus (line 28) is uninitialized and is only written by a successful waitpid(). If waitpid() returns -1 for a reason other than EINTR — for instance ECHILD (child already reaped) or the loop exits with waited < 0 and errno != EINTR — the do/while terminates with wstatus never assigned. Execution then reaches WIFEXITED(wstatus)/WEXITSTATUS(wstatus) (lines 42-43), which read an indeterminate stack value, so the parent supervisor exits with an arbitrary status code that does not reflect the real child outcome. This is a use-of-uninitialized-variable (CWE-457); the impact is limited to the supervisor's exit code (an observability/robustness bug rather than a memory-safety hole), but the invariant is that WIFEXITED/WEXITSTATUS must only be consulted when waitpid() actually populated wstatus. Initializing wstatus to 0 or checking waited == child first closes it."
+    },
+    {
+      "file": "corpus/train/train_0056_cwe269.c",
+      "lines": "74-84",
+      "code": "    if (mount(\"/proc/self/fd\", \"/proc\", NULL, MS_BIND, NULL) < 0) {\n        fuse_log(FUSE_LOG_ERR, \"mount(/proc/self/fd, MS_BIND): %m\\n\");\n        exit(1);\n    }\n\n    /* Get the /proc (actually /proc/self/fd, see above) file descriptor */\n    lo->proc_self_fd = open(\"/proc\", O_PATH);",
+      "explanation": "This block establishes the daemon's entire anti-'..' path-escape defense: /proc is narrowed to /proc/self/fd and the resulting handle is cached in lo->proc_self_fd. The latent contract (bug living in the implementation this routine only sets up, CWE-269 improper privilege management / CWE-22 path traversal) is that ALL subsequent resolution of guest-controlled paths must go through lo->proc_self_fd (openat/*at relative to this fd, or /proc/self/fd/NNN reopen), never through a raw absolute path or a path that re-enters the real /proc. If any later code path opens attacker-influenced paths without funneling through proc_self_fd, the bind-mount hardening is bypassed and a malicious guest can traverse outside the exported directory. The setup here is correct and fail-closed; the risk is downstream misuse of the descriptor it produces, which must be confirmed in the passthrough lookup/open handlers."
+    },
+    {
+      "file": "corpus/train/train_0056_cwe269.c",
+      "lines": "16-17",
+      "code": "    if (unshare(CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWNET) != 0) {\n        fuse_log(FUSE_LOG_ERR, \"unshare(CLONE_NEWPID | CLONE_NEWNS): %m\\n\");",
+      "explanation": "Two things to watch here. Functionally, moving into an empty network namespace (CLONE_NEWNET) severs all connectivity, so the contract is that every socket the daemon needs — notably the UNIX domain control/data sockets — must already exist before this call; the comment asserts they do, and if that ordering ever regresses the daemon would lose its transport. This is a correctness/availability dependency, not a memory-safety issue, and the shown code is fine. Separately, the diagnostic string on line 17 omits CLONE_NEWNET (it reads 'unshare(CLONE_NEWPID | CLONE_NEWNS)'), so on failure an operator gets a misleading message that does not mention the network-namespace flag that was actually requested — a minor observability defect with no security impact."
+    }
+  ],
+  "summary": "This is the virtiofsd/passthrough_ll privilege-separation routine (post-fix, with CLONE_NEWNET added) and it is a well-constructed, fail-closed sandbox: it unshares PID/mount/network namespaces, forks into the new PID namespace, makes / MS_SLAVE, remounts a hardened /proc, bind-mounts /proc/self/fd over /proc to block '..' escapes, and caches an O_PATH /proc handle. No memory-safety vulnerability is present in the shown code. The residual issues are robustness/lifetime concerns: an unchecked prctl(PR_SET_PDEATHSIG) with a fork→prctl parent-death race that can orphan the sandboxed server, a use of the uninitialized wstatus on non-EINTR waitpid failures, and the latent contract that all later guest-path resolution must go through lo->proc_self_fd.",
+  "reviewed_anchors": [
+    {
+      "anchor": "setup_namespaces(struct lo_data *lo, struct fuse_session *se) signature (line 2)",
+      "disposition": "dismissed",
+      "reason": "Internal setup routine; arguments are daemon-controlled, not attacker-controlled. Its role frames the trust boundary but the signature itself carries no exploitable contract."
+    },
+    {
+      "anchor": "pid_t child (line 4)",
+      "disposition": "dismissed",
+      "reason": "Local fork result used only for branch selection; checked for < 0 (line 22) and > 0 (line 26). No unsafe use."
+    },
+    {
+      "anchor": "unshare(CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWNET) (line 16)",
+      "disposition": "finding",
+      "reason": "Core sandbox action plus a diagnostic-string mismatch on the paired log line 17 (CLONE_NEWNET omitted); also carries the ordering contract that sockets must precede the network-namespace switch."
+    },
+    {
+      "anchor": "fork() and error check (lines 21-25)",
+      "disposition": "dismissed",
+      "reason": "Entry into the new PID namespace; negative return is fatal (fail-closed). Correct."
+    },
+    {
+      "anchor": "waitpid do/while loop and int wstatus (lines 27-35)",
+      "disposition": "finding",
+      "reason": "wstatus is uninitialized and only set on successful waitpid; a non-EINTR failure exits the loop leaving it unset (CWE-457)."
+    },
+    {
+      "anchor": "setup_wait_parent_capabilities() (line 30)",
+      "disposition": "dismissed",
+      "reason": "Not shown; adjusts supervisor capabilities. No contract observable in this file; cannot ground a finding on unseen code."
+    },
+    {
+      "anchor": "se->exited checks (lines 35, 38)",
+      "disposition": "dismissed",
+      "reason": "Signal-handler flag consulted to exit cleanly on termination; correct fail-safe behavior."
+    },
+    {
+      "anchor": "WIFEXITED(wstatus) / WEXITSTATUS(wstatus) (lines 42-43)",
+      "disposition": "finding",
+      "reason": "Consumers of the possibly-uninitialized wstatus; folded into the wstatus finding."
+    },
+    {
+      "anchor": "prctl(PR_SET_PDEATHSIG, SIGTERM) (line 50)",
+      "disposition": "finding",
+      "reason": "Return value unchecked and a fork->prctl parent-death race can leave the sandboxed child orphaned (improper privilege/lifetime management, CWE-269/CWE-364)."
+    },
+    {
+      "anchor": "mount(NULL, \"/\", NULL, MS_REC | MS_SLAVE, NULL) (line 56)",
+      "disposition": "dismissed",
+      "reason": "Correctly ordered before the /proc remounts and fail-closed; opts the namespace out of shared propagation as intended. No defect."
+    },
+    {
+      "anchor": "mount(\"proc\", \"/proc\", \"proc\", MS_NODEV|MS_NOEXEC|MS_NOSUID|MS_RELATIME, NULL) (line 62)",
+      "disposition": "dismissed",
+      "reason": "Hardened procfs mount with appropriate flags; fail-closed. No defect."
+    },
+    {
+      "anchor": "mount(\"/proc/self/fd\", \"/proc\", NULL, MS_BIND, NULL) (line 74)",
+      "disposition": "finding",
+      "reason": "Establishes the anti-'..' path-escape defense; carries the latent downstream contract that all guest-path resolution must use lo->proc_self_fd."
+    },
+    {
+      "anchor": "lo->proc_self_fd = open(\"/proc\", O_PATH) (line 80)",
+      "disposition": "finding",
+      "reason": "Produces the security-critical O_PATH descriptor whose correct downstream use is the sandbox invariant; folded into the proc_self_fd contract finding."
+    }
+  ],
+  "findings": [
+    {
+      "title": "Unchecked prctl(PR_SET_PDEATHSIG) and fork->prctl parent-death race can orphan the sandboxed server",
+      "anchor": "prctl(PR_SET_PDEATHSIG, SIGTERM);",
+      "file": "corpus/train/train_0056_cwe269.c",
+      "line": "50",
+      "code": "    prctl(PR_SET_PDEATHSIG, SIGTERM);",
+      "bug_class": "Improper privilege/process-lifetime management (parent-death signal race, unchecked syscall)",
+      "cwe": "CWE-269",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0056_cwe269.c (this file)",
+      "invariant": "The sandboxed child must never outlive its supervising parent; the parent-death signal must be successfully armed AND the arming must account for a parent that already exited between fork() and prctl() (e.g. by re-checking getppid() and self-terminating if the original supervisor is gone).",
+      "failure_mode": "The prctl() return value is ignored, so if arming fails (e.g. under a restrictive seccomp filter) the death-signal linkage is silently absent while every other syscall in the function is fail-closed. Additionally, PR_SET_PDEATHSIG fires only when the specific fork()ing thread dies; if the supervisor already exited in the fork->prctl window, SIGTERM is never delivered and the child FUSE server keeps serving a potentially-malicious guest as an orphan in its namespaces.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether prctl's return is checked and whether the child re-verifies the parent is still alive (getppid()) immediately after arming PR_SET_PDEATHSIG."
+    },
+    {
+      "title": "Latent: all guest-controlled path resolution must funnel through lo->proc_self_fd or the '..' bind-mount defense is bypassed",
+      "anchor": "lo->proc_self_fd = open(\"/proc\", O_PATH); (paired with the MS_BIND of /proc/self/fd over /proc)",
+      "file": "corpus/train/train_0056_cwe269.c",
+      "line": "74-84",
+      "code": "    if (mount(\"/proc/self/fd\", \"/proc\", NULL, MS_BIND, NULL) < 0) {\n        fuse_log(FUSE_LOG_ERR, \"mount(/proc/self/fd, MS_BIND): %m\\n\");\n        exit(1);\n    }\n\n    /* Get the /proc (actually /proc/self/fd, see above) file descriptor */\n    lo->proc_self_fd = open(\"/proc\", O_PATH);",
+      "bug_class": "Sandbox/path-traversal containment contract (improper privilege management)",
+      "cwe": "CWE-22",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "Every reopen/lookup of a guest-supplied path in the passthrough handlers must be performed relative to lo->proc_self_fd (fd-relative *at() calls / /proc/self/fd/NNN reopen), never via a raw absolute path or one that re-enters the real /proc, so the '..'-blocking bind mount established here is actually in force at use time.",
+      "failure_mode": "The setup here is correct and fail-closed, but the security benefit is realized only downstream. If any lookup/open/readlink handler resolves an attacker-influenced path without going through proc_self_fd, a malicious guest can traverse outside the exported subtree despite this hardening, defeating the sandbox.",
+      "cve_analog": "",
+      "what_to_confirm": "That every path-resolving operation in the passthrough layer uses lo->proc_self_fd (or an fd derived from it) rather than absolute paths, and that proc_self_fd is never closed/overwritten for the daemon's lifetime."
+    },
+    {
+      "title": "Use of uninitialized wstatus when waitpid fails for a non-EINTR reason",
+      "anchor": "int wstatus; ... waited = waitpid(child, &wstatus, 0); ... if (WIFEXITED(wstatus))",
+      "file": "corpus/train/train_0056_cwe269.c",
+      "line": "28-43",
+      "code": "        int wstatus;\n\n        do {\n            waited = waitpid(child, &wstatus, 0);\n        } while (waited < 0 && errno == EINTR && !se->exited);\n\n        if (WIFEXITED(wstatus)) {\n            exit(WEXITSTATUS(wstatus));\n        }",
+      "bug_class": "Use of uninitialized variable",
+      "cwe": "CWE-457",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0056_cwe269.c (this file)",
+      "invariant": "WIFEXITED(wstatus)/WEXITSTATUS(wstatus) may be evaluated only after a waitpid() call that actually populated wstatus (waited == child).",
+      "failure_mode": "wstatus is declared uninitialized (line 28) and set only on a successful reap. If waitpid() returns -1 with errno != EINTR (e.g. ECHILD), the loop exits without writing wstatus; WIFEXITED/WEXITSTATUS then read an indeterminate stack value and the supervisor exits with an arbitrary status. Impact is confined to the parent's exit code (robustness/observability), not memory corruption.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether wstatus is initialized (e.g. to 0) or whether the code checks waited == child before consulting WIFEXITED."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm prctl(PR_SET_PDEATHSIG) return is checked and the child re-checks getppid() after arming to close the fork->prctl orphan race.",
+    "Confirm wstatus is initialized (or waitpid success is checked) before WIFEXITED/WEXITSTATUS on lines 42-43.",
+    "Trace every guest-path lookup/open/readlink in the passthrough handlers to confirm it resolves relative to lo->proc_self_fd and never via a raw absolute path or the real /proc.",
+    "Verify all required sockets/descriptors are created before unshare(CLONE_NEWNET) on line 16 so entering the empty network namespace does not break the daemon's transport.",
+    "Confirm the ordering (MS_REC|MS_SLAVE on / before the /proc remounts) is preserved so mount changes cannot propagate to the host mount namespace.",
+    "Confirm lo->proc_self_fd is opened O_PATH, never made writable, and is not closed or overwritten for the daemon's lifetime.",
+    "Correct the diagnostic string on line 17 to include CLONE_NEWNET so failures are not misdiagnosed."
+  ]
+}

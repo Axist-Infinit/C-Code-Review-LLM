@@ -1,0 +1,179 @@
+{
+  "subsystem": "KDE Connect (kdeconnect-kde) core networking: LanLinkProvider::addLink(), the routine that registers or reuses a per-device LAN link (LanDeviceLink) after a TCP/TLS connection is established or reconnected on the local network. It is invoked once a QSslSocket has been accepted and an identity NetworkPacket has been received, and it hands the parsed packet up to the rest of the daemon via the onConnectionReceived signal.",
+  "provenance": "Identified from the symbol names and Qt idioms: LanLinkProvider, LanDeviceLink, KDECONNECT_CORE logging category, QSslSocket, QAbstractSocket, NetworkPacket, and the Q_EMIT/Q_ASSERT/connect/disconnect macros are all specific to the KDE Connect project (kde/kdeconnect-kde, core/backends/lan). The in-file banner names corpus/train/train_0161_cwe400.cpp and the sample tag /* sample: primevul_validation_0013_vuln */ marks it as a PrimeVul validation sample.",
+  "trust_boundary": "LanLinkProvider is the LAN backend that terminates connections from other devices on the same network segment. deviceId, socket, and receivedPacket all originate from a remote peer over the network: an attacker on the LAN (or one able to reach the discovery/TCP ports) chooses the deviceId string carried in the identity packet, opens/closes the socket at will, and controls the packet contents. Everything reachable from those three parameters is hostile. m_links is keyed by the attacker-supplied deviceId, so the attacker also chooses which map slot (existing or new) this call hits.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0161_cwe400.cpp",
+      "lines": "2-3",
+      "code": "void LanLinkProvider::addLink(const QString& deviceId, QSslSocket* socket, NetworkPacket* receivedPacket, LanDeviceLink::ConnectionStarted connectionOrigin)\n{",
+      "explanation": "The entry point takes four parameters that together describe a freshly accepted connection. deviceId is the remote peer's self-declared identifier (a const-ref QString) used as the key into the link registry. socket is a heap QSslSocket* for the encrypted channel; ownership of it is passed into the link object. receivedPacket is a NetworkPacket* holding the identity packet just parsed off the wire; note it is a raw pointer and is dereferenced later. connectionOrigin is an enum (LanDeviceLink::ConnectionStarted) recording whether we initiated or received the connection, which affects the TLS handshake role. None of these are validated on entry."
+    },
+    {
+      "file": "corpus/train/train_0161_cwe400.cpp",
+      "lines": "4-5",
+      "code": "// Socket disconnection will now be handled by LanDeviceLink\n    disconnect(socket, &QAbstractSocket::disconnected, socket, &QObject::deleteLater);",
+      "explanation": "Before this point some earlier code had wired the socket so that on QAbstractSocket::disconnected the socket would deleteLater() itself. Here that auto-cleanup connection is torn down, transferring responsibility for the socket's lifetime to the LanDeviceLink that will own it. This is the pivotal ownership hand-off: after this line, nothing automatically frees the socket on disconnect except the LanDeviceLink, so if the socket does not actually get adopted by a link (or if an old socket is displaced), it can leak."
+    },
+    {
+      "file": "corpus/train/train_0161_cwe400.cpp",
+      "lines": "7-9",
+      "code": "LanDeviceLink* deviceLink;\n    //Do we have a link for this device already?\n    QMap< QString, LanDeviceLink* >::iterator linkIterator = m_links.find(deviceId);",
+      "explanation": "Declares the link pointer that will be resolved below, then looks up the attacker-supplied deviceId in m_links, a QMap<QString, LanDeviceLink*> that caches one link per known device. The lookup decides between the reuse path and the create path. Because the key is the peer-controlled deviceId string, the attacker directly steers which branch executes by claiming an id that is either already present (reuse) or novel (create)."
+    },
+    {
+      "file": "corpus/train/train_0161_cwe400.cpp",
+      "lines": "10-13",
+      "code": "if (linkIterator != m_links.end()) {\n        //qCDebug(KDECONNECT_CORE) << \"Reusing link to\" << deviceId;\n        deviceLink = linkIterator.value();\n        deviceLink->reset(socket, connectionOrigin);",
+      "explanation": "Reuse path: when a link for this deviceId already exists, the existing LanDeviceLink is fetched and reset() is called with the brand-new socket and connectionOrigin. reset() is expected to swap the link's underlying socket to the new one and re-run the TLS/connection setup. The critical implicit contract is that reset() must correctly dispose of the link's previous socket; otherwise the old QSslSocket (whose deleteLater cleanup was removed at line 5, and which is not re-attached here) is orphaned. This path also means a new connection can silently reattach itself to an existing, possibly-paired device link purely by presenting a matching deviceId."
+    },
+    {
+      "file": "corpus/train/train_0161_cwe400.cpp",
+      "lines": "14-17",
+      "code": "} else {\n        deviceLink = new LanDeviceLink(deviceId, this, socket, connectionOrigin);\n        connect(deviceLink, &QObject::destroyed, this, &LanLinkProvider::deviceLinkDestroyed);\n        m_links[deviceId] = deviceLink;",
+      "explanation": "Create path: for a previously unseen deviceId, a new LanDeviceLink is heap-allocated, taking ownership of the socket. Its QObject::destroyed signal is connected to LanLinkProvider::deviceLinkDestroyed so the provider can purge the map entry when the link dies (the counterpart to the leak concern above). The new link is stored in m_links under the attacker-chosen key. Every distinct deviceId an attacker presents therefore creates and retains a new LanDeviceLink and its socket in the map until that link is destroyed."
+    },
+    {
+      "file": "corpus/train/train_0161_cwe400.cpp",
+      "lines": "18-24",
+      "code": "if (m_pairingHandlers.contains(deviceId)) {\n            //We shouldn't have a pairinghandler if we didn't have a link.\n            //Crash if debug, recover if release (by setting the new devicelink to the old pairinghandler)\n            Q_ASSERT(m_pairingHandlers.contains(deviceId));\n            m_pairingHandlers[deviceId]->setDeviceLink(deviceLink);\n        }\n    }",
+      "explanation": "Still inside the create branch: if a pairing handler already exists for this deviceId even though no link did (an inconsistent state the authors expected to be impossible), the code re-binds that stale handler to the newly created link via setDeviceLink(). The Q_ASSERT on line 21 is inside the very if that already tested the same condition, so it is a tautology in debug builds and compiles out in release (NDEBUG) builds — it cannot catch anything the surrounding if did not already imply. The comment openly documents a debug-crash / release-recover design."
+    },
+    {
+      "file": "corpus/train/train_0161_cwe400.cpp",
+      "lines": "25-26",
+      "code": "Q_EMIT onConnectionReceived(*receivedPacket, deviceLink);\n}",
+      "explanation": "Finally the identity packet is dereferenced (*receivedPacket) and emitted together with the resolved deviceLink over the onConnectionReceived signal. In Qt, a direct-connection Q_EMIT invokes every connected slot synchronously and in-line before this function returns; those slots (device creation, pairing, plugin dispatch) run with deviceLink and the dereferenced packet still live. This is the point where control leaves this function into arbitrary downstream handlers while holding raw pointers."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0161_cwe400.cpp",
+      "lines": "25",
+      "code": "Q_EMIT onConnectionReceived(*receivedPacket, deviceLink);",
+      "explanation": "receivedPacket is a raw NetworkPacket* passed in from the caller and is dereferenced (*receivedPacket) with no null check anywhere in the function. If any caller reaches addLink with receivedPacket == nullptr — e.g. a connection that completed the TLS handshake but whose identity packet failed to parse or was cleared on an error path — this is an immediate NULL-pointer dereference and daemon crash. Since the packet is produced from attacker-timed network events, an attacker who can drive the code into that state achieves a remote denial of service. The invariant the implementation must uphold is that receivedPacket is always non-null at every call site of addLink, which the function neither documents nor enforces (CWE-476)."
+    },
+    {
+      "file": "corpus/train/train_0161_cwe400.cpp",
+      "lines": "16-25",
+      "code": "connect(deviceLink, &QObject::destroyed, this, &LanLinkProvider::deviceLinkDestroyed);\n        m_links[deviceId] = deviceLink;\n        if (m_pairingHandlers.contains(deviceId)) {\n            //We shouldn't have a pairinghandler if we didn't have a link.\n            //Crash if debug, recover if release (by setting the new devicelink to the old pairinghandler)\n            Q_ASSERT(m_pairingHandlers.contains(deviceId));\n            m_pairingHandlers[deviceId]->setDeviceLink(deviceLink);\n        }\n    }\n    Q_EMIT onConnectionReceived(*receivedPacket, deviceLink);",
+      "explanation": "Object-lifetime / callback re-entrancy. The synchronous Q_EMIT onConnectionReceived at line 25 runs downstream slots in-line while deviceLink is a bare pointer held on the stack. Those slots can, directly or indirectly, destroy the LanDeviceLink (its destroyed signal is wired at line 16 to deviceLinkDestroyed, and reconnect/error handling can delete the socket which cascades to the link). If the link (or the socket it owns) is deleted during the emit, any use of deviceLink after that point — or re-entrant re-processing of the same connection through addLink — becomes a use-after-free. The reuse path (line 13 reset()) makes this worse: reset can tear down and re-create internal state while the same object is referenced by an outer, still-executing addLink frame. The implementation must guarantee the link outlives the emit (e.g. a QPointer guard or a deferred/queued emission), which is not visible here (CWE-416)."
+    },
+    {
+      "file": "corpus/train/train_0161_cwe400.cpp",
+      "lines": "5-17",
+      "code": "disconnect(socket, &QAbstractSocket::disconnected, socket, &QObject::deleteLater);\n    LanDeviceLink* deviceLink;\n    //Do we have a link for this device already?\n    QMap< QString, LanDeviceLink* >::iterator linkIterator = m_links.find(deviceId);\n    if (linkIterator != m_links.end()) {\n        //qCDebug(KDECONNECT_CORE) << \"Reusing link to\" << deviceId;\n        deviceLink = linkIterator.value();\n        deviceLink->reset(socket, connectionOrigin);\n    } else {\n        deviceLink = new LanDeviceLink(deviceId, this, socket, connectionOrigin);\n        connect(deviceLink, &QObject::destroyed, this, &LanLinkProvider::deviceLinkDestroyed);\n        m_links[deviceId] = deviceLink;",
+      "explanation": "Uncontrolled resource consumption (matches the sample's cwe400 tag). Line 5 removes the socket's self-deleteLater safety net, so from here the socket only gets freed if a LanDeviceLink adopts and later releases it. In the reuse branch (line 13), reset() is hperformed a NEW socket into an existing link, and the link's PREVIOUS socket is not touched by this function — if reset() does not itself free the old socket, each reconnection orphans one QSslSocket (a file descriptor plus TLS state). In the create branch, each novel deviceId permanently adds a LanDeviceLink + socket to m_links (line 17), and links are only pruned via the destroyed handler. A LAN attacker can therefore flood the daemon with connections that each present a unique or churning deviceId (or repeatedly reconnect the same id) and drive unbounded growth in sockets, file descriptors, and map entries, exhausting memory/FDs. The invariant is that every displaced socket is freed and that m_links growth is bounded/rate-limited against unauthenticated peers (CWE-400)."
+    },
+    {
+      "file": "corpus/train/train_0161_cwe400.cpp",
+      "lines": "9-13",
+      "code": "QMap< QString, LanDeviceLink* >::iterator linkIterator = m_links.find(deviceId);\n    if (linkIterator != m_links.end()) {\n        //qCDebug(KDECONNECT_CORE) << \"Reusing link to\" << deviceId;\n        deviceLink = linkIterator.value();\n        deviceLink->reset(socket, connectionOrigin);",
+      "explanation": "Identity-driven link takeover. The reuse decision is made purely on the string equality of the attacker-supplied deviceId against m_links, BEFORE any certificate/pairing check binds this new socket to the identity it claims. If reset() (line 13) swaps the existing, possibly-paired link onto the attacker's fresh socket prior to TLS peer-certificate verification, an unauthenticated attacker who merely learns a victim device's deviceId can hijack that device's link object and inherit its trust/pairing state, or at minimum knock the legitimate connection off. The implementation must ensure the new socket's certificate is verified to match the stored device identity before reset() adopts it; nothing in this function enforces that ordering (CWE-20 / improper authentication of the reconnecting peer)."
+    },
+    {
+      "file": "corpus/train/train_0161_cwe400.cpp",
+      "lines": "18-22",
+      "code": "if (m_pairingHandlers.contains(deviceId)) {\n            //We shouldn't have a pairinghandler if we didn't have a link.\n            //Crash if debug, recover if release (by setting the new devicelink to the old pairinghandler)\n            Q_ASSERT(m_pairingHandlers.contains(deviceId));\n            m_pairingHandlers[deviceId]->setDeviceLink(deviceLink);",
+      "explanation": "The Q_ASSERT on line 21 restates the condition of the enclosing if on line 18, so it can never fire in a way the if did not already select — it provides zero real validation and is stripped entirely in release builds (NDEBUG). More importantly, the code deliberately continues in release when it is in a state the authors consider impossible (a pairing handler existing with no prior link), re-binding a stale m_pairingHandlers[deviceId] to the new link. If that handler retained state referencing an already-destroyed prior link, setDeviceLink() operating on inconsistent internal state is a latent use-after-free / logic-corruption path. The invariant is that m_pairingHandlers and m_links are kept consistent; relying on an assert that compiles out is not enforcement (CWE-617 misuse of assertion for control flow / latent CWE-416)."
+    }
+  ],
+  "summary": "This KDE Connect LAN link-registration function processes fully attacker-controlled network inputs (deviceId, socket, receivedPacket) with no validation. The sharpest concrete issues are an unchecked *receivedPacket dereference (remote NULL-deref DoS), a synchronous Q_EMIT that can free the deviceLink/socket underneath the still-executing frame (use-after-free), and unbounded per-deviceId growth of links/sockets after the socket's auto-delete is removed (uncontrolled resource consumption). Link reuse is also keyed on an unauthenticated attacker-chosen id, enabling link takeover.",
+  "reviewed_anchors": [
+    {"anchor": "addLink(const QString& deviceId, QSslSocket* socket, NetworkPacket* receivedPacket, LanDeviceLink::ConnectionStarted connectionOrigin) — line 2", "disposition": "finding", "reason": "raw NetworkPacket* receivedPacket is dereferenced without a null guard (line 25); socket/deviceId are attacker-controlled inputs feeding lifetime and map logic"},
+    {"anchor": "disconnect(socket, &QAbstractSocket::disconnected, socket, &QObject::deleteLater) — line 5", "disposition": "finding", "reason": "removes the socket's automatic deleteLater cleanup, creating the leak/ownership hazard exploited by the resource-consumption finding"},
+    {"anchor": "m_links.find(deviceId) / QMap<QString,LanDeviceLink*> m_links — line 9", "disposition": "finding", "reason": "reuse-vs-create branch and link takeover keyed on unauthenticated attacker-chosen deviceId; unbounded map growth"},
+    {"anchor": "deviceLink->reset(socket, connectionOrigin) — line 13", "disposition": "finding", "reason": "reuse path swaps a new socket into an existing link; old socket disposal and pre-verification adoption are unenforced (leak + takeover)"},
+    {"anchor": "new LanDeviceLink(deviceId, this, socket, connectionOrigin) — line 15", "disposition": "dismissed", "reason": "the allocation itself is correct C++ (new paired with the link's own destruction via destroyed/deviceLinkDestroyed); its risk is the unbounded-count issue already captured under the m_links anchor, not a per-object memory bug"},
+    {"anchor": "connect(deviceLink, &QObject::destroyed, this, &LanLinkProvider::deviceLinkDestroyed) — line 16", "disposition": "finding", "reason": "destroyed can fire during the synchronous Q_EMIT, contributing to the use-after-free / re-entrancy concern"},
+    {"anchor": "m_links[deviceId] = deviceLink — line 17", "disposition": "dismissed", "reason": "correct insertion; its only security relevance is the unbounded-growth angle folded into the m_links/CWE-400 finding"},
+    {"anchor": "m_pairingHandlers.contains(deviceId) / Q_ASSERT(...) — lines 18-21", "disposition": "finding", "reason": "assert duplicates the enclosing if condition and compiles out in release; deliberate release-recovery re-binds a possibly-stale handler (latent inconsistency/UAF)"},
+    {"anchor": "m_pairingHandlers[deviceId]->setDeviceLink(deviceLink) — line 22", "disposition": "dismissed", "reason": "the concern (operating on a stale handler) is captured under the Q_ASSERT/pairing-handler finding; no independent contract to add"},
+    {"anchor": "Q_EMIT onConnectionReceived(*receivedPacket, deviceLink) — line 25", "disposition": "finding", "reason": "dereferences receivedPacket without null check AND synchronously invokes slots that can free deviceLink/socket mid-call (NULL-deref + UAF)"}
+  ],
+  "findings": [
+    {
+      "title": "Unchecked dereference of attacker-timed receivedPacket pointer (remote NULL-deref DoS)",
+      "anchor": "Q_EMIT onConnectionReceived(*receivedPacket, deviceLink)",
+      "file": "corpus/train/train_0161_cwe400.cpp",
+      "line": "25",
+      "code": "Q_EMIT onConnectionReceived(*receivedPacket, deviceLink);",
+      "bug_class": "NULL pointer dereference",
+      "cwe": "CWE-476",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0161_cwe400.cpp (and its call sites — implementation of the connection/handshake path, file not provided)",
+      "invariant": "receivedPacket must be non-null at every call site of addLink; the function must either guarantee this by contract at all callers or guard with `if (!receivedPacket) return;` before dereferencing.",
+      "failure_mode": "A caller that reaches addLink after a failed/cleared identity-packet parse (an error timing an attacker can provoke over the network) passes receivedPacket == nullptr; `*receivedPacket` dereferences NULL and crashes the daemon — remote denial of service.",
+      "cve_analog": "",
+      "what_to_confirm": "Trace every caller of addLink and confirm receivedPacket can never be null on any handshake success/error path; verify there is no path where the packet is freed/cleared before this emit."
+    },
+    {
+      "title": "Use-after-free via synchronous signal emission over live deviceLink/socket",
+      "anchor": "Q_EMIT onConnectionReceived(*receivedPacket, deviceLink) with destroyed connect + reset",
+      "file": "corpus/train/train_0161_cwe400.cpp",
+      "line": "13-25",
+      "code": "deviceLink->reset(socket, connectionOrigin);\n...\n    connect(deviceLink, &QObject::destroyed, this, &LanLinkProvider::deviceLinkDestroyed);\n...\n    Q_EMIT onConnectionReceived(*receivedPacket, deviceLink);",
+      "bug_class": "Use-after-free via callback re-entrancy",
+      "cwe": "CWE-416",
+      "severity": "high",
+      "where_it_lives": "implementation (file not provided) — the slots connected to onConnectionReceived and the LanDeviceLink::reset/destructor",
+      "invariant": "The LanDeviceLink pointed to by deviceLink (and its owned socket) must remain valid for the entire duration of the synchronous emit; any handler that can delete the link must be deferred, or deviceLink must be guarded (e.g. QPointer) and re-checked after the emit / not touched again.",
+      "failure_mode": "onConnectionReceived is emitted with a direct connection, so slots run in-line; a slot (or the socket's disconnected/error handling, or a nested addLink for the same peer) destroys the LanDeviceLink or its socket during the call. Subsequent use of the freed link — or the reset() path swapping internals of an object an outer frame still references — reads/writes freed memory, enabling crash or potential control-flow corruption from a network-triggered event.",
+      "cve_analog": "",
+      "what_to_confirm": "Check whether onConnectionReceived uses a direct connection and whether any connected slot (device creation, pairing, plugin load) can synchronously delete the LanDeviceLink or socket; confirm deviceLink is not dereferenced after the emit and that reset() cannot free `this` out from under a caller."
+    },
+    {
+      "title": "Uncontrolled resource consumption: orphaned sockets and unbounded m_links growth after deleteLater removal",
+      "anchor": "disconnect(socket, ...&QObject::deleteLater) + deviceLink->reset(socket,...) + m_links[deviceId] = deviceLink",
+      "file": "corpus/train/train_0161_cwe400.cpp",
+      "line": "5-17",
+      "code": "disconnect(socket, &QAbstractSocket::disconnected, socket, &QObject::deleteLater);\n...\n        deviceLink->reset(socket, connectionOrigin);\n...\n        m_links[deviceId] = deviceLink;",
+      "bug_class": "Uncontrolled resource consumption (socket/FD/memory exhaustion)",
+      "cwe": "CWE-400",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided) — LanDeviceLink::reset and the link/socket ownership/teardown code",
+      "invariant": "Every socket displaced by reset() must be deterministically freed, and the number of retained LanDeviceLink entries in m_links from unauthenticated peers must be bounded/rate-limited so an attacker cannot grow it without limit.",
+      "failure_mode": "Line 5 removes the socket's self-deleteLater cleanup, making the adopting link solely responsible for freeing it. On the reuse path, reset() installs a new socket while this function never disposes the link's previous socket, so each reconnection can orphan a QSslSocket (fd + TLS state). On the create path, each novel attacker-chosen deviceId permanently adds a link+socket to m_links. A LAN attacker flooding connections with churning deviceIds (or rapidly reconnecting one id) exhausts file descriptors and memory — daemon denial of service.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm reset() frees the prior QSslSocket before adopting the new one, and that m_links entries are removed promptly on disconnect and that there is a cap/rate limit on links from unpaired/unauthenticated devices."
+    },
+    {
+      "title": "Link takeover: reuse keyed on unauthenticated attacker-supplied deviceId",
+      "anchor": "m_links.find(deviceId) -> deviceLink->reset(socket, connectionOrigin)",
+      "file": "corpus/train/train_0161_cwe400.cpp",
+      "line": "9-13",
+      "code": "QMap< QString, LanDeviceLink* >::iterator linkIterator = m_links.find(deviceId);\n    if (linkIterator != m_links.end()) {\n        //qCDebug(KDECONNECT_CORE) << \"Reusing link to\" << deviceId;\n        deviceLink = linkIterator.value();\n        deviceLink->reset(socket, connectionOrigin);",
+      "bug_class": "Improper authentication / trusting unverified peer identity",
+      "cwe": "CWE-20",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided) — LanDeviceLink::reset and the certificate/pairing verification path",
+      "invariant": "Before an existing (possibly paired) link is reset onto a new socket, that socket's TLS peer certificate must be verified to match the stored identity for deviceId; adoption must not precede authentication.",
+      "failure_mode": "The reuse branch selects an existing link purely by string-matching the attacker-declared deviceId, then reset()s it onto the attacker's fresh socket. If certificate verification does not gate this adoption, an unauthenticated attacker who learns a victim device's deviceId can hijack that device's link/trust state or evict the legitimate connection.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify that reset() (or a caller before addLink) authenticates the new socket's certificate against the stored device certificate for deviceId before the existing link is reused."
+    },
+    {
+      "title": "Assertion duplicates enclosing condition and compiles out in release; deliberate recovery on 'impossible' state",
+      "anchor": "Q_ASSERT(m_pairingHandlers.contains(deviceId)) inside if(m_pairingHandlers.contains(deviceId))",
+      "file": "corpus/train/train_0161_cwe400.cpp",
+      "line": "18-22",
+      "code": "if (m_pairingHandlers.contains(deviceId)) {\n            //We shouldn't have a pairinghandler if we didn't have a link.\n            //Crash if debug, recover if release (by setting the new devicelink to the old pairinghandler)\n            Q_ASSERT(m_pairingHandlers.contains(deviceId));\n            m_pairingHandlers[deviceId]->setDeviceLink(deviceLink);",
+      "bug_class": "Reachable assertion / assertion used for control flow, latent state inconsistency",
+      "cwe": "CWE-617",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided) — PairingHandler::setDeviceLink and pairing-handler lifecycle",
+      "invariant": "m_pairingHandlers and m_links must be kept mutually consistent by real invariant enforcement, not by an assert that restates the branch condition and disappears under NDEBUG.",
+      "failure_mode": "The Q_ASSERT can never fail differently from the enclosing if, so it validates nothing and is stripped in release builds. In the state the authors call impossible, release builds re-bind a stale pairing handler (which may still reference an already-destroyed prior link) to the new link via setDeviceLink(), a latent use-after-free / logic-corruption path rather than a caught error.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm whether m_pairingHandlers can contain an entry with no corresponding m_links entry, and whether setDeviceLink() safely handles a handler whose previously-referenced link was destroyed."
+    }
+  ],
+  "audit_checklist": [
+    "Guard *receivedPacket at line 25 (or contractually prove non-null at all addLink callers) to remove the remote NULL-deref DoS.",
+    "Confirm onConnectionReceived's connection type and whether any slot can synchronously delete the LanDeviceLink/socket during the emit; guard deviceLink (QPointer) or defer the emission.",
+    "Verify LanDeviceLink::reset() frees the previously-owned QSslSocket before adopting the new one — the deleteLater cleanup was removed at line 5.",
+    "Bound/rate-limit m_links growth from unauthenticated peers and confirm entries are removed on disconnect via deviceLinkDestroyed.",
+    "Ensure the new socket's TLS certificate is verified against the stored identity for deviceId BEFORE an existing link is reused (line 13), to prevent link takeover.",
+    "Confirm m_pairingHandlers cannot hold an entry without a matching m_links entry, and that setDeviceLink() tolerates a handler referencing a destroyed prior link; replace the tautological Q_ASSERT with real consistency handling."
+  ]
+}

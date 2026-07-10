@@ -1,0 +1,173 @@
+{
+  "subsystem": "TensorFlow Grappler graph-optimization pass. Specifically the RemoveCastLikeAndValuePreserving rewrite stage of the ArithmeticOptimizer: a TrySimplify() override that inspects a consumer NodeDef and its single input producer, and when one is a Cast-like op and the other is value-preserving, folds/reorders the pair by cloning both nodes with adjusted DataTypes. It rewrites the in-memory computation graph (GraphDef) before execution.",
+  "provenance": "Identified from TensorFlow Grappler idioms: NodeDef / OpDef / DataType types, the Status return type with the TF_RETURN_IF_ERROR macro, OpRegistry::Global()->LookUpOpDef, and the Grappler helper vocabulary (IsCastLike, IsValuePreserving, IsCheckNumerics, IsControlFlow, IsInPreserveSet, InputTypeForNode/OutputTypeForNode, DataTypeSize, ParseNodeScopeAndName, OptimizedNodeName, AddCopyNode, ctx().node_map->AddOutput/NodeExists, AddToOptimizationQueue, IsKernelRegisteredForNode). The signature Status TrySimplify(NodeDef*, string*) override is the ArithmeticOptimizerStage contract. The banner comment `/* sample: primevul_train_2170_vuln */` and the file name train_0228_cwe476.cpp confirm this is a PrimeVul-derived TensorFlow sample flagged for a NULL/invalid pointer dereference.",
+  "trust_boundary": "The NodeDef graph is attacker-controllable. Grappler runs on a GraphDef/SavedModel/serialized graph supplied by the caller (a loaded model file, a remotely served model, or a deserialized graph). Every field of every NodeDef reachable here is hostile: the node's op string, its `input` repeated field (its NAMES and its COUNT), its device string, and its name. Nothing in this function establishes that the consumer or the resolved producer actually has an input to read, nor that helper lookups returned valid, non-null objects. The trust boundary is therefore the moment an untrusted GraphDef is handed to the optimizer; from that point onward node structure must be validated, not assumed.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0228_cwe476.cpp",
+      "lines": "2-4",
+      "code": "  Status TrySimplify(NodeDef* consumer, string* simplified_node_name) override {\n    NodeDef* producer;\n    TF_RETURN_IF_ERROR(GetInputNode(consumer->input(0), &producer));",
+      "explanation": "This is one rewrite stage of the ArithmeticOptimizer. TrySimplify is invoked with a candidate `consumer` node and an out-parameter `simplified_node_name` that the caller reads to learn the rewritten node's name; it returns a Status. Line 3 declares an uninitialized `producer` pointer. Line 4 fetches the node feeding the consumer's first input: `consumer->input(0)` returns the string name of edge 0, and GetInputNode resolves that name in the node map, storing the NodeDef* into `producer`. TF_RETURN_IF_ERROR aborts the stage (returning early) if that lookup fails. Note that `consumer->input(0)` is executed unconditionally, before any check that the consumer actually HAS an input."
+    },
+    {
+      "file": "corpus/train/train_0228_cwe476.cpp",
+      "lines": "5-9",
+      "code": "    const bool producer_is_cast = IsCastLike(*producer);\n    const bool can_optimize =\n        !IsCheckNumerics(*producer) &&\n        ((producer_is_cast && IsValuePreserving(*consumer)) ||\n         (IsValuePreserving(*producer) && IsCastLike(*consumer)));",
+      "explanation": "Line 5 dereferences `*producer` to classify it: producer_is_cast is true when the producer is a Cast-like op. Lines 6-9 compute can_optimize, the eligibility predicate for the rewrite. The pair is eligible only if the producer is NOT a CheckNumerics op, AND either (a) the producer is a cast and the consumer is value-preserving, or (b) the producer is value-preserving and the consumer is a cast. In other words exactly one of the two nodes is a cast and the other is value-preserving; this is the shape the stage knows how to reorder so the value-preserving op runs on the narrower/wider dtype."
+    },
+    {
+      "file": "corpus/train/train_0228_cwe476.cpp",
+      "lines": "10-14",
+      "code": "    if (!can_optimize || IsControlFlow(*producer) ||\n        IsInPreserveSet(*producer) ||\n        producer->device() != consumer->device()) {\n      return Status::OK();\n    }",
+      "explanation": "This is the bail-out gate. The stage declines (returns OK with no rewrite) if the pair is not eligible, or if the producer is a control-flow node, or if the producer is in the preserve set (nodes the user pinned as un-rewritable, e.g. fetch/feed nodes), or if producer and consumer live on different devices (reordering across devices would change placement semantics). All four dereference `*producer` or producer->device(), which is safe here only because line 4 already established producer is non-null via GetInputNode."
+    },
+    {
+      "file": "corpus/train/train_0228_cwe476.cpp",
+      "lines": "16-25",
+      "code": "    const NodeDef* cast_like_node = producer_is_cast ? producer : consumer;\n    const OpDef* cast_like_op_def = nullptr;\n    TF_RETURN_IF_ERROR(OpRegistry::Global()->LookUpOpDef(cast_like_node->op(),\n                                                         &cast_like_op_def));\n    DataType cast_src_type;\n    TF_RETURN_IF_ERROR(InputTypeForNode(*cast_like_node, *cast_like_op_def, 0,\n                                        &cast_src_type));\n    DataType cast_dst_type;\n    TF_RETURN_IF_ERROR(OutputTypeForNode(*cast_like_node, *cast_like_op_def, 0,\n                                         &cast_dst_type));",
+      "explanation": "Line 16 selects whichever of the two nodes is the cast as cast_like_node. Lines 17-19 look up that op's OpDef from the global registry by its op string; failure returns early. Lines 20-22 compute cast_src_type, the DataType of the cast's input-0, from the node and its OpDef. Lines 23-25 compute cast_dst_type, the DataType of the cast's output-0. These are the source and destination dtypes of the cast, which the stage needs to decide whether reordering is profitable and legal."
+    },
+    {
+      "file": "corpus/train/train_0228_cwe476.cpp",
+      "lines": "26-34",
+      "code": "    if (!IsFixedSizeType(cast_src_type) || !IsFixedSizeType(cast_dst_type)) {\n      return Status::OK();\n    } else if (producer_is_cast &&\n               DataTypeSize(cast_dst_type) <= DataTypeSize(cast_src_type)) {\n      return Status::OK();\n    } else if (!producer_is_cast &&\n               DataTypeSize(cast_dst_type) >= DataTypeSize(cast_src_type)) {\n      return Status::OK();\n    }",
+      "explanation": "The profitability guard. Lines 26-27 bail if either dtype is not fixed-size (e.g. variable-width strings), since DataTypeSize is only meaningful for fixed-width types. Lines 28-30: if the producer is the cast and the cast narrows or keeps the width (dst<=src), reordering saves nothing, so bail. Lines 31-33: symmetric case when the consumer is the cast (dst>=src). Only a strictly profitable widen/narrow arrangement survives to the rewrite below."
+    },
+    {
+      "file": "corpus/train/train_0228_cwe476.cpp",
+      "lines": "37-46",
+      "code": "    const string optimized_producer_name = OptimizedNodeName(\n        ParseNodeScopeAndName(producer->name()), DataTypeString(cast_dst_type));\n    const string optimized_consumer_name = OptimizedNodeName(\n        ParseNodeScopeAndName(consumer->name()), DataTypeString(cast_src_type));\n    const bool is_already_optimized =\n        ctx().node_map->NodeExists(optimized_consumer_name) ||\n        ctx().node_map->NodeExists(optimized_producer_name);\n    if (is_already_optimized) {\n      return Status::OK();\n    }",
+      "explanation": "Idempotence guard. Lines 37-40 synthesize deterministic names for the two new nodes by combining the scope/name of the original node with the target dtype string (so re-running the pass reproduces the same names). Lines 41-43 check the node map to see whether those synthesized names already exist, which would mean this pair was rewritten on a previous pass. Lines 44-46 bail if so, preventing repeated rewriting and duplicate-node insertion."
+    },
+    {
+      "file": "corpus/train/train_0228_cwe476.cpp",
+      "lines": "49-54",
+      "code": "    NodeDef* input;\n    TF_RETURN_IF_ERROR(GetInputNode(producer->input(0), &input));\n    NodeDef* new_producer = AddCopyNode(optimized_consumer_name, consumer);\n    new_producer->set_input(0, producer->input(0));\n    ctx().node_map->AddOutput(input->name(), new_producer->name());",
+      "explanation": "The rewrite begins. Line 50 resolves the producer's own input-0 (the node feeding the producer) into `input`; note it reads `producer->input(0)` unconditionally, again assuming the producer has at least one input. Line 52 clones the consumer node under the new name optimized_consumer_name and calls it new_producer (the pair is being reordered, so the copy of the consumer becomes the new upstream node). Line 53 rewires new_producer's input 0 to point at the producer's original input. Line 54 records in the node map that `input` now feeds new_producer. The comment (lines 48/51) confirms the copies are added in reverse order."
+    },
+    {
+      "file": "corpus/train/train_0228_cwe476.cpp",
+      "lines": "57-63",
+      "code": "    NodeDef* new_consumer = AddCopyNode(optimized_producer_name, producer);\n    new_consumer->set_input(0, new_producer->name());\n    NodeDef* new_value_preserving =\n        producer_is_cast ? new_producer : new_consumer;\n    const DataType new_input_type =\n        producer_is_cast ? cast_src_type : cast_dst_type;",
+      "explanation": "Line 57 clones the producer under optimized_producer_name as new_consumer (the copy of the producer becomes the new downstream node). Line 58 wires new_consumer to consume new_producer, completing the reversed chain input -> new_producer -> new_consumer. Lines 60-61 pick which of the two new nodes is the value-preserving one (the non-cast). Lines 62-63 pick the DataType that node's input must now carry: after reordering, the value-preserving op operates on the cast's source or destination dtype depending on which side was the cast."
+    },
+    {
+      "file": "corpus/train/train_0228_cwe476.cpp",
+      "lines": "66-76",
+      "code": "    TF_RETURN_IF_ERROR(SetInputType(new_input_type, new_value_preserving));\n    TF_RETURN_IF_ERROR(IsKernelRegisteredForNode(*new_value_preserving));\n    ctx().node_map->AddOutput(new_producer->name(), new_consumer->name());\n    AddToOptimizationQueue(new_producer);\n    *simplified_node_name = new_consumer->name();\n    return Status::OK();\n  }",
+      "explanation": "Line 66 updates the value-preserving node's declared input type to new_input_type. Line 69 verifies a kernel is actually registered for that op with the new dtype (so the rewritten graph remains executable); this dereferences *new_value_preserving. Line 70 records the new_producer -> new_consumer edge in the node map. Line 72 enqueues new_producer for further optimization. Line 73 publishes new_consumer's name to the caller via the out-parameter, telling the driver that consumer has been replaced by new_consumer. Line 75 returns success."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0228_cwe476.cpp",
+      "lines": "4",
+      "code": "    TF_RETURN_IF_ERROR(GetInputNode(consumer->input(0), &producer));",
+      "explanation": "`consumer->input(0)` is read with no prior check that consumer->input_size() >= 1. The consumer NodeDef comes from an attacker-controlled GraphDef; nothing forces a node reaching this stage to have any inputs. If the consumer has zero inputs, `input(0)` indexes past the end of the protobuf repeated field: in debug builds this trips a DCHECK, and in release builds it is an out-of-bounds read returning a reference to memory outside the array, which is then treated as a node-name string and passed to GetInputNode. The result is a crash / denial of service from a malformed model, and is the concrete CWE-476/CWE-125 failure this sample is labeled for. The invariant is: reject (or skip) any node with input_size() < 1 BEFORE calling input(0)."
+    },
+    {
+      "file": "corpus/train/train_0228_cwe476.cpp",
+      "lines": "50",
+      "code": "    TF_RETURN_IF_ERROR(GetInputNode(producer->input(0), &input));",
+      "explanation": "The same unchecked-input hazard applies to the producer. `producer->input(0)` assumes the resolved producer node also has at least one input. A cast-like or value-preserving op with zero inputs is graph-invalid but nothing here rejects it; the producer's structure is attacker-controlled just like the consumer's. Reading input(0) on an empty repeated field is again an out-of-bounds access leading to a crash. Note this is reached only after all the eligibility gates pass, so it is a second, independently triggerable instance of the same missing input_size() guard. Invariant: verify producer->input_size() >= 1 before line 50."
+    },
+    {
+      "file": "corpus/train/train_0228_cwe476.cpp",
+      "lines": "52-53",
+      "code": "    NodeDef* new_producer = AddCopyNode(optimized_consumer_name, consumer);\n    new_producer->set_input(0, producer->input(0));",
+      "explanation": "The return value of AddCopyNode is stored in new_producer and immediately dereferenced on line 53 (set_input) with no null check. If AddCopyNode can fail or decline to create a node (for example when a node of that name already races into existence, or an internal allocation/insertion path returns null), new_producer is null and line 53 is a direct NULL pointer dereference (CWE-476). The same pattern repeats at line 57-58 for new_consumer. Additionally, set_input(0, ...) requires the copied node to already possess an input slot 0; the copy is of `consumer`, whose input structure is attacker-influenced. Invariant: AddCopyNode must be documented never to return null on this path AND the copied node must be guaranteed to have index-0 input, or both must be checked before dereference."
+    },
+    {
+      "file": "corpus/train/train_0228_cwe476.cpp",
+      "lines": "54",
+      "code": "    ctx().node_map->AddOutput(input->name(), new_producer->name());",
+      "explanation": "`input` is dereferenced (input->name()) at line 54. This is safe ONLY if GetInputNode at line 50 always sets a non-null NodeDef* on success. In Grappler, GetInputNode returns an error Status when the name cannot be resolved (handled by TF_RETURN_IF_ERROR), so `input` should be non-null here; this is a lower-risk item than the input(0) accesses above, but it depends entirely on GetInputNode's postcondition that success implies a non-null out-pointer. If any GetInputNode variant can return OK with a null out-parameter (e.g. a node that exists in the map but was erased), line 54 dereferences null. Invariant: GetInputNode success guarantees a non-null NodeDef*."
+    },
+    {
+      "file": "corpus/train/train_0228_cwe476.cpp",
+      "lines": "2-76",
+      "code": "  Status TrySimplify(NodeDef* consumer, string* simplified_node_name) override {",
+      "explanation": "Structurally, this stage trusts the shape of an untrusted graph throughout: it assumes both endpoints have an input-0, assumes clone operations succeed, and assumes registry/type lookups behave. The overall failure class is missing input validation (CWE-20) on a hostile GraphDef, which manifests as the specific out-of-bounds/null dereferences above. A hardened version validates node arity once at entry and treats every NodeDef* obtained from helpers as possibly-null until proven otherwise. The impact is remote denial of service whenever an attacker can get a crafted model optimized (serving, model conversion, SavedModel load)."
+    }
+  ],
+  "summary": "Attacker-controlled TensorFlow GraphDef nodes are trusted to have at least one input: consumer->input(0) (line 4) and producer->input(0) (line 50) are read with no input_size() guard, so a node with zero inputs causes an out-of-bounds protobuf access and a crash (the labeled CWE-476/CWE-125). Secondary risk: AddCopyNode results (lines 53, 58) are dereferenced without a null check. Net effect is a remotely triggerable denial of service during graph optimization; there is no memory-corruption-to-code-execution primitive visible here.",
+  "reviewed_anchors": [
+    {"anchor": "Status TrySimplify(NodeDef* consumer, string* simplified_node_name) override (line 2)", "disposition": "finding", "reason": "Entry point that consumes an attacker-controlled NodeDef graph without arity validation."},
+    {"anchor": "consumer->input(0) (line 4)", "disposition": "finding", "reason": "Reads input index 0 with no input_size() check; OOB on zero-input node."},
+    {"anchor": "GetInputNode(consumer->input(0), &producer) (line 4)", "disposition": "dismissed", "reason": "Guarded by TF_RETURN_IF_ERROR; on success producer is non-null, so subsequent *producer derefs are safe. The hazard is the input(0) argument, tracked separately."},
+    {"anchor": "IsCastLike(*producer) (line 5)", "disposition": "dismissed", "reason": "producer already validated non-null by GetInputNode success."},
+    {"anchor": "can_optimize predicate (lines 6-9)", "disposition": "dismissed", "reason": "Pure boolean logic over already-valid node references; no memory-safety contract."},
+    {"anchor": "bail-out gate incl. producer->device() != consumer->device() (lines 10-14)", "disposition": "dismissed", "reason": "Dereferences valid non-null nodes; correctly returns OK when ineligible."},
+    {"anchor": "cast_like_node = producer_is_cast ? producer : consumer (line 16)", "disposition": "dismissed", "reason": "Selects between two already-non-null pointers."},
+    {"anchor": "OpRegistry::Global()->LookUpOpDef(cast_like_node->op(), &cast_like_op_def) (lines 18-19)", "disposition": "dismissed", "reason": "Error-checked via TF_RETURN_IF_ERROR; op string lookup failure returns early, cast_like_op_def set on success."},
+    {"anchor": "InputTypeForNode / OutputTypeForNode (lines 21-25)", "disposition": "dismissed", "reason": "Both error-checked; dtypes only used after success."},
+    {"anchor": "IsFixedSizeType / DataTypeSize guards (lines 26-33)", "disposition": "dismissed", "reason": "Correctly gate DataTypeSize behind IsFixedSizeType, avoiding meaningless size on variable-width types; profitability logic, not a safety bug."},
+    {"anchor": "OptimizedNodeName / ParseNodeScopeAndName / DataTypeString (lines 37-40)", "disposition": "dismissed", "reason": "Name synthesis over already-valid node names; no untrusted-length or buffer contract."},
+    {"anchor": "ctx().node_map->NodeExists idempotence check (lines 41-46)", "disposition": "dismissed", "reason": "Read-only existence probe; prevents duplicate rewrite, no safety issue."},
+    {"anchor": "producer->input(0) (line 50)", "disposition": "finding", "reason": "Second unchecked input(0) access; OOB on zero-input producer."},
+    {"anchor": "AddCopyNode(...) return values new_producer/new_consumer (lines 52, 57)", "disposition": "finding", "reason": "Dereferenced at lines 53/58 without null check."},
+    {"anchor": "new_producer->set_input(0, producer->input(0)) (line 53)", "disposition": "finding", "reason": "Deref of possibly-null new_producer plus another producer->input(0) read."},
+    {"anchor": "ctx().node_map->AddOutput(input->name(), ...) (line 54)", "disposition": "finding", "reason": "Derefs input; low-risk, depends on GetInputNode postcondition."},
+    {"anchor": "new_consumer->set_input(0, new_producer->name()) (line 58)", "disposition": "dismissed", "reason": "Same null-deref class as line 53 finding; covered by the AddCopyNode finding to avoid duplication."},
+    {"anchor": "new_value_preserving / new_input_type selection (lines 60-63)", "disposition": "dismissed", "reason": "Ternary selection over pointers/dtypes already produced above."},
+    {"anchor": "SetInputType(new_input_type, new_value_preserving) (line 66)", "disposition": "dismissed", "reason": "Error-checked; operates on node created above."},
+    {"anchor": "IsKernelRegisteredForNode(*new_value_preserving) (line 69)", "disposition": "dismissed", "reason": "Error-checked kernel-existence verification; dereferences a node created locally."},
+    {"anchor": "AddToOptimizationQueue(new_producer) / *simplified_node_name = new_consumer->name() (lines 72-73)", "disposition": "dismissed", "reason": "Publishes results of local, non-null nodes; no untrusted contract."}
+  ],
+  "findings": [
+    {
+      "title": "Unchecked node input index (input(0)) on attacker-controlled NodeDef — OOB read / crash",
+      "anchor": "consumer->input(0) and producer->input(0)",
+      "file": "corpus/train/train_0228_cwe476.cpp",
+      "line": "4,50",
+      "code": "TF_RETURN_IF_ERROR(GetInputNode(consumer->input(0), &producer));\n...\nTF_RETURN_IF_ERROR(GetInputNode(producer->input(0), &input));",
+      "bug_class": "Out-of-bounds read / invalid dereference from unvalidated node arity (NULL/invalid pointer dereference)",
+      "cwe": "CWE-476",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0228_cwe476.cpp (and the full ArithmeticOptimizer implementation, file not provided)",
+      "invariant": "Before reading input(N), the code must verify the NodeDef has input_size() > N. A node reaching this stage with zero inputs must be skipped or rejected, not indexed.",
+      "failure_mode": "An attacker supplies a GraphDef in which the consumer node (or the resolved producer node) has an empty `input` list. `input(0)` on an empty protobuf RepeatedPtrField reads past the array bounds — a DCHECK failure in debug builds and an out-of-bounds read returning a garbage string reference in release builds — which is then passed to GetInputNode. The process crashes, giving a remotely triggerable denial of service whenever a malicious model is optimized (serving, conversion, SavedModel load).",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm no earlier caller guarantees input_size() >= 1 for nodes dispatched to this stage, and that GetInputNode does not itself bounds-check before line 4/50 executes the input(0) access."
+    },
+    {
+      "title": "AddCopyNode return value dereferenced without NULL check",
+      "anchor": "new_producer = AddCopyNode(...); new_producer->set_input(...)",
+      "file": "corpus/train/train_0228_cwe476.cpp",
+      "line": "52-53",
+      "code": "NodeDef* new_producer = AddCopyNode(optimized_consumer_name, consumer);\nnew_producer->set_input(0, producer->input(0));",
+      "bug_class": "NULL pointer dereference on unchecked factory return",
+      "cwe": "CWE-476",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "AddCopyNode must be guaranteed to return a non-null NodeDef* on this path (and the copied node must have an input slot 0), or its result must be null-checked before dereference; the same applies to new_consumer at lines 57-58.",
+      "failure_mode": "If AddCopyNode returns null (e.g. an internal insertion/allocation path fails, or a name collision it cannot resolve), line 53 dereferences null and crashes. Because the copied node inherits the attacker-influenced consumer's input structure, set_input(0, ...) also assumes an existing input-0 slot. Impact is a crash / denial of service; severity is medium because it is contingent on AddCopyNode's failure behavior, which is not visible here.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify AddCopyNode's contract: can it ever return null, and does the returned copy always contain at least one input entry so set_input(0, ...) is valid?"
+    },
+    {
+      "title": "Missing structural validation of untrusted GraphDef before rewrite",
+      "anchor": "Status TrySimplify(NodeDef* consumer, string* simplified_node_name)",
+      "file": "corpus/train/train_0228_cwe476.cpp",
+      "line": "2-76",
+      "code": "Status TrySimplify(NodeDef* consumer, string* simplified_node_name) override {",
+      "bug_class": "Improper input validation of untrusted graph structure",
+      "cwe": "CWE-20",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0228_cwe476.cpp",
+      "invariant": "Every stage that consumes an untrusted NodeDef must validate arity and treat helper-returned pointers as untrusted until checked; graph-shape assumptions must be enforced, not presumed.",
+      "failure_mode": "The stage assumes both endpoints have input-0 and that clone/lookup helpers always succeed with non-null outputs. A crafted model that violates any of these assumptions turns an optimization pass into a crash. This is the umbrella cause of the two concrete dereference findings above; hardening is a single arity/null-validation policy at stage entry and after each helper call.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm whether Grappler performs a global graph-validity pass guaranteeing minimum arity before this stage runs; if not, this stage is directly exposed to malformed nodes."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm consumer->input_size() >= 1 is guaranteed before line 4 reads input(0); if not, add an arity guard.",
+    "Confirm the resolved producer has input_size() >= 1 before line 50 reads producer->input(0).",
+    "Verify AddCopyNode (lines 52, 57) can never return null on this path, or add null checks before set_input.",
+    "Verify GetInputNode's postcondition: an OK Status always yields a non-null NodeDef* (protects line 54 input->name()).",
+    "Confirm the copied nodes returned by AddCopyNode always contain an input slot 0 so set_input(0, ...) is valid.",
+    "Check whether a global GraphDef validity/arity pass runs before the ArithmeticOptimizer, bounding the exposure of these unchecked input(0) accesses.",
+    "Confirm DataTypeSize is never called on a non-fixed-size dtype outside the IsFixedSizeType guard (lines 26-33)."
+  ]
+}

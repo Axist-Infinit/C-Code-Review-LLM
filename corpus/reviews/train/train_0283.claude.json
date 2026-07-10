@@ -1,0 +1,256 @@
+{
+  "subsystem": "TORQUE / OpenPBS resource-manager server, function svr_mailowner() in the pbs_server mail-notification path. It builds the recipient list and command line for an external sendmail process and forks/execs it to deliver job-status e-mail (start/end/abort notifications) for a batch job.",
+  "provenance": "Identified by the PBS/TORQUE naming conventions and symbols throughout: the job struct pjob->ji_qs.ji_jobid and pjob->ji_wattr[JOB_ATR_*] attribute arrays, server.sv_attr[SRV_ATR_*] server attributes, ATR_VFLAG_SET flags, log_event() with PBSEVENT_*/PBS_EVENTCLASS_JOB, PBS_DEFAULT_MAIL, and the MAIL_FORCE/MAIL_NONE/MAIL_ABORT constants. The function name svr_mailowner and the sample tag 'primevul_c_train_2308_fixed' place this in TORQUE's src/server mail code (svr_mail.c family).",
+  "trust_boundary": "The job object pjob is populated from a submitted batch job, so its attributes are attacker-influenced: JOB_ATR_job_owner, JOB_ATR_euser, JOB_ATR_mailuser (the array-of-strings mail-user list), JOB_ATR_mailpnts, and the caller-supplied 'text' are all data an unprivileged submitting user controls. server.sv_attr[SRV_ATR_*] (MailDomain, mailfrom, NoMailForce) is administrator configuration and is comparatively trusted, but the job-derived strings flow unbounded into a fixed 1024-byte stack buffer and then into the argv of an external sendmail exec. pbs_server typically runs as root, so a memory-safety or argument-injection defect here is a local privilege-escalation / RCE surface.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0283_cwe94.c",
+      "lines": "2-9",
+      "code": "void svr_mailowner(\n\n  job   *pjob,       /* I */\n  int    mailpoint,  /* note, single character  */\n  int    force,      /* if set to MAIL_FORCE, force mail delivery */\n  char *text)      /* (optional) additional message text */\n\n  {",
+      "explanation": "Entry point of the mail-notification routine. pjob is the job whose owner is to be notified and carries all the attacker-influenced job attributes. mailpoint is a single character code identifying the notification type (start/end/abort). force, when equal to MAIL_FORCE, forces delivery regardless of the job's mail preferences. text is an optional additional message body supplied by the caller. The function returns void and performs its work by forking an external sendmail process."
+    },
+    {
+      "file": "corpus/train/train_0283_cwe94.c",
+      "lines": "10-23",
+      "code": "int         status = 0;\n  int         numargs = 0;\n  int         pipes[2];\n  int         counter;\n  pid_t       pid;\n  char       *mailptr;\n  char       *mailfrom = NULL;\n  char        tmpBuf[LOG_BUF_SIZE];\n  // We call sendmail with cmd_name + 2 arguments + # of mailto addresses + 1 for null\n  char       *sendmail_args[100];\n  char        mailto[1024];\n  FILE       *stream;\n\n  struct array_strings *pas;",
+      "explanation": "Local state. numargs indexes sendmail_args, a fixed 100-element array of char* that becomes the argv passed to execv. mailto is a fixed 1024-byte stack buffer that accumulates the recipient address list. tmpBuf[LOG_BUF_SIZE] is a scratch buffer for formatted log lines. mailptr holds a heap copy of mailto used for comma-splitting. mailfrom is the envelope sender, initialized NULL. pipes[2] is the parent/child pipe used to feed the mail body to sendmail. pas points at the job's mail-user array-of-strings. Note that mailto is declared WITHOUT initialization here."
+    },
+    {
+      "file": "corpus/train/train_0283_cwe94.c",
+      "lines": "25-39",
+      "code": "if ((server.sv_attr[SRV_ATR_MailDomain].at_flags & ATR_VFLAG_SET) &&\n      (server.sv_attr[SRV_ATR_MailDomain].at_val.at_str != NULL) &&\n      (!strcasecmp(\"never\", server.sv_attr[SRV_ATR_MailDomain].at_val.at_str)))\n    {\n    /* never send user mail under any conditions */\n    if (LOGLEVEL >= 3) \n      {\n      log_event(PBSEVENT_ERROR | PBSEVENT_ADMIN | PBSEVENT_JOB,\n        PBS_EVENTCLASS_JOB,\n        pjob->ji_qs.ji_jobid,\n        \"Not sending email: Mail domain set to 'never'\\n\");\n      }\n\n    return;\n    }",
+      "explanation": "Global opt-out. If the server MailDomain attribute is set and literally equals the string \"never\" (case-insensitive), no mail is ever sent: the function logs (when LOGLEVEL>=3) and returns early. The three-part guard first checks the ATR_VFLAG_SET flag, then that the string pointer is non-NULL, then compares — a correctly ordered NULL guard before dereference."
+    },
+    {
+      "file": "corpus/train/train_0283_cwe94.c",
+      "lines": "41-56",
+      "code": "if (LOGLEVEL >= 3)\n    {\n    char tmpBuf[LOG_BUF_SIZE];\n\n    snprintf(tmpBuf, LOG_BUF_SIZE, \"preparing to send '%c' mail for job %s to %s (%.64s)\\n\",\n             (char)mailpoint,\n             pjob->ji_qs.ji_jobid,\n             pjob->ji_wattr[JOB_ATR_job_owner].at_val.at_str,\n             (text != NULL) ? text : \"---\");\n\n    log_event(\n      PBSEVENT_ERROR | PBSEVENT_ADMIN | PBSEVENT_JOB,\n      PBS_EVENTCLASS_JOB,\n      pjob->ji_qs.ji_jobid,\n      tmpBuf);\n    }",
+      "explanation": "Diagnostic logging at LOGLEVEL>=3. It formats a message into a locally-shadowed tmpBuf using snprintf bounded by LOG_BUF_SIZE, so the copy itself is bounded. The attacker-controlled 'text' is truncated to 64 characters by the %.64s conversion, and job_owner is inserted via %s. This block is defensively written — the bound and the %.64s cap are correct. It reads pjob->ji_wattr[JOB_ATR_job_owner].at_val.at_str without a prior NULL check, which would crash if that attribute pointer were NULL, but for a valid job it is populated."
+    },
+    {
+      "file": "corpus/train/train_0283_cwe94.c",
+      "lines": "63-101",
+      "code": "if ((force != MAIL_FORCE) ||\n    (server.sv_attr[(int)SRV_ATR_NoMailForce].at_val.at_long == TRUE))\n    {\n\n    if (pjob->ji_wattr[JOB_ATR_mailpnts].at_flags & ATR_VFLAG_SET)\n      {\n      if (*(pjob->ji_wattr[JOB_ATR_mailpnts].at_val.at_str) ==  MAIL_NONE)\n        {\n        /* do not send mail. No mail requested on job */\n        log_event(PBSEVENT_JOB,\n                  PBS_EVENTCLASS_JOB,\n                  pjob->ji_qs.ji_jobid,\n                  \"Not sending email: job requested no e-mail\");\n        return;\n        }\n      /* see if user specified mail of this type */\n      if (strchr(\n            pjob->ji_wattr[JOB_ATR_mailpnts].at_val.at_str,\n            mailpoint) == NULL)\n        {\n        /* do not send mail */\n        log_event(PBSEVENT_ERROR | PBSEVENT_ADMIN | PBSEVENT_JOB,\n          PBS_EVENTCLASS_JOB,\n          pjob->ji_qs.ji_jobid,\n          \"Not sending email: User does not want mail of this type.\\n\");\n\n        return;\n        }\n      }\n    else if (mailpoint != MAIL_ABORT) /* not set, default to abort */\n      {\n      log_event(PBSEVENT_ERROR | PBSEVENT_ADMIN | PBSEVENT_JOB,\n        PBS_EVENTCLASS_JOB,\n        pjob->ji_qs.ji_jobid,\n        \"Not sending email: Default mailpoint does not include this type.\\n\");\n\n      return;\n      }\n    }",
+      "explanation": "Delivery-policy gate. Unless force==MAIL_FORCE (and the server does not forbid forced mail via SRV_ATR_NoMailForce), the code honors the job's mail preferences: if the job's mailpoints string begins with MAIL_NONE it returns; otherwise strchr scans the job's mailpoints string for the requested mailpoint character and returns if it is not present. If the mailpoints attribute is not set at all, mail is sent only for MAIL_ABORT. Note *(...at_str) at line 69 and the strchr at 79-81 dereference the job mailpnts string pointer without a NULL check under the ATR_VFLAG_SET flag; the code trusts the flag to imply a valid string."
+    },
+    {
+      "file": "corpus/train/train_0283_cwe94.c",
+      "lines": "108-116",
+      "code": "if (fork())\n    {\n    return;  /* its all up to the child now */\n    }\n\n  /* Close the rest of the open file descriptors */\n  int numfds = sysconf(_SC_OPEN_MAX);\n  while (--numfds > 0)\n    close(numfds);",
+      "explanation": "The routine forks so the potentially slow mail delivery does not block the server. In the parent (fork() returns a nonzero pid) it returns immediately. The child (fork() returns 0) proceeds and closes every file descriptor from _SC_OPEN_MAX-1 down to 1, leaving only fd 0. Note that fork() returning -1 on failure is also nonzero and truthy, so an error is treated identically to a successful parent return — the failure is silently swallowed rather than logged."
+    },
+    {
+      "file": "corpus/train/train_0283_cwe94.c",
+      "lines": "118-134",
+      "code": "/* Who is mail from, if SRV_ATR_mailfrom not set use default */\n  if ((mailfrom = server.sv_attr[SRV_ATR_mailfrom].at_val.at_str) == NULL)\n    {\n    if (LOGLEVEL >= 5)\n      {\n      char tmpBuf[LOG_BUF_SIZE];\n\n      snprintf(tmpBuf,sizeof(tmpBuf),\n        \"Updated mailto from user list: '%s'\\n\",\n        mailto);\n      log_event(PBSEVENT_ERROR | PBSEVENT_ADMIN | PBSEVENT_JOB,\n        PBS_EVENTCLASS_JOB,\n        pjob->ji_qs.ji_jobid,\n        tmpBuf);\n      }\n    mailfrom = PBS_DEFAULT_MAIL;\n    }",
+      "explanation": "Determine the envelope sender. mailfrom is set from the server SRV_ATR_mailfrom attribute; if that is NULL, the code logs (at LOGLEVEL>=5) and falls back to the compile-time PBS_DEFAULT_MAIL. Critically, the log line at 125-127 formats mailto with %s, but this block executes BEFORE mailto is ever written — mailto is not initialized until line 137. At this point mailto holds indeterminate stack contents."
+    },
+    {
+      "file": "corpus/train/train_0283_cwe94.c",
+      "lines": "136-156",
+      "code": "/* Who does the mail go to?  If mail-list, them; else owner */\n  *mailto = '\\0';\n\n  if (pjob->ji_wattr[JOB_ATR_mailuser].at_flags & ATR_VFLAG_SET)\n    {\n    /* has mail user list, send to them rather than owner */\n    pas = pjob->ji_wattr[JOB_ATR_mailuser].at_val.at_arst;\n\n    if (pas != NULL)\n      {\n      int i;\n      for (i = 0;i < pas->as_usedptr;i++)\n        {\n        if ((strlen(mailto) + strlen(pas->as_string[i]) + 2) < sizeof(mailto))\n          {\n          strcat(mailto, pas->as_string[i]);\n          strcat(mailto, \" \");\n          }\n        }\n      }\n    }",
+      "explanation": "mailto is finally initialized to the empty string at line 137. If the job carries an explicit mail-user list (JOB_ATR_mailuser), the code iterates the array-of-strings pas and appends each address followed by a space. This branch is the SAFE, bounds-checked one: line 149 verifies strlen(mailto)+strlen(next)+2 < sizeof(mailto) BEFORE each strcat, so it cannot overflow mailto[1024]. This is the pattern the rest of the function should have used but does not."
+    },
+    {
+      "file": "corpus/train/train_0283_cwe94.c",
+      "lines": "158-203",
+      "code": "else\n    {\n    /* no mail user list, just send to owner */\n    if ((server.sv_attr[SRV_ATR_MailDomain].at_flags & ATR_VFLAG_SET) &&\n        (server.sv_attr[SRV_ATR_MailDomain].at_val.at_str != NULL))\n      {\n      strcpy(mailto, pjob->ji_wattr[JOB_ATR_euser].at_val.at_str);\n      strcat(mailto, \"@\");\n      strcat(mailto, server.sv_attr[SRV_ATR_MailDomain].at_val.at_str);\n\n      if (LOGLEVEL >= 5) \n        {\n        char tmpBuf[LOG_BUF_SIZE];\n\n        snprintf(tmpBuf,sizeof(tmpBuf),\n          \"Updated mailto from job owner and mail domain: '%s'\\n\",\n          mailto);\n        log_event(PBSEVENT_ERROR | PBSEVENT_ADMIN | PBSEVENT_JOB,\n          PBS_EVENTCLASS_JOB,\n          pjob->ji_qs.ji_jobid,\n          tmpBuf);\n        }\n      }\n    else\n      {\n#ifdef TMAILDOMAIN\n      strcpy(mailto, pjob->ji_wattr[JOB_ATR_euser].at_val.at_str);\n      strcat(mailto, \"@\");\n      strcat(mailto, TMAILDOMAIN);\n#else /* TMAILDOMAIN */\n      strcpy(mailto, pjob->ji_wattr[JOB_ATR_job_owner].at_val.at_str);\n#endif /* TMAILDOMAIN */\n\n      if (LOGLEVEL >= 5)\n        {\n        char tmpBuf[LOG_BUF_SIZE];\n\n        snprintf(tmpBuf,sizeof(tmpBuf),\n          \"Updated mailto from job owner: '%s'\\n\",\n          mailto);\n        log_event(PBSEVENT_ERROR | PBSEVENT_ADMIN | PBSEVENT_JOB,\n          PBS_EVENTCLASS_JOB,\n          pjob->ji_qs.ji_jobid,\n          tmpBuf);\n        }\n      }\n    }",
+      "explanation": "When there is no mail-user list, the recipient is the job owner. If a MailDomain is configured, line 163 strcpy's the job's euser string into mailto, then strcat's \"@\" and the mail domain. Otherwise (line 187, no TMAILDOMAIN), it strcpy's the full job_owner string (typically \"user@host\"). Unlike the mailuser branch, NONE of these strcpy/strcat calls perform any length check against sizeof(mailto): the job-derived euser/job_owner strings are copied verbatim into the fixed 1024-byte buffer. The subsequent log blocks correctly use snprintf(...,sizeof(tmpBuf),...)."
+    },
+    {
+      "file": "corpus/train/train_0283_cwe94.c",
+      "lines": "205-223",
+      "code": "sendmail_args[numargs++] = (char *)SENDMAIL_CMD;\n  sendmail_args[numargs++] = (char *)\"-f\";\n  sendmail_args[numargs++] = (char *)mailfrom;\n\n  /* Add the e-mail addresses to the command line */\n  mailptr = strdup(mailto);\n  sendmail_args[numargs++] = mailptr;\n  for (counter=0; counter < (int)strlen(mailptr); counter++)\n    {\n    if (mailptr[counter] == ',')\n      {\n      mailptr[counter] = '\\0';\n      sendmail_args[numargs++] = mailptr + counter + 1;\n      if (numargs >= 99)\n        break;\n      }\n    }\n\n  sendmail_args[numargs] = NULL;",
+      "explanation": "Build the argv for sendmail: the program path, \"-f\", the envelope sender mailfrom, then the recipient string. mailptr is a heap duplicate of mailto (strdup can return NULL on OOM, unchecked). The loop splits mailptr on commas in place, NUL-terminating each field and pushing the pointer to the next field as an additional argv entry. numargs is bounded against 99 inside the loop so the 100-element array is not overrun, and the argv is NULL-terminated at line 223. The recipient/sender strings are placed into argv with no leading \"--\" end-of-options marker."
+    },
+    {
+      "file": "corpus/train/train_0283_cwe94.c",
+      "lines": "225-250",
+      "code": "/* Create a pipe to talk to the sendmail process we are about to fork */\n  if (pipe(pipes) == -1)\n    {\n    snprintf(tmpBuf, sizeof(tmpBuf), \"Unable to pipes for sending e-mail\\n\");\n    log_event(PBSEVENT_ERROR | PBSEVENT_ADMIN | PBSEVENT_JOB,\n      PBS_EVENTCLASS_JOB,\n      pjob->ji_qs.ji_jobid,\n      tmpBuf);\n\n    free(mailptr);\n    exit(-1);\n    }\n\n  if ((pid=fork()) == -1)\n    {\n    snprintf(tmpBuf, sizeof(tmpBuf), \"Unable to fork for sending e-mail\\n\");\n    log_event(PBSEVENT_ERROR | PBSEVENT_ADMIN | PBSEVENT_JOB,\n      PBS_EVENTCLASS_JOB,\n      pjob->ji_qs.ji_jobid,\n      tmpBuf);\n\n    free(mailptr);\n    close(pipes[0]);\n    close(pipes[1]);\n    exit(-1);\n    }",
+      "explanation": "Set up the pipe and second fork. pipe(pipes) creates the read/write ends used to feed the message body to sendmail; on failure the child process logs, frees mailptr, and exits. The second fork() splits into a grandchild that will exec sendmail and a middle process that writes the body. fork() failure is handled: it logs, frees mailptr, closes both pipe ends, and exits. These error paths are correctly guarded."
+    },
+    {
+      "file": "corpus/train/train_0283_cwe94.c",
+      "lines": "251-266",
+      "code": "else if (pid == 0)\n    {\n    /* CHILD */\n\n    /* Make stdin the read end of the pipe */\n    dup2(pipes[0], 0);\n\n    /* Close the rest of the open file descriptors */\n    int numfds = sysconf(_SC_OPEN_MAX);\n    while (--numfds > 0)\n      close(numfds);\n\n    execv(SENDMAIL_CMD, sendmail_args);\n    /* This never returns, but if the execv fails the child should exit */\n    exit(1);\n    }",
+      "explanation": "The exec child: it wires the read end of the pipe onto stdin via dup2, closes all higher file descriptors, and execv's SENDMAIL_CMD with the constructed sendmail_args argv. execv does not spawn a shell, so classic shell metacharacter command injection does not apply — but every argv element is passed straight to sendmail. If execv fails the child exits(1)."
+    },
+    {
+      "file": "corpus/train/train_0283_cwe94.c",
+      "lines": "267-315",
+      "code": "else\n    {\n    /* This is the parent */\n\n    /* Close the read end of the pipe */\n    close(pipes[0]);\n\n    /* Write the body to the pipe */\n    stream = fdopen(pipes[1], \"w\");\n    write_email(stream, pjob, mailto, mailpoint, text);\n\n    fflush(stream);\n\n    /* Close and wait for the command to finish */\n    if (fclose(stream) != 0)\n      {\n      snprintf(tmpBuf,sizeof(tmpBuf),\n        \"Piping mail body to sendmail closed: errno %d:%s\\n\",\n        errno, strerror(errno));\n\n      log_event(PBSEVENT_ERROR | PBSEVENT_ADMIN | PBSEVENT_JOB,\n        PBS_EVENTCLASS_JOB,\n        pjob->ji_qs.ji_jobid,\n        tmpBuf);\n      }\n\n    // we aren't going to block in order to find out whether or not sendmail worked \n    if ((waitpid(pid, &status, WNOHANG) != 0) &&\n        (status != 0))\n      {\n      snprintf(tmpBuf,sizeof(tmpBuf),\n        \"Sendmail command returned %d. Mail may not have been sent\\n\",\n        status);\n\n      log_event(PBSEVENT_ERROR | PBSEVENT_ADMIN | PBSEVENT_JOB,\n        PBS_EVENTCLASS_JOB,\n        pjob->ji_qs.ji_jobid,\n        tmpBuf);\n      }\n\n    // don't leave zombies\n    while (waitpid(-1, &status, WNOHANG) != 0)\n      {\n      // zombie reaped, NO-OP\n      }\n\n    free(mailptr);\n    exit(0);\n    }",
+      "explanation": "The body-writing parent: it closes the read end, wraps the write end in a FILE* via fdopen, and calls write_email() to stream the message body (including the attacker-controlled 'text' and the job) to sendmail's stdin. It flushes and closes the stream, non-blockingly reaps the sendmail child (WNOHANG) and logs a nonzero exit, then reaps any remaining zombies, frees mailptr, and exits. fdopen's return value is not checked before write_email/fflush dereference stream."
+    },
+    {
+      "file": "corpus/train/train_0283_cwe94.c",
+      "lines": "317-320",
+      "code": "/* NOT REACHED */\n\n  exit(0);\n  }  /* END svr_mailowner() */",
+      "explanation": "A defensive exit(0) that is unreachable because every branch of the child process above already exits. Marks the end of svr_mailowner()."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0283_cwe94.c",
+      "lines": "163-165",
+      "code": "strcpy(mailto, pjob->ji_wattr[JOB_ATR_euser].at_val.at_str);\n      strcat(mailto, \"@\");\n      strcat(mailto, server.sv_attr[SRV_ATR_MailDomain].at_val.at_str);",
+      "explanation": "The owner/domain branch copies the job-derived euser string into the fixed 1024-byte mailto buffer with strcpy — which writes until the source NUL with no destination bound — then appends \"@\" and the mail domain with strcat. euser (the job's effective user, derived from submission) is attacker-influenced; there is NO length check equivalent to the guarded loop at line 149. A euser (or, combined, euser + domain) whose length reaches or exceeds 1024 bytes overflows mailto on the stack, corrupting adjacent locals (sendmail_args, pipes, saved registers/return address) — a classic stack buffer overflow. Impact ranges from crash to control-flow hijack in a root daemon. The implementation must bound every copy: reject or truncate when strlen(src)+... >= sizeof(mailto), exactly as the mailuser branch does."
+    },
+    {
+      "file": "corpus/train/train_0283_cwe94.c",
+      "lines": "183-188",
+      "code": "strcpy(mailto, pjob->ji_wattr[JOB_ATR_euser].at_val.at_str);\n      strcat(mailto, \"@\");\n      strcat(mailto, TMAILDOMAIN);\n#else /* TMAILDOMAIN */\n      strcpy(mailto, pjob->ji_wattr[JOB_ATR_job_owner].at_val.at_str);",
+      "explanation": "The no-MailDomain branch has the same defect from a second anchor: strcpy of euser (with TMAILDOMAIN) or, in the default build, strcpy of the job_owner string into mailto[1024] with no bound. job_owner is the fully attacker-supplied \"user@host\" owner string. Because sizeof(mailto) is never consulted here, an over-long owner string overflows the same fixed stack buffer. Same failure class (CWE-120) as lines 163-165 but reached under a different configuration, so both copy sites must be fixed; a bound on only one path leaves the overflow reachable."
+    },
+    {
+      "file": "corpus/train/train_0283_cwe94.c",
+      "lines": "205-217",
+      "code": "sendmail_args[numargs++] = (char *)mailfrom;\n\n  /* Add the e-mail addresses to the command line */\n  mailptr = strdup(mailto);\n  sendmail_args[numargs++] = mailptr;\n  for (counter=0; counter < (int)strlen(mailptr); counter++)\n    {\n    if (mailptr[counter] == ',')\n      {\n      mailptr[counter] = '\\0';\n      sendmail_args[numargs++] = mailptr + counter + 1;",
+      "explanation": "Argument injection into sendmail. The attacker-controlled recipient tokens (from euser/job_owner/mailuser, split on commas) are placed directly into the execv argv with no \"--\" end-of-options marker preceding them, and mailfrom is passed after \"-f\". A recipient or owner string crafted to begin with '-' is interpreted by sendmail as an option rather than an address: sendmail flags such as -C<file> (alternate config), -X<file> (log to arbitrary path), or -O QueueDirectory can be abused for arbitrary file write / configuration override, which in a root context can escalate to code execution. Because execv bypasses the shell there is no metacharacter injection, but option injection is fully in play. The implementation must insert a literal \"--\" argv element before any user-derived address and reject addresses beginning with '-'."
+    },
+    {
+      "file": "corpus/train/train_0283_cwe94.c",
+      "lines": "125-127",
+      "code": "snprintf(tmpBuf,sizeof(tmpBuf),\n        \"Updated mailto from user list: '%s'\\n\",\n        mailto);",
+      "explanation": "Use of an uninitialized buffer. This snprintf reads mailto with %s, but it executes inside the mailfrom==NULL block at lines 119-134, which runs BEFORE mailto is initialized to '\\0' at line 137. mailto[1024] is declared without initialization (line 20), so at this point it contains indeterminate stack bytes. The %s conversion reads until it finds a NUL; if none appears within the buffer it reads past the 1024-byte array (out-of-bounds read), and in any case it copies leftover stack contents into the log — an information-disclosure / uninitialized-read defect (reachable when the server mailfrom attribute is unset and LOGLEVEL>=5). The fix is to initialize mailto before any read, or not to log it here."
+    },
+    {
+      "file": "corpus/train/train_0283_cwe94.c",
+      "lines": "210-212",
+      "code": "mailptr = strdup(mailto);\n  sendmail_args[numargs++] = mailptr;\n  for (counter=0; counter < (int)strlen(mailptr); counter++)",
+      "explanation": "Unchecked strdup return. strdup allocates and can return NULL under memory pressure. mailptr is stored into argv and then immediately passed to strlen(mailptr) at line 212, which dereferences NULL and crashes the mail child (denial of a notification, and a NULL is left in argv if execv were somehow reached). The implementation should check mailptr != NULL and bail out on allocation failure before use."
+    },
+    {
+      "file": "corpus/train/train_0283_cwe94.c",
+      "lines": "275-278",
+      "code": "stream = fdopen(pipes[1], \"w\");\n    write_email(stream, pjob, mailto, mailpoint, text);\n\n    fflush(stream);",
+      "explanation": "Unchecked fdopen return. fdopen can return NULL (e.g. out of memory). stream is passed straight into write_email() and then fflush(stream) without a NULL check; if write_email dereferences the FILE* (or fflush(NULL) semantics aside, write_email almost certainly writes to it), a NULL stream leads to a crash. Lower severity than the overflow but the return value should be validated before use."
+    },
+    {
+      "file": "corpus/train/train_0283_cwe94.c",
+      "lines": "108-110",
+      "code": "if (fork())\n    {\n    return;  /* its all up to the child now */\n    }",
+      "explanation": "fork() failure (-1) is not distinguished from the successful-parent case: -1 is truthy, so on fork failure the function simply returns as if a child were handling delivery, and no mail is sent and nothing is logged. This is a robustness/error-handling gap (silent failure) rather than a memory-safety bug, but it means notification loss under resource exhaustion goes undetected."
+    }
+  ],
+  "summary": "svr_mailowner() copies attacker-influenced job strings (euser, job_owner) into a fixed 1024-byte stack buffer using unbounded strcpy/strcat on the owner/domain path (lines 163-165, 183-188) — a stack buffer overflow in a root-privileged daemon — while the parallel mailuser path (line 149) is correctly bounded. It then passes those user-derived strings into the sendmail execv argv with no \"--\" separator, permitting sendmail option/argument injection, and additionally reads the uninitialized mailto buffer in a log line and dereferences unchecked strdup/fdopen results.",
+  "reviewed_anchors": [
+    {"anchor": "svr_mailowner(job *pjob, int mailpoint, int force, char *text)", "disposition": "dismissed", "reason": "Signature itself carries no buffer; pjob/text define the trust boundary and are analyzed at their use sites."},
+    {"anchor": "char mailto[1024] (line 20)", "disposition": "finding", "reason": "Fixed destination buffer filled by unbounded strcpy/strcat and read while uninitialized."},
+    {"anchor": "char *sendmail_args[100] (line 19)", "disposition": "finding", "reason": "Becomes execv argv; user-derived tokens injected without an end-of-options marker (argument injection). Index numargs is itself bounded at 99, so no array overrun."},
+    {"anchor": "char tmpBuf[LOG_BUF_SIZE] (line 17) and shadowed copies (43,123,169,192)", "disposition": "dismissed", "reason": "Written only via snprintf(...,sizeof/LOG_BUF_SIZE,...); bounded log scratch buffers."},
+    {"anchor": "int pipes[2] (line 12)", "disposition": "dismissed", "reason": "Fixed two-element fd array used only with pipe()/index 0,1; no attacker-controlled indexing."},
+    {"anchor": "int numargs / counter / status (lines 10-13)", "disposition": "dismissed", "reason": "Loop/index counters; numargs bounded against 99 before write."},
+    {"anchor": "snprintf(...,\"%.64s\", text) at 45-49", "disposition": "dismissed", "reason": "Bounded by LOG_BUF_SIZE and text truncated to 64 chars; safe."},
+    {"anchor": "bounds-checked strcat loop at 149-153", "disposition": "dismissed", "reason": "Explicit strlen()+2 < sizeof(mailto) guard before each strcat; the safe reference pattern."},
+    {"anchor": "strcpy/strcat at 163-165 (owner + mail domain)", "disposition": "finding", "reason": "Unbounded copy of job euser/domain into mailto[1024]; stack overflow."},
+    {"anchor": "strcpy/strcat at 183-188 (owner, TMAILDOMAIN / job_owner)", "disposition": "finding", "reason": "Same unbounded-copy class from a different config path."},
+    {"anchor": "mailptr = strdup(mailto) at 210", "disposition": "finding", "reason": "NULL return unchecked before strlen(mailptr) dereference."},
+    {"anchor": "snprintf reading mailto at 125-127", "disposition": "finding", "reason": "Reads mailto with %s before it is initialized at line 137 (uninitialized/OOB read + info leak)."},
+    {"anchor": "execv(SENDMAIL_CMD, sendmail_args) at 263", "disposition": "finding", "reason": "User-derived recipients/sender passed as argv without \"--\"; sendmail option injection."},
+    {"anchor": "stream = fdopen(pipes[1], \"w\") at 275", "disposition": "finding", "reason": "Return value not checked before write_email/fflush use."},
+    {"anchor": "if (fork()) at 108", "disposition": "finding", "reason": "fork() == -1 not distinguished from parent; silent delivery failure."},
+    {"anchor": "*(...JOB_ATR_mailpnts...at_str) / strchr at 69,79-81", "disposition": "dismissed", "reason": "Dereference guarded by ATR_VFLAG_SET; not an attacker-controlled memory-safety primitive assuming the flag/string invariant holds."},
+    {"anchor": "while(--numfds>0) close(numfds) at 114-116, 259-261", "disposition": "dismissed", "reason": "Standard post-fork fd cleanup; no attacker input."},
+    {"anchor": "waitpid loops at 294,308", "disposition": "dismissed", "reason": "Non-blocking reaping; no security contract."}
+  ],
+  "findings": [
+    {
+      "title": "Stack buffer overflow: unbounded strcpy/strcat of job owner into mailto[1024]",
+      "anchor": "strcpy(mailto, pjob->ji_wattr[JOB_ATR_euser].at_val.at_str); strcat(mailto, ...)",
+      "file": "corpus/train/train_0283_cwe94.c",
+      "line": "163-165, 183-188",
+      "code": "strcpy(mailto, pjob->ji_wattr[JOB_ATR_euser].at_val.at_str);\n      strcat(mailto, \"@\");\n      strcat(mailto, server.sv_attr[SRV_ATR_MailDomain].at_val.at_str);",
+      "bug_class": "Stack buffer overflow (unbounded string copy without size check)",
+      "cwe": "CWE-120",
+      "severity": "critical",
+      "where_it_lives": "corpus/train/train_0283_cwe94.c (svr_mailowner)",
+      "invariant": "Every write into mailto[1024] must first verify strlen(src) (plus any '@'/domain appended) is less than sizeof(mailto), exactly as the mailuser branch at line 149 does.",
+      "failure_mode": "A job whose euser or job_owner string (attacker-influenced at submission) is >= ~1024 bytes causes strcpy/strcat to write past mailto on the stack, corrupting adjacent locals and the return address in the root pbs_server mail child; consequences range from crash to arbitrary code execution. The mailuser path is bounded but these owner paths are not.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm no upstream cap on euser/job_owner length (PBS_MAXUSER + host can exceed 1024 with a crafted host/domain) and that mailto is a fixed 1024-byte automatic array with no bounds check on these copies."
+    },
+    {
+      "title": "Sendmail argument (option) injection via unsanitized recipient/sender in execv argv",
+      "anchor": "sendmail_args[numargs++] = mailptr + counter + 1; ... execv(SENDMAIL_CMD, sendmail_args)",
+      "file": "corpus/train/train_0283_cwe94.c",
+      "line": "205-223, 263",
+      "code": "sendmail_args[numargs++] = (char *)mailfrom;\n  ...\n  sendmail_args[numargs++] = mailptr + counter + 1;\n  ...\n  execv(SENDMAIL_CMD, sendmail_args);",
+      "bug_class": "Argument/option injection into external program",
+      "cwe": "CWE-88",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0283_cwe94.c (svr_mailowner)",
+      "invariant": "User-derived addresses and sender must be passed only as operands: insert a literal \"--\" argv element before the first address and reject any address/sender beginning with '-'.",
+      "failure_mode": "A recipient or owner string beginning with '-' (e.g. from a crafted mailuser list or owner) is interpreted by sendmail as an option; flags such as -C, -X, or -O QueueDirectory can force sendmail to read an attacker config or write to an arbitrary path, escalating within the root daemon. execv avoids shell injection but not option injection since no \"--\" separator is used.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm SENDMAIL_CMD is a sendmail-compatible MTA that honors these options and that no argv element \"--\" is inserted before user-derived addresses."
+    },
+    {
+      "title": "Read of uninitialized mailto buffer in log line",
+      "anchor": "snprintf(tmpBuf,sizeof(tmpBuf), \"Updated mailto from user list: '%s'\\n\", mailto)",
+      "file": "corpus/train/train_0283_cwe94.c",
+      "line": "125-127",
+      "code": "snprintf(tmpBuf,sizeof(tmpBuf),\n        \"Updated mailto from user list: '%s'\\n\",\n        mailto);",
+      "bug_class": "Use of uninitialized stack buffer (info disclosure / out-of-bounds read)",
+      "cwe": "CWE-457",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0283_cwe94.c (svr_mailowner)",
+      "invariant": "mailto must be initialized (line 137 '*mailto=0') before any read; no code path may read mailto before it is set.",
+      "failure_mode": "When SRV_ATR_mailfrom is unset (mailfrom==NULL) and LOGLEVEL>=5, the code formats mailto with %s at line 127, but mailto is not initialized until line 137. The %s reads indeterminate stack bytes into the log (information disclosure) and, if no NUL exists within the 1024-byte array, reads out of bounds.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm no earlier assignment to mailto exists on this path and that mailto[1024] is an uninitialized automatic array at line 20."
+    },
+    {
+      "title": "Unchecked strdup() return dereferenced by strlen",
+      "anchor": "mailptr = strdup(mailto); ... strlen(mailptr)",
+      "file": "corpus/train/train_0283_cwe94.c",
+      "line": "210-212",
+      "code": "mailptr = strdup(mailto);\n  sendmail_args[numargs++] = mailptr;\n  for (counter=0; counter < (int)strlen(mailptr); counter++)",
+      "bug_class": "NULL pointer dereference (unchecked allocation)",
+      "cwe": "CWE-476",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0283_cwe94.c (svr_mailowner)",
+      "invariant": "The result of strdup must be checked for NULL before it is stored into argv or passed to strlen.",
+      "failure_mode": "Under memory pressure strdup returns NULL; strlen(mailptr) at line 212 then dereferences NULL and crashes the mail child, and a NULL argv entry would be left behind.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm there is no NULL check on mailptr before line 212."
+    },
+    {
+      "title": "Unchecked fdopen() return used by write_email/fflush",
+      "anchor": "stream = fdopen(pipes[1], \"w\"); write_email(stream, ...); fflush(stream)",
+      "file": "corpus/train/train_0283_cwe94.c",
+      "line": "275-278",
+      "code": "stream = fdopen(pipes[1], \"w\");\n    write_email(stream, pjob, mailto, mailpoint, text);\n\n    fflush(stream);",
+      "bug_class": "NULL pointer dereference (unchecked return)",
+      "cwe": "CWE-476",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0283_cwe94.c (svr_mailowner)",
+      "invariant": "fdopen's return must be checked for NULL before the FILE* is used.",
+      "failure_mode": "If fdopen fails (returns NULL), write_email() and fflush(stream) operate on a NULL FILE* and crash the mail child.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm write_email dereferences the stream and that no NULL guard precedes it."
+    },
+    {
+      "title": "fork() failure treated as success (silent delivery loss)",
+      "anchor": "if (fork()) { return; }",
+      "file": "corpus/train/train_0283_cwe94.c",
+      "line": "108-110",
+      "code": "if (fork())\n    {\n    return;  /* its all up to the child now */\n    }",
+      "bug_class": "Unchecked/ambiguous return value error handling",
+      "cwe": "CWE-252",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0283_cwe94.c (svr_mailowner)",
+      "invariant": "fork() == -1 must be handled distinctly from the parent (pid>0) case and logged.",
+      "failure_mode": "On fork() failure (-1, truthy) the function returns as if a child were delivering mail; no notification is sent and the failure is not logged.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm no separate -1 handling exists for this first fork."
+    }
+  ],
+  "audit_checklist": [
+    "Add a sizeof(mailto) bound to the owner/domain strcpy/strcat at 163-165 and 183-188 (mirror the guarded loop at 149) or replace with snprintf/strlcpy.",
+    "Insert a literal \"--\" argv element before the first user-derived address and reject addresses/sender beginning with '-' before execv, to block sendmail option injection.",
+    "Initialize mailto (or move '*mailto=0' above line 119) so the log at 125-127 never reads uninitialized/out-of-bounds stack.",
+    "Check strdup() (line 210) and fdopen() (line 275) returns for NULL before use.",
+    "Distinguish fork()==-1 from the parent case at line 108 and log the failure.",
+    "Confirm upstream length limits on euser/job_owner/mailuser entries and that PBS_MAXUSER + hostname cannot exceed 1024 bytes."
+  ]
+}

@@ -1,0 +1,249 @@
+{
+  "subsystem": "AFFLIB (Advanced Forensic Format) page/segment retrieval. af_get_page() reads one page (a fixed-size block of a forensic disk image) out of an AFF container, transparently decompressing it when the stored segment is compressed (ALG_ZERO run/zero, ALG_ZLIB, or optional ALG_LZMA) and writing the reconstructed page into a caller-supplied buffer. It also synthesizes 'bad block' fill for missing segments and pads the tail of a partially-filled page.",
+  "provenance": "Identified from the AFFLIB-specific symbols and idioms: the AFFILE* handle type, af_get_page_raw(), af->image_pagesize / af->image_sectorsize / af->badflag / af->openmode / af->error_reporter / af->bytes_memcpy / af->pages_decompressed fields, the AF_PAGE_COMPRESSED / AF_PAGE_COMP_ALG_MASK / AF_PAGE_COMP_ALG_ZERO / AF_PAGE_COMP_ALG_ZLIB / AF_PAGE_COMP_ALG_LZMA constants, AF_BADBLOCK_FILL, the I64d printf macro, and the zlib uncompress()/USE_LZMA path. The header comment '/* sample: primevul_train_3356_vuln */' and the filename token 'cwe295' are provenance labels only; CWE-295 (certificate validation) is unrelated to this code and was treated as noise — the file was reviewed blind on its merits.",
+  "trust_boundary": "The AFF container file is the untrusted input: an AFF image is an attacker-supplyable artifact (evidence transported between parties, downloaded, or crafted). Every value read via af_get_page_raw() from that container is hostile: the segment flags (arg/pageflag, selecting the decompression algorithm), page_len (the on-disk segment size that sizes the malloc and the raw read), compressed_data (the raw compressed bytes), and — critically — the decompressed length that ALG_ZERO reads out of the payload. The image metadata af->image_pagesize and af->image_sectorsize also originate from the container header and are attacker-influenced. The only in-process trust input is the caller's data buffer and its stated size *bytes; the function's safety depends on an unstated contract between that size and af->image_pagesize.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0065_cwe295.cpp",
+      "lines": "2-9",
+      "code": "int af_get_page(AFFILE *af,int64_t pagenum,unsigned char *data,size_t *bytes)\n{\n    uint32_t arg=0;\n    size_t page_len=0;\n\n    if (af_trace){\n\tfprintf(af_trace,\"af_get_page(%p,pagenum=%\" I64d \",buf=%p,bytes=%u)\\n\",af,pagenum,data,(int)*bytes);\n    }",
+      "explanation": "Entry point. af is the AFF file handle; pagenum selects which page to fetch; data is a caller-owned output buffer (may be NULL to mean 'just tell me the size'); bytes is an in/out pointer that on entry states the capacity of data and on exit reports how many bytes were produced. Locals arg (segment flags) and page_len (on-disk segment length) are zero-initialized. When the af_trace debug FILE* is set, it logs the arguments; note it dereferences *bytes here, so callers must pass a valid bytes pointer even in trace mode."
+    },
+    {
+      "file": "corpus/train/train_0065_cwe295.cpp",
+      "lines": "14-31",
+      "code": "    int r = af_get_page_raw(af,pagenum,&arg,0,&page_len);\n    if(r){\n\t/* Segment doesn't exist.\n\t * If we have been provided with a buffer,\n\t * fill buffer with the 'bad segment' flag and return.\n\t */\n\tif(data && (af->openmode & AF_BADBLOCK_FILL) && errno == ENOENT)\n\t{\n\t    for(size_t i = 0;i <= af->image_pagesize - af->image_sectorsize;\n\t\ti+= af->image_sectorsize){\n\t\tmemcpy(data+i,af->badflag,af->image_sectorsize);\n\t\taf->bytes_memcpy += af->image_sectorsize;\n\t    }\n\n\t    r = 0;\n\t}\n\treturn r;\t\t// segment doesn't exist\n    }",
+      "explanation": "First it probes the segment with af_get_page_raw(af,pagenum,&arg,0,&page_len): passing a NULL data (the 4th argument is 0) asks only for the segment flags (arg) and length (page_len). A non-zero return means the segment is absent. If the caller gave a buffer, the file was opened with AF_BADBLOCK_FILL, and errno is ENOENT, it fabricates a 'bad block' page by memcpy-ing af->badflag (one sector-sized token) across the whole page, sector by sector, from offset 0 up to and including image_pagesize - image_sectorsize. It tallies af->bytes_memcpy, clears r to signal success, and returns. The loop bound and the destination extent are both driven by af->image_pagesize / af->image_sectorsize, which come from the container, not from *bytes."
+    },
+    {
+      "file": "corpus/train/train_0065_cwe295.cpp",
+      "lines": "35-44",
+      "code": "    uint32_t pageflag = 0;\n    if((arg & AF_PAGE_COMPRESSED)==0){\n\tif(data==0){\t\t\t// if no data provided, just return size of the segment if requested\n\t    if(bytes) *bytes = page_len;\t// set the number of bytes in the page if requested\n\t    return 0;\n\t}\n\tint ret = af_get_page_raw(af,pagenum,&pageflag,data,bytes);\n\tif(*bytes > page_len) *bytes = page_len; // we only read this much\n\tif(ret!=0) return ret;\t\t// some error happened?\n    }",
+      "explanation": "The uncompressed fast path. If the segment flags say the page is NOT compressed, and the caller passed no buffer, it simply returns page_len as the size and exits. Otherwise it re-reads the raw segment straight into data via af_get_page_raw, this time passing *bytes as the destination capacity so the raw reader can bound its copy. It then clamps the reported size to page_len (you cannot have read more than the segment holds). This path correctly treats *bytes as the buffer capacity — a contract the compressed path below does NOT follow consistently."
+    },
+    {
+      "file": "corpus/train/train_0065_cwe295.cpp",
+      "lines": "45-57",
+      "code": "    else {\n\t/* Allocate memory to hold the compressed segment */\n\tunsigned char *compressed_data = (unsigned char *)malloc(page_len);\n\tsize_t compressed_data_len = page_len;\n\tif(compressed_data==0){\n\t    return -2;\t\t\t// memory error\n\t}\n\n\t/* Get the data */\n\tif(af_get_page_raw(af,pagenum,&pageflag,compressed_data,&compressed_data_len)){\n\t    free(compressed_data);\n\t    return -3;\t\t\t// read error\n\t}",
+      "explanation": "The compressed branch. It allocates a scratch buffer of page_len bytes to hold the raw compressed segment, records the capacity in compressed_data_len, and NULL-checks the malloc (returns -2 on failure). It then reads the raw compressed bytes into that buffer; af_get_page_raw updates compressed_data_len to the number of bytes actually read. On read failure it frees the scratch buffer and returns -3. page_len is attacker-controlled container metadata; if it is 0, malloc(0) has implementation-defined behavior and a NULL return would be misreported as a memory error."
+    },
+    {
+      "file": "corpus/train/train_0065_cwe295.cpp",
+      "lines": "62-68",
+      "code": "\tint res = -1;\t\t\t// 0 is success\n\tbool free_data = false;\n\tif(data==0){\n\t    data = (unsigned char *)malloc(af->image_pagesize);\n\t    free_data = true;\n\t    *bytes = af->image_pagesize; // I can hold this much\n\t}",
+      "explanation": "res tracks decompression outcome (0 == success). If the caller supplied no output buffer, the function allocates its own of exactly af->image_pagesize bytes, marks free_data so it will be released later, and sets *bytes to image_pagesize to advertise that full capacity to the decompressors. Note this self-allocated buffer is NULL-unchecked — a failed malloc here leaves data == NULL, which the subsequent memset/uncompress/fill will dereference. It also establishes the implicit assumption that the decompression target is image_pagesize bytes large, which only holds for this self-allocated case, not for a caller-supplied buffer whose real size is whatever the caller set in *bytes."
+    },
+    {
+      "file": "corpus/train/train_0065_cwe295.cpp",
+      "lines": "70-79",
+      "code": "\tswitch((pageflag & AF_PAGE_COMP_ALG_MASK)){\n\tcase AF_PAGE_COMP_ALG_ZERO:\n\t    if(compressed_data_len != 4){\n\t\t(*af->error_reporter)(\"ALG_ZERO compressed data is %d bytes, expected 4.\",compressed_data_len);\n\t\tbreak;\n\t    }\n\t    memset(data,0,af->image_pagesize);\n\t    *bytes = ntohl(*(long *)compressed_data);\n\t    res = 0;\t\t\t// not very hard to decompress with the ZERO compressor.\n\t    break;",
+      "explanation": "Dispatch on the low bits of pageflag selecting the compression algorithm. ALG_ZERO is a run-of-zeros encoding: it validates that exactly 4 compressed bytes were read, zero-fills the entire image_pagesize-byte destination, then sets the produced length *bytes to a 32-bit big-endian integer decoded from the 4-byte payload. Two hostile inputs converge here: the destination extent (image_pagesize) and the reported length (*bytes = ntohl(...)) are both derived from the untrusted container rather than from the caller's real buffer size. It also reads through (long *) — 8 bytes on LP64 — from a payload validated to be only 4 bytes long."
+    },
+    {
+      "file": "corpus/train/train_0065_cwe295.cpp",
+      "lines": "81-101",
+      "code": "\tcase AF_PAGE_COMP_ALG_ZLIB:\n\t    res = uncompress(data,(uLongf *)bytes,compressed_data,compressed_data_len);\n\t    switch(res){\n\t    case Z_OK:\n\t\tbreak;\n\t    case Z_ERRNO:\n\t\t(*af->error_reporter)(\"Z_ERRNOR decompressing segment %\" I64d,pagenum);\n\t    case Z_STREAM_ERROR:\n\t\t(*af->error_reporter)(\"Z_STREAM_ERROR decompressing segment %\" I64d,pagenum);\n\t    case Z_DATA_ERROR:\n\t\t(*af->error_reporter)(\"Z_DATA_ERROR decompressing segment %\" I64d,pagenum);\n\t    case Z_MEM_ERROR:\n\t\t(*af->error_reporter)(\"Z_MEM_ERROR decompressing segment %\" I64d,pagenum);\n\t    case Z_BUF_ERROR:\n\t\t(*af->error_reporter)(\"Z_BUF_ERROR decompressing segment %\" I64d,pagenum);\n\t    case Z_VERSION_ERROR:\n\t\t(*af->error_reporter)(\"Z_VERSION_ERROR decompressing segment %\" I64d,pagenum);\n\t    default:\n\t\t(*af->error_reporter)(\"uncompress returned an invalid value in get_segment\");\n\t    }\n\t    break;",
+      "explanation": "ALG_ZLIB inflates compressed_data into data using zlib's uncompress(). The destination-capacity/out-length argument is *bytes reinterpreted as (uLongf *). zlib uses *bytes as the output buffer capacity and rewrites it with the produced length, returning Z_BUF_ERROR if the output would exceed it — so uncompress itself is bounded by whatever *bytes holds. The inner switch reports errors, but every non-Z_OK case is missing a break, so a single error (e.g. Z_DATA_ERROR) falls through and fires every remaining error_reporter message down to default. The (uLongf *)bytes cast type-puns a size_t* as an unsigned long*, which mismatches width on LLP64 platforms (size_t 64-bit, uLong 32-bit)."
+    },
+    {
+      "file": "corpus/train/train_0065_cwe295.cpp",
+      "lines": "103-116",
+      "code": "#ifdef USE_LZMA\n\tcase AF_PAGE_COMP_ALG_LZMA:\n\t    res = lzma_uncompress(data,bytes,compressed_data,compressed_data_len);\n\t    if (af_trace) fprintf(af_trace,\"   LZMA decompressed page %\" I64d \". %d bytes => %u bytes\\n\",\n\t\t\t\t  pagenum,(int)compressed_data_len,(int)*bytes);\n\t    switch(res){\n\t    case 0:break;\t\t// OK\n\t    case 1:(*af->error_reporter)(\"LZMA header error decompressing segment %\" I64d \"\\n\",pagenum);\n\t\tbreak;\n\t    case 2:(*af->error_reporter)(\"LZMA memory error decompressing segment %\" I64d \"\\n\",pagenum);\n\t\tbreak;\n\t    }\n\t    break;\n#endif",
+      "explanation": "Optional ALG_LZMA path, compiled only when USE_LZMA is defined. It calls lzma_uncompress(data, bytes, compressed_data, compressed_data_len), passing *bytes as the destination capacity and out-length just like the zlib case, then optionally traces the size transformation and maps res codes 1/2 to header/memory errors. Its safety hinges on the same invariant: that *bytes accurately bounds the size of data. Unlike the zlib inner switch, these cases do include breaks."
+    },
+    {
+      "file": "corpus/train/train_0065_cwe295.cpp",
+      "lines": "118-131",
+      "code": "\tdefault:\n\t    (*af->error_reporter)(\"Unknown compression algorithm 0x%d\",\n\t\t\t\t  pageflag & AF_PAGE_COMP_ALG_MASK);\n\t    break;\n\t}\n\n\tif(free_data){\n\t    free(data);\n\t    data = 0;\t\t\t// restore the way it was\n\t}\n\tfree(compressed_data);\t\t// don't need this one anymore\n\taf->pages_decompressed++;\n\tif(res!=Z_OK) return -1;\n    }",
+      "explanation": "Unknown algorithm ids report an error and leave res == -1. After the switch, if the buffer was self-allocated it is freed and data reset to NULL (so the tail-fill block below is skipped for that case). The compressed scratch buffer is freed, the decompressed-page counter is bumped, and any non-Z_OK result (Z_OK == 0) makes the function return -1. Because Z_OK is 0 and the ALG_ZERO/LZMA success codes are also 0, the res!=Z_OK test correctly treats them as success."
+    },
+    {
+      "file": "corpus/train/train_0065_cwe295.cpp",
+      "lines": "133-151",
+      "code": "    if(data && (af->image_pagesize > af->image_sectorsize)){\n\tconst int SECTOR_SIZE = af->image_sectorsize;\t// for ease of typing\n\tsize_t bytes_left_in_sector = (SECTOR_SIZE - (*bytes % SECTOR_SIZE)) % SECTOR_SIZE;\n\tfor(size_t i=0;i<bytes_left_in_sector;i++){\n\t    data[*bytes + i] = 0;\n\t}\n\tsize_t end_of_data = *bytes + bytes_left_in_sector;\n\n\t/* Now fill to the end of the page... */\n\tfor(size_t i = end_of_data; i <= af->image_pagesize-SECTOR_SIZE; i+=SECTOR_SIZE){\n\t    memcpy(data+i,af->badflag,SECTOR_SIZE);\n\t    af->bytes_memcpy += SECTOR_SIZE;\n\t}\n    }\n    return 0;\n}",
+      "explanation": "Tail padding, run for both the uncompressed and compressed branches whenever data is non-NULL and the page is larger than one sector. It first zero-fills from offset *bytes up to the next sector boundary (data[*bytes + i] = 0), then fills the remaining whole sectors of the page with the badflag token via memcpy, from end_of_data up to and including image_pagesize - SECTOR_SIZE. Both the write offsets (*bytes + i, data+i) and the terminal bound (image_pagesize) are derived from values an attacker can influence through the container (the decompressed *bytes from ALG_ZERO, and image_pagesize/image_sectorsize), and none of them is checked against the true size of the caller's buffer."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0065_cwe295.cpp",
+      "lines": "76-77",
+      "code": "\t    memset(data,0,af->image_pagesize);\n\t    *bytes = ntohl(*(long *)compressed_data);",
+      "explanation": "In the ALG_ZERO case the produced length *bytes is set to a fully attacker-controlled 32-bit value decoded from the 4-byte compressed payload, with NO validation that it does not exceed af->image_pagesize or the caller's actual buffer size. That poisoned *bytes then indexes the tail-fill at line 141 (data[*bytes + i] = 0) and seeds end_of_data for the memcpy fill at line 147, turning it into an out-of-bounds write at an attacker-chosen offset. Separately, the memset zero-fills image_pagesize bytes into data unconditionally; if the caller supplied a buffer smaller than image_pagesize (the function accepted *bytes as its size but never checked *bytes >= image_pagesize), this alone overflows the destination. Invariant the implementation must uphold: the decompressed length must be clamped to min(image_pagesize, caller_capacity) BEFORE it is used to index data, and image_pagesize must be proven <= the caller's buffer size before any full-page write."
+    },
+    {
+      "file": "corpus/train/train_0065_cwe295.cpp",
+      "lines": "137-149",
+      "code": "    if(data && (af->image_pagesize > af->image_sectorsize)){\n\tconst int SECTOR_SIZE = af->image_sectorsize;\t// for ease of typing\n\tsize_t bytes_left_in_sector = (SECTOR_SIZE - (*bytes % SECTOR_SIZE)) % SECTOR_SIZE;\n\tfor(size_t i=0;i<bytes_left_in_sector;i++){\n\t    data[*bytes + i] = 0;\n\t}\n\tsize_t end_of_data = *bytes + bytes_left_in_sector;\n\n\t/* Now fill to the end of the page... */\n\tfor(size_t i = end_of_data; i <= af->image_pagesize-SECTOR_SIZE; i+=SECTOR_SIZE){\n\t    memcpy(data+i,af->badflag,SECTOR_SIZE);\n\t    af->bytes_memcpy += SECTOR_SIZE;\n\t}",
+      "explanation": "This block writes into the caller's data buffer at offsets derived from *bytes and from af->image_pagesize, but its only guard is that data is non-NULL and pagesize > sectorsize — never that the buffer is at least image_pagesize bytes. The memcpy loop writes badflag from end_of_data up to image_pagesize, so any caller who passed a buffer smaller than image_pagesize (perfectly legal by the function's own uncompressed path, which honors *bytes as the size) gets a heap/stack buffer overflow. Combined with an attacker-inflated *bytes from ALG_ZERO, data[*bytes + i] = 0 writes far past the allocation. Invariant: every write here must be bounded by the caller's real capacity, and *bytes must already be trustworthy (<= capacity) on entry to this block."
+    },
+    {
+      "file": "corpus/train/train_0065_cwe295.cpp",
+      "lines": "22-24",
+      "code": "\t    for(size_t i = 0;i <= af->image_pagesize - af->image_sectorsize;\n\t\ti+= af->image_sectorsize){\n\t\tmemcpy(data+i,af->badflag,af->image_sectorsize);",
+      "explanation": "The bad-block fill loop (and the identical pattern at line 146) computes its terminal bound as af->image_pagesize - af->image_sectorsize in unsigned (size_t) arithmetic. Both operands are container-supplied image geometry. If a malicious image declares image_sectorsize > image_pagesize (or image_pagesize == 0), the subtraction underflows to a value near SIZE_MAX, so the loop runs essentially forever, memcpy-ing af->badflag sector by sector across the entire address space starting at data — a catastrophic out-of-bounds write. Even with sane geometry, the destination extent (~image_pagesize) is never checked against the caller's buffer size. Invariant: reject image_sectorsize == 0 and image_sectorsize > image_pagesize before this loop, and bound the destination by the caller's capacity."
+    },
+    {
+      "file": "corpus/train/train_0065_cwe295.cpp",
+      "lines": "72-77",
+      "code": "\t    if(compressed_data_len != 4){\n\t\t(*af->error_reporter)(\"ALG_ZERO compressed data is %d bytes, expected 4.\",compressed_data_len);\n\t\tbreak;\n\t    }\n\t    memset(data,0,af->image_pagesize);\n\t    *bytes = ntohl(*(long *)compressed_data);",
+      "explanation": "The length gate confirms compressed_data_len == 4, but the dereference reads *(long *)compressed_data, which is 8 bytes on any LP64/LLP64 platform. compressed_data was malloc'd to page_len; if page_len is 4 (or the segment genuinely holds only the 4 validated bytes), reading a full long reads 4 bytes out of bounds — an out-of-bounds read / type-confusion. ntohl only byte-swaps the low 32 bits, so on a little-endian 64-bit host the high 4 bytes of the long are read but discarded, meaning the read is both unnecessary and unsafe. Invariant: decode exactly a uint32_t (e.g. via a uint32_t*/memcpy of 4 bytes), never a long, from a buffer validated to be 4 bytes."
+    },
+    {
+      "file": "corpus/train/train_0065_cwe295.cpp",
+      "lines": "82-82",
+      "code": "\t    res = uncompress(data,(uLongf *)bytes,compressed_data,compressed_data_len);",
+      "explanation": "zlib's uncompress bounds its output by the value pointed to (the capacity of data). Here the capacity is *bytes reinterpreted through (uLongf *). Two problems: (1) if the caller-supplied *bytes overstates the real buffer size, uncompress will happily inflate up to that overstated bound and overflow data — the function never validates *bytes against a true allocation; (2) the (uLongf *)bytes cast type-puns a size_t* (64-bit) as unsigned long* (32-bit on Windows LLP64), so on those platforms uncompress writes/reads a 32-bit length through a 64-bit slot, corrupting *bytes and mis-bounding both the decompression and the subsequent tail-fill. Invariant: pass a value/type that exactly matches the destination buffer's real capacity and the API's uLongf width; do not trust a caller-declared *bytes as a decompression bound without an authoritative size."
+    },
+    {
+      "file": "corpus/train/train_0065_cwe295.cpp",
+      "lines": "84-99",
+      "code": "\t    switch(res){\n\t    case Z_OK:\n\t\tbreak;\n\t    case Z_ERRNO:\n\t\t(*af->error_reporter)(\"Z_ERRNOR decompressing segment %\" I64d,pagenum);\n\t    case Z_STREAM_ERROR:\n\t\t(*af->error_reporter)(\"Z_STREAM_ERROR decompressing segment %\" I64d,pagenum);\n\t    case Z_DATA_ERROR:\n\t\t(*af->error_reporter)(\"Z_DATA_ERROR decompressing segment %\" I64d,pagenum);\n\t    case Z_MEM_ERROR:\n\t\t(*af->error_reporter)(\"Z_MEM_ERROR decompressing segment %\" I64d,pagenum);\n\t    case Z_BUF_ERROR:\n\t\t(*af->error_reporter)(\"Z_BUF_ERROR decompressing segment %\" I64d,pagenum);\n\t    case Z_VERSION_ERROR:\n\t\t(*af->error_reporter)(\"Z_VERSION_ERROR decompressing segment %\" I64d,pagenum);\n\t    default:\n\t\t(*af->error_reporter)(\"uncompress returned an invalid value in get_segment\");\n\t    }",
+      "explanation": "Every non-Z_OK case lacks a break, so control falls through: a Z_DATA_ERROR (a normal outcome for corrupt/malicious compressed input) reports Z_DATA_ERROR, then Z_MEM_ERROR, Z_BUF_ERROR, Z_VERSION_ERROR and the 'invalid value' default — a misleading cascade of error messages. If error_reporter is a fatal/abort handler, an attacker crafting a corrupt zlib segment reaches it repeatedly; if it is best-effort logging, this is a log-spam / diagnostic-integrity defect rather than memory-unsafe. Invariant: each error case must break; do not rely on fall-through, especially where an unhandled/NULL error_reporter would itself fault."
+    },
+    {
+      "file": "corpus/train/train_0065_cwe295.cpp",
+      "lines": "64-67",
+      "code": "\tif(data==0){\n\t    data = (unsigned char *)malloc(af->image_pagesize);\n\t    free_data = true;\n\t    *bytes = af->image_pagesize; // I can hold this much",
+      "explanation": "The self-allocated fallback buffer is not NULL-checked. If malloc(af->image_pagesize) fails (image_pagesize can be large and attacker-influenced), data becomes NULL and *bytes is set to image_pagesize, after which memset(data,...) at line 76, uncompress(data,...) at line 82, or data[*bytes + i] at line 141 dereference NULL — a crash (denial of service). Also image_pagesize here is trusted as the malloc size while elsewhere it must equal the caller buffer size; the two never reconcile. Invariant: check the allocation and fail with -2 as the compressed-scratch malloc does; keep a single authoritative page-size that is validated against both the allocation and any full-page fill."
+    }
+  ],
+  "summary": "This AFFLIB af_get_page() decompresses attacker-supplied AFF-container segments into a caller buffer while trusting container-derived sizes (image_pagesize, image_sectorsize) and, for ALG_ZERO, a length decoded straight out of the payload — none of which is validated against the caller's real buffer capacity. The result is multiple remote heap/buffer-overflow primitives (attacker-controlled *bytes indexing data, full-page memset/fill into an undersized buffer, and an unsigned-underflow loop bound), plus an out-of-bounds/type-confused read and a NULL-deref DoS. High severity; the file's 'cwe295' label is a mislabel — the real classes are CWE-787/CWE-125/CWE-191/CWE-476.",
+  "reviewed_anchors": [
+    {"anchor": "int af_get_page(AFFILE *af,int64_t pagenum,unsigned char *data,size_t *bytes) (line 2)", "disposition": "finding", "reason": "*bytes is both the caller's buffer capacity and the produced length; the function never enforces *bytes >= image_pagesize before full-page writes — the core buffer-size contract."},
+    {"anchor": "af_trace fprintf, *bytes deref (lines 7-9)", "disposition": "dismissed", "reason": "Debug-only logging gated on af_trace; format uses fixed string, no attacker-controlled format specifier."},
+    {"anchor": "af_get_page_raw(af,pagenum,&arg,0,&page_len) (line 14)", "disposition": "dismissed", "reason": "External helper; sets attacker-controlled arg/page_len — its outputs are treated as hostile downstream but the call site itself carries no bug."},
+    {"anchor": "af->openmode & AF_BADBLOCK_FILL, errno==ENOENT (line 20)", "disposition": "dismissed", "reason": "Mode/errno predicate gating the fill path; carries no memory-safety contract by itself."},
+    {"anchor": "bad-block fill loop, bound image_pagesize - image_sectorsize (lines 22-26)", "disposition": "finding", "reason": "Unsigned underflow of a container-supplied geometry subtraction plus unchecked destination extent into caller data."},
+    {"anchor": "arg & AF_PAGE_COMPRESSED (line 36)", "disposition": "dismissed", "reason": "Flag test selecting compressed vs uncompressed path; a branch selector, not a size/bounds contract."},
+    {"anchor": "uncompressed path af_get_page_raw + *bytes clamp (lines 41-42)", "disposition": "dismissed", "reason": "This path correctly passes *bytes as capacity and clamps to page_len; it establishes the safe contract the compressed path violates, but is not itself buggy."},
+    {"anchor": "malloc(page_len) for compressed_data (line 47)", "disposition": "dismissed", "reason": "NULL-checked at line 49; page_len==0 -> malloc(0) is a low-impact spurious -2, not memory-unsafe."},
+    {"anchor": "compressed_data_len = page_len, updated by af_get_page_raw (lines 48,54)", "disposition": "finding", "reason": "Its ==4 gate is defeated by the (long*) 8-byte read in ALG_ZERO; the length validation is width-mismatched."},
+    {"anchor": "self-allocated buffer malloc(image_pagesize), *bytes=image_pagesize (lines 64-67)", "disposition": "finding", "reason": "Allocation is not NULL-checked; a failed malloc leads to NULL deref in memset/uncompress/fill."},
+    {"anchor": "switch on pageflag & AF_PAGE_COMP_ALG_MASK (line 70)", "disposition": "dismissed", "reason": "Algorithm dispatch; individual cases are analyzed separately."},
+    {"anchor": "ALG_ZERO: memset(data,0,image_pagesize); *bytes = ntohl(*(long*)compressed_data) (lines 76-77)", "disposition": "finding", "reason": "Attacker-controlled produced length and full-page memset with no capacity check; primary OOB-write source, plus 8-byte read from a 4-byte payload."},
+    {"anchor": "ALG_ZLIB: uncompress(data,(uLongf*)bytes,...) (line 82)", "disposition": "finding", "reason": "Decompression bound taken from an unvalidated caller *bytes and a width-mismatched (uLongf*) cast."},
+    {"anchor": "zlib result inner switch (lines 83-100)", "disposition": "finding", "reason": "Missing breaks cause fall-through error cascades; low-severity correctness/diagnostic defect (potential repeated error_reporter invocation)."},
+    {"anchor": "ALG_LZMA: lzma_uncompress(data,bytes,...) (lines 104-115)", "disposition": "dismissed", "reason": "Behind #ifdef USE_LZMA and shares the exact same 'trust caller *bytes as capacity' hazard already captured by the zlib/ALG_ZERO findings; not materially distinct."},
+    {"anchor": "cleanup: free_data/free(data)/free(compressed_data), res!=Z_OK return -1 (lines 124-130)", "disposition": "dismissed", "reason": "Frees are single and paired (data reset to 0); success-code mapping is correct since Z_OK==0."},
+    {"anchor": "tail fill: data[*bytes+i]=0 and memcpy(data+i,badflag,SECTOR_SIZE) (lines 137-149)", "disposition": "finding", "reason": "Writes into caller buffer at offsets from *bytes and up to image_pagesize with no capacity check; amplifies the ALG_ZERO *bytes poisoning into OOB writes."},
+    {"anchor": "error_reporter format strings with %d and size_t/hex args (lines 73,119)", "disposition": "dismissed", "reason": "Fixed (non-attacker) format strings with a %d/size_t type mismatch; a printf hygiene bug, not attacker-controlled format string."}
+  ],
+  "findings": [
+    {
+      "title": "ALG_ZERO decompressed length is attacker-controlled and drives out-of-bounds writes",
+      "anchor": "*bytes = ntohl(*(long *)compressed_data);",
+      "file": "corpus/train/train_0065_cwe295.cpp",
+      "line": "77",
+      "code": "\t    *bytes = ntohl(*(long *)compressed_data);",
+      "bug_class": "Out-of-bounds write (attacker-controlled length / missing input validation)",
+      "cwe": "CWE-787",
+      "severity": "critical",
+      "where_it_lives": "corpus/train/train_0065_cwe295.cpp (this file)",
+      "invariant": "The decompressed/produced length written to *bytes must be clamped to min(af->image_pagesize, caller_buffer_capacity) before it is ever used to index or bound writes into data.",
+      "failure_mode": "A malicious AFF container marks a page ALG_ZERO with a 4-byte payload whose big-endian value is arbitrary. That value is stored into *bytes with no upper-bound check, then used at line 141 (data[*bytes + i] = 0) and to seed end_of_data for the memcpy fill at line 147, producing writes at an attacker-chosen offset far beyond the caller's buffer — a controllable heap/stack overflow leading to memory corruption and likely code execution.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm no caller re-validates *bytes after af_get_page returns and before it is used; verify image_pagesize and caller capacity are not independently enforced to be >= this value elsewhere."
+    },
+    {
+      "title": "Full-page memset/fill writes image_pagesize bytes into a caller buffer of unchecked size",
+      "anchor": "memset(data,0,af->image_pagesize); / memcpy(data+i,af->badflag,SECTOR_SIZE)",
+      "file": "corpus/train/train_0065_cwe295.cpp",
+      "line": "76,146-148",
+      "code": "\t    memset(data,0,af->image_pagesize);",
+      "bug_class": "Buffer overflow (write past caller buffer, missing size check)",
+      "cwe": "CWE-787",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0065_cwe295.cpp (this file)",
+      "invariant": "Before any write spanning the full page (memset at 76, the fill loop at 146-148, the bad-block fill at 22-26), the code must prove the caller's buffer is at least af->image_pagesize bytes; the uncompressed path treats *bytes as the true capacity, so the compressed/fill paths must not silently assume a larger buffer.",
+      "failure_mode": "A caller (following the uncompressed-path convention) passes a buffer sized to *bytes that is smaller than af->image_pagesize. On a compressed or bad-block page the code memsets/fills image_pagesize bytes into that buffer, overflowing it. image_pagesize is container-derived, so an attacker can additionally inflate it to enlarge the overflow.",
+      "cve_analog": "",
+      "what_to_confirm": "Check every caller of af_get_page to see whether data is always at least af->image_pagesize; if any caller sizes by *bytes, this is a live overflow."
+    },
+    {
+      "title": "Unsigned underflow of image_pagesize - image_sectorsize makes fill loops run unbounded",
+      "anchor": "for(size_t i = 0;i <= af->image_pagesize - af->image_sectorsize; i+= af->image_sectorsize)",
+      "file": "corpus/train/train_0065_cwe295.cpp",
+      "line": "22-24,146",
+      "code": "\t    for(size_t i = 0;i <= af->image_pagesize - af->image_sectorsize;\n\t\ti+= af->image_sectorsize){\n\t\tmemcpy(data+i,af->badflag,af->image_sectorsize);",
+      "bug_class": "Integer underflow leading to out-of-bounds write",
+      "cwe": "CWE-191",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0065_cwe295.cpp (this file)",
+      "invariant": "image_sectorsize must be non-zero and <= image_pagesize before computing image_pagesize - image_sectorsize in size_t arithmetic; the loop must also be bounded by the caller's buffer.",
+      "failure_mode": "A crafted image declares image_sectorsize larger than image_pagesize (or image_pagesize == 0 with the >sectorsize guard bypassed at line 22). The size_t subtraction wraps to ~SIZE_MAX, so the loop iterates far beyond the buffer, memcpy-ing badflag across memory — a massive out-of-bounds write / crash. A zero image_sectorsize additionally causes a division/step problem (i += 0 never advances) in related arithmetic.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify where image_pagesize/image_sectorsize are set from the container and whether they are validated (sectorsize>0, pagesize a multiple of and >= sectorsize) before af_get_page runs."
+    },
+    {
+      "title": "Type-confused 8-byte read from a 4-byte-validated payload in ALG_ZERO",
+      "anchor": "ntohl(*(long *)compressed_data) guarded by compressed_data_len != 4",
+      "file": "corpus/train/train_0065_cwe295.cpp",
+      "line": "72-77",
+      "code": "\t    if(compressed_data_len != 4){\n\t\t(*af->error_reporter)(\"ALG_ZERO compressed data is %d bytes, expected 4.\",compressed_data_len);\n\t\tbreak;\n\t    }\n\t    memset(data,0,af->image_pagesize);\n\t    *bytes = ntohl(*(long *)compressed_data);",
+      "bug_class": "Out-of-bounds read / type confusion (long vs 4-byte value)",
+      "cwe": "CWE-125",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0065_cwe295.cpp (this file)",
+      "invariant": "Decode exactly the 4 validated bytes as a uint32_t (uint32_t*, or memcpy into a uint32_t); never dereference (long *) over a buffer proven to hold only 4 bytes.",
+      "failure_mode": "compressed_data may be allocated as small as page_len (potentially 4). The (long *) dereference reads sizeof(long) bytes — 8 on LP64/LLP64 — so it reads 4 bytes past the end of the compressed buffer, an out-of-bounds read; ntohl then only swaps the low 32 bits, so the extra bytes are read but meaningless, confirming the read is both unsafe and unnecessary.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm sizeof(long) on target platforms and the actual allocation size of compressed_data when compressed_data_len==4."
+    },
+    {
+      "title": "zlib/LZMA decompression bound taken from unvalidated *bytes with a width-mismatched cast",
+      "anchor": "uncompress(data,(uLongf *)bytes,compressed_data,compressed_data_len)",
+      "file": "corpus/train/train_0065_cwe295.cpp",
+      "line": "82",
+      "code": "\t    res = uncompress(data,(uLongf *)bytes,compressed_data,compressed_data_len);",
+      "bug_class": "Incorrect type cast / decompression into buffer of unverified capacity",
+      "cwe": "CWE-704",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0065_cwe295.cpp (this file)",
+      "invariant": "The out-length pointer passed to uncompress must (a) hold the true remaining capacity of data, and (b) have exactly the uLongf width zlib expects; a size_t* must not be blindly cast to uLongf* where the widths differ.",
+      "failure_mode": "uncompress trusts *bytes as the output capacity; if a caller overstates *bytes relative to the real data allocation, zlib inflates up to the overstated bound and overflows. On LLP64 (Windows) the (uLongf *)bytes cast writes a 32-bit length into a 64-bit slot, corrupting *bytes (leaving stale high bits) and mis-bounding the later tail-fill, potentially producing OOB writes. The same pattern applies to the LZMA path at line 105.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm size_t vs uLongf widths on all supported targets and that *bytes always equals the real capacity of data at line 82."
+    },
+    {
+      "title": "Self-allocated fallback buffer is not NULL-checked before use",
+      "anchor": "data = (unsigned char *)malloc(af->image_pagesize);",
+      "file": "corpus/train/train_0065_cwe295.cpp",
+      "line": "64-67",
+      "code": "\tif(data==0){\n\t    data = (unsigned char *)malloc(af->image_pagesize);\n\t    free_data = true;\n\t    *bytes = af->image_pagesize; // I can hold this much",
+      "bug_class": "NULL pointer dereference (unchecked malloc)",
+      "cwe": "CWE-476",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0065_cwe295.cpp (this file)",
+      "invariant": "malloc's return value must be checked for NULL before data is written; on failure the function should return the memory-error code (as the compressed-scratch malloc at line 47-50 does).",
+      "failure_mode": "When the caller passes no buffer, malloc(af->image_pagesize) can fail (image_pagesize is container-influenced and may be large). data stays NULL and *bytes is set to image_pagesize; the subsequent memset(data,...) (76), uncompress(data,...) (82), or data[*bytes + i] (141) dereference NULL, crashing the process (denial of service).",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm there is no NULL guard between line 65 and the first use of data; verify malloc failure semantics under the largest attacker-selectable image_pagesize."
+    },
+    {
+      "title": "Missing break statements cause zlib error-case fall-through cascade",
+      "anchor": "switch(res){ case Z_ERRNO: ... case Z_STREAM_ERROR: ... }",
+      "file": "corpus/train/train_0065_cwe295.cpp",
+      "line": "83-100",
+      "code": "\t    switch(res){\n\t    case Z_OK:\n\t\tbreak;\n\t    case Z_ERRNO:\n\t\t(*af->error_reporter)(\"Z_ERRNOR decompressing segment %\" I64d,pagenum);\n\t    case Z_STREAM_ERROR:\n\t\t(*af->error_reporter)(\"Z_STREAM_ERROR decompressing segment %\" I64d,pagenum);\n\t    case Z_DATA_ERROR:\n\t\t(*af->error_reporter)(\"Z_DATA_ERROR decompressing segment %\" I64d,pagenum);\n\t    case Z_MEM_ERROR:\n\t\t(*af->error_reporter)(\"Z_MEM_ERROR decompressing segment %\" I64d,pagenum);\n\t    case Z_BUF_ERROR:\n\t\t(*af->error_reporter)(\"Z_BUF_ERROR decompressing segment %\" I64d,pagenum);\n\t    case Z_VERSION_ERROR:\n\t\t(*af->error_reporter)(\"Z_VERSION_ERROR decompressing segment %\" I64d,pagenum);\n\t    default:\n\t\t(*af->error_reporter)(\"uncompress returned an invalid value in get_segment\");\n\t    }",
+      "bug_class": "Omitted break / unintended switch fall-through",
+      "cwe": "CWE-484",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0065_cwe295.cpp (this file)",
+      "invariant": "Each non-Z_OK case must end with break so exactly one diagnostic fires per error code.",
+      "failure_mode": "A corrupt/malicious zlib segment returning e.g. Z_DATA_ERROR falls through every subsequent case down to default, emitting a cascade of misleading error messages; if error_reporter aborts or is expensive, this is a controllable diagnostic-integrity / minor-DoS issue. No memory corruption, but it obscures the true error and can be triggered remotely with a bad segment.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify the intended behavior of error_reporter (log vs abort) and that only one message should be emitted per zlib error."
+    }
+  ],
+  "audit_checklist": [
+    "Prove that every caller passes a data buffer of at least af->image_pagesize bytes, or add an explicit check *bytes >= af->image_pagesize before any full-page memset/fill.",
+    "Clamp the ALG_ZERO decompressed length (line 77) to min(image_pagesize, caller capacity) before it is used to index data at lines 141/143/146.",
+    "Validate af->image_sectorsize != 0 and af->image_sectorsize <= af->image_pagesize (and pagesize a multiple of sectorsize) before the underflow-prone loops at lines 22-24 and 146.",
+    "Replace *(long *)compressed_data with a 4-byte uint32_t decode so the read cannot exceed the validated 4-byte payload.",
+    "Confirm size_t vs uLongf width on all targets and ensure the uncompress/lzma_uncompress out-length reflects the true buffer capacity, not an unvalidated caller *bytes.",
+    "Add a NULL check after malloc(af->image_pagesize) at line 65 and return the memory-error code on failure.",
+    "Add break to each zlib error case (lines 86-98) and confirm error_reporter is non-NULL and non-fatal when driven by malicious segments.",
+    "Trace where image_pagesize/image_sectorsize/page_len originate in the AFF container and confirm they are bounds-checked at parse time."
+  ]
+}

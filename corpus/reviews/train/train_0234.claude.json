@@ -1,0 +1,199 @@
+{
+  "subsystem": "AMD Cryptographic Coprocessor (CCP) driver — the SHA/HMAC command dispatcher ccp_run_sha_cmd() from the Linux kernel crypto stack (drivers/crypto/ccp/ccp-ops.c). It marshals a caller-supplied SHA request (type, source scatterlist, context buffer, HMAC opad, message-bit count, first/final flags) into the hardware's storage-block (SB) layout, drives the SHA engine, retrieves the digest, and, for HMAC, recursively runs a second (final) SHA over opad||inner-digest.",
+  "provenance": "Identified by the function name ccp_run_sha_cmd and the pervasive ccp_/CCP_ vocabulary: struct ccp_cmd_queue, struct ccp_cmd, struct ccp_sha_engine, struct ccp_dm_workarea, struct ccp_op, the CCP_SHA_TYPE_* enum, CCP_SB_BYTES, CCP_VERSION(major,minor), CCP_PASSTHRU_BYTESWAP_256BIT, LSB_ITEM_SIZE, and helpers ccp_init_dm_workarea/ccp_set_dm_area/ccp_copy_to_sb/ccp_copy_from_sb/ccp_get_dm_area/ccp_init_data/ccp_prepare_data/ccp_process_data. Kernel idioms (kmalloc/GFP_KERNEL, kfree, -EINVAL/-ENOMEM, scatterlist, scatterwalk_map_and_copy) confirm Linux kernel. The sample banner 'primevul_c_train_2549_vuln' and the corpus filename train_0234_cwe401.c flag a CWE-401 (memory leak) concern.",
+  "trust_boundary": "The struct ccp_cmd / ccp_sha_engine fields (sha->type, sha->ctx, sha->ctx_len, sha->src, sha->src_len, sha->opad, sha->opad_len, sha->msg_bits, sha->first/final) are populated by callers of the kernel crypto API and can be driven from user space through AF_ALG / algif_hash. Lengths (ctx_len, src_len, opad_len) and the context/opad buffers are therefore attacker-influenced and must be validated against the fixed hardware SB geometry (CCP_SB_BYTES, LSB_ITEM_SIZE) before any copy. The hardware itself and the pre-allocated sb_ctx are trusted; the request descriptor is not.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0234_cwe401.c",
+      "lines": "2-14",
+      "code": "ccp_run_sha_cmd(struct ccp_cmd_queue *cmd_q, struct ccp_cmd *cmd)\n{\n\tstruct ccp_sha_engine *sha = &cmd->u.sha;\n\tstruct ccp_dm_workarea ctx;\n\tstruct ccp_data src;\n\tstruct ccp_op op;\n\tunsigned int ioffset, ooffset;\n\tunsigned int digest_size;\n\tint sb_count;\n\tconst void *init;\n\tu64 block_size;\n\tint ctx_size;\n\tint ret;",
+      "explanation": "Entry point: cmd_q is the per-queue hardware handle, cmd is the request descriptor. Line 4 aliases sha = &cmd->u.sha, the union member carrying every attacker-influenced SHA parameter. The remaining locals are on-stack scratch: ctx is a DMA work area that will mirror the hardware context; src wraps the input scatterlist; op is the hardware operation descriptor; ioffset/ooffset are byte offsets into the 32-byte SB slot for placing/extracting the digest depending on SHA variant and CCP version; digest_size/ctx_size/sb_count/block_size describe the chosen algorithm; init points at the algorithm's initial-state constant. Note ctx and src are declared but NOT zero-initialized here — that matters for the cleanup paths."
+    },
+    {
+      "file": "corpus/train/train_0234_cwe401.c",
+      "lines": "16-46",
+      "code": "\tswitch (sha->type) {\n\tcase CCP_SHA_TYPE_1:\n\t\tif (sha->ctx_len < SHA1_DIGEST_SIZE)\n\t\t\treturn -EINVAL;\n\t\tblock_size = SHA1_BLOCK_SIZE;\n\t\tbreak;\n\tcase CCP_SHA_TYPE_224:\n\t\tif (sha->ctx_len < SHA224_DIGEST_SIZE)\n\t\t\treturn -EINVAL;\n\t\tblock_size = SHA224_BLOCK_SIZE;\n\t\tbreak;\n\tcase CCP_SHA_TYPE_256:\n\t\tif (sha->ctx_len < SHA256_DIGEST_SIZE)\n\t\t\treturn -EINVAL;\n\t\tblock_size = SHA256_BLOCK_SIZE;\n\t\tbreak;\n\tcase CCP_SHA_TYPE_384:\n\t\tif (cmd_q->ccp->vdata->version < CCP_VERSION(4, 0)\n\t\t    || sha->ctx_len < SHA384_DIGEST_SIZE)\n\t\t\treturn -EINVAL;\n\t\tblock_size = SHA384_BLOCK_SIZE;\n\t\tbreak;\n\tcase CCP_SHA_TYPE_512:\n\t\tif (cmd_q->ccp->vdata->version < CCP_VERSION(4, 0)\n\t\t    || sha->ctx_len < SHA512_DIGEST_SIZE)\n\t\t\treturn -EINVAL;\n\t\tblock_size = SHA512_BLOCK_SIZE;\n\t\tbreak;\n\tdefault:\n\t\treturn -EINVAL;\n\t}",
+      "explanation": "First validation gate. It dispatches on sha->type and, per variant, (a) enforces a MINIMUM context length via sha->ctx_len < SHA*_DIGEST_SIZE and (b) selects the block_size used later for length alignment and buffer sizing. SHA-384/512 additionally require CCP hardware version >= 4.0. The default returns -EINVAL, so after this switch sha->type is guaranteed to be one of the five named constants — this is what makes the later switch defaults 'unreachable'. Crucially the ctx_len check is a floor (>= digest size), NOT a check that ctx_len is large enough for the sb_count*CCP_SB_BYTES restore performed later."
+    },
+    {
+      "file": "corpus/train/train_0234_cwe401.c",
+      "lines": "48-52",
+      "code": "\tif (!sha->ctx)\n\t\treturn -EINVAL;\n\n\tif (!sha->final && (sha->src_len & (block_size - 1)))\n\t\treturn -EINVAL;",
+      "explanation": "Requires a non-NULL context buffer, then, for non-final (streaming) requests, requires the source length to be a whole multiple of block_size using the mask (block_size - 1). This mask trick is valid only because every SHA*_BLOCK_SIZE is a power of two; a non-final request whose src_len is not block-aligned is rejected because the engine can only hash whole blocks until the final call."
+    },
+    {
+      "file": "corpus/train/train_0234_cwe401.c",
+      "lines": "54-99",
+      "code": "\t/* The version 3 device can't handle zero-length input */\n\tif (cmd_q->ccp->vdata->version == CCP_VERSION(3, 0)) {\n\n\t\tif (!sha->src_len) {\n\t\t\tunsigned int digest_len;\n\t\t\tconst u8 *sha_zero;\n\n\t\t\t/* Not final, just return */\n\t\t\tif (!sha->final)\n\t\t\t\treturn 0;\n\n\t\t\t/* CCP can't do a zero length sha operation so the\n\t\t\t * caller must buffer the data.\n\t\t\t */\n\t\t\tif (sha->msg_bits)\n\t\t\t\treturn -EINVAL;\n\n\t\t\t/* The CCP cannot perform zero-length sha operations\n\t\t\t * so the caller is required to buffer data for the\n\t\t\t * final operation. However, a sha operation for a\n\t\t\t * message with a total length of zero is valid so\n\t\t\t * known values are required to supply the result.\n\t\t\t */\n\t\t\tswitch (sha->type) {\n\t\t\tcase CCP_SHA_TYPE_1:\n\t\t\t\tsha_zero = sha1_zero_message_hash;\n\t\t\t\tdigest_len = SHA1_DIGEST_SIZE;\n\t\t\t\tbreak;\n\t\t\tcase CCP_SHA_TYPE_224:\n\t\t\t\tsha_zero = sha224_zero_message_hash;\n\t\t\t\tdigest_len = SHA224_DIGEST_SIZE;\n\t\t\t\tbreak;\n\t\t\tcase CCP_SHA_TYPE_256:\n\t\t\t\tsha_zero = sha256_zero_message_hash;\n\t\t\t\tdigest_len = SHA256_DIGEST_SIZE;\n\t\t\t\tbreak;\n\t\t\tdefault:\n\t\t\t\treturn -EINVAL;\n\t\t\t}\n\n\t\t\tscatterwalk_map_and_copy((void *)sha_zero, sha->ctx, 0,\n\t\t\t\t\t\t digest_len, 1);\n\n\t\t\treturn 0;\n\t\t}\n\t}",
+      "explanation": "Special case for v3.0 hardware, which cannot process a zero-length input. If src_len is zero: a non-final request just returns 0 (data is being buffered by the caller); a final request with a non-zero msg_bits is rejected; otherwise the empty-message digest is a known constant, so the precomputed sha*_zero_message_hash is copied into sha->ctx and the function returns. The copy length digest_len equals the variant's digest size, and sha->ctx_len was already validated >= that digest size at lines 16-46, so this copy is in-bounds. SHA-384/512 aren't handled here (default -EINVAL) because they only run on v4.0+ hardware."
+    },
+    {
+      "file": "corpus/train/train_0234_cwe401.c",
+      "lines": "101-149",
+      "code": "\t/* Set variables used throughout */\n\tswitch (sha->type) {\n\tcase CCP_SHA_TYPE_1:\n\t\tdigest_size = SHA1_DIGEST_SIZE;\n\t\tinit = (void *) ccp_sha1_init;\n\t\tctx_size = SHA1_DIGEST_SIZE;\n\t\tsb_count = 1;\n\t\tif (cmd_q->ccp->vdata->version != CCP_VERSION(3, 0))\n\t\t\tooffset = ioffset = CCP_SB_BYTES - SHA1_DIGEST_SIZE;\n\t\telse\n\t\t\tooffset = ioffset = 0;\n\t\tbreak;\n\tcase CCP_SHA_TYPE_224:\n\t\tdigest_size = SHA224_DIGEST_SIZE;\n\t\tinit = (void *) ccp_sha224_init;\n\t\tctx_size = SHA256_DIGEST_SIZE;\n\t\tsb_count = 1;\n\t\tioffset = 0;\n\t\tif (cmd_q->ccp->vdata->version != CCP_VERSION(3, 0))\n\t\t\tooffset = CCP_SB_BYTES - SHA224_DIGEST_SIZE;\n\t\telse\n\t\t\tooffset = 0;\n\t\tbreak;\n\tcase CCP_SHA_TYPE_256:\n\t\tdigest_size = SHA256_DIGEST_SIZE;\n\t\tinit = (void *) ccp_sha256_init;\n\t\tctx_size = SHA256_DIGEST_SIZE;\n\t\tsb_count = 1;\n\t\tooffset = ioffset = 0;\n\t\tbreak;\n\tcase CCP_SHA_TYPE_384:\n\t\tdigest_size = SHA384_DIGEST_SIZE;\n\t\tinit = (void *) ccp_sha384_init;\n\t\tctx_size = SHA512_DIGEST_SIZE;\n\t\tsb_count = 2;\n\t\tioffset = 0;\n\t\tooffset = 2 * CCP_SB_BYTES - SHA384_DIGEST_SIZE;\n\t\tbreak;\n\tcase CCP_SHA_TYPE_512:\n\t\tdigest_size = SHA512_DIGEST_SIZE;\n\t\tinit = (void *) ccp_sha512_init;\n\t\tctx_size = SHA512_DIGEST_SIZE;\n\t\tsb_count = 2;\n\t\tooffset = ioffset = 0;\n\t\tbreak;\n\tdefault:\n\t\tret = -EINVAL;\n\t\tgoto e_data;\n\t}",
+      "explanation": "Second dispatch sets the geometry used for the rest of the routine: digest_size (bytes retrieved at the end), init (pointer to the variant's initial hash state constant), ctx_size (the size copied when seeding the first block — note SHA-224 uses SHA256_DIGEST_SIZE=32 and SHA-384 uses SHA512_DIGEST_SIZE=64 because the internal state is larger than the truncated output), sb_count (1 SB slot for SHA1/224/256, 2 for SHA384/512), and the ioffset/ooffset placement within the 32-byte SB slot. The offsets differ between v3.0 and later hardware because of digest right/left-justification in the SB. The default does ret=-EINVAL; goto e_data — but it is unreachable because lines 16-46 already rejected unknown types."
+    },
+    {
+      "file": "corpus/train/train_0234_cwe401.c",
+      "lines": "151-162",
+      "code": "\t/* For zero-length plaintext the src pointer is ignored;\n\t * otherwise both parts must be valid\n\t */\n\tif (sha->src_len && !sha->src)\n\t\treturn -EINVAL;\n\n\tmemset(&op, 0, sizeof(op));\n\top.cmd_q = cmd_q;\n\top.jobid = CCP_NEW_JOBID(cmd_q->ccp);\n\top.sb_ctx = cmd_q->sb_ctx; /* Pre-allocated */\n\top.u.sha.type = sha->type;\n\top.u.sha.msg_bits = sha->msg_bits;",
+      "explanation": "Consistency check: a non-zero src_len with a NULL src pointer is rejected (a zero-length request may legitimately have src == NULL). Then the hardware op descriptor is zero-initialized and populated: cmd_q handle, a fresh job id, the pre-allocated context SB (sb_ctx), the algorithm type, and the caller's message-bit count (used by the engine to finalize the SHA length field)."
+    },
+    {
+      "file": "corpus/train/train_0234_cwe401.c",
+      "lines": "164-197",
+      "code": "\tret = ccp_init_dm_workarea(&ctx, cmd_q, sb_count * CCP_SB_BYTES,\n\t\t\t\t   DMA_BIDIRECTIONAL);\n\tif (ret)\n\t\treturn ret;\n\tif (sha->first) {\n\t\tswitch (sha->type) {\n\t\tcase CCP_SHA_TYPE_1:\n\t\tcase CCP_SHA_TYPE_224:\n\t\tcase CCP_SHA_TYPE_256:\n\t\t\tmemcpy(ctx.address + ioffset, init, ctx_size);\n\t\t\tbreak;\n\t\tcase CCP_SHA_TYPE_384:\n\t\tcase CCP_SHA_TYPE_512:\n\t\t\tmemcpy(ctx.address + ctx_size / 2, init,\n\t\t\t       ctx_size / 2);\n\t\t\tmemcpy(ctx.address, init + ctx_size / 2,\n\t\t\t       ctx_size / 2);\n\t\t\tbreak;\n\t\tdefault:\n\t\t\tret = -EINVAL;\n\t\t\tgoto e_ctx;\n\t\t}\n\t} else {\n\t\t/* Restore the context */\n\t\tret = ccp_set_dm_area(&ctx, 0, sha->ctx, 0,\n\t\t\t\t      sb_count * CCP_SB_BYTES);\n\t\tif (ret)\n\t\t\tgoto e_ctx;\n\t}",
+      "explanation": "Allocates the DMA work area ctx sized sb_count*CCP_SB_BYTES (32 or 64 bytes). If this is the first block, the initial hash state (init) is written into ctx: for SHA1/224/256 ctx_size bytes at ioffset; for SHA384/512 the state is split into two halves (right half into the first slot, left half into the second) to match the SB byte-swap layout described in the comment. Otherwise (streaming continuation) the previously saved context is restored FROM sha->ctx via ccp_set_dm_area, reading sb_count*CCP_SB_BYTES bytes out of the caller's context buffer. From here on, any error must clean up ctx via the e_ctx label."
+    },
+    {
+      "file": "corpus/train/train_0234_cwe401.c",
+      "lines": "199-204",
+      "code": "\tret = ccp_copy_to_sb(cmd_q, &ctx, op.jobid, op.sb_ctx,\n\t\t\t     CCP_PASSTHRU_BYTESWAP_256BIT);\n\tif (ret) {\n\t\tcmd->engine_error = cmd_q->cmd_error;\n\t\tgoto e_ctx;\n\t}",
+      "explanation": "Pushes the assembled context work area into the hardware storage block using a 256-bit byte-swap so the little-endian SB matches the algorithm's expected state layout. On failure it records the engine error into cmd and jumps to e_ctx to release the work area."
+    },
+    {
+      "file": "corpus/train/train_0234_cwe401.c",
+      "lines": "206-233",
+      "code": "\tif (sha->src) {\n\t\t/* Send data to the CCP SHA engine; block_size is set above */\n\t\tret = ccp_init_data(&src, cmd_q, sha->src, sha->src_len,\n\t\t\t\t    block_size, DMA_TO_DEVICE);\n\t\tif (ret)\n\t\t\tgoto e_ctx;\n\n\t\twhile (src.sg_wa.bytes_left) {\n\t\t\tccp_prepare_data(&src, NULL, &op, block_size, false);\n\t\t\tif (sha->final && !src.sg_wa.bytes_left)\n\t\t\t\top.eom = 1;\n\n\t\t\tret = cmd_q->ccp->vdata->perform->sha(&op);\n\t\t\tif (ret) {\n\t\t\t\tcmd->engine_error = cmd_q->cmd_error;\n\t\t\t\tgoto e_data;\n\t\t\t}\n\n\t\t\tccp_process_data(&src, NULL, &op);\n\t\t}\n\t} else {\n\t\top.eom = 1;\n\t\tret = cmd_q->ccp->vdata->perform->sha(&op);\n\t\tif (ret) {\n\t\t\tcmd->engine_error = cmd_q->cmd_error;\n\t\t\tgoto e_data;\n\t\t}\n\t}",
+      "explanation": "The data pump. If there is a source, ccp_init_data wraps sha->src/src_len into the src DMA descriptor (this is the point after which the e_data label's ccp_free_data(&src) is valid). The while loop feeds block_size chunks: ccp_prepare_data stages the next chunk, op.eom is set when this is the final chunk of a final request, perform->sha(&op) runs the hardware, and ccp_process_data advances. With no source, a single end-of-message operation runs. Errors after ccp_init_data go to e_data (free src then ctx)."
+    },
+    {
+      "file": "corpus/train/train_0234_cwe401.c",
+      "lines": "235-243",
+      "code": "\t/* Retrieve the SHA context - convert from LE to BE using\n\t * 32-byte (256-bit) byteswapping to BE\n\t */\n\tret = ccp_copy_from_sb(cmd_q, &ctx, op.jobid, op.sb_ctx,\n\t\t\t       CCP_PASSTHRU_BYTESWAP_256BIT);\n\tif (ret) {\n\t\tcmd->engine_error = cmd_q->cmd_error;\n\t\tgoto e_data;\n\t}",
+      "explanation": "Reads the resulting hardware context back out of the SB into the ctx work area, byte-swapping from the little-endian SB representation to big-endian. On error it records the engine error and jumps to e_data."
+    },
+    {
+      "file": "corpus/train/train_0234_cwe401.c",
+      "lines": "245-272",
+      "code": "\tif (sha->final) {\n\t\t/* Finishing up, so get the digest */\n\t\tswitch (sha->type) {\n\t\tcase CCP_SHA_TYPE_1:\n\t\tcase CCP_SHA_TYPE_224:\n\t\tcase CCP_SHA_TYPE_256:\n\t\t\tccp_get_dm_area(&ctx, ooffset,\n\t\t\t\t\tsha->ctx, 0,\n\t\t\t\t\tdigest_size);\n\t\t\tbreak;\n\t\tcase CCP_SHA_TYPE_384:\n\t\tcase CCP_SHA_TYPE_512:\n\t\t\tccp_get_dm_area(&ctx, 0,\n\t\t\t\t\tsha->ctx, LSB_ITEM_SIZE - ooffset,\n\t\t\t\t\tLSB_ITEM_SIZE);\n\t\t\tccp_get_dm_area(&ctx, LSB_ITEM_SIZE + ooffset,\n\t\t\t\t\tsha->ctx, 0,\n\t\t\t\t\tLSB_ITEM_SIZE - ooffset);\n\t\t\tbreak;\n\t\tdefault:\n\t\t\tret = -EINVAL;\n\t\t\tgoto e_ctx;\n\t\t}\n\t} else {\n\t\t/* Stash the context */\n\t\tccp_get_dm_area(&ctx, 0, sha->ctx, 0,\n\t\t\t\tsb_count * CCP_SB_BYTES);\n\t}",
+      "explanation": "Extraction. For a final request, the digest is copied from ctx back into sha->ctx: SHA1/224/256 copy digest_size bytes from ctx offset ooffset; SHA384/512 reassemble the two halves across LSB_ITEM_SIZE boundaries using ooffset. For a non-final request, the whole sb_count*CCP_SB_BYTES context is stashed back into sha->ctx so the next call can restore it. Because sha->ctx_len was validated >= digest_size (final) and the non-final stash writes sb_count*CCP_SB_BYTES, a caller must have sized sha->ctx to at least that."
+    },
+    {
+      "file": "corpus/train/train_0234_cwe401.c",
+      "lines": "274-334",
+      "code": "\tif (sha->final && sha->opad) {\n\t\t/* HMAC operation, recursively perform final SHA */\n\t\tstruct ccp_cmd hmac_cmd;\n\t\tstruct scatterlist sg;\n\t\tu8 *hmac_buf;\n\n\t\tif (sha->opad_len != block_size) {\n\t\t\tret = -EINVAL;\n\t\t\tgoto e_data;\n\t\t}\n\n\t\thmac_buf = kmalloc(block_size + digest_size, GFP_KERNEL);\n\t\tif (!hmac_buf) {\n\t\t\tret = -ENOMEM;\n\t\t\tgoto e_data;\n\t\t}\n\t\tsg_init_one(&sg, hmac_buf, block_size + digest_size);\n\n\t\tscatterwalk_map_and_copy(hmac_buf, sha->opad, 0, block_size, 0);\n\t\tswitch (sha->type) {\n\t\tcase CCP_SHA_TYPE_1:\n\t\tcase CCP_SHA_TYPE_224:\n\t\tcase CCP_SHA_TYPE_256:\n\t\t\tmemcpy(hmac_buf + block_size,\n\t\t\t       ctx.address + ooffset,\n\t\t\t       digest_size);\n\t\t\tbreak;\n\t\tcase CCP_SHA_TYPE_384:\n\t\tcase CCP_SHA_TYPE_512:\n\t\t\tmemcpy(hmac_buf + block_size,\n\t\t\t       ctx.address + LSB_ITEM_SIZE + ooffset,\n\t\t\t       LSB_ITEM_SIZE);\n\t\t\tmemcpy(hmac_buf + block_size +\n\t\t\t       (LSB_ITEM_SIZE - ooffset),\n\t\t\t       ctx.address,\n\t\t\t       LSB_ITEM_SIZE);\n\t\t\tbreak;\n\t\tdefault:\n\t\t\tret = -EINVAL;\n\t\t\tgoto e_ctx;\n\t\t}\n\n\t\tmemset(&hmac_cmd, 0, sizeof(hmac_cmd));\n\t\thmac_cmd.engine = CCP_ENGINE_SHA;\n\t\thmac_cmd.u.sha.type = sha->type;\n\t\thmac_cmd.u.sha.ctx = sha->ctx;\n\t\thmac_cmd.u.sha.ctx_len = sha->ctx_len;\n\t\thmac_cmd.u.sha.src = &sg;\n\t\thmac_cmd.u.sha.src_len = block_size + digest_size;\n\t\thmac_cmd.u.sha.opad = NULL;\n\t\thmac_cmd.u.sha.opad_len = 0;\n\t\thmac_cmd.u.sha.first = 1;\n\t\thmac_cmd.u.sha.final = 1;\n\t\thmac_cmd.u.sha.msg_bits = (block_size + digest_size) << 3;\n\n\t\tret = ccp_run_sha_cmd(cmd_q, &hmac_cmd);\n\t\tif (ret)\n\t\t\tcmd->engine_error = hmac_cmd.engine_error;\n\n\t\tkfree(hmac_buf);\n\t}",
+      "explanation": "HMAC finalization. When the request is final AND carries an opad, the outer-pad HMAC step runs: opad_len must exactly equal block_size, then hmac_buf of block_size+digest_size bytes is allocated, opad is copied into the first block_size bytes, and the just-computed inner digest is appended (from ctx.address, reassembled for 384/512). A fresh hmac_cmd is built with opad=NULL (so the recursion terminates after one level), first=final=1, src pointing at the hmac_buf scatterlist, and ccp_run_sha_cmd is called recursively to hash opad||inner_digest into sha->ctx. On the normal path hmac_buf is freed via kfree at the end. The default switch case, however, does goto e_ctx WITHOUT freeing hmac_buf."
+    },
+    {
+      "file": "corpus/train/train_0234_cwe401.c",
+      "lines": "336-344",
+      "code": "e_data:\n\tif (sha->src)\n\t\tccp_free_data(&src, cmd_q);\n\ne_ctx:\n\tccp_dm_free(&ctx);\n\n\treturn ret;\n}",
+      "explanation": "Unified cleanup. e_data conditionally frees the src DMA descriptor (guarded by sha->src, since src is only initialized inside the if (sha->src) block at line 206) and falls through to e_ctx, which frees the ctx work area allocated at line 169, then returns ret. Note the guard is sha->src (the caller pointer), not a flag proving ccp_init_data actually ran; and jumping straight to e_ctx (as the HMAC default does) skips e_data entirely."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0234_cwe401.c",
+      "lines": "285-313",
+      "code": "\t\thmac_buf = kmalloc(block_size + digest_size, GFP_KERNEL);\n\t\tif (!hmac_buf) {\n\t\t\tret = -ENOMEM;\n\t\t\tgoto e_data;\n\t\t}\n\t\tsg_init_one(&sg, hmac_buf, block_size + digest_size);\n\n\t\tscatterwalk_map_and_copy(hmac_buf, sha->opad, 0, block_size, 0);\n\t\tswitch (sha->type) {\n\t\tcase CCP_SHA_TYPE_1:\n\t\tcase CCP_SHA_TYPE_224:\n\t\tcase CCP_SHA_TYPE_256:\n\t\t\tmemcpy(hmac_buf + block_size,\n\t\t\t       ctx.address + ooffset,\n\t\t\t       digest_size);\n\t\t\tbreak;\n\t\tcase CCP_SHA_TYPE_384:\n\t\tcase CCP_SHA_TYPE_512:\n\t\t\tmemcpy(hmac_buf + block_size,\n\t\t\t       ctx.address + LSB_ITEM_SIZE + ooffset,\n\t\t\t       LSB_ITEM_SIZE);\n\t\t\tmemcpy(hmac_buf + block_size +\n\t\t\t       (LSB_ITEM_SIZE - ooffset),\n\t\t\t       ctx.address,\n\t\t\t       LSB_ITEM_SIZE);\n\t\t\tbreak;\n\t\tdefault:\n\t\t\tret = -EINVAL;\n\t\t\tgoto e_ctx;\n\t\t}",
+      "explanation": "Memory leak (CWE-401). hmac_buf is heap-allocated at line 285 and is only released by the kfree at line 333 on the paths that reach the bottom of the HMAC block. The default case of the switch at lines 311-313 does ret = -EINVAL; goto e_ctx, which bypasses line 333 and jumps directly to e_ctx (which frees only ctx), so hmac_buf is never freed — a per-request kmalloc leak. This is the file's flagged CWE-401. In practice the default is unreachable because sha->type was already narrowed to the five valid constants at lines 16-46, so it is defensive dead code; nevertheless the correct cleanup contract is that every early exit after line 285 must kfree(hmac_buf). The safe fix is to goto a label that frees hmac_buf (or free it inline before the goto)."
+    },
+    {
+      "file": "corpus/train/train_0234_cwe401.c",
+      "lines": "192-196",
+      "code": "\t\t/* Restore the context */\n\t\tret = ccp_set_dm_area(&ctx, 0, sha->ctx, 0,\n\t\t\t\t      sb_count * CCP_SB_BYTES);\n\t\tif (ret)\n\t\t\tgoto e_ctx;",
+      "explanation": "Potential out-of-bounds read of the caller context buffer (CWE-125), latent in ccp_set_dm_area. On a streaming continuation this reads sb_count*CCP_SB_BYTES bytes FROM sha->ctx (32 bytes for SHA1/224/256, 64 for SHA384/512). But the only length guarantee established at lines 16-46 is sha->ctx_len >= SHA*_DIGEST_SIZE, i.e. a floor at the DIGEST size, not the SB size: SHA1 digest is 20 but the read is 32, SHA224 is 28 vs 32, SHA384 is 48 vs 64. A caller supplying a context buffer sized to exactly ctx_len (e.g. 20 bytes for SHA1) therefore has up to 12 bytes read past its end. The same asymmetry applies to the non-final stash at lines 270-271 which WRITES sb_count*CCP_SB_BYTES back into sha->ctx (CWE-787 in that direction). Invariant: ctx_len (and the ctx allocation) must be >= sb_count*CCP_SB_BYTES before any full-context restore/stash, not merely >= the digest size."
+    },
+    {
+      "file": "corpus/train/train_0234_cwe401.c",
+      "lines": "146-148",
+      "code": "\tdefault:\n\t\tret = -EINVAL;\n\t\tgoto e_data;",
+      "explanation": "Use of uninitialized stack objects on the cleanup path (CWE-457), latent. This default (and any goto e_data reached before ccp_init_data has run) lands on e_data: if (sha->src) ccp_free_data(&src, cmd_q); e_ctx: ccp_dm_free(&ctx);. At line 148 neither src nor ctx has been initialized (ctx is allocated at line 169; src inside the if at line 206), yet e_data will call ccp_free_data on the garbage src whenever sha->src is non-NULL, and e_ctx will call ccp_dm_free on the garbage ctx — freeing/dereferencing uninitialized stack pointers. Both this default and the HMAC default at 311 are unreachable given the earlier type validation, so this is defensive dead code, but the cleanup contract is unsound: the guards (sha->src / unconditional ctx free) do not prove the objects were ever constructed. Invariant: cleanup must be gated on 'was this resource actually initialized', e.g. zero-init ctx/src or use a boolean/initialization order that reaches the free only after construction."
+    },
+    {
+      "file": "corpus/train/train_0234_cwe401.c",
+      "lines": "274-329",
+      "code": "\tif (sha->final && sha->opad) {\n\t\t/* HMAC operation, recursively perform final SHA */\n\t\tstruct ccp_cmd hmac_cmd;\n...\n\t\tret = ccp_run_sha_cmd(cmd_q, &hmac_cmd);",
+      "explanation": "Re-entrant recursion (informational). ccp_run_sha_cmd calls itself at line 329 to perform the HMAC outer hash. Termination is guaranteed only because the inner hmac_cmd sets opad = NULL (line 323), so the recursion is bounded to depth 1 and cannot loop. Each level allocates its own ctx work area (line 169) and, on the outer level, hmac_buf; the recursive call runs entirely before kfree(hmac_buf) at 333, so no reuse-after-free arises. The contract to preserve: the inner command must always clear opad, otherwise this becomes unbounded recursion / kernel stack exhaustion. Worth confirming the invariant is enforced rather than assumed."
+    },
+    {
+      "file": "corpus/train/train_0234_cwe401.c",
+      "lines": "285-290",
+      "code": "\t\thmac_buf = kmalloc(block_size + digest_size, GFP_KERNEL);\n\t\tif (!hmac_buf) {\n\t\t\tret = -ENOMEM;\n\t\t\tgoto e_data;\n\t\t}\n\t\tsg_init_one(&sg, hmac_buf, block_size + digest_size);",
+      "explanation": "Allocation-size arithmetic (informational). block_size + digest_size is an addition of two small, driver-selected constants (block_size is a u64 SHA*_BLOCK_SIZE up to 128, digest_size up to 64), both derived from the already-validated sha->type — not attacker-multiplied — so no integer overflow of the kmalloc size is reachable. The NULL return of kmalloc is correctly checked before use (line 286), avoiding CWE-476. This anchor is called out only to record that it was reviewed and found sound; the real defect at this allocation is the leak on the error path (finding above)."
+    }
+  ],
+  "summary": "Kernel AMD-CCP SHA/HMAC dispatcher. The flagged issue is a CWE-401 memory leak: hmac_buf (kmalloc, line 285) is not freed on the switch default's goto e_ctx (lines 311-313), which skips the kfree at line 333 — though that default is unreachable given the earlier type validation, making it defensive dead code rather than a live leak. A more substantive latent concern is that the full-context restore/stash copies sb_count*CCP_SB_BYTES to/from sha->ctx while only ctx_len >= digest_size is validated, allowing an out-of-bounds read/write of an undersized caller context buffer. Cleanup labels also free src/ctx that may be uninitialized on the (unreachable) early defaults.",
+  "reviewed_anchors": [
+    {"anchor": "ccp_run_sha_cmd(struct ccp_cmd_queue *cmd_q, struct ccp_cmd *cmd) signature", "disposition": "dismissed", "reason": "Entry signature; both pointers are trusted kernel structures — carries no length/buffer contract itself."},
+    {"anchor": "sha = &cmd->u.sha (line 4) and locals ctx/src/op (lines 5-7)", "disposition": "finding", "reason": "ctx and src are declared uninitialized and are freed by the cleanup labels; see uninitialized-cleanup finding."},
+    {"anchor": "first switch sha->type ctx_len floor checks (lines 16-46)", "disposition": "finding", "reason": "Validates ctx_len >= DIGEST size only, not >= sb_count*CCP_SB_BYTES; underlies the OOB restore/stash finding."},
+    {"anchor": "if (!sha->ctx) return -EINVAL (lines 48-49)", "disposition": "dismissed", "reason": "NULL context pointer is correctly rejected before use."},
+    {"anchor": "block-alignment mask sha->src_len & (block_size - 1) (line 51)", "disposition": "dismissed", "reason": "Valid power-of-two mask; every SHA*_BLOCK_SIZE is a power of two, so the alignment check is sound."},
+    {"anchor": "v3.0 zero-length handling + scatterwalk_map_and_copy into sha->ctx (lines 54-99)", "disposition": "dismissed", "reason": "Copy length digest_len <= sha->ctx_len already validated at lines 16-46; in-bounds."},
+    {"anchor": "second switch geometry: digest_size/init/ctx_size/sb_count/ioffset/ooffset (lines 101-149)", "disposition": "dismissed", "reason": "Assigns constants per validated type; ctx_size for 224/384 intentionally larger (state vs truncated output)."},
+    {"anchor": "second switch default: goto e_data (lines 146-148)", "disposition": "finding", "reason": "Unreachable, but jumps to cleanup that frees uninitialized src/ctx — see CWE-457 finding."},
+    {"anchor": "if (sha->src_len && !sha->src) return -EINVAL (line 154)", "disposition": "dismissed", "reason": "Correctly rejects non-zero length with NULL source."},
+    {"anchor": "op setup memset + field assignment (lines 157-162)", "disposition": "dismissed", "reason": "Zero-inits op then sets trusted fields; no boundary contract."},
+    {"anchor": "ccp_init_dm_workarea(&ctx, ..., sb_count * CCP_SB_BYTES) (line 169)", "disposition": "dismissed", "reason": "Allocation of the DMA work area; size is a small validated constant, return value checked at line 171."},
+    {"anchor": "first-block memcpy(ctx.address + ioffset, init, ctx_size) / split copies (lines 173-190)", "disposition": "dismissed", "reason": "Destination ctx is sized sb_count*CCP_SB_BYTES and init is a fixed kernel constant; ctx_size and ctx_size/2 fit the allocation."},
+    {"anchor": "ccp_set_dm_area(&ctx, 0, sha->ctx, 0, sb_count * CCP_SB_BYTES) restore (lines 193-194)", "disposition": "finding", "reason": "Reads sb_count*CCP_SB_BYTES from sha->ctx though only ctx_len >= digest validated — OOB read (CWE-125)."},
+    {"anchor": "ccp_copy_to_sb / ccp_copy_from_sb (lines 199, 238)", "disposition": "dismissed", "reason": "Hardware SB transfers with fixed byteswap option; return values checked, errors routed to labels."},
+    {"anchor": "data pump loop perform->sha(&op) (lines 206-233)", "disposition": "dismissed", "reason": "Iterates block_size chunks with proper eom handling; errors go to e_data after src init."},
+    {"anchor": "final digest extraction ccp_get_dm_area into sha->ctx (lines 245-267)", "disposition": "dismissed", "reason": "digest_size <= ctx_len validated for final path; SHA384/512 reassembly stays within sb_count*CCP_SB_BYTES."},
+    {"anchor": "non-final stash ccp_get_dm_area(&ctx, 0, sha->ctx, 0, sb_count * CCP_SB_BYTES) (lines 270-271)", "disposition": "finding", "reason": "Writes sb_count*CCP_SB_BYTES into sha->ctx though only ctx_len >= digest validated — OOB write side of the ctx-length finding."},
+    {"anchor": "if (sha->opad_len != block_size) return -EINVAL (line 280)", "disposition": "dismissed", "reason": "Exact-equality check bounds the opad copy to block_size; sound."},
+    {"anchor": "hmac_buf = kmalloc(block_size + digest_size, GFP_KERNEL) (line 285)", "disposition": "finding", "reason": "Heap allocation whose free is skipped on the switch default goto e_ctx — CWE-401 leak."},
+    {"anchor": "HMAC switch default: goto e_ctx (lines 311-313)", "disposition": "finding", "reason": "Bypasses kfree(hmac_buf) at line 333 — the flagged memory leak."},
+    {"anchor": "recursive ccp_run_sha_cmd(cmd_q, &hmac_cmd) (line 329)", "disposition": "finding", "reason": "Self-recursion; termination relies on inner opad=NULL — informational re-entrancy note."},
+    {"anchor": "kfree(hmac_buf) (line 333)", "disposition": "dismissed", "reason": "Correct free on the normal path; the defect is the paths that bypass it, captured above."},
+    {"anchor": "e_data / e_ctx cleanup labels (lines 336-344)", "disposition": "finding", "reason": "Fall-through cleanup can act on uninitialized src/ctx and is skipped for hmac_buf — covered by the leak and CWE-457 findings."}
+  ],
+  "findings": [
+    {
+      "title": "hmac_buf memory leak on HMAC switch default path (goto e_ctx bypasses kfree)",
+      "anchor": "default: ret = -EINVAL; goto e_ctx; inside the HMAC type switch; hmac_buf allocated at line 285, freed only at line 333",
+      "file": "corpus/train/train_0234_cwe401.c",
+      "line": "285-313",
+      "code": "\t\thmac_buf = kmalloc(block_size + digest_size, GFP_KERNEL);\n\t\tif (!hmac_buf) {\n\t\t\tret = -ENOMEM;\n\t\t\tgoto e_data;\n\t\t}\n...\n\t\tdefault:\n\t\t\tret = -EINVAL;\n\t\t\tgoto e_ctx;\n\t\t}",
+      "bug_class": "Memory leak (missing kfree on error path)",
+      "cwe": "CWE-401",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0234_cwe401.c",
+      "invariant": "Every exit from the HMAC block after the successful kmalloc at line 285 must release hmac_buf; an error goto must target a label that frees hmac_buf (or free it inline before jumping).",
+      "failure_mode": "If control reaches the HMAC switch default (lines 311-313) it executes goto e_ctx, which jumps past kfree(hmac_buf) at line 333 to a label that frees only ctx — leaking block_size+digest_size bytes per occurrence. Because sha->type is already constrained to the five valid constants by lines 16-46, this default is unreachable dead code, so the leak is latent/defensive rather than reliably triggerable; it is nonetheless the file's flagged CWE-401 and an incorrect cleanup contract.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the HMAC switch default is truly unreachable given prior type validation, and that no other early exit between lines 285 and 333 (present or future) can skip kfree(hmac_buf); prefer a dedicated e_free_hmac label."
+    },
+    {
+      "title": "Out-of-bounds read/write of caller context: full-SB restore/stash sized past validated ctx_len",
+      "anchor": "ccp_set_dm_area(&ctx, 0, sha->ctx, 0, sb_count * CCP_SB_BYTES) restore and ccp_get_dm_area(&ctx, 0, sha->ctx, 0, sb_count * CCP_SB_BYTES) stash, versus ctx_len >= SHA*_DIGEST_SIZE",
+      "file": "corpus/train/train_0234_cwe401.c",
+      "line": "193-194",
+      "code": "\t\tret = ccp_set_dm_area(&ctx, 0, sha->ctx, 0,\n\t\t\t\t      sb_count * CCP_SB_BYTES);",
+      "bug_class": "Out-of-bounds read/write (length floor mismatch)",
+      "cwe": "CWE-125",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "Before restoring (line 193) or stashing (line 270) the full hardware context, the caller's sha->ctx buffer must be at least sb_count*CCP_SB_BYTES bytes; validation must enforce ctx_len >= sb_count*CCP_SB_BYTES, not merely ctx_len >= SHA*_DIGEST_SIZE.",
+      "failure_mode": "The only length guarantee is ctx_len >= digest size (lines 16-46), but the streaming restore reads, and the non-final stash writes, sb_count*CCP_SB_BYTES bytes: 32 for SHA1 (digest 20), 32 for SHA224 (28), 64 for SHA384 (48). A caller that sizes sha->ctx to exactly its ctx_len can have up to 12 bytes read past the buffer (restore) or written past it (stash), corrupting or leaking adjacent kernel memory. The actual copy lives in ccp_set_dm_area/ccp_get_dm_area, not shown here.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm whether any in-kernel or AF_ALG caller can drive a non-first/non-final request with ctx_len between the digest size and sb_count*CCP_SB_BYTES, and whether ccp_set_dm_area/ccp_get_dm_area clamp to the smaller of ctx_len and the requested length."
+    },
+    {
+      "title": "Cleanup labels free potentially-uninitialized src/ctx on early goto",
+      "anchor": "e_data: if (sha->src) ccp_free_data(&src, cmd_q); e_ctx: ccp_dm_free(&ctx); reached via second-switch default goto e_data (line 148)",
+      "file": "corpus/train/train_0234_cwe401.c",
+      "line": "336-341",
+      "code": "e_data:\n\tif (sha->src)\n\t\tccp_free_data(&src, cmd_q);\n\ne_ctx:\n\tccp_dm_free(&ctx);",
+      "bug_class": "Use of uninitialized resource in cleanup",
+      "cwe": "CWE-457",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0234_cwe401.c",
+      "invariant": "A cleanup label must only release a resource that has actually been constructed; the free guard must reflect initialization state (ctx allocated at line 169, src at line 208), not just the caller pointer sha->src.",
+      "failure_mode": "The second-switch default at lines 146-148 does goto e_data before ctx (line 169) or src (line 208) is initialized. e_data then calls ccp_free_data(&src) whenever sha->src is non-NULL, operating on a garbage stack descriptor, and e_ctx unconditionally calls ccp_dm_free on the uninitialized ctx — freeing/dereferencing indeterminate pointers. The default is unreachable given prior type validation, so this is latent defensive dead code, but the cleanup contract is unsound and would bite if any future early exit precedes initialization.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify no reachable path performs goto e_data/e_ctx before ccp_init_dm_workarea (line 169) and, for e_data, before ccp_init_data (line 208); consider zero-initializing ctx/src or gating the frees on an initialized flag."
+    }
+  ],
+  "audit_checklist": [
+    "Trace every exit from the HMAC block after line 285 and confirm hmac_buf is freed on all of them; add an e_free_hmac label rather than goto e_ctx.",
+    "Check ccp_set_dm_area (restore, line 193) and ccp_get_dm_area (stash, line 270): do they bound-check against the caller's actual sha->ctx allocation, given only ctx_len >= digest_size is validated?",
+    "Add/verify a ctx_len >= sb_count*CCP_SB_BYTES check for non-first (restore) and non-final (stash) requests, especially SHA1/224/384 where digest size < SB size.",
+    "Confirm the second-switch default (line 148) and HMAC switch default (line 311) are truly unreachable, and that e_data/e_ctx never run on uninitialized src/ctx.",
+    "Confirm the HMAC recursion always sets inner opad=NULL (line 323) so ccp_run_sha_cmd cannot recurse beyond depth 1.",
+    "Verify block_size+digest_size (line 285) cannot overflow the kmalloc size (it should not, being small validated constants) and that the NULL return is handled (it is, line 286).",
+    "Confirm all engine-error and -EINVAL/-ENOMEM early returns before line 169 (the pre-allocation validation gates) free nothing they must not, and that returns after line 169 route through the labels."
+  ]
+}

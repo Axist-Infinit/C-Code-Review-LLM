@@ -1,0 +1,156 @@
+{
+  "subsystem": "Linux kernel IPv4 TCP stack — Path-MTU black-hole detection helper tcp_mtu_probing(), part of the TCP retransmission-timeout / MTU-probing machinery (net/ipv4/tcp_timer.c). When repeated retransmissions suggest a PMTU black hole, this routine either turns on MSS-clamping MTU probing or, if already enabled, lowers the probing search floor (search_low) and re-syncs the connection MSS.",
+  "provenance": "Identified from kernel-internal identifiers and idioms: the function name tcp_mtu_probing; the socket container types struct inet_connection_sock *icsk and struct sock *sk; the ICSK MTU-probing state icsk->icsk_mtup.{enabled,probe_timestamp,search_low}; sock_net(sk), tcp_sk(sk), tcp_jiffies32; the per-netns TCP sysctls net->ipv4.sysctl_tcp_mtu_probing and net->ipv4.sysctl_tcp_base_mss; and the MSS/MTU converters tcp_mtu_to_mss()/tcp_mss_to_mtu()/tcp_sync_mss(). The in-file banner '/* sample: primevul_c_train_3414_vuln */' and the corpus filename train_0204_cwe770.c further tag it. This is verbatim upstream Linux TCP code.",
+  "trust_boundary": "This runs in the retransmission-timer path, i.e. it is driven by remote network conditions. An off-path or on-path attacker cannot write these fields directly, but can INDUCE the code path and steer its inputs: black-hole detection (line 8 gate) is reached after repeated RTOs, which an attacker can provoke by dropping/blackholing packets or by injecting ICMP 'fragmentation needed' / spoofed segments; icsk->icsk_mtup.search_low is seeded from PMTU discovery and the peer-advertised MSS, both attacker-influenceable; and tcp_sk(sk)->tcp_header_len grows with negotiated TCP options (timestamps, SACK) that the peer can request. The admin sysctls sysctl_tcp_mtu_probing and sysctl_tcp_base_mss are trusted config, but the per-connection MSS outcome computed here is attacker-steerable. The hostile surface is therefore the derived MSS floor on line 17: how small the effective send MSS is allowed to become.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0204_cwe770.c",
+      "lines": "2-5",
+      "code": "static void tcp_mtu_probing(struct inet_connection_sock *icsk, struct sock *sk)\n{\n\tconst struct net *net = sock_net(sk);\n\tint mss;",
+      "explanation": "Declares a file-local helper taking the inet-connection-sock control block icsk (which holds the MTU-probing sub-state icsk->icsk_mtup) and the owning struct sock *sk. It resolves the network namespace via net = sock_net(sk) so it can read the per-netns TCP sysctls, and declares a signed int mss that will hold the candidate maximum segment size in bytes computed later. The function returns void and mutates state through icsk and sk. It is invoked from the TCP RTO handling when the stack suspects that large packets are being silently dropped along the path (a PMTU black hole)."
+    },
+    {
+      "file": "corpus/train/train_0204_cwe770.c",
+      "lines": "7-9",
+      "code": "/* Black hole detection */\n\tif (!net->ipv4.sysctl_tcp_mtu_probing)\n\t\treturn;",
+      "explanation": "Gates the whole routine on the per-namespace sysctl net.ipv4.tcp_mtu_probing. If the administrator has left MTU probing disabled (value 0) the function returns immediately and does nothing. A non-zero value means the stack is permitted to react to suspected black holes by shrinking the segment size and probing. This single read is the enable switch for everything below; it is trusted config, not attacker data, but it decides whether the attacker-steerable arithmetic downstream ever runs."
+    },
+    {
+      "file": "corpus/train/train_0204_cwe770.c",
+      "lines": "11-13",
+      "code": "if (!icsk->icsk_mtup.enabled) {\n\t\ticsk->icsk_mtup.enabled = 1;\n\t\ticsk->icsk_mtup.probe_timestamp = tcp_jiffies32;",
+      "explanation": "First-strike branch: if MSS-clamping MTU probing is not yet enabled on this connection, it turns it on (enabled = 1) and stamps icsk_mtup.probe_timestamp with the current tcp_jiffies32. Enabling probing bounds the connection's MSS to the currently discovered search range and starts the machinery that will bisect the MTU. On this first pass it does NOT reduce search_low — it merely arms probing so that subsequent invocations (the else branch) can lower the floor."
+    },
+    {
+      "file": "corpus/train/train_0204_cwe770.c",
+      "lines": "14-16",
+      "code": "} else {\n\t\tmss = tcp_mtu_to_mss(sk, icsk->icsk_mtup.search_low) >> 1;\n\t\tmss = min(net->ipv4.sysctl_tcp_base_mss, mss);",
+      "explanation": "Repeat branch: probing was already enabled, so black-hole detection has fired again and the stack must probe smaller. It converts the current probing floor MTU icsk_mtup.search_low into an MSS via tcp_mtu_to_mss() and then HALVES it (>> 1) — each re-entry cuts the candidate MSS in half, a geometric descent toward tiny segments. Line 16 caps that candidate at the administrator's base MSS sysctl net.ipv4.tcp_base_mss (default 1024) via min(), so mss is never larger than base_mss; this is only an upper bound, it does not stop mss from getting very small."
+    },
+    {
+      "file": "corpus/train/train_0204_cwe770.c",
+      "lines": "17-18",
+      "code": "mss = max(mss, 68 - tcp_sk(sk)->tcp_header_len);\n\t\ticsk->icsk_mtup.search_low = tcp_mss_to_mtu(sk, mss);",
+      "explanation": "Line 17 is the only LOWER bound on the shrinking MSS: it raises mss to at least 68 - tcp_sk(sk)->tcp_header_len. The constant 68 is the historic IPv4 minimum-reassembly datagram size; subtracting the negotiated TCP header length (20 bytes with no options, growing to ~32 with timestamps and more with SACK) yields the floor. Line 18 converts the resulting MSS back to an MTU with tcp_mss_to_mtu() and stores it as the new icsk_mtup.search_low, so the next probe/RTO round starts from this lowered floor. The critical property here is what that floor evaluates to: it is derived from a fixed 68 minus an option-dependent header length, NOT from the dedicated minimum-send-MSS sysctl."
+    },
+    {
+      "file": "corpus/train/train_0204_cwe770.c",
+      "lines": "20-21",
+      "code": "tcp_sync_mss(sk, icsk->icsk_pmtu_cookie);\n}",
+      "explanation": "Regardless of which branch ran, the function finishes by calling tcp_sync_mss(sk, icsk->icsk_pmtu_cookie), which recomputes the connection's advertised/effective MSS from the (possibly just-lowered) probing state and the cached PMTU cookie. This is what makes the shrunken search_low take effect on the wire: after this call the connection will segment outgoing data using the smaller MSS. tcp_sync_mss() itself is not shown."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0204_cwe770.c",
+      "lines": "17",
+      "code": "mss = max(mss, 68 - tcp_sk(sk)->tcp_header_len);",
+      "explanation": "This floor does not enforce the kernel's minimum-send-MSS invariant. The lower bound is 68 - tcp_header_len, which SHRINKS as the peer negotiates more TCP options: with plain headers it is 48, but with timestamps (tcp_header_len ~32) it falls to ~36, and with additional SACK/option space it goes lower still — well under net.ipv4.tcp_min_snd_mss (default 48). Combined with the geometric halving on line 15, a remote peer that keeps triggering black-hole detection (dropping large segments, spoofing ICMP frag-needed, or advertising a tiny MSS) can drive search_low, and via tcp_sync_mss() the effective send MSS, down to a handful of bytes. Sending a fixed amount of application data at a tiny MSS forces the stack to build, queue, checksum, and transmit a huge number of minimal segments, and forces proportional retransmission-queue / SACK bookkeeping work — an amplified CPU and memory resource-exhaustion denial of service against the sender. The implementation must clamp mss to at least sysctl_tcp_min_snd_mss (the upstream fix replaced this line with `mss = max(mss, net->ipv4.sysctl_tcp_min_snd_mss)`), so no attacker-inducible option combination can push the segment size below the administrative floor."
+    },
+    {
+      "file": "corpus/train/train_0204_cwe770.c",
+      "lines": "15",
+      "code": "mss = tcp_mtu_to_mss(sk, icsk->icsk_mtup.search_low) >> 1;",
+      "explanation": "The unconditional halving (>> 1) on every re-entry compounds the weak floor above: each additional attacker-induced black-hole event cuts the candidate MSS in half before line 17's floor is applied, so only a few forced RTO rounds are needed to reach the minimum. There is no rate limit or hysteresis on how often black-hole detection may fire, so the descent to the (too-low) floor is fast. The invariant the implementation must uphold is that repeated probing cannot ratchet the send MSS below a safe minimum; the halving is only safe if line 17's floor is a real minimum-send-MSS, which it is not."
+    },
+    {
+      "file": "corpus/train/train_0204_cwe770.c",
+      "lines": "8",
+      "code": "if (!net->ipv4.sysctl_tcp_mtu_probing)",
+      "explanation": "Latent data-race / load-tearing hygiene: this read of net->ipv4.sysctl_tcp_mtu_probing (and likewise net->ipv4.sysctl_tcp_base_mss on line 16) is a plain, unannotated access to a sysctl that can be updated concurrently from another CPU while this timer runs. Upstream hardened these to READ_ONCE() to prevent the compiler from tearing or reloading the value and to satisfy KCSAN. This is a low-severity correctness/robustness concern, not the primary security bug, but the implementation should mark these mutable-sysctl reads with READ_ONCE()."
+    }
+  ],
+  "summary": "This is the upstream Linux tcp_mtu_probing() black-hole-detection helper in its pre-CVE-2019-11479 form. The single lower bound on the shrinking MSS (line 17, `max(mss, 68 - tcp_header_len)`) is option-dependent and does not enforce tcp_min_snd_mss, so a remote peer that repeatedly triggers black-hole detection can drive the effective send MSS to a few bytes, causing amplified per-segment CPU/memory resource exhaustion (a small-MSS DoS). A secondary, low-severity issue is the unannotated concurrent sysctl reads.",
+  "reviewed_anchors": [
+    {
+      "anchor": "tcp_mtu_probing(struct inet_connection_sock *icsk, struct sock *sk) — function signature (line 2)",
+      "disposition": "dismissed",
+      "reason": "Internal helper taking two trusted in-kernel socket pointers; the signature itself carries no attacker-controlled scalar, the risk lives in the arithmetic it performs."
+    },
+    {
+      "anchor": "const struct net *net = sock_net(sk); (line 4)",
+      "disposition": "dismissed",
+      "reason": "Resolves the netns to reach per-netns sysctls; no bound or copy, just a pointer deref of trusted socket state."
+    },
+    {
+      "anchor": "int mss; (line 5)",
+      "disposition": "dismissed",
+      "reason": "Signed local scalar for the candidate MSS; it is the vehicle for the finding but the type itself is fine (values stay in a small positive range after the min/max clamps)."
+    },
+    {
+      "anchor": "net->ipv4.sysctl_tcp_mtu_probing (line 8)",
+      "disposition": "finding",
+      "reason": "Mutable sysctl read without READ_ONCE — load-tearing / KCSAN data-race hygiene (secondary low finding)."
+    },
+    {
+      "anchor": "icsk->icsk_mtup.enabled / probe_timestamp (lines 11-13)",
+      "disposition": "dismissed",
+      "reason": "First-pass arming of probing; sets a flag and a jiffies stamp, no size arithmetic or attacker-controlled bound."
+    },
+    {
+      "anchor": "mss = tcp_mtu_to_mss(sk, icsk->icsk_mtup.search_low) >> 1; (line 15)",
+      "disposition": "finding",
+      "reason": "Unconditional halving on every re-entry compounds the weak floor and accelerates the descent to a tiny MSS (part of the small-MSS DoS)."
+    },
+    {
+      "anchor": "mss = min(net->ipv4.sysctl_tcp_base_mss, mss); (line 16)",
+      "disposition": "dismissed",
+      "reason": "Provides only an UPPER bound (cap at base_mss) plus a concurrent-sysctl-read concern folded into the line-8 finding; it does not prevent mss from becoming too small."
+    },
+    {
+      "anchor": "mss = max(mss, 68 - tcp_sk(sk)->tcp_header_len); (line 17)",
+      "disposition": "finding",
+      "reason": "The sole lower bound on the send MSS; option-dependent and does not enforce tcp_min_snd_mss, enabling attacker-driven tiny-MSS resource exhaustion — the primary finding."
+    },
+    {
+      "anchor": "icsk->icsk_mtup.search_low = tcp_mss_to_mtu(sk, mss); (line 18)",
+      "disposition": "dismissed",
+      "reason": "Stores the derived MTU back; the danger is the value it stores (covered by line 17), not the assignment itself."
+    },
+    {
+      "anchor": "tcp_sync_mss(sk, icsk->icsk_pmtu_cookie); (line 20)",
+      "disposition": "dismissed",
+      "reason": "Applies the recomputed MSS; unshown helper with a (sk, cookie) signature carrying no unbounded length — it is the delivery mechanism for the line-17 outcome, not a distinct bug."
+    }
+  ],
+  "findings": [
+    {
+      "title": "MTU-probing MSS floor does not enforce tcp_min_snd_mss — attacker-inducible tiny-MSS resource exhaustion",
+      "anchor": "mss = max(mss, 68 - tcp_sk(sk)->tcp_header_len);",
+      "file": "corpus/train/train_0204_cwe770.c",
+      "line": "17",
+      "code": "mss = max(mss, 68 - tcp_sk(sk)->tcp_header_len);",
+      "bug_class": "Uncontrolled resource consumption (send MSS driven below a safe minimum)",
+      "cwe": "CWE-770",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0204_cwe770.c (net/ipv4/tcp_timer.c upstream)",
+      "invariant": "The MSS chosen during black-hole probing must never fall below net.ipv4.tcp_min_snd_mss; the lower clamp must be `max(mss, net->ipv4.sysctl_tcp_min_snd_mss)` so that no negotiated TCP-header-length / option combination and no number of forced probe rounds can push the effective send MSS below the administrative minimum.",
+      "failure_mode": "The floor 68 - tcp_header_len shrinks as the peer negotiates TCP options (48 with a bare header, ~36 with timestamps, lower with SACK), dropping below tcp_min_snd_mss (default 48). A remote attacker who repeatedly triggers black-hole detection — by dropping large segments, spoofing ICMP 'fragmentation needed', or advertising a tiny MSS — combined with the halving on line 15, drives icsk_mtup.search_low and hence the effective send MSS down to a few bytes. The sender must then split each unit of data into many minimal segments, multiplying per-segment CPU (checksum, segmentation, TSO teardown), retransmit-queue, and SACK bookkeeping cost: an amplified denial of service against the sending host.",
+      "cve_analog": "CVE-2019-11479",
+      "what_to_confirm": "Confirm the upstream fix commit 967c05aee439 ('tcp: enforce tcp_min_snd_mss in tcp_mtu_probing()') is applied so line 17 reads `mss = max(mss, net->ipv4.sysctl_tcp_min_snd_mss);` (or the later tcp_mtu_probe_floor equivalent), and that tcp_min_snd_mss is honoured everywhere segment size can be lowered."
+    },
+    {
+      "title": "Unannotated concurrent sysctl reads (load tearing / data race)",
+      "anchor": "if (!net->ipv4.sysctl_tcp_mtu_probing)",
+      "file": "corpus/train/train_0204_cwe770.c",
+      "line": "8",
+      "code": "if (!net->ipv4.sysctl_tcp_mtu_probing)",
+      "bug_class": "Data race on mutable sysctl read (missing READ_ONCE)",
+      "cwe": "CWE-362",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0204_cwe770.c (net/ipv4/tcp_timer.c upstream)",
+      "invariant": "Reads of concurrently-writable sysctls (sysctl_tcp_mtu_probing on line 8, sysctl_tcp_base_mss on line 16) must use READ_ONCE() so the compiler cannot tear or re-load the value while an administrator updates it from another CPU.",
+      "failure_mode": "A plain access lets the compiler reload or partially observe the sysctl while it is being written from userspace on another CPU, producing a torn/inconsistent value used in the probing decision. Impact is limited to a transient wrong MSS/gate decision, not memory corruption, hence low severity; it is also a KCSAN finding.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify these mutable-sysctl reads use READ_ONCE() in the shipped tree (upstream added READ_ONCE around these sysctl accesses)."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm line 17 clamps the probing MSS to net->ipv4.sysctl_tcp_min_snd_mss (fix 967c05aee439 / later tcp_mtu_probe_floor), not the option-dependent constant 68 - tcp_header_len.",
+    "Verify tcp_min_snd_mss is enforced consistently on every path that can lower the send MSS (tcp_mtu_probing, tcp_sync_mss, MSS negotiation, tcp_fragment) so black-hole probing cannot bypass it.",
+    "Check for rate-limiting / hysteresis on how often black-hole detection can fire, so the geometric halving on line 15 cannot be repeatedly forced by a remote peer.",
+    "Trace how icsk_mtup.search_low is seeded from PMTU / peer-advertised MSS to bound how small an attacker can make it before this routine runs.",
+    "Wrap the mutable sysctl reads (sysctl_tcp_mtu_probing, sysctl_tcp_base_mss) in READ_ONCE() to avoid load tearing / data races.",
+    "Confirm the resulting minimum MSS keeps segmentation cost bounded under a chosen-drop / spoofed-ICMP attack (small-MSS DoS regression test)."
+  ]
+}

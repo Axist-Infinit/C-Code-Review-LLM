@@ -1,0 +1,138 @@
+{
+  "subsystem": "Linux KVM in-kernel I/O bus device registry. This is kvm_io_bus_unregister_dev(), the routine that removes a single struct kvm_io_device from a per-VM struct kvm_io_bus (an MMIO/PIO dispatch table) by allocating a smaller replacement bus, copying the surviving entries into it, and swapping it in under RCU/SRCU. It manages the lifetime of the array of struct kvm_io_range entries that the fast MMIO/PIO read/write path walks.",
+  "provenance": "Identified by the exact upstream symbol names and idioms: kvm_io_bus_unregister_dev(struct kvm *, enum kvm_bus, struct kvm_io_device *), struct kvm_io_bus, struct kvm_io_range, kvm_get_bus(), kvm_iodevice_destructor(), rcu_assign_pointer(kvm->buses[bus_idx], ...), synchronize_srcu_expedited(&kvm->srcu), struct_size(bus, range, ...), GFP_KERNEL_ACCOUNT and pr_err — all from virt/kvm/kvm_main.c in the Linux kernel. The header comment 'sample: primevul_c_train_3136_fixed' marks it as a PrimeVul-derived sample; provenance corroborated by the API surface, not trusted from the comment.",
+  "trust_boundary": "This is host-kernel code, not a wire parser, so the immediate inputs (kvm, bus_idx, dev) come from other kernel call sites, not directly from a malicious packet. The genuine trust boundary is CONCURRENCY and RESOURCE EXHAUSTION driven by a guest/userspace: (1) other vCPU threads run the SRCU-protected read side (kvm_io_bus_read/write walk bus->range[] under srcu_read_lock), so any object this function frees is potentially live under a concurrent reader; (2) the kmalloc() on line 20 can fail under attacker-influenced memory pressure, steering execution into the else branch. The hostile conditions are therefore a concurrent guest I/O access racing this unregister, and an induced allocation failure — both reachable from an unprivileged guest.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0021_cwe401.c",
+      "lines": "2-3",
+      "code": "void kvm_io_bus_unregister_dev(struct kvm *kvm, enum kvm_bus bus_idx,\n\t\t\t       struct kvm_io_device *dev)",
+      "explanation": "Function signature. It removes one device `dev` from the I/O bus identified by `bus_idx` (KVM_MMIO_BUS or KVM_PIO_BUS) belonging to the virtual machine `kvm`. It returns void, meaning the caller has NO way to learn whether the operation succeeded or failed — a critical contract detail, because it forces this routine to always leave the VM in a consistent state even when it cannot allocate. Callers invoke this while holding kvm->lock (the slots/devices mutex), so this body is serialized against other bus mutations but NOT against the lockless SRCU readers."
+    },
+    {
+      "file": "corpus/train/train_0021_cwe401.c",
+      "lines": "5-6",
+      "code": "\tint i, j;\n\tstruct kvm_io_bus *new_bus, *bus;",
+      "explanation": "Local state. `i` will hold the index of the matching device inside the current bus, `j` iterates in the failure path. `bus` is the existing (soon-to-be-replaced) bus, `new_bus` is the smaller replacement that will hold one fewer range entry. Both index variables are signed `int`, matching bus->dev_count's type; the arithmetic that follows depends on dev_count being a small non-negative count."
+    },
+    {
+      "file": "corpus/train/train_0021_cwe401.c",
+      "lines": "8-10",
+      "code": "\tbus = kvm_get_bus(kvm, bus_idx);\n\tif (!bus)\n\t\treturn;",
+      "explanation": "Fetches the current bus pointer for this bus index via kvm_get_bus() (an rcu/srcu-dereference helper guarded by the caller's lock) and bails out cleanly if the bus does not exist (NULL). This is the NULL guard that prevents a later dereference of bus->dev_count / bus->range."
+    },
+    {
+      "file": "corpus/train/train_0021_cwe401.c",
+      "lines": "12-15",
+      "code": "\tfor (i = 0; i < bus->dev_count; i++)\n\t\tif (bus->range[i].dev == dev) {\n\t\t\tbreak;\n\t\t}",
+      "explanation": "Linear search across the `bus->dev_count` range entries for the one whose `.dev` pointer equals the device being removed. On a match it breaks with `i` pointing at that slot. If no entry matches, the loop exits with `i == bus->dev_count`. bus->range is the trailing flexible/variable-length array of struct kvm_io_range that the fast path also walks."
+    },
+    {
+      "file": "corpus/train/train_0021_cwe401.c",
+      "lines": "17-18",
+      "code": "\tif (i == bus->dev_count)\n\t\treturn;",
+      "explanation": "If the device was not found (loop ran to completion), return without changes. A useful side effect of this guard is that it also handles dev_count == 0 (i stays 0 == dev_count) so the subtraction dev_count - 1 below can never be reached with dev_count == 0. After this point dev_count >= 1 and 0 <= i <= dev_count - 1."
+    },
+    {
+      "file": "corpus/train/train_0021_cwe401.c",
+      "lines": "20-21",
+      "code": "\tnew_bus = kmalloc(struct_size(bus, range, bus->dev_count - 1),\n\t\t\t  GFP_KERNEL_ACCOUNT);",
+      "explanation": "Allocates a replacement bus sized for (dev_count - 1) range entries using struct_size(), the overflow-checked flexible-array sizing helper (it returns SIZE_MAX on multiplication overflow, which kmalloc then rejects, so the size computation itself is safe). GFP_KERNEL_ACCOUNT charges the allocation to the VM's memcg. This allocation may fail (return NULL) under memory pressure, which drives the two-branch logic below."
+    },
+    {
+      "file": "corpus/train/train_0021_cwe401.c",
+      "lines": "22-26",
+      "code": "\tif (new_bus) {\n\t\tmemcpy(new_bus, bus, sizeof(*bus) + i * sizeof(struct kvm_io_range));\n\t\tnew_bus->dev_count--;\n\t\tmemcpy(new_bus->range + i, bus->range + i + 1,\n\t\t       (new_bus->dev_count - i) * sizeof(struct kvm_io_range));",
+      "explanation": "Success path (array compaction). First memcpy copies the bus header plus the first `i` range entries (the ones before the removed slot) verbatim. Then dev_count is decremented so new_bus->dev_count == original dev_count - 1. The second memcpy shifts the entries AFTER the removed slot down by one: it copies (new_bus->dev_count - i) == (dev_count - 1 - i) entries from bus->range[i+1..] into new_bus->range[i..]. Because i <= dev_count - 1, the count is >= 0 and new_bus has capacity for exactly dev_count - 1 entries, so both copies stay in bounds; when i is the last index the count is 0 and nothing is copied."
+    },
+    {
+      "file": "corpus/train/train_0021_cwe401.c",
+      "lines": "27-34",
+      "code": "\t} else {\n\t\tpr_err(\"kvm: failed to shrink bus, removing it completely\\n\");\n\t\tfor (j = 0; j < bus->dev_count; j++) {\n\t\t\tif (j == i)\n\t\t\t\tcontinue;\n\t\t\tkvm_iodevice_destructor(bus->range[j].dev);\n\t\t}\n\t}",
+      "explanation": "Failure path (allocation failed, new_bus == NULL). Because the function cannot return an error to the caller, it degrades by tearing the WHOLE bus down: it logs, then walks every device on the bus and calls kvm_iodevice_destructor() (which typically frees the device object) on each one EXCEPT the target `dev` at index i (skipped via the continue, presumably because the caller destroys that one). new_bus stays NULL, so below the bus pointer will be replaced with NULL, i.e. the bus is emptied entirely. This is the 'clean up rather than leak' fallback added to fix the earlier missing-free bug."
+    },
+    {
+      "file": "corpus/train/train_0021_cwe401.c",
+      "lines": "36-39",
+      "code": "\trcu_assign_pointer(kvm->buses[bus_idx], new_bus);\n\tsynchronize_srcu_expedited(&kvm->srcu);\n\tkfree(bus);\n\treturn;",
+      "explanation": "Publishes the new bus (either the compacted array, or NULL in the failure path) into kvm->buses[bus_idx] with a release barrier, then waits a full SRCU grace period via synchronize_srcu_expedited() so that every in-flight lockless reader that could still be looking at the OLD `bus` has finished, and only THEN frees the old bus with kfree(). This ordering — publish, sync, then free — is the standard RCU-style safe-reclaim pattern and is exactly why the old `bus` container can be freed here without racing readers."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0021_cwe401.c",
+      "lines": "29-37",
+      "code": "\t\tfor (j = 0; j < bus->dev_count; j++) {\n\t\t\tif (j == i)\n\t\t\t\tcontinue;\n\t\t\tkvm_iodevice_destructor(bus->range[j].dev);\n\t\t}\n\t}\n\n\trcu_assign_pointer(kvm->buses[bus_idx], new_bus);\n\tsynchronize_srcu_expedited(&kvm->srcu);",
+      "explanation": "Use-after-free via reclaim-before-grace-period. In the allocation-failure branch the individual devices (bus->range[j].dev) are destroyed on lines 29-33, which runs BEFORE the pointer swap on line 36 and BEFORE synchronize_srcu_expedited() on line 37. The devices are still reachable to the lockless read side (kvm_io_bus_read/kvm_io_bus_write dereference bus->range[j].dev under srcu_read_lock) at the instant they are freed, and the old bus is still published in kvm->buses[bus_idx] during the whole destruction loop. A concurrent vCPU performing guest MMIO/PIO can therefore call a device's read/write handler on an object that kvm_iodevice_destructor() has just freed → use-after-free (read and indirect-call through freed memory), an exploitable primitive. The invariant the implementation must uphold — and which the success path DOES uphold but this branch does NOT — is: unpublish the bus and wait a full SRCU grace period BEFORE calling any device destructor. The fix is to defer the destructor loop until after synchronize_srcu_expedited(). This matches the upstream hardening 'KVM: Destroy I/O bus devices on unregister failure _after_ sync'ing SRCU'."
+    },
+    {
+      "file": "corpus/train/train_0021_cwe401.c",
+      "lines": "27-34",
+      "code": "\t} else {\n\t\tpr_err(\"kvm: failed to shrink bus, removing it completely\\n\");\n\t\tfor (j = 0; j < bus->dev_count; j++) {\n\t\t\tif (j == i)\n\t\t\t\tcontinue;\n\t\t\tkvm_iodevice_destructor(bus->range[j].dev);\n\t\t}\n\t}",
+      "explanation": "Availability / collateral-destruction hazard. Because the function has a void return and cannot propagate ENOMEM, a failure to allocate one smaller bus causes it to destroy EVERY other device on the bus and replace the bus with NULL. A guest able to drive the host into transient memory pressure at the moment it unregisters a single device can thus tear down all of that VM's other MMIO/PIO devices (guest-visible denial of service / loss of emulated hardware state). This is by design as a lesser-evil fallback, but the failure mode is disproportionate; the robust contract (later adopted upstream) is that kvm_io_bus_unregister_dev() should not need to allocate on the failure path at all (e.g. mark the slot dead in place) so it can never fail."
+    },
+    {
+      "file": "corpus/train/train_0021_cwe401.c",
+      "lines": "25-26",
+      "code": "\t\tmemcpy(new_bus->range + i, bus->range + i + 1,\n\t\t       (new_bus->dev_count - i) * sizeof(struct kvm_io_range));",
+      "explanation": "Compaction arithmetic to confirm (assessed SAFE here, flagged for auditor attention). The copy length is (new_bus->dev_count - i) where new_bus->dev_count has already been decremented to original dev_count - 1. Since the found index satisfies 0 <= i <= dev_count - 1, the term is >= 0 and never underflows, and new_bus was sized for dev_count - 1 entries so the destination has room. The correctness of this whole routine hinges on that i <= dev_count - 1 invariant established by the search loop and the i == dev_count early return; if a future refactor removed the early-return guard or let dev_count be modified concurrently, this subtraction on signed int could go negative and be sign-extended to a huge size_t, turning the memcpy into a massive out-of-bounds copy. No bug as written."
+    }
+  ],
+  "summary": "A KVM I/O-bus device-unregister routine that safely compacts the bus in the common path but, in the kmalloc-failure fallback, frees the individual I/O devices BEFORE unpublishing the bus and waiting out the SRCU grace period — a use-after-free (CWE-416) reachable by a concurrent guest during induced memory pressure. A secondary robustness issue is that a single allocation failure tears down every other device on the VM's bus (guest-visible DoS). The array-compaction arithmetic itself is in-bounds.",
+  "reviewed_anchors": [
+    {"anchor": "void kvm_io_bus_unregister_dev(struct kvm *, enum kvm_bus bus_idx, struct kvm_io_device *dev) (lines 2-3)", "disposition": "finding", "reason": "void return means failure cannot be reported, forcing the destructive fallback that carries the UAF and DoS findings."},
+    {"anchor": "int i, j; (line 5)", "disposition": "dismissed", "reason": "signed loop indices bounded by dev_count; no attacker control, no overflow as used."},
+    {"anchor": "struct kvm_io_bus *new_bus, *bus; (line 6)", "disposition": "dismissed", "reason": "local pointers; lifetime handled by the RCU publish/sync/free pattern below."},
+    {"anchor": "bus = kvm_get_bus(kvm, bus_idx); + if (!bus) return; (lines 8-10)", "disposition": "dismissed", "reason": "proper NULL guard prevents dereference of a missing bus."},
+    {"anchor": "search loop bus->range[i].dev == dev (lines 12-15)", "disposition": "dismissed", "reason": "bounded by dev_count; establishes the 0 <= i <= dev_count-1 invariant relied on later."},
+    {"anchor": "if (i == bus->dev_count) return; (lines 17-18)", "disposition": "dismissed", "reason": "not-found / empty-bus guard; also blocks dev_count-1 underflow when dev_count is 0."},
+    {"anchor": "kmalloc(struct_size(bus, range, bus->dev_count - 1), GFP_KERNEL_ACCOUNT) (lines 20-21)", "disposition": "finding", "reason": "its NULL/failure branch is the trigger for the destructive fallback path; struct_size itself is overflow-checked."},
+    {"anchor": "memcpy(new_bus, bus, sizeof(*bus) + i * sizeof(struct kvm_io_range)) (line 23)", "disposition": "dismissed", "reason": "copies header + i entries; i <= dev_count-1 fits within new_bus capacity."},
+    {"anchor": "new_bus->dev_count-- (line 24)", "disposition": "dismissed", "reason": "decrement is correct; keeps count consistent with the smaller allocation."},
+    {"anchor": "memcpy tail (new_bus->dev_count - i) * sizeof(struct kvm_io_range) (lines 25-26)", "disposition": "finding", "reason": "flagged as an auditor-attention item; in-bounds as written but the subtraction depends on the i <= dev_count-1 invariant not being broken by refactors/concurrency."},
+    {"anchor": "else branch destructor loop kvm_iodevice_destructor(bus->range[j].dev) (lines 29-33)", "disposition": "finding", "reason": "frees live SRCU-visible devices before the grace period -> use-after-free (primary finding)."},
+    {"anchor": "rcu_assign_pointer(kvm->buses[bus_idx], new_bus) (line 36)", "disposition": "dismissed", "reason": "correct publish-with-barrier; publishing NULL in the failure path is intentional."},
+    {"anchor": "synchronize_srcu_expedited(&kvm->srcu) (line 37)", "disposition": "finding", "reason": "its placement AFTER the failure-path destructor loop is exactly the ordering bug; anchor for the UAF finding."},
+    {"anchor": "kfree(bus) (line 38)", "disposition": "dismissed", "reason": "freeing the old bus container after the grace period is the correct safe-reclaim step."}
+  ],
+  "findings": [
+    {
+      "title": "Use-after-free: I/O devices destroyed before SRCU grace period on the allocation-failure path",
+      "anchor": "kvm_iodevice_destructor(bus->range[j].dev) at line 32, ordered before synchronize_srcu_expedited(&kvm->srcu) at line 37",
+      "file": "corpus/train/train_0021_cwe401.c",
+      "line": "29-37",
+      "code": "\t\tfor (j = 0; j < bus->dev_count; j++) {\n\t\t\tif (j == i)\n\t\t\t\tcontinue;\n\t\t\tkvm_iodevice_destructor(bus->range[j].dev);\n\t\t}\n\t}\n\n\trcu_assign_pointer(kvm->buses[bus_idx], new_bus);\n\tsynchronize_srcu_expedited(&kvm->srcu);",
+      "bug_class": "Use-after-free (reclaim before RCU/SRCU grace period)",
+      "cwe": "CWE-416",
+      "severity": "high",
+      "where_it_lives": "implementation (this file; upstream virt/kvm/kvm_main.c)",
+      "invariant": "No struct kvm_io_device reachable from a published bus may be destroyed until the bus has been unpublished from kvm->buses[bus_idx] AND a full SRCU grace period (synchronize_srcu_expedited) has elapsed, guaranteeing no concurrent srcu_read_lock'd reader still holds a pointer to it.",
+      "failure_mode": "Under kmalloc failure (attacker-induced memory pressure), the else branch calls kvm_iodevice_destructor() on every device while the old bus is still installed in kvm->buses[bus_idx] and before synchronize_srcu_expedited(). A concurrent vCPU doing guest MMIO/PIO enters kvm_io_bus_read/write under srcu_read_lock, resolves bus->range[j].dev, and invokes its handler on memory that was just freed — use-after-free read and indirect call, a strong local-privilege-escalation primitive.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm kvm_iodevice_destructor() frees the device object, that kvm_io_bus_read/write dereference bus->range[].dev only under srcu_read_lock(&kvm->srcu), and that the destructor loop is not otherwise serialized against those readers; the fix is to move the destructor loop to AFTER synchronize_srcu_expedited()."
+    },
+    {
+      "title": "Single allocation failure destroys all other devices on the VM's bus (guest-visible DoS)",
+      "anchor": "else { pr_err(\"kvm: failed to shrink bus, removing it completely\"); ... kvm_iodevice_destructor(bus->range[j].dev); }",
+      "file": "corpus/train/train_0021_cwe401.c",
+      "line": "27-34",
+      "code": "\t} else {\n\t\tpr_err(\"kvm: failed to shrink bus, removing it completely\\n\");\n\t\tfor (j = 0; j < bus->dev_count; j++) {\n\t\t\tif (j == i)\n\t\t\t\tcontinue;\n\t\t\tkvm_iodevice_destructor(bus->range[j].dev);\n\t\t}\n\t}",
+      "bug_class": "Improper handling of exceptional conditions / disproportionate teardown",
+      "cwe": "CWE-460",
+      "severity": "medium",
+      "where_it_lives": "implementation (this file; upstream virt/kvm/kvm_main.c)",
+      "invariant": "Removing one device must not destroy unrelated devices; because the function returns void and cannot report ENOMEM, its failure path must degrade without collateral loss of still-in-use emulated hardware (ideally by not allocating on the failure path at all).",
+      "failure_mode": "Because kmalloc of the shrunk bus can fail, and the function cannot signal failure, the fallback destroys every device on the bus except the target and installs a NULL bus. A guest able to induce transient memory pressure exactly when a device is unregistered can wipe out all of its VM's other MMIO/PIO devices, a denial of service.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm whether callers can tolerate this bus-wide teardown, and whether a non-allocating removal (mark the entry dead in place / never-fail unregister) is the intended contract upstream."
+    }
+  ],
+  "audit_checklist": [
+    "Verify the failure-path destructor loop (lines 29-33) runs only AFTER rcu_assign_pointer + synchronize_srcu_expedited (lines 36-37) — reorder to eliminate the use-after-free.",
+    "Confirm all readers of bus->range[].dev (kvm_io_bus_read / kvm_io_bus_write and coalesced-MMIO paths) hold srcu_read_lock(&kvm->srcu) and that this write side holds kvm->lock so the only unsynchronized race is the SRCU read side.",
+    "Confirm kvm_iodevice_destructor() actually frees the kvm_io_device (making the pre-grace-period call a real UAF, not just a logical error).",
+    "Re-examine whether kvm_io_bus_unregister_dev should be allowed to fail at all; consider a non-allocating in-place removal so the destructive 'remove it completely' fallback disappears.",
+    "Verify the i <= dev_count-1 invariant (search loop + i==dev_count return) cannot be broken by concurrent bus mutation, since the tail memcpy length (new_bus->dev_count - i) would underflow to a huge size_t if i ever exceeded dev_count-1.",
+    "Confirm struct_size(bus, range, dev_count-1) is only reached with dev_count >= 1 and that its overflow-saturation-to-SIZE_MAX behavior is honored by kmalloc."
+  ]
+}

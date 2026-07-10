@@ -1,0 +1,284 @@
+{
+  "subsystem": "Linux kernel memory management: transparent huge page (THP) support. This is __split_huge_pmd(), the entry point that splits a huge (PMD-mapped) page into individual PTEs. It takes the per-VMA page-table lock, drives the mmu_notifier invalidation protocol so secondary MMUs (KVM, IOMMU) are kept coherent, optionally resolves and locks the backing struct page, and then calls __split_huge_pmd_locked() to perform the actual split. It is invoked on COW faults, mprotect/mremap, page migration setup (freeze), memory reclaim and mlock paths.",
+  "provenance": "Identified by the exact function name and signature __split_huge_pmd(struct vm_area_struct *, pmd_t *, unsigned long address, bool freeze, struct page *) plus the mm-specific idioms: pmd_lock(), pmd_trans_huge(), pmd_page(), pmd_same(), is_pmd_migration_entry(), pmd_devmap(), the mmu_notifier_range API (mmu_notifier_range_init/MMU_NOTIFY_CLEAR/invalidate_range_start/invalidate_range_only_end), HPAGE_PMD_MASK/HPAGE_PMD_SIZE, VM_BUG_ON/VM_WARN_ON_ONCE, and trylock_page/lock_page. These are all definitions from mm/huge_memory.c in the mainline Linux kernel. The header comment 'sample: primevul_c_validation_0223_fixed' marks it as the fixed variant of a PrimeVul race sample.",
+  "trust_boundary": "This is in-kernel code, not a wire parser, so the classic 'network byte off the socket' boundary does not apply. The hostile input here is CONCURRENCY: multiple CPUs operating on the same mm/pmd simultaneously (fault handlers, reclaim, khugepaged, migration, other split callers). The security boundary is the page-table lock (ptl) and the page lock; any unlocked window is attacker-influenceable because an unprivileged process can drive faults/madvise on shared or COW huge pages to hit the exact interleaving. address, freeze, and page are supplied by in-kernel callers, but the *state* they point at (*pmd, the struct page refcount/flags) is mutated concurrently by other userspace-triggered threads. The pmd itself and the page it maps are the hostile, racing objects.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0003_cwe362.c",
+      "lines": "2-4",
+      "code": "void __split_huge_pmd(struct vm_area_struct *vma, pmd_t *pmd,\n\t\tunsigned long address, bool freeze, struct page *page)\n{",
+      "explanation": "Function entry. vma is the virtual memory area whose huge mapping is being split; pmd is a pointer to the page middle directory entry that currently maps a huge page. address is the faulting/target virtual address inside that 2MB region. freeze is a boolean requesting that the split install migration entries (used when the caller wants the page frozen for migration). page is an OPTIONAL caller-supplied struct page that, when non-NULL, both selects which page to act on and signals that the caller already holds that page's lock. The function returns void and communicates only through side effects on the page tables and mmu notifiers."
+    },
+    {
+      "file": "corpus/train/train_0003_cwe362.c",
+      "lines": "5-8",
+      "code": "\tspinlock_t *ptl;\n\tstruct mmu_notifier_range range;\n\tbool was_locked = false;\n\tpmd_t _pmd;",
+      "explanation": "Local state. ptl will hold the page-table spinlock guarding this pmd. range is the mmu_notifier invalidation descriptor announcing the address window being modified so secondary MMUs can invalidate their mappings. was_locked records whether the page lock was already held by the caller on entry (true) versus acquired inside this function (false); it decides who is responsible for unlocking the page at the end. _pmd is a stack snapshot of the pmd value used to detect concurrent modification across a lock-drop window."
+    },
+    {
+      "file": "corpus/train/train_0003_cwe362.c",
+      "lines": "10-13",
+      "code": "\tmmu_notifier_range_init(&range, MMU_NOTIFY_CLEAR, 0, vma, vma->vm_mm,\n\t\t\t\taddress & HPAGE_PMD_MASK,\n\t\t\t\t(address & HPAGE_PMD_MASK) + HPAGE_PMD_SIZE);\n\tmmu_notifier_invalidate_range_start(&range);",
+      "explanation": "Initializes the notifier range as a CLEAR event covering exactly the huge-page-aligned window [address & HPAGE_PMD_MASK, +HPAGE_PMD_SIZE) — i.e. the full 2MB region the pmd maps, computed by masking the address down to the PMD boundary. mmu_notifier_invalidate_range_start() then opens the invalidation critical section: it calls every registered secondary-MMU notifier (KVM shadow page tables, IOMMU/SVA, etc.) telling them a mapping in this range is about to change, so they stop using stale translations. This must be paired with a matching _end call before return."
+    },
+    {
+      "file": "corpus/train/train_0003_cwe362.c",
+      "lines": "14",
+      "code": "\tptl = pmd_lock(vma->vm_mm, pmd);",
+      "explanation": "Acquires the page-table lock protecting this pmd (in practice the PMD-split ptl or the mm's page_table_lock) and stores it in ptl. From here until spin_unlock, reads and writes of *pmd are serialized against other CPUs — this lock is the primary concurrency-control mechanism for the whole function. Every path out of the function must release exactly this lock once."
+    },
+    {
+      "file": "corpus/train/train_0003_cwe362.c",
+      "lines": "20-26",
+      "code": "\tVM_BUG_ON(freeze && !page);\n\tif (page) {\n\t\tVM_WARN_ON_ONCE(!PageLocked(page));\n\t\twas_locked = true;\n\t\tif (page != pmd_page(*pmd))\n\t\t\tgoto out;\n\t}",
+      "explanation": "Precondition checks. VM_BUG_ON(freeze && !page) asserts that a migration-setup (freeze) request must always come with a specific page to check against — the comment at lines 16-19 explains that without it the code could replace the wrong page. When a page was supplied, VM_WARN_ON_ONCE(!PageLocked(page)) documents the contract that the caller must already hold that page's lock, was_locked is set true so the epilogue will NOT unlock it, and page != pmd_page(*pmd) verifies the pmd still maps the expected page; if it has changed underneath (raced away), it jumps straight to out without splitting. Note VM_BUG_ON and VM_WARN_ON_ONCE are debug-build assertions."
+    },
+    {
+      "file": "corpus/train/train_0003_cwe362.c",
+      "lines": "28-29",
+      "code": "repeat:\n\tif (pmd_trans_huge(*pmd)) {",
+      "explanation": "The repeat label is the retry target for the lock-drop dance below. pmd_trans_huge(*pmd) tests whether the pmd currently maps an anonymous/file transparent huge page (as opposed to a devmap pmd or a migration entry). Re-reading *pmd here (rather than trusting an earlier read) is deliberate because the value may have changed since entry. Only the trans_huge case needs the page-lock handling that follows."
+    },
+    {
+      "file": "corpus/train/train_0003_cwe362.c",
+      "lines": "30-46",
+      "code": "\t\tif (!page) {\n\t\t\tpage = pmd_page(*pmd);\n\t\t\tif (unlikely(!trylock_page(page))) {\n\t\t\t\tget_page(page);\n\t\t\t\t_pmd = *pmd;\n\t\t\t\tspin_unlock(ptl);\n\t\t\t\tlock_page(page);\n\t\t\t\tspin_lock(ptl);\n\t\t\t\tif (unlikely(!pmd_same(*pmd, _pmd))) {\n\t\t\t\t\tunlock_page(page);\n\t\t\t\t\tput_page(page);\n\t\t\t\t\tpage = NULL;\n\t\t\t\t\tgoto repeat;\n\t\t\t\t}\n\t\t\t\tput_page(page);\n\t\t\t}\n\t\t}",
+      "explanation": "This is the core lock-ordering dance. If the caller did not pass a page, it is resolved from the pmd via pmd_page(*pmd). The code then needs the page lock but must not sleep while holding the ptl spinlock, so it first tries trylock_page(). On failure it must drop the spinlock to sleep: it takes a refcount with get_page() so the page cannot be freed, snapshots the pmd into _pmd, releases ptl (spin_unlock), sleeps in lock_page(), then re-acquires ptl (spin_lock). Because the pmd could have been changed by another CPU while unlocked, it re-validates with pmd_same(*pmd, _pmd); if the pmd changed it undoes everything (unlock_page, put_page, clear page, goto repeat) and starts over. If unchanged, it drops the temporary get_page refcount (put_page) while keeping the page lock. This revalidation is precisely the fix for the TOCTOU race."
+    },
+    {
+      "file": "corpus/train/train_0003_cwe362.c",
+      "lines": "47-48",
+      "code": "\t\tif (PageMlocked(page))\n\t\t\tclear_page_mlock(page);",
+      "explanation": "Still inside the trans_huge branch, with page now resolved and locked. If the huge page was mlocked (locked into RAM by userspace), clear_page_mlock() clears that state before the mapping is split, so the accounting is corrected as the single huge mapping becomes many small ones. page is guaranteed non-NULL here: either the caller passed it or the block above assigned it from pmd_page()."
+    },
+    {
+      "file": "corpus/train/train_0003_cwe362.c",
+      "lines": "49-51",
+      "code": "\t} else if (!(pmd_devmap(*pmd) || is_pmd_migration_entry(*pmd)))\n\t\tgoto out;\n\t__split_huge_pmd_locked(vma, pmd, range.start, freeze);",
+      "explanation": "The else branch handles pmds that are not trans_huge: if the pmd is neither a devmap (DAX/ZONE_DEVICE) mapping nor an existing migration entry, there is nothing to split, so it jumps to out. Otherwise (trans_huge, devmap, or migration entry) execution falls through to __split_huge_pmd_locked(vma, pmd, range.start, freeze) — the routine that performs the real work of tearing the pmd down into a pte table while holding ptl. range.start is the huge-page-aligned base address computed earlier. This callee is not included in the sample; its correctness is a latent dependency of this function."
+    },
+    {
+      "file": "corpus/train/train_0003_cwe362.c",
+      "lines": "52-55",
+      "code": "out:\n\tspin_unlock(ptl);\n\tif (!was_locked && page)\n\t\tunlock_page(page);",
+      "explanation": "The single cleanup epilogue reached by every path. spin_unlock(ptl) releases the page-table lock exactly once. Then the page lock is released ONLY if this function acquired it (!was_locked) and a page exists — if the caller already held the lock (was_locked true) the caller owns the unlock, so releasing it here would be a double-unlock/ownership violation. This asymmetric ownership is the reason was_locked exists."
+    },
+    {
+      "file": "corpus/train/train_0003_cwe362.c",
+      "lines": "56-70",
+      "code": "\t/*\n\t * No need to double call mmu_notifier->invalidate_range() callback.\n\t * They are 3 cases to consider inside __split_huge_pmd_locked():\n\t *  1) pmdp_huge_clear_flush_notify() call invalidate_range() obvious\n\t *  2) __split_huge_zero_page_pmd() read only zero page and any write\n\t *    fault will trigger a flush_notify before pointing to a new page\n\t *    (it is fine if the secondary mmu keeps pointing to the old zero\n\t *    page in the meantime)\n\t *  3) Split a huge pmd into pte pointing to the same page. No need\n\t *     to invalidate secondary tlb entry they are all still valid.\n\t *     any further changes to individual pte will notify. So no need\n\t *     to call mmu_notifier->invalidate_range()\n\t */\n\tmmu_notifier_invalidate_range_only_end(&range);\n}",
+      "explanation": "Closes the mmu_notifier critical section. It deliberately uses the _only_end variant rather than mmu_notifier_invalidate_range_end(): _only_end runs the end hooks but SKIPS the invalidate_range() callback, on the theory (documented in the comment) that __split_huge_pmd_locked already issued the necessary invalidate_range in each of the three split cases. The comment is an in-code claim about safety and, per the review rules, is treated as untrusted narrative rather than proof — the correctness of skipping the callback depends entirely on the not-shown callee actually invalidating in all cases."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0003_cwe362.c",
+      "lines": "32-43",
+      "code": "\t\t\tif (unlikely(!trylock_page(page))) {\n\t\t\t\tget_page(page);\n\t\t\t\t_pmd = *pmd;\n\t\t\t\tspin_unlock(ptl);\n\t\t\t\tlock_page(page);\n\t\t\t\tspin_lock(ptl);\n\t\t\t\tif (unlikely(!pmd_same(*pmd, _pmd))) {\n\t\t\t\t\tunlock_page(page);\n\t\t\t\t\tput_page(page);\n\t\t\t\t\tpage = NULL;\n\t\t\t\t\tgoto repeat;",
+      "explanation": "This is the central CWE-362 window. Between spin_unlock(ptl) (line 35) and spin_lock(ptl) (line 37) the page-table lock is not held, so another CPU driven by an unprivileged fault/madvise can concurrently split, migrate, collapse, or free the huge pmd. The safety invariant is twofold: (1) the page must not be freed while unlocked — upheld by get_page() before the drop; and (2) any operation performed after re-acquiring the lock must first confirm the pmd has not changed — upheld by the pmd_same(*pmd, _pmd) revalidation, which on mismatch undoes the refcount/page-lock and restarts via goto repeat. If either the get_page were missing (use-after-free, CWE-416) or the pmd_same check were missing/incorrect (stale-pmd operation, CWE-362 leading to wrong-page split), this is a classic exploitable TOCTOU. In this fixed sample both guards are present; the residual risk is that pmd_same only compares the pmd value bits — it will not detect a change that leaves the pmd numerically identical (e.g. an A/B/A recycle of the same pfn), so the callee must not rely on more than pfn-identity."
+    },
+    {
+      "file": "corpus/train/train_0003_cwe362.c",
+      "lines": "51",
+      "code": "\t__split_huge_pmd_locked(vma, pmd, range.start, freeze);",
+      "explanation": "LATENT — the bug class this function is famous for lives in the callee that is not shown. Historically __split_huge_pmd_locked mishandled the dirty bit when clearing and re-establishing the pmd under this very lock protocol: a concurrent COW split could lose the dirty bit and let a read-only huge page be written after the split, the 'Huge Dirty COW' privilege-escalation (CVE-2017-1000405). The invariant the implementation must uphold is that the pmd teardown atomically preserves dirty/write/soft-dirty/uffd-wp state and installs ptes consistent with the pmd observed under ptl. This function passes freeze straight through, so if the callee installs migration entries while the page identity assumption (guarded only by the debug-only VM_BUG_ON at line 20 in production) is wrong, the wrong page can be frozen/replaced."
+    },
+    {
+      "file": "corpus/train/train_0003_cwe362.c",
+      "lines": "20-22",
+      "code": "\tVM_BUG_ON(freeze && !page);\n\tif (page) {\n\t\tVM_WARN_ON_ONCE(!PageLocked(page));",
+      "explanation": "Both correctness gates here are DEBUG-ONLY. VM_BUG_ON and VM_WARN_ON_ONCE compile to nothing when CONFIG_DEBUG_VM is disabled (the common production configuration). So in a production kernel there is NO runtime enforcement that a freeze request carries a page, nor that a caller-supplied page is actually locked. If a caller violates either contract, the code proceeds silently: the freeze/migration path (line 51) can act with an unverified page, and PageMlocked/clear_page_mlock and the split can run on a page whose lock the caller never held, opening a page-state race (CWE-362 / CWE-667 improper locking). The invariant is that these preconditions must be guaranteed by every caller because the callee cannot rely on the asserts firing."
+    },
+    {
+      "file": "corpus/train/train_0003_cwe362.c",
+      "lines": "23-24",
+      "code": "\t\twas_locked = true;\n\t\tif (page != pmd_page(*pmd))",
+      "explanation": "Ownership/asymmetric-unlock hazard. Setting was_locked = true whenever a page is passed makes the epilogue (lines 54-55) skip unlock_page for that page. This is correct ONLY if the caller genuinely holds the lock; if a caller passes an unlocked page (not caught in production, see prior step), the page is never unlocked here and the caller does not expect to unlock it either, risking a leaked page lock and a permanently stuck page — a denial-of-service style deadlock. Conversely, the invariant that the function releases exactly the locks it took must hold on every goto out path; here the single out epilogue makes that structurally correct, but it hinges entirely on was_locked being set the instant page ownership is assumed."
+    },
+    {
+      "file": "corpus/train/train_0003_cwe362.c",
+      "lines": "24",
+      "code": "\t\tif (page != pmd_page(*pmd))",
+      "explanation": "pmd_page(*pmd) is evaluated here BEFORE the pmd_trans_huge()/pmd_devmap()/is_pmd_migration_entry() type checks at lines 29 and 49. pmd_page() interprets the pmd's pfn bits as a struct page; on a pmd that is not a normal present huge mapping (for example a migration entry, where the pfn field is repurposed) the returned pointer is not a meaningful page and the comparison is against a bogus value (CWE-125/CWE-476 territory if later dereferenced). In practice callers that pass a page pass a present trans_huge pmd, so this is normally safe, but the ordering means the safety depends on the caller's contract rather than on a local type check — worth confirming the pmd is always present-huge when page is non-NULL."
+    },
+    {
+      "file": "corpus/train/train_0003_cwe362.c",
+      "lines": "69",
+      "code": "\tmmu_notifier_invalidate_range_only_end(&range);",
+      "explanation": "Using _only_end instead of the full invalidate_range_end suppresses the secondary-MMU invalidate_range() callback on the assumption (comment lines 56-68) that __split_huge_pmd_locked already invalidated in all three cases. If that assumption is wrong for any path — e.g. a new split case is added, or case 3 (split into ptes pointing to the same page) does not in fact leave secondary TLBs valid — a KVM guest or IOMMU device could keep a live 2MB translation to a page that has been split/remapped, a memory-coherence bug that can leak or corrupt data across the virtualization/DMA boundary (CWE-362 coherence). The invariant: every mutation performed under this notifier range must be matched by an explicit invalidate_range from the callee for the _only_end optimization to be sound. The in-code comment asserting safety is untrusted and must be verified, not assumed."
+    }
+  ],
+  "summary": "This is the fixed variant of __split_huge_pmd(): the historically dangerous TOCTOU around dropping and re-taking the page-table lock (lines 35-37) is correctly mitigated by a get_page() refcount plus a pmd_same() revalidation with retry. The residual and latent risks are concurrency/coherence contracts, not local buffer bugs: the actual split (and the Huge-Dirty-COW-class dirty-bit handling, CVE-2017-1000405) lives in the not-shown __split_huge_pmd_locked(); the freeze/page-locked preconditions are enforced only by debug-only VM_BUG_ON/VM_WARN_ON_ONCE; and the invalidate_range_only_end() optimization trusts the callee to have issued all secondary-MMU invalidations. Low residual risk in this snippet given the visible fix, but several contracts must be confirmed in the callee and callers.",
+  "reviewed_anchors": [
+    {
+      "anchor": "__split_huge_pmd(struct vm_area_struct *vma, pmd_t *pmd, unsigned long address, bool freeze, struct page *page) signature (lines 2-3)",
+      "disposition": "finding",
+      "reason": "Optional page param doubles as an ownership signal and freeze drives migration-entry install; contracts are concurrency-critical."
+    },
+    {
+      "anchor": "spinlock_t *ptl (line 5)",
+      "disposition": "finding",
+      "reason": "Primary concurrency-control lock; dropped and reacquired mid-function, the crux of the CWE-362 window."
+    },
+    {
+      "anchor": "struct mmu_notifier_range range (line 6)",
+      "disposition": "finding",
+      "reason": "Drives secondary-MMU coherence; closed with _only_end which suppresses a callback."
+    },
+    {
+      "anchor": "bool was_locked (line 7)",
+      "disposition": "finding",
+      "reason": "Decides asymmetric page-lock ownership at the epilogue; wrong value leaks or double-unlocks the page lock."
+    },
+    {
+      "anchor": "pmd_t _pmd (line 8)",
+      "disposition": "finding",
+      "reason": "Snapshot used by pmd_same revalidation; the entire race fix depends on it."
+    },
+    {
+      "anchor": "mmu_notifier_range_init(...) / invalidate_range_start (lines 10-13)",
+      "disposition": "dismissed",
+      "reason": "Correct start of a balanced notifier section; window covers the full aligned PMD region. No local defect."
+    },
+    {
+      "anchor": "ptl = pmd_lock(vma->vm_mm, pmd) (line 14)",
+      "disposition": "dismissed",
+      "reason": "Standard lock acquisition, released once on every path; no defect in isolation (covered by the ptl-drop finding)."
+    },
+    {
+      "anchor": "VM_BUG_ON(freeze && !page) (line 20)",
+      "disposition": "finding",
+      "reason": "Debug-only assertion enforcing the freeze precondition; compiled out in production, so unenforced."
+    },
+    {
+      "anchor": "VM_WARN_ON_ONCE(!PageLocked(page)) (line 22)",
+      "disposition": "finding",
+      "reason": "Debug-only check of the caller-holds-page-lock contract; no production enforcement."
+    },
+    {
+      "anchor": "if (page != pmd_page(*pmd)) goto out (line 24)",
+      "disposition": "finding",
+      "reason": "pmd_page evaluated before the pmd type checks; relies on caller contract that the pmd is present-huge."
+    },
+    {
+      "anchor": "repeat: / pmd_trans_huge(*pmd) (lines 28-29)",
+      "disposition": "dismissed",
+      "reason": "Retry target and type re-read under lock; correct pattern, no defect on its own."
+    },
+    {
+      "anchor": "trylock_page/get_page/spin_unlock/lock_page/spin_lock/pmd_same drop-reacquire block (lines 32-45)",
+      "disposition": "finding",
+      "reason": "The central CWE-362 TOCTOU window; refcount + pmd_same revalidation are the fix and must be verified."
+    },
+    {
+      "anchor": "if (PageMlocked(page)) clear_page_mlock(page) (lines 47-48)",
+      "disposition": "dismissed",
+      "reason": "page is non-NULL and page-locked at this point on all reaching paths; accounting-only, no security contract."
+    },
+    {
+      "anchor": "else if (!(pmd_devmap(*pmd) || is_pmd_migration_entry(*pmd))) goto out (lines 49-50)",
+      "disposition": "dismissed",
+      "reason": "Guards the callee to the splittable pmd types; correct gating, no defect."
+    },
+    {
+      "anchor": "__split_huge_pmd_locked(vma, pmd, range.start, freeze) (line 51)",
+      "disposition": "finding",
+      "reason": "Not shown; carries the real teardown incl. dirty-bit handling (Huge Dirty COW class). Latent."
+    },
+    {
+      "anchor": "out: spin_unlock(ptl); if (!was_locked && page) unlock_page(page) (lines 52-55)",
+      "disposition": "finding",
+      "reason": "Asymmetric unlock keyed on was_locked; correctness depends on the ownership contract."
+    },
+    {
+      "anchor": "mmu_notifier_invalidate_range_only_end(&range) (line 69)",
+      "disposition": "finding",
+      "reason": "Suppresses invalidate_range callback; secondary-MMU coherence depends on the callee having invalidated."
+    }
+  ],
+  "findings": [
+    {
+      "title": "TOCTOU on page-table lock drop/reacquire during page-lock acquisition",
+      "anchor": "trylock_page/get_page/spin_unlock/lock_page/spin_lock/pmd_same block",
+      "file": "corpus/train/train_0003_cwe362.c",
+      "line": "32-43",
+      "code": "\t\t\tif (unlikely(!trylock_page(page))) {\n\t\t\t\tget_page(page);\n\t\t\t\t_pmd = *pmd;\n\t\t\t\tspin_unlock(ptl);\n\t\t\t\tlock_page(page);\n\t\t\t\tspin_lock(ptl);\n\t\t\t\tif (unlikely(!pmd_same(*pmd, _pmd))) {\n\t\t\t\t\tunlock_page(page);\n\t\t\t\t\tput_page(page);\n\t\t\t\t\tpage = NULL;\n\t\t\t\t\tgoto repeat;",
+      "bug_class": "Race condition (time-of-check/time-of-use across a dropped spinlock)",
+      "cwe": "CWE-362",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0003_cwe362.c",
+      "invariant": "While the ptl is dropped to sleep in lock_page(), the target page must be pinned (get_page) so it cannot be freed, and after re-acquiring ptl the code must confirm the pmd is unchanged (pmd_same) before operating; on mismatch it must fully unwind (unlock_page, put_page, clear page) and retry.",
+      "failure_mode": "An unprivileged process racing faults/migration/collapse on the same huge pmd can mutate *pmd during the unlocked window (lines 35-37). Without the get_page pin the page could be freed => use-after-free (CWE-416); without the pmd_same recheck the code would split/mlock a stale or wrong page => wrong-page corruption or info leak. In this fixed sample both guards are present and correct, so the exploitable primitive is closed; the finding documents the contract and the one residual assumption (pmd_same only compares value bits, so an A/B/A pfn recycle would be treated as unchanged).",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm get_page precedes the spin_unlock, that no field of the page or pmd is used between spin_lock and the pmd_same check, and that pfn-identity (not full content identity) is a sufficient sameness test for every reaching split case."
+    },
+    {
+      "title": "Latent Huge-Dirty-COW-class defect in the not-shown split callee",
+      "anchor": "__split_huge_pmd_locked(vma, pmd, range.start, freeze)",
+      "file": "corpus/train/train_0003_cwe362.c",
+      "line": "51",
+      "code": "\t__split_huge_pmd_locked(vma, pmd, range.start, freeze);",
+      "bug_class": "Race condition / lost dirty bit during pmd teardown (privilege escalation)",
+      "cwe": "CWE-362",
+      "severity": "high",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "The pmd->pte teardown must atomically preserve write/dirty/soft-dirty/uffd-wp state and install ptes consistent with the pmd observed under ptl; when freeze is set it must install migration entries only for the verified page.",
+      "failure_mode": "This function delegates the actual split to __split_huge_pmd_locked, which historically lost the dirty bit while clearing/re-establishing a huge pmd under COW, letting a read-only huge page be written after the split (Huge Dirty COW). Because freeze is passed through and the page-identity precondition is enforced only by a debug-only VM_BUG_ON (line 20), a mis-set freeze or wrong page could freeze/replace the wrong page. The visible caller is correct; the risk lives entirely in the callee's dirty-bit and migration-entry handling.",
+      "cve_analog": "CVE-2017-1000405",
+      "what_to_confirm": "Inspect __split_huge_pmd_locked to confirm dirty/write bits are preserved across pmdp_huge_clear_flush and that migration entries are only installed for the caller-verified page."
+    },
+    {
+      "title": "Freeze/page-lock preconditions enforced only by debug-only assertions",
+      "anchor": "VM_BUG_ON(freeze && !page) / VM_WARN_ON_ONCE(!PageLocked(page))",
+      "file": "corpus/train/train_0003_cwe362.c",
+      "line": "20-22",
+      "code": "\tVM_BUG_ON(freeze && !page);\n\tif (page) {\n\t\tVM_WARN_ON_ONCE(!PageLocked(page));",
+      "bug_class": "Unenforced precondition / improper locking assumption",
+      "cwe": "CWE-667",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0003_cwe362.c",
+      "invariant": "Every caller must pass a non-NULL page when freeze is true, and must already hold the lock on any page it passes; the function relies on these without runtime enforcement in production builds.",
+      "failure_mode": "VM_BUG_ON and VM_WARN_ON_ONCE expand to no-ops when CONFIG_DEBUG_VM is off (typical production). A caller that requests freeze without a page, or passes an unlocked page, is not stopped: the migration-entry path runs with an unverified page, and clear_page_mlock/split run on a page whose lock was never actually held, opening a page-state race. Impact ranges from wrong-page migration to page-flag corruption. The mitigation is entirely on the caller side.",
+      "cve_analog": "",
+      "what_to_confirm": "Audit all callers of __split_huge_pmd to prove page is always non-NULL when freeze is true and always page-locked when passed, since the callee cannot rely on the asserts firing."
+    },
+    {
+      "title": "Asymmetric page-lock unlock keyed on was_locked can leak the page lock",
+      "anchor": "was_locked = true; ... if (!was_locked && page) unlock_page(page)",
+      "file": "corpus/train/train_0003_cwe362.c",
+      "line": "54-55",
+      "code": "\tif (!was_locked && page)\n\t\tunlock_page(page);",
+      "bug_class": "Lock-ownership asymmetry (leaked lock / potential deadlock)",
+      "cwe": "CWE-667",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0003_cwe362.c",
+      "invariant": "The function must release exactly the page lock it acquired: unlock only when it locked the page itself (was_locked==false), and never unlock a caller-owned lock. was_locked must be set the instant page ownership is assumed (line 23).",
+      "failure_mode": "was_locked is set true for ANY caller-supplied page (line 23), so the epilogue skips unlock_page for it. If a caller passes an unlocked page (not caught in production, see prior finding), the page is never unlocked by this function and the caller does not expect to either => a permanently held page lock, which can wedge reclaim/fault paths waiting on that page (DoS-style hang). The structural single-exit epilogue is otherwise correct for the locks actually taken.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm no caller passes an unlocked page and that every internal page acquisition path leaves was_locked==false so the unlock at line 55 balances exactly one lock_page/trylock_page."
+    },
+    {
+      "title": "invalidate_range_only_end suppresses secondary-MMU callback, trusting the callee",
+      "anchor": "mmu_notifier_invalidate_range_only_end(&range)",
+      "file": "corpus/train/train_0003_cwe362.c",
+      "line": "69",
+      "code": "\tmmu_notifier_invalidate_range_only_end(&range);",
+      "bug_class": "Secondary-MMU coherence race (missed invalidation)",
+      "cwe": "CWE-362",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0003_cwe362.c",
+      "invariant": "For the _only_end optimization to be sound, __split_huge_pmd_locked must itself issue an mmu_notifier invalidate_range for every mutation performed within this notifier window, across all split cases.",
+      "failure_mode": "_only_end runs the end hooks but SKIPS the invalidate_range() callback, on the comment's assertion that the callee already invalidated in each of three cases. If any case (or a future one) fails to invalidate — e.g. case 3, split into ptes pointing to the same page, is assumed to leave secondary TLBs valid — a KVM guest or IOMMU device could retain a live 2MB translation to a now-split/remapped region, causing cross-boundary data leak or corruption. The in-code comment (lines 56-68) is untrusted narrative and must be proven, not assumed.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify __split_huge_pmd_locked emits invalidate_range for the huge-clear, zero-page, and same-page split cases, so that skipping the callback here is genuinely redundant rather than a missed invalidation."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm get_page() always precedes spin_unlock(ptl) and put_page() balances it on both the retry and success paths (lines 33-44), and that no page/pmd field is used between spin_lock and the pmd_same check.",
+    "Inspect __split_huge_pmd_locked() for dirty/write/soft-dirty/uffd-wp bit preservation across pmd teardown (Huge Dirty COW / CVE-2017-1000405 class) and for freezing only the verified page.",
+    "Audit every caller: page must be non-NULL when freeze is true, and any page passed must already be page-locked, since VM_BUG_ON/VM_WARN_ON_ONCE are no-ops in production kernels.",
+    "Prove the was_locked accounting: the function unlocks exactly the page lock it acquired and never a caller-owned one, so no page lock is leaked on any exit path.",
+    "Verify __split_huge_pmd_locked issues mmu_notifier invalidate_range in all three documented cases, making mmu_notifier_invalidate_range_only_end() a safe optimization rather than a missed secondary-MMU invalidation.",
+    "Check that pmd_page(*pmd) at line 24 is only reached with a present trans_huge pmd (never a migration/devmap pmd whose pfn bits are repurposed)."
+  ]
+}

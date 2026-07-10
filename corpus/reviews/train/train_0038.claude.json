@@ -1,0 +1,218 @@
+{
+  "subsystem": "Ghostscript raster printer device driver: the jetp3852_print_page() page-emit callback for the JETP-3852 (3-bit RGB) color thermal-transfer printer. It reads rendered scan lines out of the Ghostscript printer device, bit-transposes each 8-byte group into three color bit-planes, run-length-skips blank lines, and streams ESC/printer command bytes plus the complemented plane data to the output stream.",
+  "provenance": "Identified by the Ghostscript/Artifex API surface: the parameter types gx_device_printer* and gp_file*, the helpers gdev_mem_bytes_per_scan_line(), gdev_prn_copy_scan_lines(), the error path return_error(gs_error_rangecheck) and emprintf2(pdev->memory, ...), the gp_fputs/gp_fprintf/gp_fputc/gp_fwrite wrappers, the `byte`/`ulong` typedefs, and the LINE_SIZE device macro. The banner comment /* sample: primevul_c_test_0314_vuln */ and the function name jetp3852_print_page match the historic Ghostscript gdevjetp/3852 driver (GPL/AGPL, Artifex Software).",
+  "trust_boundary": "This is a device *_print_page callback invoked while rendering an input PostScript/PDF/PCL job. The attacker controls the job, hence the page geometry (width and resolution) that determines line_size = gdev_mem_bytes_per_scan_line(pdev), and the rendered pixel content copied into `data` by gdev_prn_copy_scan_lines(). Both the length driver (line_size) and the byte values consumed as table indices (dp[0..7]) are therefore attacker-influenced. The fixed stack buffers data[DATA_SIZE] and plane_data[LINE_SIZE*3] are the destinations that must not be overrun.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0038_cwe120.c",
+      "lines": "2-3",
+      "code": "jetp3852_print_page(gx_device_printer *pdev, gp_file *prn_stream)\n{",
+      "explanation": "The function is a Ghostscript device print_page entry point. `pdev` is the printer device instance and carries the page geometry (pdev->height, pdev->memory) and pixel store; `prn_stream` is the output byte stream that the printer command language is written to. Ghostscript calls this once per rendered page after the page has been rasterized into the device's band/memory buffer. Its job is to translate the internal raster into the JETP-3852 wire command format."
+    },
+    {
+      "file": "corpus/train/train_0038_cwe120.c",
+      "lines": "4",
+      "code": "#define DATA_SIZE (LINE_SIZE * 8)",
+      "explanation": "DATA_SIZE is derived from the device-specific LINE_SIZE macro (defined elsewhere in the driver, not shown). It is the size of the per-scan-line working buffer. The factor of 8 exists because the transpose step below processes the scan line in groups of 8 source bytes at a time to build bit planes; LINE_SIZE is effectively the number of 8-byte groups (and the size of one output color plane). Every subsequent bound in this function is expressed relative to DATA_SIZE and LINE_SIZE, so the correctness of all buffer math hinges on this one external constant."
+    },
+    {
+      "file": "corpus/train/train_0038_cwe120.c",
+      "lines": "6-12",
+      "code": "    unsigned int cnt_2prn;\n    unsigned int count,tempcnt;\n    unsigned char vtp,cntc1,cntc2;\n    int line_size_color_plane;\n\n    byte data[DATA_SIZE];\n    byte plane_data[LINE_SIZE * 3];",
+      "explanation": "Local state. `data[DATA_SIZE]` is the per-line input buffer that raster bytes are copied into. `plane_data[LINE_SIZE * 3]` receives the three transposed color bit-planes (one LINE_SIZE-byte plane each for the three planes written at odp[0], odp[LINE_SIZE], odp[LINE_SIZE*2]). cnt_2prn/count/tempcnt/line_size_color_plane hold the per-plane byte counts sent in the printer header; vtp/cntc1/cntc2 are single-byte command arguments. Both `data` and `plane_data` are fixed-size stack arrays, so any write past their ends is a stack overflow."
+    },
+    {
+      "file": "corpus/train/train_0038_cwe120.c",
+      "lines": "14-15",
+      "code": "    /* Set initial condition for printer */\n    gp_fputs(\"\\033@\",prn_stream);",
+      "explanation": "Emits the ESC @ (0x1B 0x40) printer-reset command to initialize the device before the page data. Pure output, no untrusted input consumed here."
+    },
+    {
+      "file": "corpus/train/train_0038_cwe120.c",
+      "lines": "19-27",
+      "code": "        int lnum;\n        int line_size = gdev_mem_bytes_per_scan_line((gx_device *)pdev);\n        int num_blank_lines = 0;\n\n        if (line_size > DATA_SIZE) {\n            emprintf2(pdev->memory, \"invalid resolution and/or width gives line_size = %d, max. is %d\\n\",\n                      line_size, DATA_SIZE);\n            return_error(gs_error_rangecheck);\n        }",
+      "explanation": "line_size is the number of bytes in one rendered scan line, computed from the device width/resolution by gdev_mem_bytes_per_scan_line(). It is a signed int and is fully determined by the (attacker-chosen) page geometry. The guard rejects the page with gs_error_rangecheck only when line_size is strictly greater than DATA_SIZE, i.e. it treats DATA_SIZE as the maximum acceptable line size. num_blank_lines accumulates consecutive all-zero scan lines so they can be run-length-encoded later. Note this guard is the ONLY size sanity check protecting the fixed `data` buffer for the rest of the function."
+    },
+    {
+      "file": "corpus/train/train_0038_cwe120.c",
+      "lines": "29-35",
+      "code": "        for ( lnum = 0; lnum < pdev->height; lnum++ ) {\n            byte *end_data = data + line_size;\n            gdev_prn_copy_scan_lines(pdev, lnum,\n                                     (byte *)data, line_size);\n            /* Remove trailing 0s. */\n            while ( end_data > data && end_data[-1] == 0 )\n                end_data--;",
+      "explanation": "For every raster row (0..pdev->height-1), end_data is initialized to one-past the last valid byte (data + line_size), then gdev_prn_copy_scan_lines() copies exactly line_size bytes of rendered pixel data into `data`. The trailing-zero trim walks end_data backward over any zero bytes so that trailing blank pixels are not transmitted; it correctly stops at `data` (end_data > data) so it never underflows below the buffer start. After this loop end_data points at one past the last non-zero byte, and can be anywhere in the inclusive range [data, data + line_size]."
+    },
+    {
+      "file": "corpus/train/train_0038_cwe120.c",
+      "lines": "36-46",
+      "code": "            if ( end_data == data ) {\n                /* Blank line */\n                num_blank_lines++;\n            } else {\n                int i;\n                byte *odp;\n                byte *row;\n\n                /* Pad with 0s to fill out the last */\n                /* block of 8 bytes. */\n                memset(end_data, 0, 7);",
+      "explanation": "If the whole line trimmed down to nothing (end_data == data) it is counted as blank and deferred. Otherwise the code wants to zero-pad the tail so the last 8-byte transpose group is complete, and it does so with memset(end_data, 0, 7) — unconditionally writing 7 bytes starting at end_data. Because end_data may equal data + line_size and line_size may equal DATA_SIZE (the guard only rejects `>`), this memset can write up to 7 bytes beyond the end of `data`. This is the padding-write hazard analyzed below."
+    },
+    {
+      "file": "corpus/train/train_0038_cwe120.c",
+      "lines": "48-70",
+      "code": "                /* Transpose the data to get pixel planes. */\n                for ( i = 0, odp = plane_data; i < DATA_SIZE;\n                      i += 8, odp++\n                    ) { /* The following is for 16-bit machines */\n#define spread3(c)\\\n { 0, c, c*0x100, c*0x101, c*0x10000L, c*0x10001L, c*0x10100L, c*0x10101L }\n                    static ulong spr40[8] = spread3(0x40);\n                    static ulong spr8[8] = spread3(8);\n                    static ulong spr2[8] = spread3(2);\n                    register byte *dp = data + i;\n                    register ulong pword =\n                                     (spr40[dp[0]] << 1) +\n                                     (spr40[dp[1]]) +\n                                     (spr40[dp[2]] >> 1) +\n                                     (spr8[dp[3]] << 1) +\n                                     (spr8[dp[4]]) +\n                                     (spr8[dp[5]] >> 1) +\n                                     (spr2[dp[6]]) +\n                                     (spr2[dp[7]] >> 1);\n                    odp[0] = (byte)(pword >> 16);\n                    odp[LINE_SIZE] = (byte)(pword >> 8);\n                    odp[LINE_SIZE*2] = (byte)(pword);\n                }",
+      "explanation": "The transpose reads the scan line 8 source bytes at a time (i steps by 8 up to DATA_SIZE) and produces one output byte per group into three planes. spread3(c) expands to an 8-element table of bit-spread constants; the three static tables spr40/spr8/spr2 are each declared `[8]`, i.e. they are indexed by a 3-bit value 0..7. For each group, dp = data + i and the code indexes spr40[dp[0..2]], spr8[dp[3..5]], spr2[dp[6..7]] using the raw pixel bytes as indices, sums the shifted contributions into a ulong `pword`, and writes the three resulting bytes to odp[0], odp[LINE_SIZE], odp[LINE_SIZE*2]. Because odp advances once per group and the loop runs DATA_SIZE/8 = LINE_SIZE times, odp spans plane_data[0..LINE_SIZE-1] and odp[LINE_SIZE*2] reaches plane_data[3*LINE_SIZE-1] — the exact end of plane_data, so the plane writes are in-bounds by construction. The design assumes each source byte is a 3-bit color index (0..7)."
+    },
+    {
+      "file": "corpus/train/train_0038_cwe120.c",
+      "lines": "71-81",
+      "code": "                /* Skip blank lines if any */\n                if ( num_blank_lines > 0 ) {\n                    /* Do \"dot skips\" */\n                    while(num_blank_lines > 255) {\n                        gp_fputs(\"\\033e\\377\",prn_stream);\n                        num_blank_lines -= 255;\n                    }\n                    vtp = num_blank_lines;\n                    gp_fprintf(prn_stream,\"\\033e%c\",vtp);\n                    num_blank_lines = 0;\n                }",
+      "explanation": "Before emitting the current non-blank line, any accumulated blank lines are flushed as ESC e <count> dot-skip commands. Counts above 255 are emitted in chunks of 255 (the max representable in the single-byte argument), and the remainder is placed in vtp (unsigned char) and written with %c. The residual after the while loop is 1..255, so the vtp truncation is safe here. num_blank_lines is then reset."
+    },
+    {
+      "file": "corpus/train/train_0038_cwe120.c",
+      "lines": "88-96",
+      "code": "                count = line_size / 3;\n                line_size_color_plane = count / 3;\n                cnt_2prn = line_size_color_plane * 3 + 5;\n                tempcnt = cnt_2prn;\n                cntc1 = (tempcnt & 0xFF00) >> 8;\n                cntc2 = (tempcnt & 0x00FF);\n                gp_fprintf(prn_stream, \"\\033[O%c%c\\200\\037\",cntc2,cntc1);\n                gp_fputc('\\000',prn_stream);\n                gp_fputs(\"\\124\\124\",prn_stream);",
+      "explanation": "The per-plane byte count is derived by dividing line_size by 3 (three color planes) and then by 3 again to obtain line_size_color_plane, the number of bytes to transmit per plane. cnt_2prn = line_size_color_plane*3 + 5 is the total payload length placed in the ESC [ O graphics header, split little-endian into low byte cntc2 and high byte cntc1 and emitted with the fixed header bytes. line_size_color_plane also bounds the complement/write loop below, so this arithmetic ties the transmitted length to the plane buffer."
+    },
+    {
+      "file": "corpus/train/train_0038_cwe120.c",
+      "lines": "98-110",
+      "code": "                for ( row = plane_data + LINE_SIZE * 2, i = 0;\n                      i < 3; row -= LINE_SIZE, i++ ) {\n                    int jj;\n                    byte ctemp;\n                    odp = row;\n                    /* Complement bytes */\n                    for (jj=0; jj< line_size_color_plane; jj++) {\n                        ctemp = *odp;\n                        *odp++ = ~ctemp;\n                    }\n                    gp_fwrite(row, sizeof(byte),\n                              line_size_color_plane, prn_stream);\n                }",
+      "explanation": "The three planes are emitted in R,G,B order by starting at plane_data + LINE_SIZE*2 and stepping down by LINE_SIZE each iteration (so row visits the third, second, first plane). For each plane the first line_size_color_plane bytes are one's-complemented in place (~ctemp) and then written to the stream. Since line_size_color_plane = (line_size/3)/3 <= DATA_SIZE/9 < LINE_SIZE, the complement and fwrite stay within each LINE_SIZE-sized plane region of plane_data, so these accesses are in-bounds."
+    },
+    {
+      "file": "corpus/train/train_0038_cwe120.c",
+      "lines": "115-119",
+      "code": "    /* eject page */\n    gp_fputs(\"\\014\", prn_stream);\n\n    return 0;\n}",
+      "explanation": "After all rows are processed, a form-feed (0x0C) is emitted to eject the page and the function returns 0 (success). No untrusted input is consumed at teardown."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0038_cwe120.c",
+      "lines": "46",
+      "code": "                memset(end_data, 0, 7);",
+      "explanation": "Stack out-of-bounds write. end_data can be as high as data + line_size, and the guard at line 23 (`if (line_size > DATA_SIZE)`) only rejects line_size STRICTLY greater than DATA_SIZE, so line_size == DATA_SIZE is accepted. When the trimmed line has a non-zero last byte, end_data == data + DATA_SIZE (one past the buffer), and memset(end_data, 0, 7) writes 7 zero bytes at data[DATA_SIZE..DATA_SIZE+6], past the end of the `data` stack array. More generally, whenever end_data lands within 6 bytes of the end of the buffer (line_size close to DATA_SIZE and few/no trailing zeros), the memset overruns by (7 - (DATA_SIZE - offset)) bytes. The attacker reaches this by choosing a page width/resolution that makes gdev_mem_bytes_per_scan_line() return exactly DATA_SIZE (or within 6 of it) and rendering content whose last byte(s) are non-zero. Impact: overwrite of adjacent stack locals / saved registers / stack canary with zeros — memory corruption, potential crash or control-flow effect. The invariant the code must uphold is that end_data + 7 <= data + DATA_SIZE; equivalently the guard must reserve the 7-byte pad (reject line_size > DATA_SIZE - 7) or clamp the memset length to the space actually remaining in `data`."
+    },
+    {
+      "file": "corpus/train/train_0038_cwe120.c",
+      "lines": "54-66",
+      "code": "                    static ulong spr40[8] = spread3(0x40);\n                    static ulong spr8[8] = spread3(8);\n                    static ulong spr2[8] = spread3(2);\n                    register byte *dp = data + i;\n                    register ulong pword =\n                                     (spr40[dp[0]] << 1) +\n                                     (spr40[dp[1]]) +\n                                     (spr40[dp[2]] >> 1) +\n                                     (spr8[dp[3]] << 1) +\n                                     (spr8[dp[4]]) +\n                                     (spr8[dp[5]] >> 1) +\n                                     (spr2[dp[6]]) +\n                                     (spr2[dp[7]] >> 1);",
+      "explanation": "Out-of-bounds read of the spread tables. spr40, spr8 and spr2 are each declared with 8 elements, but they are indexed by dp[0..7], which are full unsigned-char pixel bytes with range 0..255. The code silently assumes every source byte is a 3-bit color index (0..7), consistent with a 3-bit RGB device color model. If any byte in `data` is >= 8 — because of a wider/mis-configured device depth, a rendering path that leaves >3-bit values, or the uninitialized-tail read described in the next step — the access sprNN[dp[k]] reads up to spr..[255], i.e. as far as ~2 KB past the 8-entry (64-byte) static array into adjacent static storage. Impact: the out-of-bounds bytes are folded into pword and shifted into the output planes, disclosing adjacent process memory into the printed output (information exposure), and on some layouts an unmapped read/crash. The invariant is that every byte handed to the transpose must be within [0,7]; the code never validates this and relies entirely on the device color model being 3-bit."
+    },
+    {
+      "file": "corpus/train/train_0038_cwe120.c",
+      "lines": "49",
+      "code": "                for ( i = 0, odp = plane_data; i < DATA_SIZE;",
+      "explanation": "Use of uninitialized stack memory. gdev_prn_copy_scan_lines() at line 31-32 fills only line_size bytes of `data`, and the pad at line 46 zeroes just 7 bytes near the end, but this transpose loop iterates the full DATA_SIZE (i < DATA_SIZE), not line_size. When line_size < DATA_SIZE, the bytes data[line_size..DATA_SIZE-1] are never initialized on this iteration, yet they are read as dp[0..7] and used both as table indices (feeding the OOB-read hazard above) and as pixel content. The `data` array is reused across all rows, so on later rows it also holds stale data from previous, possibly wider lines. Impact: printed output derived from uninitialized/stale stack contents (correctness bug plus a latent information-exposure channel) and amplification of the spread-table OOB read when a garbage byte exceeds 7. The invariant is that the transpose bound should be the actually-populated extent (round line_size up to a multiple of 8), not the full DATA_SIZE."
+    },
+    {
+      "file": "corpus/train/train_0038_cwe120.c",
+      "lines": "20-23",
+      "code": "        int line_size = gdev_mem_bytes_per_scan_line((gx_device *)pdev);\n        int num_blank_lines = 0;\n\n        if (line_size > DATA_SIZE) {",
+      "explanation": "Signed-length hazard. line_size is a signed int and the only bound check is an upper bound (`> DATA_SIZE`). If gdev_mem_bytes_per_scan_line() ever returns a negative value (integer overflow in an extreme width*depth computation, or an error sentinel), the check passes (a negative is not > DATA_SIZE) and the negative line_size flows into end_data = data + line_size (line 30, a pointer before the buffer) and into gdev_prn_copy_scan_lines(pdev, lnum, data, line_size) as a size argument. Impact: wild pointer / massive copy length depending on the callee's signedness handling — potential out-of-bounds access. The invariant is that line_size must be validated as 0 <= line_size <= DATA_SIZE - 7 before use; a lower-bound (non-negative) check is missing."
+    },
+    {
+      "file": "corpus/train/train_0038_cwe120.c",
+      "lines": "90-93",
+      "code": "                cnt_2prn = line_size_color_plane * 3 + 5;\n                tempcnt = cnt_2prn;\n                cntc1 = (tempcnt & 0xFF00) >> 8;\n                cntc2 = (tempcnt & 0x00FF);",
+      "explanation": "Protocol length truncation (low severity, not memory-unsafe here). cnt_2prn is an unsigned int but only its low 16 bits are transmitted (cntc1 = high byte, cntc2 = low byte). If line_size_color_plane*3+5 ever exceeds 0xFFFF, the high bits are silently dropped and the printer is told a wrong (too-small) payload length, desynchronizing the output stream. With line_size bounded by DATA_SIZE this cannot happen for reasonable LINE_SIZE, but it is a fragile encoding that depends on the external LINE_SIZE macro staying small; it is worth confirming LINE_SIZE keeps cnt_2prn <= 0xFFFF. No local memory safety impact."
+    }
+  ],
+  "summary": "A Ghostscript JETP-3852 printer driver page-emit routine with an attacker-influenced scan-line size. The primary defect is a fixed 7-byte zero-pad memset(end_data,0,7) whose destination can reach one-past the DATA_SIZE `data` stack buffer because the size guard only rejects line_size strictly greater than DATA_SIZE (CWE-787). Secondary hazards: the 8-entry spread tables are indexed by full 0..255 pixel bytes (out-of-bounds read, CWE-125), the transpose loop reads the full DATA_SIZE rather than line_size (uninitialized/stale stack read, CWE-908), and line_size is a signed value with no lower-bound check.",
+  "reviewed_anchors": [
+    { "anchor": "DATA_SIZE macro (LINE_SIZE * 8)", "disposition": "finding", "reason": "Sole bound on the data buffer; the `>` guard against it leaves no room for the 7-byte pad." },
+    { "anchor": "LINE_SIZE (external device macro)", "disposition": "dismissed", "reason": "Defined elsewhere; all buffer sizes scale with it, but no security contract is visible in this file beyond being assumed small — flagged as an assumption in the truncation risk." },
+    { "anchor": "byte data[DATA_SIZE] (line 11)", "disposition": "finding", "reason": "Fixed stack buffer overrun by the pad memset and read past populated extent by the transpose loop." },
+    { "anchor": "byte plane_data[LINE_SIZE * 3] (line 12)", "disposition": "dismissed", "reason": "Transpose writes odp[0..LINE_SIZE*2] over exactly LINE_SIZE groups reaching plane_data[3*LINE_SIZE-1]; complement/fwrite use line_size_color_plane < LINE_SIZE — all in-bounds by construction." },
+    { "anchor": "int line_size = gdev_mem_bytes_per_scan_line(...) (line 20)", "disposition": "finding", "reason": "Signed, attacker-influenced length with only an upper-bound check; a negative return is not rejected." },
+    { "anchor": "if (line_size > DATA_SIZE) guard (line 23)", "disposition": "finding", "reason": "Uses strict `>`, permitting line_size == DATA_SIZE and ignoring the 7-byte pad reservation." },
+    { "anchor": "end_data = data + line_size (line 30)", "disposition": "finding", "reason": "Can equal data+DATA_SIZE (one past end); becomes the memset destination." },
+    { "anchor": "gdev_prn_copy_scan_lines(pdev, lnum, data, line_size) (line 31-32)", "disposition": "dismissed", "reason": "Copies exactly line_size (<= DATA_SIZE) bytes into data; safe given a valid non-negative line_size — the risk is the missing non-negative check, captured under line_size." },
+    { "anchor": "trailing-zero trim while-loop (line 34-35)", "disposition": "dismissed", "reason": "Guarded by end_data > data, so it cannot underflow below the buffer start." },
+    { "anchor": "memset(end_data, 0, 7) (line 46)", "disposition": "finding", "reason": "Fixed 7-byte write past a destination that can reach the end of `data` — stack overflow." },
+    { "anchor": "spread3 macro / spr40,spr8,spr2 [8] tables (lines 52-56)", "disposition": "finding", "reason": "8-element tables indexed by full 0..255 pixel bytes — out-of-bounds read when a byte exceeds 7." },
+    { "anchor": "transpose loop bound i < DATA_SIZE (line 49)", "disposition": "finding", "reason": "Reads the whole buffer including uninitialized/stale bytes beyond line_size." },
+    { "anchor": "pword table-index reads dp[0..7] (lines 57-66)", "disposition": "finding", "reason": "Same OOB-read anchor as the spread tables; indices are unvalidated pixel bytes." },
+    { "anchor": "odp[0]/odp[LINE_SIZE]/odp[LINE_SIZE*2] plane writes (lines 67-69)", "disposition": "dismissed", "reason": "Exactly fill plane_data over LINE_SIZE groups; in-bounds." },
+    { "anchor": "blank-line dot-skip loop + vtp = num_blank_lines (lines 74-78)", "disposition": "dismissed", "reason": "while(>255) leaves a 1..255 residual, so the unsigned-char truncation is exact and safe." },
+    { "anchor": "count/line_size_color_plane/cnt_2prn arithmetic (lines 88-90)", "disposition": "dismissed", "reason": "Divides line_size down; line_size_color_plane < LINE_SIZE, so it cannot exceed plane bounds." },
+    { "anchor": "cntc1/cntc2 truncation to unsigned char (lines 92-93)", "disposition": "finding", "reason": "Only low 16 bits of cnt_2prn are transmitted; latent length-desync if LINE_SIZE were large (low severity)." },
+    { "anchor": "complement loop + gp_fwrite line_size_color_plane (lines 104-109)", "disposition": "dismissed", "reason": "Bounded by line_size_color_plane < LINE_SIZE within each plane region; in-bounds read/write." },
+    { "anchor": "row = plane_data + LINE_SIZE*2, row -= LINE_SIZE (lines 98-99)", "disposition": "dismissed", "reason": "Iterates the three plane bases downward; stays within plane_data." }
+  ],
+  "findings": [
+    {
+      "title": "Stack buffer overflow from fixed 7-byte tail pad (guard uses '>' and ignores pad)",
+      "anchor": "memset(end_data, 0, 7); with guard if (line_size > DATA_SIZE)",
+      "file": "corpus/train/train_0038_cwe120.c",
+      "line": "46",
+      "code": "memset(end_data, 0, 7);",
+      "bug_class": "Stack out-of-bounds write (off-by / insufficient bounds check)",
+      "cwe": "CWE-787",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0038_cwe120.c",
+      "invariant": "The pad must stay inside `data`: end_data + 7 <= data + DATA_SIZE. Equivalently the guard must reject line_size > DATA_SIZE - 7 (or clamp the memset length to (data + DATA_SIZE) - end_data).",
+      "failure_mode": "line_size is attacker-influenced via page width/resolution and the guard at line 23 rejects only line_size strictly greater than DATA_SIZE, so line_size == DATA_SIZE is accepted. After trailing-zero trim, end_data can equal data + line_size == data + DATA_SIZE; memset(end_data,0,7) then writes data[DATA_SIZE..DATA_SIZE+6], up to 7 zero bytes past the stack buffer. Choosing a geometry with line_size within 6 of DATA_SIZE and a non-zero last pixel triggers it. Impact: adjacent stack locals / saved registers / canary overwritten with zeros -> corruption, crash, or control-flow effect.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm gdev_mem_bytes_per_scan_line() can return a value in [DATA_SIZE-6, DATA_SIZE] for an attacker-selectable page, and that no later trim guarantees at least 7 bytes of headroom before the memset."
+    },
+    {
+      "title": "Out-of-bounds read of 8-element spread tables indexed by full 0..255 pixel bytes",
+      "anchor": "spr40[8]/spr8[8]/spr2[8] indexed by dp[0..7]",
+      "file": "corpus/train/train_0038_cwe120.c",
+      "line": "54-66",
+      "code": "static ulong spr40[8] = spread3(0x40);\nstatic ulong spr8[8] = spread3(8);\nstatic ulong spr2[8] = spread3(2);\nregister byte *dp = data + i;\nregister ulong pword =\n                 (spr40[dp[0]] << 1) +\n                 (spr40[dp[1]]) +\n                 (spr40[dp[2]] >> 1) +\n                 (spr8[dp[3]] << 1) +\n                 (spr8[dp[4]]) +\n                 (spr8[dp[5]] >> 1) +\n                 (spr2[dp[6]]) +\n                 (spr2[dp[7]] >> 1);",
+      "bug_class": "Out-of-bounds read (unvalidated array index)",
+      "cwe": "CWE-125",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0038_cwe120.c",
+      "invariant": "Every source byte used as a table index must be in [0,7] (a 3-bit color index), matching the 8-entry table size; otherwise the index must be masked (dp[k] & 7) or validated.",
+      "failure_mode": "The tables have 8 entries but are indexed by unsigned-char pixel bytes (0..255). Any byte >= 8 — from a wider/misconfigured device depth, a rendering path leaving non-3-bit values, or the uninitialized tail read (see next finding) — reads up to spr..[255], ~2 KB past the 64-byte static array into adjacent static storage. Those bytes are shifted into pword and printed, disclosing adjacent process memory into the output, or crashing on an unmapped read.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the device's color model guarantees every byte in `data` is <= 7, and whether the tables should be masked/enlarged; check what static data neighbors spr40/spr8/spr2 in the binary."
+    },
+    {
+      "title": "Transpose reads full DATA_SIZE, consuming uninitialized/stale stack beyond line_size",
+      "anchor": "for ( i = 0, odp = plane_data; i < DATA_SIZE; ...)",
+      "file": "corpus/train/train_0038_cwe120.c",
+      "line": "49",
+      "code": "for ( i = 0, odp = plane_data; i < DATA_SIZE;",
+      "bug_class": "Use of uninitialized/stale memory (info exposure)",
+      "cwe": "CWE-908",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0038_cwe120.c",
+      "invariant": "The transpose must only read bytes actually populated by gdev_prn_copy_scan_lines(): bound the loop by line_size rounded up to a multiple of 8, and zero the whole padding region, not just 7 bytes.",
+      "failure_mode": "gdev_prn_copy_scan_lines() fills only line_size bytes and the pad zeroes only 7, but the loop iterates i < DATA_SIZE. When line_size < DATA_SIZE, bytes data[line_size..DATA_SIZE-1] are uninitialized (or stale from a previous, wider row since `data` is reused) yet are read as pixel/index values. Result: printed output derived from uninitialized stack memory (correctness + latent info leak) and amplification of the spread-table OOB read when a garbage byte exceeds 7.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm whether downstream only sends line_size_color_plane bytes per plane (limiting exposure) and whether uninitialized data can index the spread tables out of range before that limiting takes effect."
+    },
+    {
+      "title": "Signed line_size with only an upper-bound check (no non-negative validation)",
+      "anchor": "int line_size = gdev_mem_bytes_per_scan_line(...); if (line_size > DATA_SIZE)",
+      "file": "corpus/train/train_0038_cwe120.c",
+      "line": "20-23",
+      "code": "int line_size = gdev_mem_bytes_per_scan_line((gx_device *)pdev);\nint num_blank_lines = 0;\n\nif (line_size > DATA_SIZE) {",
+      "bug_class": "Missing input validation / signed length underflow",
+      "cwe": "CWE-20",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0038_cwe120.c",
+      "invariant": "line_size must be validated as 0 <= line_size <= DATA_SIZE - 7 before being used as a pointer offset (end_data = data + line_size) or a copy length.",
+      "failure_mode": "line_size is signed and only checked against an upper bound. If gdev_mem_bytes_per_scan_line() returns a negative value (overflow in width*depth math or an error sentinel), the guard passes and the negative flows into end_data = data + line_size (a pointer before the buffer) and into gdev_prn_copy_scan_lines as a size, risking wild pointer / oversized copy depending on callee signedness.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the range and error semantics of gdev_mem_bytes_per_scan_line() — can it return negative, and how does gdev_prn_copy_scan_lines interpret a negative length?"
+    },
+    {
+      "title": "Payload-length header truncated to 16 bits",
+      "anchor": "cnt_2prn / cntc1 / cntc2 encoding",
+      "file": "corpus/train/train_0038_cwe120.c",
+      "line": "90-93",
+      "code": "cnt_2prn = line_size_color_plane * 3 + 5;\ntempcnt = cnt_2prn;\ncntc1 = (tempcnt & 0xFF00) >> 8;\ncntc2 = (tempcnt & 0x00FF);",
+      "bug_class": "Numeric truncation of a protocol length field",
+      "cwe": "CWE-681",
+      "severity": "info",
+      "where_it_lives": "corpus/train/train_0038_cwe120.c",
+      "invariant": "cnt_2prn (line_size_color_plane*3+5) must fit in 16 bits; the external LINE_SIZE must keep it <= 0xFFFF.",
+      "failure_mode": "cnt_2prn is an unsigned int but only its low 16 bits (cntc1:cntc2) are emitted in the ESC [ O header. If a large LINE_SIZE ever pushed cnt_2prn above 0xFFFF, the printer would receive a wrong (too-small) payload length and the stream would desynchronize. Bounded away by DATA_SIZE for small LINE_SIZE, so no local memory-safety impact.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the maximum LINE_SIZE for this device keeps line_size_color_plane*3+5 <= 0xFFFF."
+    }
+  ],
+  "audit_checklist": [
+    "Change the guard at line 23 to reserve the pad (reject line_size > DATA_SIZE - 7) or clamp memset length to (data + DATA_SIZE) - end_data so the 7-byte pad can never overrun `data`.",
+    "Confirm the maximum value gdev_mem_bytes_per_scan_line() can return for an attacker-chosen page and that it is non-negative; add a 0 <= line_size lower-bound check.",
+    "Verify the device color model guarantees every byte in `data` is in [0,7]; if not, mask spread-table indices (dp[k] & 7) or size the tables to 256.",
+    "Bound the transpose loop by the populated extent (line_size rounded up to a multiple of 8), not DATA_SIZE, and zero the full padding region so no uninitialized/stale stack is transposed or printed.",
+    "Confirm LINE_SIZE keeps line_size_color_plane*3+5 within 16 bits so the ESC [ O payload-length header is never truncated.",
+    "Check that `data` reuse across rows cannot leak a previous, wider line's pixels through the fixed-DATA_SIZE transpose."
+  ]
+}

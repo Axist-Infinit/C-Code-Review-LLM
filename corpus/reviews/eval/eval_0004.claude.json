@@ -1,0 +1,221 @@
+{
+  "subsystem": "TensorFlow core op kernel: the Compute() method of the StringNGrams op (tf.raw_ops.StringNGrams / StringNGramsOp in tensorflow/core/kernels/string_ngrams_op.cc). It takes a flat string tensor `data` plus an integer `data_splits` (RaggedTensor row-splits) describing how `data` is partitioned into per-row sequences, then emits an n-gram RaggedTensor: an output `ngrams` string tensor of all generated n-grams and an output `ngrams_splits` int tensor of row offsets. Attributes ngram_widths_, pad_width_, preserve_short_ (and a separator, not shown) parameterize how many n-grams each row produces.",
+  "provenance": "Identified from TensorFlow-specific API surface: the kernel entry point `void Compute(tensorflow::OpKernelContext* context) override` (line 2), `context->input(...)`, `context->allocate_output(...)`, `Tensor::flat<tstring>()` / `flat<SPLITS_TYPE>()`, the `tstring` string type, `TensorShape`, and the `errors::InvalidArgument(...)` builder wrapped by the `OP_REQUIRES` / `OP_REQUIRES_OK` guard macros. `SPLITS_TYPE` is the row-splits index type macro (int32 or int64) used to instantiate the ragged op. The `data` / `data_splits` naming and the ngrams/preserve_short/pad_width semantics match TensorFlow's StringNGramsOp (Apache-2.0). The sample banner `primevul_test_0050_vuln` and file name `eval_0004_cwe190.cpp` come from the PrimeVul corpus.",
+  "trust_boundary": "This is a TensorFlow kernel: its inputs are the runtime tensor arguments to the op. In TF's threat model these are attacker-controllable whenever the graph or its feed values come from an untrusted source (a loaded SavedModel/GraphDef, a serving request supplying tensors, or any user who can call tf.raw_ops.StringNGrams). The hostile inputs are the values inside `data_splits` (arbitrary integers in splits_vec, which drive every index and length computation), the element count of `data`, and the op attributes ngram_widths_, pad_width_, and preserve_short_. The kernel must treat splits_vec as fully adversarial: monotonicity, bounds, and the arithmetic that turns splits into output-buffer sizes are all reachable from untrusted input.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/eval/eval_0004_cwe190.cpp",
+      "lines": "2-7",
+      "code": "  void Compute(tensorflow::OpKernelContext* context) override {\n    for (int ngram_width : ngram_widths_) {\n      OP_REQUIRES(\n          context, ngram_width > 0,\n          errors::InvalidArgument(\"ngram_widths must contain positive values\"));\n    }",
+      "explanation": "Compute() is the per-invocation kernel body; `context` carries the op's inputs, output allocators, and the mechanism to raise errors. The loop iterates the attribute `ngram_widths_` (the set of n-gram sizes the op will produce) and asserts each is strictly positive via OP_REQUIRES, which — if the predicate is false — populates `context` with an InvalidArgument status and returns from Compute. Note this gate only vets values that came from the `ngram_widths_` attribute; a width value computed later from input data (line 102) does not pass through this check."
+    },
+    {
+      "file": "corpus/eval/eval_0004_cwe190.cpp",
+      "lines": "9-15",
+      "code": "    const tensorflow::Tensor* data;\n    OP_REQUIRES_OK(context, context->input(\"data\", &data));\n    const auto& input_data = data->flat<tstring>().data();\n\n    const tensorflow::Tensor* splits;\n    OP_REQUIRES_OK(context, context->input(\"data_splits\", &splits));\n    const auto& splits_vec = splits->flat<SPLITS_TYPE>();",
+      "explanation": "The two inputs are fetched. `data` is the flat string tensor of tokens; `input_data` is a raw pointer to its underlying contiguous `tstring` array obtained via flat<tstring>().data(), so `input_data[k]` is the k-th token. `splits` is the row-splits tensor, viewed as `splits_vec`, a flat accessor of SPLITS_TYPE integers where `splits_vec(i)` is an index into `data`. OP_REQUIRES_OK propagates any failure from fetching the inputs. Everything downstream indexes `input_data` and sizes buffers using values pulled from `splits_vec`, which is untrusted."
+    },
+    {
+      "file": "corpus/eval/eval_0004_cwe190.cpp",
+      "lines": "17-20",
+      "code": "    // Validate that the splits are valid indices into data, only if there are\n    // splits specified.\n    const int input_data_size = data->flat<tstring>().size();\n    const int splits_vec_size = splits_vec.size();",
+      "explanation": "`input_data_size` caches the number of tokens in `data`, and `splits_vec_size` caches the number of split entries. Both are read from tensor .size() accessors (Eigen index type, effectively int64) and immediately narrowed to `int`. These two ints become the bounds used by the validation loop and the batch-count arithmetic below, so the narrowing here is load-bearing."
+    },
+    {
+      "file": "corpus/eval/eval_0004_cwe190.cpp",
+      "lines": "21-39",
+      "code": "    if (splits_vec_size > 0) {\n      int prev_split = splits_vec(0);\n      OP_REQUIRES(context, prev_split == 0,\n                  errors::InvalidArgument(\"First split value must be 0, got \",\n                                          prev_split));\n      for (int i = 1; i < splits_vec_size; ++i) {\n        bool valid_splits = splits_vec(i) >= prev_split;\n        valid_splits = valid_splits && (splits_vec(i) <= input_data_size);\n        OP_REQUIRES(context, valid_splits,\n                    errors::InvalidArgument(\n                        \"Invalid split value \", splits_vec(i), \", must be in [\",\n                        prev_split, \", \", input_data_size, \"]\"));\n        prev_split = splits_vec(i);\n      }\n      OP_REQUIRES(context, prev_split == input_data_size,\n                  errors::InvalidArgument(\n                      \"Last split value must be data size. Expected \",\n                      input_data_size, \", got \", prev_split));\n    }",
+      "explanation": "This is the row-splits validation gate — the security-critical guard that makes the token READ side safe. When there is at least one split, it requires splits_vec(0)==0, then walks the array requiring each entry to be non-decreasing (`>= prev_split`) and no larger than `input_data_size`, and finally requires the last entry to equal `input_data_size`. If all pass, every splits_vec(i) lies in [0, input_data_size] and the values are monotonic, so `&input_data[splits_vec(i)]` and reads of `splits_vec(i+1)-splits_vec(i)` tokens stay within `data`. Crucially, all of these comparisons are performed after splits_vec(i) has been narrowed into `int prev_split`/int comparisons and against the `int input_data_size`; the bound is enforced in int space, not in SPLITS_TYPE space."
+    },
+    {
+      "file": "corpus/eval/eval_0004_cwe190.cpp",
+      "lines": "41-45",
+      "code": "    int num_batch_items = splits_vec.size() - 1;\n    tensorflow::Tensor* ngrams_splits;\n    OP_REQUIRES_OK(\n        context, context->allocate_output(1, splits->shape(), &ngrams_splits));\n    auto ngrams_splits_data = ngrams_splits->flat<SPLITS_TYPE>().data();",
+      "explanation": "`num_batch_items` is the number of rows = number of split entries minus one, again narrowed to `int`. The output row-splits tensor `ngrams_splits` is allocated with the same shape as the input splits, and `ngrams_splits_data` is its raw writable buffer. `ngrams_splits_data[i]` will hold the running offset (in n-grams) at which row i's output begins; the final entry is the total number of n-grams and is later used to size the main output buffer."
+    },
+    {
+      "file": "corpus/eval/eval_0004_cwe190.cpp",
+      "lines": "47-56",
+      "code": "    // If there is no data or size, return an empty RT.\n    if (data->flat<tstring>().size() == 0 || splits_vec.size() == 0) {\n      tensorflow::Tensor* empty;\n      OP_REQUIRES_OK(context,\n                     context->allocate_output(0, data->shape(), &empty));\n      for (int i = 0; i <= num_batch_items; ++i) {\n        ngrams_splits_data[i] = 0;\n      }\n      return;\n    }",
+      "explanation": "Fast path for empty inputs: if `data` has zero tokens or there are zero splits, allocate an empty ngrams output and zero-fill the ngrams_splits buffer, then return. Because this runs after num_batch_items is computed, the loop bound `i <= num_batch_items` matters: if splits_vec.size()==0 then num_batch_items == -1 and the loop body does not execute (writing nothing); if splits_vec.size()>=1 the buffer has that many entries and the loop writes exactly them. This guard prevents the later size-arithmetic from running on degenerate inputs."
+    },
+    {
+      "file": "corpus/eval/eval_0004_cwe190.cpp",
+      "lines": "58-68",
+      "code": "    ngrams_splits_data[0] = 0;\n    for (int i = 1; i <= num_batch_items; ++i) {\n      int length = splits_vec(i) - splits_vec(i - 1);\n      int num_ngrams = 0;\n      for (int ngram_width : ngram_widths_)\n        num_ngrams += get_num_ngrams(length, ngram_width);\n      if (preserve_short_ && length > 0 && num_ngrams == 0) {\n        num_ngrams = 1;\n      }\n      ngrams_splits_data[i] = ngrams_splits_data[i - 1] + num_ngrams;\n    }",
+      "explanation": "First pass: compute the prefix-sum of n-gram counts to lay out the output. For each row i, `length` is the token count of that row (splits difference, kept in `int`), `num_ngrams` sums get_num_ngrams(length, width) across all configured widths, and preserve_short_ bumps a zero count to one for a non-empty row. The running total is written into ngrams_splits_data[i] as `ngrams_splits_data[i-1] + num_ngrams`. This accumulated total is the exact number of output strings that the second pass will write, and (via its final element) the size that the output tensor is allocated to hold — so the arithmetic here must not overflow relative to what pass two actually writes."
+    },
+    {
+      "file": "corpus/eval/eval_0004_cwe190.cpp",
+      "lines": "70-75",
+      "code": "    tensorflow::Tensor* ngrams;\n    OP_REQUIRES_OK(\n        context,\n        context->allocate_output(\n            0, TensorShape({ngrams_splits_data[num_batch_items]}), &ngrams));\n    auto ngrams_data = ngrams->flat<tstring>().data();",
+      "explanation": "The main output tensor `ngrams` is allocated with a 1-D shape whose single dimension is `ngrams_splits_data[num_batch_items]` — the grand total of n-grams computed in pass one. `ngrams_data` is its raw writable tstring buffer. Every subsequent CreateNgrams write targets an offset into this buffer, so the correctness of this allocation size versus the second pass's writes is the central memory-safety invariant of the whole kernel."
+    },
+    {
+      "file": "corpus/eval/eval_0004_cwe190.cpp",
+      "lines": "77-86",
+      "code": "    for (int i = 0; i < num_batch_items; ++i) {\n      auto data_start = &input_data[splits_vec(i)];\n      int output_start_idx = ngrams_splits_data[i];\n      for (int ngram_width : ngram_widths_) {\n        auto output_start = &ngrams_data[output_start_idx];\n        int length = splits_vec(i + 1) - splits_vec(i);\n        int num_ngrams = get_num_ngrams(length, ngram_width);\n        CreateNgrams(data_start, output_start, num_ngrams, ngram_width);\n        output_start_idx += num_ngrams;\n      }",
+      "explanation": "Second pass: actually produce the n-grams. `data_start` points at the first token of row i inside `input_data` (index splits_vec(i), which the validation gate bounded to [0, input_data_size]). `output_start_idx` starts at the row's precomputed offset. For each width it recomputes `length` and `num_ngrams = get_num_ngrams(length, ngram_width)`, then CreateNgrams writes `num_ngrams` strings starting at `output_start` (offset output_start_idx in ngrams_data), and advances output_start_idx. Memory safety here requires that the sum of num_ngrams written for every row/width never exceeds the total that was allocated at line 74 — i.e. the per-width num_ngrams recomputed here must exactly match what pass one summed."
+    },
+    {
+      "file": "corpus/eval/eval_0004_cwe190.cpp",
+      "lines": "87-107",
+      "code": "      // If we're preserving short sequences, check to see if no sequence was\n      // generated by comparing the current output start idx to the original\n      // one (ngram_splits_data). If no ngrams were generated, then they will\n      // be equal (since we increment output_start_idx by num_ngrams every\n      // time we create a set of ngrams.)\n      if (preserve_short_ && output_start_idx == ngrams_splits_data[i]) {\n        int data_length = splits_vec(i + 1) - splits_vec(i);\n        // One legitimate reason to not have any ngrams when preserve_short_\n        // is true is if the sequence itself is empty. In that case, move on.\n        if (data_length == 0) {\n          continue;\n        }\n        // We don't have to worry about dynamic padding sizes here: if padding\n        // was dynamic, every sequence would have had sufficient padding to\n        // generate at least one ngram.\n        int ngram_width = data_length + 2 * pad_width_;\n        auto output_start = &ngrams_data[output_start_idx];\n        int num_ngrams = 1;\n        CreateNgrams(data_start, output_start, num_ngrams, ngram_width);\n      }",
+      "explanation": "The preserve_short_ tail: if no n-grams were emitted for a non-empty row (detected by output_start_idx still equal to the row's start offset), the op synthesizes one padded n-gram spanning the whole row. It computes a synthetic width `ngram_width = data_length + 2 * pad_width_`, points output_start at the current offset, and CreateNgrams writes a single n-gram of that width. This width is derived from input data and the pad_width_ attribute rather than from ngram_widths_, so it never passed the positivity gate at lines 4-6, and the `data_length + 2 * pad_width_` expression is signed int arithmetic on attacker-influenced magnitudes."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/eval/eval_0004_cwe190.cpp",
+      "lines": "58-74",
+      "code": "      ngrams_splits_data[i] = ngrams_splits_data[i - 1] + num_ngrams;\n    }\n\n    tensorflow::Tensor* ngrams;\n    OP_REQUIRES_OK(\n        context,\n        context->allocate_output(\n            0, TensorShape({ngrams_splits_data[num_batch_items]}), &ngrams));",
+      "explanation": "The output size is a running sum of per-row n-gram counts, and both the individual num_ngrams and the accumulator are computed in bounded integer types (int num_ngrams; ngrams_splits_data of SPLITS_TYPE). The split-validation gate only proves splits are monotonic and <= input_data_size; it says nothing about how large the resulting n-gram total is. With a large per-row `length` (up to input_data_size) times many rows and multiple widths, `get_num_ngrams(length, ngram_width)` and the prefix sum `ngrams_splits_data[i-1] + num_ngrams` can overflow the width used, producing a total that is wrong (or negative). That corrupted total flows straight into TensorShape({ngrams_splits_data[num_batch_items]}) at line 74, so the ngrams output is allocated too small (or the shape is bogus). The second pass then writes the true, larger number of n-grams into the undersized buffer via CreateNgrams — a heap out-of-bounds write. The invariant the implementation must uphold is that the accumulated n-gram count is computed in a type wide enough to hold it AND checked to match what pass two writes before it is used as the allocation size; here it is not."
+    },
+    {
+      "file": "corpus/eval/eval_0004_cwe190.cpp",
+      "lines": "102-105",
+      "code": "        int ngram_width = data_length + 2 * pad_width_;\n        auto output_start = &ngrams_data[output_start_idx];\n        int num_ngrams = 1;\n        CreateNgrams(data_start, output_start, num_ngrams, ngram_width);",
+      "explanation": "In the preserve_short_ tail, the synthetic width is `int ngram_width = data_length + 2 * pad_width_`. `data_length` is an attacker-controlled row length (splits difference, up to input_data_size) and `pad_width_` is an attribute; `2 * pad_width_` and the addition are signed-int operations that can overflow (UB, and in practice a wraparound to a negative or nonsensical width). Unlike the ngram_widths_ entries, this width is never run through the `ngram_width > 0` gate at lines 4-6. CreateNgrams is then called with this width and num_ngrams=1: a negative or overflowed width can make the helper compute a wrong copy extent and read past the end of the row in `input_data` (out-of-bounds read) and/or write a malformed n-gram. The implementation must compute this width in a checked/wide type and reject non-positive or overflowed values before calling CreateNgrams."
+    },
+    {
+      "file": "corpus/eval/eval_0004_cwe190.cpp",
+      "lines": "19-20",
+      "code": "    const int input_data_size = data->flat<tstring>().size();\n    const int splits_vec_size = splits_vec.size();",
+      "explanation": "Both tensor sizes are truncated from a 64-bit Eigen index into `int`. If `data` (or splits) legitimately holds more than INT_MAX elements, `input_data_size` becomes negative or a small wrapped value, which then serves as the upper bound in the validation loop (line 28) and as the expected last-split value (line 35). A wrapped `input_data_size` makes the bounds check `splits_vec(i) <= input_data_size` accept out-of-range indices, defeating the very gate that keeps `&input_data[splits_vec(i)]` in bounds. The implementation should carry these sizes as int64 and compare in the splits' native index type."
+    },
+    {
+      "file": "corpus/eval/eval_0004_cwe190.cpp",
+      "lines": "22-33",
+      "code": "      int prev_split = splits_vec(0);\n      OP_REQUIRES(context, prev_split == 0,\n                  errors::InvalidArgument(\"First split value must be 0, got \",\n                                          prev_split));\n      for (int i = 1; i < splits_vec_size; ++i) {\n        bool valid_splits = splits_vec(i) >= prev_split;\n        valid_splits = valid_splits && (splits_vec(i) <= input_data_size);\n        OP_REQUIRES(context, valid_splits,",
+      "explanation": "When SPLITS_TYPE is int64, splits_vec(i) is a 64-bit value but it is compared against `int prev_split` and `int input_data_size`. `prev_split` is a 32-bit copy of splits_vec(i) (line 33: prev_split = splits_vec(i)), silently truncating the high 32 bits. A crafted split whose low 32 bits look in-range (e.g. value 0x1_0000_0005 truncates to 5) can pass the `>= prev_split` / `<= input_data_size` checks while the full 64-bit value used later at `&input_data[splits_vec(i)]` (line 78) and in `splits_vec(i)-splits_vec(i-1)` lengths is far out of range — an out-of-bounds read of `data`, and a wrong `length` feeding the size math. The bounds comparison must be done in the same (full) width as the value that is later used to index."
+    },
+    {
+      "file": "corpus/eval/eval_0004_cwe190.cpp",
+      "lines": "60-83",
+      "code": "      int length = splits_vec(i) - splits_vec(i - 1);\n      int num_ngrams = 0;\n      for (int ngram_width : ngram_widths_)\n        num_ngrams += get_num_ngrams(length, ngram_width);",
+      "explanation": "The output layout is computed twice — once in pass one (line 60-67, summed across widths with the preserve_short_ bump) and again in pass two (line 82-83, per width, plus the separate preserve_short_ path at 102-105). Memory safety depends on these two computations agreeing exactly, because pass one sizes the buffer and pass two fills it. Any divergence — a different `length` due to int truncation, a get_num_ngrams that is not a pure function of (length,width), or the preserve_short_ branch at 102-105 emitting an extra n-gram that pass one's `num_ngrams==0 -> 1` bump did not account for — makes pass two write more strings than were allocated, an out-of-bounds write into ngrams_data. The implementation must guarantee the two passes produce identical counts (ideally by sizing from the same values it writes)."
+    },
+    {
+      "file": "corpus/eval/eval_0004_cwe190.cpp",
+      "lines": "41-52",
+      "code": "    int num_batch_items = splits_vec.size() - 1;",
+      "explanation": "`num_batch_items` narrows splits_vec.size()-1 to int. For an in-range non-empty input this is fine and the empty guard (lines 48-56) handles size==0 (num_batch_items == -1, loops skipped). The residual concern is truncation for pathologically large split tensors: if splits_vec.size() exceeds INT_MAX, num_batch_items wraps, and the loops at lines 52, 59, and 77 that use it as an int bound iterate the wrong number of times (potentially over- or under-writing ngrams_splits_data / ngrams_data). Lower likelihood than the arithmetic-overflow findings, but the count should be carried as int64."
+    }
+  ],
+  "summary": "This is TensorFlow's StringNGramsOp::Compute. It contains the row-splits validation gate that bounds the READ side, but the n-gram COUNT arithmetic that sizes the output buffer is done in bounded int/SPLITS_TYPE without overflow checks, and the second pass writes based on recomputed counts: an attacker who controls data_splits (and pad_width_) can make the accumulated total at line 74 overflow — or the synthetic width at line 102 overflow — so the ngrams output is under-allocated and CreateNgrams writes out of bounds (integer-overflow-driven heap buffer overflow). Truncation of int64 sizes/splits into int can also defeat the bounds gate itself.",
+  "reviewed_anchors": [
+    {"anchor": "void Compute(tensorflow::OpKernelContext* context) override (line 2)", "disposition": "dismissed", "reason": "Kernel entry point; the context pointer is framework-supplied and non-null by contract, no finding on the signature itself."},
+    {"anchor": "ngram_widths_ positivity gate, OP_REQUIRES ngram_width > 0 (lines 3-6)", "disposition": "dismissed", "reason": "Correctly rejects non-positive attribute widths; but note it does NOT cover the width computed at line 102 (captured under that finding)."},
+    {"anchor": "input_data = data->flat<tstring>().data() (line 11)", "disposition": "dismissed", "reason": "Raw pointer into data buffer; safe as long as indices stay bounded, which is the subject of the splits findings rather than this line."},
+    {"anchor": "splits_vec = splits->flat<SPLITS_TYPE>() (line 15)", "disposition": "finding", "reason": "Source of all untrusted indices; SPLITS_TYPE width vs int narrowing is a truncation hazard (F4)."},
+    {"anchor": "SPLITS_TYPE macro (lines 15,45,58)", "disposition": "finding", "reason": "When int64, comparisons/copies into int truncate the high bits, defeating validation (F4)."},
+    {"anchor": "const int input_data_size = ...size() (line 19)", "disposition": "finding", "reason": "int64 size narrowed to int; a wrapped bound weakens the validation gate (F3)."},
+    {"anchor": "const int splits_vec_size = splits_vec.size() (line 20)", "disposition": "dismissed", "reason": "Only used as a loop bound within validation; truncation subsumed by the num_batch_items/size narrowing finding (F6)."},
+    {"anchor": "Row-splits validation loop (lines 21-39)", "disposition": "finding", "reason": "The critical READ-side gate; it is correct in int space but is undermined by int/int64 narrowing (F3/F4) and provides no bound on n-gram COUNT."},
+    {"anchor": "int prev_split = splits_vec(0) and prev_split = splits_vec(i) (lines 22, 33)", "disposition": "finding", "reason": "Narrows 64-bit split into int used for bounds comparison — truncation bypass (F4)."},
+    {"anchor": "int num_batch_items = splits_vec.size() - 1 (line 41)", "disposition": "finding", "reason": "int narrowing of size()-1; loop-bound truncation for huge tensors (F6). Underflow to -1 for empty splits is guarded at lines 48-56."},
+    {"anchor": "allocate_output(1, splits->shape(), &ngrams_splits) / ngrams_splits_data (lines 42-45)", "disposition": "dismissed", "reason": "Output allocated to match the input splits shape; buffer size matches the index range used, no independent contract."},
+    {"anchor": "Empty-input guard (lines 47-56)", "disposition": "dismissed", "reason": "Correctly short-circuits zero data/splits and its ngrams_splits_data write loop is bounded by num_batch_items; no issue."},
+    {"anchor": "Prefix-sum loop and ngrams_splits_data[i] = ngrams_splits_data[i-1] + num_ngrams (lines 58-67)", "disposition": "finding", "reason": "Unchecked accumulation of n-gram counts that sizes the output buffer — integer overflow -> under-allocation (F1)."},
+    {"anchor": "int length = splits_vec(i) - splits_vec(i-1) (line 60)", "disposition": "finding", "reason": "int-typed length feeding get_num_ngrams; truncation/consistency risk between the two passes (F5)."},
+    {"anchor": "num_ngrams += get_num_ngrams(length, ngram_width) (lines 62-63)", "disposition": "finding", "reason": "Helper (not shown) return summed in int; overflow and pass-1/pass-2 count agreement are the core hazards (F1/F5)."},
+    {"anchor": "preserve_short_ zero->one bump (lines 64-66)", "disposition": "finding", "reason": "Must exactly mirror the preserve_short_ write path at 102-105 or the count desyncs (F5)."},
+    {"anchor": "allocate_output(0, TensorShape({ngrams_splits_data[num_batch_items]}), &ngrams) (lines 70-74)", "disposition": "finding", "reason": "Output size taken directly from the possibly-overflowed accumulator — the sink of the heap overflow (F1)."},
+    {"anchor": "ngrams_data = ngrams->flat<tstring>().data() (line 75)", "disposition": "dismissed", "reason": "Raw write pointer; its safety is entirely determined by the allocation-size finding (F1)."},
+    {"anchor": "data_start = &input_data[splits_vec(i)] (line 78)", "disposition": "finding", "reason": "Indexes data with a split value; safe under the int-space gate but exposed by SPLITS_TYPE truncation (F4)."},
+    {"anchor": "output_start = &ngrams_data[output_start_idx]; CreateNgrams(...) (lines 81-84)", "disposition": "finding", "reason": "The write site; writes num_ngrams strings that must fit the buffer sized in pass one (F1/F5)."},
+    {"anchor": "output_start_idx += num_ngrams (line 85)", "disposition": "dismissed", "reason": "Cursor advance; correctness follows from the pass-1/pass-2 count agreement finding (F5)."},
+    {"anchor": "preserve_short_ tail predicate output_start_idx == ngrams_splits_data[i] (line 92)", "disposition": "dismissed", "reason": "Detection logic for the zero-ngram case; the hazard is the width/count it then produces (F2/F5)."},
+    {"anchor": "int ngram_width = data_length + 2 * pad_width_ (line 102)", "disposition": "finding", "reason": "Signed-int overflow of a data/attribute-derived width that bypasses the positivity gate (F2)."},
+    {"anchor": "CreateNgrams(data_start, output_start, num_ngrams, ngram_width) in tail (line 105)", "disposition": "finding", "reason": "Writes one n-gram of the computed width; negative/overflowed width -> OOB read/write (F2)."},
+    {"anchor": "pad_width_ attribute (lines 102)", "disposition": "finding", "reason": "Attacker-influenced multiplier in the width computation; overflow contributor (F2)."},
+    {"anchor": "get_num_ngrams / CreateNgrams helpers (not shown)", "disposition": "finding", "reason": "Latent: the actual copy bounds live in these helpers; their behavior under overflowed length/width is the realization of F1/F2/F5."},
+    {"anchor": "OP_REQUIRES / OP_REQUIRES_OK macros", "disposition": "dismissed", "reason": "Standard TF status-check macros; assumed to early-return on failure, no per-site contract issue."}
+  ],
+  "findings": [
+    {
+      "title": "Integer overflow in n-gram count accumulation under-allocates the ngrams output (heap OOB write)",
+      "anchor": "ngrams_splits_data[i] = ngrams_splits_data[i - 1] + num_ngrams;  ...  TensorShape({ngrams_splits_data[num_batch_items]})",
+      "file": "corpus/eval/eval_0004_cwe190.cpp",
+      "line": "58-74",
+      "code": "    ngrams_splits_data[0] = 0;\n    for (int i = 1; i <= num_batch_items; ++i) {\n      int length = splits_vec(i) - splits_vec(i - 1);\n      int num_ngrams = 0;\n      for (int ngram_width : ngram_widths_)\n        num_ngrams += get_num_ngrams(length, ngram_width);\n      if (preserve_short_ && length > 0 && num_ngrams == 0) {\n        num_ngrams = 1;\n      }\n      ngrams_splits_data[i] = ngrams_splits_data[i - 1] + num_ngrams;\n    }\n\n    tensorflow::Tensor* ngrams;\n    OP_REQUIRES_OK(\n        context,\n        context->allocate_output(\n            0, TensorShape({ngrams_splits_data[num_batch_items]}), &ngrams));",
+      "bug_class": "Integer overflow leading to heap buffer overflow (under-allocation)",
+      "cwe": "CWE-190",
+      "severity": "high",
+      "where_it_lives": "corpus/eval/eval_0004_cwe190.cpp (Compute) plus get_num_ngrams/CreateNgrams in implementation (file not provided)",
+      "invariant": "The total number of n-grams (per-row num_ngrams and the running prefix sum that becomes the output dimension) must be computed in a type wide enough to hold it, checked for overflow, and must equal exactly the number of strings the second pass writes before it is used as the allocation size.",
+      "failure_mode": "The splits gate bounds indices but not the n-gram count. With rows whose `length` is large and several ngram_widths_, get_num_ngrams(length,width) and the accumulator ngrams_splits_data[i-1]+num_ngrams overflow int/SPLITS_TYPE, yielding a wrong or negative total. That total is passed straight to TensorShape at line 74, so `ngrams` is allocated too small. The second pass (lines 81-84) then CreateNgrams-writes the true, larger count of tstrings into the undersized buffer, corrupting the heap — a remotely reachable out-of-bounds write from crafted data_splits.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether get_num_ngrams and the prefix sum are performed in int64 with overflow checks (OP_REQUIRES on the total), and whether the total used at line 74 provably equals the sum of num_ngrams written in the second pass."
+    },
+    {
+      "title": "Signed integer overflow of preserve_short synthetic width bypasses positivity gate",
+      "anchor": "int ngram_width = data_length + 2 * pad_width_;",
+      "file": "corpus/eval/eval_0004_cwe190.cpp",
+      "line": "102",
+      "code": "        int ngram_width = data_length + 2 * pad_width_;",
+      "bug_class": "Signed integer overflow feeding an out-of-bounds n-gram copy",
+      "cwe": "CWE-190",
+      "severity": "medium",
+      "where_it_lives": "corpus/eval/eval_0004_cwe190.cpp (line 102) with the copy in CreateNgrams — implementation (file not provided)",
+      "invariant": "A width derived from input data and pad_width_ must be computed in a checked/wide type, validated to be positive and within the row's available (padded) length, before being handed to CreateNgrams — the same positivity guarantee the ngram_widths_ gate provides.",
+      "failure_mode": "`data_length` (attacker-controlled row length up to input_data_size) plus `2 * pad_width_` is evaluated in signed int; large data_length or pad_width_ overflows (UB / wraparound to a negative or huge width). This width never passes the `ngram_width > 0` check at lines 4-6. CreateNgrams(data_start, output_start, 1, ngram_width) then uses it to determine how many tokens to read from data_start and how to format the single n-gram, so a negative/overflowed width causes an out-of-bounds read of `data` and/or a malformed write at output_start.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether CreateNgrams tolerates non-positive/overflowed ngram_width, and whether pad_width_ is bounded at op construction so data_length + 2*pad_width_ cannot overflow int."
+    },
+    {
+      "title": "int/int64 truncation of split values defeats the bounds-validation gate (OOB read)",
+      "anchor": "int prev_split = splits_vec(0); ... valid_splits = ... && (splits_vec(i) <= input_data_size)",
+      "file": "corpus/eval/eval_0004_cwe190.cpp",
+      "line": "19-33",
+      "code": "    const int input_data_size = data->flat<tstring>().size();\n    ...\n      int prev_split = splits_vec(0);\n    ...\n        bool valid_splits = splits_vec(i) >= prev_split;\n        valid_splits = valid_splits && (splits_vec(i) <= input_data_size);",
+      "bug_class": "Numeric truncation weakening a bounds check (out-of-bounds read)",
+      "cwe": "CWE-197",
+      "severity": "medium",
+      "where_it_lives": "corpus/eval/eval_0004_cwe190.cpp (lines 19, 22, 27-33, 78)",
+      "invariant": "The split value that is later used to index input_data (line 78) and to compute lengths must be validated in its full native width; sizes and split values must not be narrowed to int before the bounds comparison.",
+      "failure_mode": "When SPLITS_TYPE is int64, splits_vec(i) holds 64 bits but is compared against `int prev_split` (a truncated copy) and the truncated `int input_data_size`. A split whose low 32 bits fall inside [0, input_data_size] but whose full value is far larger passes validation, then `&input_data[splits_vec(i)]` at line 78 and `splits_vec(i)-splits_vec(i-1)` read out of bounds. Symmetrically, an `input_data_size` computed from a >INT_MAX tensor wraps negative and makes every `<= input_data_size` check spuriously pass or fail.",
+      "cve_analog": "",
+      "what_to_confirm": "The concrete instantiation of SPLITS_TYPE (int32 vs int64) and whether prev_split/input_data_size are int64 in the real kernel; confirm the comparison width matches the indexing width."
+    },
+    {
+      "title": "Two-pass n-gram count divergence between layout and fill (heap OOB write)",
+      "anchor": "num_ngrams += get_num_ngrams(length, ngram_width) (pass 1) vs CreateNgrams(...num_ngrams...) (pass 2)",
+      "file": "corpus/eval/eval_0004_cwe190.cpp",
+      "line": "62-105",
+      "code": "      for (int ngram_width : ngram_widths_)\n        num_ngrams += get_num_ngrams(length, ngram_width);\n      if (preserve_short_ && length > 0 && num_ngrams == 0) {\n        num_ngrams = 1;\n      }",
+      "bug_class": "Buffer size/write-count mismatch (out-of-bounds write)",
+      "cwe": "CWE-787",
+      "severity": "medium",
+      "where_it_lives": "corpus/eval/eval_0004_cwe190.cpp (pass one lines 58-68, pass two lines 77-106) and get_num_ngrams/CreateNgrams — implementation (file not provided)",
+      "invariant": "The number of n-grams counted per row in pass one (which sizes the buffer) must exactly equal the number written per row in pass two, including the preserve_short_ special case, for all inputs.",
+      "failure_mode": "Pass one sizes the output; pass two writes it. If get_num_ngrams is not a pure function of (length,width), if `length` truncates differently, or if the preserve_short_ write at lines 102-105 emits an n-gram that pass one's `num_ngrams==0 -> 1` bump (lines 64-66) did not count for that row, pass two writes more tstrings than were allocated at line 74, overflowing ngrams_data. The bug is latent in the coordination between the two passes and their shared helper.",
+      "cve_analog": "",
+      "what_to_confirm": "That for every (length,width) and every preserve_short_ path the counts summed in pass one match the CreateNgrams write counts in pass two exactly, with no off-by-one in the preserve_short_ branch."
+    },
+    {
+      "title": "int narrowing of tensor sizes / batch count for large tensors",
+      "anchor": "int num_batch_items = splits_vec.size() - 1;",
+      "file": "corpus/eval/eval_0004_cwe190.cpp",
+      "line": "41",
+      "code": "    int num_batch_items = splits_vec.size() - 1;",
+      "bug_class": "Numeric truncation of a loop bound",
+      "cwe": "CWE-197",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0004_cwe190.cpp (line 41, used at lines 52, 59, 74, 77)",
+      "invariant": "The row count and all tensor sizes must be represented in the same 64-bit index type the tensors use, so loop bounds and the final output dimension index cannot wrap.",
+      "failure_mode": "splits_vec.size()-1 is narrowed to int. For a splits tensor with more than INT_MAX entries num_batch_items wraps; the loops at lines 52/59/77 and the index ngrams_splits_data[num_batch_items] at line 74 then use a wrong count, mis-sizing the output or reading/writing the wrong number of rows. Lower likelihood (requires an enormous tensor) but a real narrowing defect; the empty-input underflow (size==0 -> -1) is separately handled by the guard at lines 48-56.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether num_batch_items and the size accessors are int64 in the real kernel and whether any path can reach line 74 with a wrapped num_batch_items."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm get_num_ngrams and the prefix-sum ngrams_splits_data[i-1]+num_ngrams are computed in int64 with an explicit overflow/OP_REQUIRES check before the total sizes the ngrams output at line 74.",
+    "Prove the number of n-grams counted per row in pass one equals the number written per row in pass two (including the preserve_short_ paths at lines 64-66 and 102-105) for all inputs.",
+    "Verify data_length + 2 * pad_width_ (line 102) cannot overflow and that CreateNgrams rejects non-positive or over-length ngram_width (this width bypasses the lines 4-6 gate).",
+    "Check the actual instantiation of SPLITS_TYPE and ensure split values, prev_split, and input_data_size are compared in full 64-bit width so truncation cannot smuggle an out-of-range index past lines 27-35 into &input_data[splits_vec(i)] at line 78.",
+    "Confirm pad_width_ and ngram_widths_ attributes are range-checked at op construction so downstream width/length arithmetic stays in range.",
+    "Confirm sizes/num_batch_items are carried as int64 so large tensors cannot wrap the loop bounds at lines 52/59/77 or the index at line 74.",
+    "Confirm CreateNgrams/get_num_ngrams cannot read past the end of a row in input_data when length equals the maximum allowed by the splits (row spanning the whole data buffer)."
+  ]
+}

@@ -1,0 +1,187 @@
+{
+  "subsystem": "QEMU block layer VHDX image-format driver — specifically vhdx_parse_metadata(), which reads and parses the metadata region of a Microsoft VHDX virtual-disk image (the metadata table header plus its table entries, then the File Parameters / Virtual Disk Size / Logical Sector Size / Physical Sector Size metadata items) and derives the disk geometry (block size, sector sizes, sectors-per-block, chunk ratio) used for all subsequent block address translation.",
+  "provenance": "Identified from the QEMU-specific API surface: BlockDriverState, BDRVVHDXState, qemu_blockalign()/qemu_vfree(), bdrv_pread(), and the le32_to_cpus/le64_to_cpus/vhdx_metadata_header_le_import helpers, together with the VHDX_* macros (VHDX_METADATA_TABLE_MAX_SIZE, VHDX_META_FLAGS_IS_REQUIRED, VHDX_PARAMS_HAS_PARENT, VHDX_MAX_SECTORS_PER_BLOCK, META_*_PRESENT) and the VHDX metadata item GUIDs (file_param_guid, virtual_size_guid, page83_guid, logical_sector_guid, phys_sector_guid, parent_locator_guid). The banner names corpus/train/train_0230_cwe835.c and the header comment '/* sample: primevul_c_train_2489_vuln */'. The function name vhdx_parse_metadata and its structure match block/vhdx.c in QEMU.",
+  "trust_boundary": "The entire content of the VHDX image file is attacker-controlled: a guest, a downloaded/attached disk image, or a malicious VM image supplier fully controls every byte read by bdrv_pread(). The metadata table header (s->metadata_hdr, its signature and entry_count), every VHDXMetadataTableEntry (item_id, data_bits, and especially the .offset fields), and the raw File Parameters / sizes read back from file offsets are all hostile input. The only sanity gates before use are the 8-byte 'metadata' signature check (line 22) and the entry_count size cap (lines 29-33). Everything downstream — the per-entry .offset used as an absolute file read offset, block_size, and logical_sector_size — is untrusted and must be validated before it drives arithmetic or I/O.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0230_cwe835.c",
+      "lines": "2-8",
+      "code": "static int vhdx_parse_metadata(BlockDriverState *bs, BDRVVHDXState *s)\n{\n    int ret = 0;\n    uint8_t *buffer;\n    int offset = 0;\n    uint32_t i = 0;\n    VHDXMetadataTableEntry md_entry;",
+      "explanation": "Entry point for parsing the VHDX metadata region. bs is the block device state and s is the VHDX-specific driver state that will be populated. Local state: ret holds the errno-style result, buffer will point at a heap allocation that mirrors the on-disk metadata table, offset is a running byte cursor into that buffer (declared as a signed int), i is the loop counter over metadata entries, and md_entry is a single fixed-size on-disk metadata table entry copied out of the buffer one at a time. The critical observation is that this function turns raw image-file bytes into the driver's authoritative view of disk geometry."
+    },
+    {
+      "file": "corpus/train/train_0230_cwe835.c",
+      "lines": "10-16",
+      "code": "buffer = qemu_blockalign(bs, VHDX_METADATA_TABLE_MAX_SIZE);\n\n    ret = bdrv_pread(bs->file, s->metadata_rt.file_offset, buffer,\n                     VHDX_METADATA_TABLE_MAX_SIZE);\n    if (ret < 0) {\n        goto exit;\n    }",
+      "explanation": "Allocates a fixed-size, block-aligned scratch buffer of exactly VHDX_METADATA_TABLE_MAX_SIZE bytes, then reads that many bytes from the image file starting at s->metadata_rt.file_offset (the metadata region offset discovered earlier from the region table) into the buffer. Because the read length equals the allocation size, this bulk read cannot itself overflow the buffer. A negative return jumps to cleanup. The buffer is now a faithful, fully attacker-controlled copy of the metadata table region."
+    },
+    {
+      "file": "corpus/train/train_0230_cwe835.c",
+      "lines": "17-25",
+      "code": "memcpy(&s->metadata_hdr, buffer, sizeof(s->metadata_hdr));\n    offset += sizeof(s->metadata_hdr);\n\n    vhdx_metadata_header_le_import(&s->metadata_hdr);\n\n    if (memcmp(&s->metadata_hdr.signature, \"metadata\", 8)) {\n        ret = -EINVAL;\n        goto exit;\n    }",
+      "explanation": "Copies the fixed-size metadata table header out of the front of the buffer into s->metadata_hdr and advances the cursor past it. vhdx_metadata_header_le_import byte-swaps the little-endian on-disk fields (including entry_count) into host order. The one validation gate here is the 8-byte magic check: the signature field must equal the ASCII string \"metadata\" or the image is rejected. This is the only structural check that the region actually is a metadata table before its entry_count is trusted."
+    },
+    {
+      "file": "corpus/train/train_0230_cwe835.c",
+      "lines": "27-33",
+      "code": "s->metadata_entries.present = 0;\n\n    if ((s->metadata_hdr.entry_count * sizeof(md_entry)) >\n        (VHDX_METADATA_TABLE_MAX_SIZE - offset)) {\n        ret = -EINVAL;\n        goto exit;\n    }",
+      "explanation": "Clears the bitmask that tracks which required metadata items have been seen, then bounds the loop: the total bytes the entries would occupy (entry_count times the fixed 32-byte entry size) must not exceed the buffer space remaining after the header (VHDX_METADATA_TABLE_MAX_SIZE minus offset). This is the guard that keeps the per-entry memcpy at line 36 inside the allocated buffer — it caps entry_count so that buffer + offset never walks past the allocation. Because offset (the header size) is strictly smaller than the max size, the right-hand subtraction stays positive and does not underflow, and sizeof(md_entry) forces the product into size_t arithmetic."
+    },
+    {
+      "file": "corpus/train/train_0230_cwe835.c",
+      "lines": "35-40",
+      "code": "for (i = 0; i < s->metadata_hdr.entry_count; i++) {\n        memcpy(&md_entry, buffer + offset, sizeof(md_entry));\n        offset += sizeof(md_entry);\n\n        vhdx_metadata_entry_le_import(&md_entry);",
+      "explanation": "Iterates entry_count times. Each iteration copies one fixed-size VHDXMetadataTableEntry from the current cursor position in the buffer into md_entry, advances the cursor by the entry size, and byte-swaps the entry's little-endian fields (item_id GUID, .offset, .length, .data_bits) into host order. Thanks to the line 29-33 cap, every buffer + offset access stays within the allocation, and the counter i strictly increases each pass so the loop is bounded and terminates. md_entry is now an attacker-controlled decoded entry."
+    },
+    {
+      "file": "corpus/train/train_0230_cwe835.c",
+      "lines": "41-100",
+      "code": "if (guid_eq(md_entry.item_id, file_param_guid)) {\n            if (s->metadata_entries.present & META_FILE_PARAMETER_PRESENT) {\n                ret = -EINVAL;\n                goto exit;\n            }\n            s->metadata_entries.file_parameters_entry = md_entry;\n            s->metadata_entries.present |= META_FILE_PARAMETER_PRESENT;\n            continue;\n        }",
+      "explanation": "This is the dispatch body (shown for the file_parameters case; the same shape repeats for virtual_size_guid, page83_guid, logical_sector_guid, phys_sector_guid, and parent_locator_guid at lines 51-100). Each entry's item_id GUID is compared against the six known metadata item GUIDs. On a match, a duplicate check rejects images that present the same item twice (present bit already set -> -EINVAL), the whole entry (crucially including its untrusted .offset) is stored into the corresponding slot of s->metadata_entries, the present bit is set, and the loop continues. The stored .offset values are what later drive bdrv_pread reads; nothing validates them here."
+    },
+    {
+      "file": "corpus/train/train_0230_cwe835.c",
+      "lines": "102-108",
+      "code": "if (md_entry.data_bits & VHDX_META_FLAGS_IS_REQUIRED) {\n            /* cannot read vhdx file - required region table entry that\n             * we do not understand.  per spec, we must fail to open */\n            ret = -ENOTSUP;\n            goto exit;\n        }",
+      "explanation": "For any entry whose GUID did not match a known item, the IS_REQUIRED flag in data_bits is honored: if the image marks an unknown item as required, the spec mandates refusing to open the image (-ENOTSUP). Unknown but optional entries are silently ignored (the loop falls through to the next iteration)."
+    },
+    {
+      "file": "corpus/train/train_0230_cwe835.c",
+      "lines": "110-113",
+      "code": "if (s->metadata_entries.present != META_ALL_PRESENT) {\n        ret = -ENOTSUP;\n        goto exit;\n    }",
+      "explanation": "After the loop, requires that every mandatory metadata item was found: the accumulated present bitmask must equal META_ALL_PRESENT. This guarantees that the file_parameters, virtual_disk_size, logical_sector_size, and phys_sector_size entries were all populated, which is what makes the subsequent unconditional dereferences of those entry slots safe from reading uninitialized slot data."
+    },
+    {
+      "file": "corpus/train/train_0230_cwe835.c",
+      "lines": "115-145",
+      "code": "ret = bdrv_pread(bs->file,\n                     s->metadata_entries.file_parameters_entry.offset\n                                         + s->metadata_rt.file_offset,\n                     &s->params,\n                     sizeof(s->params));\n\n    if (ret < 0) {\n        goto exit;\n    }\n\n    le32_to_cpus(&s->params.block_size);\n    le32_to_cpus(&s->params.data_bits);\n\n\n    /* We now have the file parameters, so we can tell if this is a\n     * differencing file (i.e.. has_parent), is dynamic or fixed\n     * sized (leave_blocks_allocated), and the block size */\n\n    /* The parent locator required iff the file parameters has_parent set */\n    if (s->params.data_bits & VHDX_PARAMS_HAS_PARENT) {\n        if (s->metadata_entries.present & META_PARENT_LOCATOR_PRESENT) {\n            /* TODO: parse  parent locator fields */\n            ret = -ENOTSUP; /* temp, until differencing files are supported */\n            goto exit;\n        } else {\n            /* if has_parent is set, but there is not parent locator present,\n             * then that is an invalid combination */\n            ret = -EINVAL;\n            goto exit;\n        }\n    }",
+      "explanation": "Reads the File Parameters structure from the image at file_parameters_entry.offset + s->metadata_rt.file_offset into s->params, then byte-swaps block_size and data_bits. Note that the .offset added here comes straight from the untrusted metadata entry with no range check. It then handles differencing (has_parent) images: if VHDX_PARAMS_HAS_PARENT is set, it requires a parent locator to be present and, since differencing files are unsupported, returns -ENOTSUP; a has_parent flag without a parent locator is rejected as invalid."
+    },
+    {
+      "file": "corpus/train/train_0230_cwe835.c",
+      "lines": "150-177",
+      "code": "ret = bdrv_pread(bs->file,\n                     s->metadata_entries.virtual_disk_size_entry.offset\n                                           + s->metadata_rt.file_offset,\n                     &s->virtual_disk_size,\n                     sizeof(uint64_t));\n    if (ret < 0) {\n        goto exit;\n    }\n    ret = bdrv_pread(bs->file,\n                     s->metadata_entries.logical_sector_size_entry.offset\n                                             + s->metadata_rt.file_offset,\n                     &s->logical_sector_size,\n                     sizeof(uint32_t));\n    if (ret < 0) {\n        goto exit;\n    }\n    ret = bdrv_pread(bs->file,\n                     s->metadata_entries.phys_sector_size_entry.offset\n                                          + s->metadata_rt.file_offset,\n                     &s->physical_sector_size,\n                     sizeof(uint32_t));\n    if (ret < 0) {\n        goto exit;\n    }\n\n    le64_to_cpus(&s->virtual_disk_size);\n    le32_to_cpus(&s->logical_sector_size);\n    le32_to_cpus(&s->physical_sector_size);",
+      "explanation": "Reads the remaining three geometry items — the 8-byte virtual disk size, the 4-byte logical sector size, and the 4-byte physical sector size — each from its respective entry's untrusted .offset plus the metadata region base, then byte-swaps them to host order. As with the file parameters read, each .offset is attacker-controlled and is combined only with s->metadata_rt.file_offset; there is no verification that .offset points inside the metadata region or the file."
+    },
+    {
+      "file": "corpus/train/train_0230_cwe835.c",
+      "lines": "179-210",
+      "code": "if (s->logical_sector_size == 0 || s->params.block_size == 0) {\n        ret = -EINVAL;\n        goto exit;\n    }\n\n    /* both block_size and sector_size are guaranteed powers of 2 */\n    s->sectors_per_block = s->params.block_size / s->logical_sector_size;\n    s->chunk_ratio = (VHDX_MAX_SECTORS_PER_BLOCK) *\n                     (uint64_t)s->logical_sector_size /\n                     (uint64_t)s->params.block_size;\n\n    /* These values are ones we will want to use for division / multiplication\n     * later on, and they are all guaranteed (per the spec) to be powers of 2,\n     * so we can take advantage of that for shift operations during\n     * reads/writes */\n    if (s->logical_sector_size & (s->logical_sector_size - 1)) {\n        ret = -EINVAL;\n        goto exit;\n    }\n    if (s->sectors_per_block & (s->sectors_per_block - 1)) {\n        ret = -EINVAL;\n        goto exit;\n    }\n    if (s->chunk_ratio & (s->chunk_ratio - 1)) {\n        ret = -EINVAL;\n        goto exit;\n    }\n    s->block_size = s->params.block_size;\n    if (s->block_size & (s->block_size - 1)) {\n        ret = -EINVAL;\n        goto exit;\n    }",
+      "explanation": "This block validates and derives the geometry. It first rejects a zero logical_sector_size or block_size (guarding the two divisions that follow against divide-by-zero). It then computes sectors_per_block = block_size / logical_sector_size and chunk_ratio = VHDX_MAX_SECTORS_PER_BLOCK * logical_sector_size / block_size. Finally it enforces that logical_sector_size, sectors_per_block, chunk_ratio, and block_size are each a power of two using the classic x & (x - 1) == 0 idiom, so later code can replace multiply/divide with shifts. Notably, this is only a zero-and-power-of-two check: it does not enforce the spec's legal RANGES for block_size (1 MB to 256 MB) or logical_sector_size (512 or 4096)."
+    },
+    {
+      "file": "corpus/train/train_0230_cwe835.c",
+      "lines": "212-219",
+      "code": "vhdx_set_shift_bits(s);\n\n    ret = 0;\n\nexit:\n    qemu_vfree(buffer);\n    return ret;",
+      "explanation": "Precomputes the shift amounts (log2 of the just-validated power-of-two geometry values) for fast address translation, sets success, and at the shared exit label frees the metadata buffer and returns. qemu_vfree is safe on the always-initialized buffer pointer, and the single cleanup path avoids leaks across the many goto exit branches."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0230_cwe835.c",
+      "lines": "179-210",
+      "code": "if (s->logical_sector_size == 0 || s->params.block_size == 0) {\n        ret = -EINVAL;\n        goto exit;\n    }\n\n    /* both block_size and sector_size are guaranteed powers of 2 */\n    s->sectors_per_block = s->params.block_size / s->logical_sector_size;",
+      "explanation": "block_size and logical_sector_size come directly from attacker-controlled metadata, and the only checks applied are non-zero and power-of-two. The VHDX specification constrains block_size to [1 MiB, 256 MiB] and logical_sector_size to exactly 512 or 4096, but none of those RANGE bounds are enforced here. An attacker can therefore supply, e.g., logical_sector_size = 2^31 or block_size = 2^30 (both powers of two) that pass every check. These values are then used pervasively in later address arithmetic (sector/block offset computations, allocation sizing, shift counts derived by vhdx_set_shift_bits) where an out-of-range but power-of-two value produces bogus offsets/sizes and out-of-bounds access or excessive memory use. The implementation invariant is that block_size and logical_sector_size must be validated against their spec ranges before any geometry is derived from them. This is the documented QEMU VHDX flaw CVE-2014-0148."
+    },
+    {
+      "file": "corpus/train/train_0230_cwe835.c",
+      "lines": "185-205",
+      "code": "s->sectors_per_block = s->params.block_size / s->logical_sector_size;\n    s->chunk_ratio = (VHDX_MAX_SECTORS_PER_BLOCK) *\n                     (uint64_t)s->logical_sector_size /\n                     (uint64_t)s->params.block_size;\n[...]\n    if (s->sectors_per_block & (s->sectors_per_block - 1)) {\n        ret = -EINVAL;\n        goto exit;\n    }\n    if (s->chunk_ratio & (s->chunk_ratio - 1)) {\n        ret = -EINVAL;\n        goto exit;\n    }",
+      "explanation": "The power-of-two idiom x & (x - 1) treats ZERO as a valid power of two: for x == 0, (0 - 1) is all-ones and 0 & all-ones == 0, so the check passes. Because block_size and logical_sector_size are not range-bounded (see previous step), an attacker can make block_size < logical_sector_size, so the integer division sectors_per_block = block_size / logical_sector_size evaluates to 0 — and 0 sails through the sectors_per_block power-of-two gate at lines 198-201. The same holds for chunk_ratio when block_size is large relative to VHDX_MAX_SECTORS_PER_BLOCK * logical_sector_size. A zero sectors_per_block or chunk_ratio then reaches vhdx_set_shift_bits() and the block/chunk address translation, where it is used as a divisor or shift base — causing division-by-zero or nonsensical zero-strided addressing at read/write time. The invariant is that the derived geometry must be rejected when it is zero, not just when it is non-power-of-two."
+    },
+    {
+      "file": "corpus/train/train_0230_cwe835.c",
+      "lines": "115-170",
+      "code": "ret = bdrv_pread(bs->file,\n                     s->metadata_entries.file_parameters_entry.offset\n                                         + s->metadata_rt.file_offset,\n                     &s->params,\n                     sizeof(s->params));",
+      "explanation": "Each metadata item is read back from the file at entry.offset + s->metadata_rt.file_offset, where entry.offset was copied verbatim from the untrusted metadata table entry (lines 46, 56, 66/etc.) and never validated. The VHDX spec requires each metadata entry offset to fall within the bounds of the metadata region, but no check verifies that .offset is within the region, that offset + file_offset does not wrap, or that the read stays inside the file. An attacker chooses these offsets freely to point the geometry reads at arbitrary file locations (or, with a crafted small offset, back into unrelated header bytes), yielding a misparse of block_size/sector_size from attacker-selected bytes and, on 32-bit offset + 64-bit base arithmetic, potential wrap. The impact is bounded only by bdrv_pread's own file-size check (which turns a fully out-of-file offset into an error), but in-file over-read/confusion is not prevented. The invariant is that every metadata entry .offset must be range-checked against the metadata region before being used as a read offset. This is part of the CVE-2014-0148 hardening."
+    },
+    {
+      "file": "corpus/train/train_0230_cwe835.c",
+      "lines": "29-33",
+      "code": "if ((s->metadata_hdr.entry_count * sizeof(md_entry)) >\n        (VHDX_METADATA_TABLE_MAX_SIZE - offset)) {\n        ret = -EINVAL;\n        goto exit;\n    }",
+      "explanation": "This cap is what keeps the loop's buffer + offset reads (line 36) inside the allocation and what bounds the loop trip count, so it is load-bearing. It is correct on LP64 hosts: entry_count is a 16-bit field, sizeof(md_entry) is size_t, so the product is computed in 64-bit size_t (max ~2 MB) with no overflow, and offset (the 32-byte header size) is smaller than VHDX_METADATA_TABLE_MAX_SIZE so the subtraction stays positive. The residual concern to confirm is purely on a hypothetical build where size_t is 32-bit and VHDX_METADATA_TABLE_MAX_SIZE is small: the guard remains safe because 65535 * 32 still fits in 32 bits. No underflow or overflow is reachable here as written — this anchor is a correctly-implemented bound, not a bug, but it must not be weakened."
+    },
+    {
+      "file": "corpus/train/train_0230_cwe835.c",
+      "lines": "35-40",
+      "code": "for (i = 0; i < s->metadata_hdr.entry_count; i++) {\n        memcpy(&md_entry, buffer + offset, sizeof(md_entry));\n        offset += sizeof(md_entry);",
+      "explanation": "Despite the file banner naming CWE-835 (infinite loop), the loop cannot spin forever: i is a uint32_t that strictly increments each iteration, entry_count is a fixed value read once, and the memcpy source is capped by the line 29-33 check, so the loop performs a bounded number of iterations and terminates. The memcpy itself reads a fixed 32 bytes from buffer + offset, and because entry_count * 32 <= VHDX_METADATA_TABLE_MAX_SIZE - header_size, offset can never advance the source past the allocation — so there is no out-of-bounds read of the buffer here. This step is included to record that the loop and the in-buffer copy were reviewed and found safe as written; the real exposures are the unvalidated geometry values and entry offsets above."
+    }
+  ],
+  "summary": "vhdx_parse_metadata safely bounds its in-memory metadata-table walk (the entry_count cap makes the per-entry memcpy and loop bounded and in-bounds), but it under-validates attacker-controlled geometry: block_size and logical_sector_size are checked only for zero and power-of-two, not for their spec-mandated ranges, and the power-of-two idiom admits zero, so a crafted VHDX can drive sectors_per_block/chunk_ratio to 0 or push out-of-range geometry into later shift/division and address arithmetic (denial-of-service / out-of-bounds access). The per-entry .offset fields are likewise used as file read offsets with no range check. These map to the documented QEMU flaw CVE-2014-0148.",
+  "reviewed_anchors": [
+    {"anchor": "vhdx_parse_metadata(BlockDriverState *bs, BDRVVHDXState *s) signature", "disposition": "dismissed", "reason": "Entry point; carries no contract itself beyond that both pointers are non-NULL, which callers in the open path guarantee."},
+    {"anchor": "int offset (line 6)", "disposition": "dismissed", "reason": "Signed cursor, but it is only ever incremented by fixed 32-byte steps up to the capped entry count, staying well within positive int range and within the buffer."},
+    {"anchor": "buffer = qemu_blockalign(bs, VHDX_METADATA_TABLE_MAX_SIZE) (line 10)", "disposition": "dismissed", "reason": "Fixed-size allocation equal to the subsequent read length; cannot be overflowed by the bulk read."},
+    {"anchor": "bdrv_pread(..., VHDX_METADATA_TABLE_MAX_SIZE) (lines 12-13)", "disposition": "dismissed", "reason": "Read length equals allocation size; safe bulk load."},
+    {"anchor": "memcmp(&s->metadata_hdr.signature, \"metadata\", 8) (line 22)", "disposition": "dismissed", "reason": "Validation gate; correctly compares the fixed 8-byte magic before trusting the header."},
+    {"anchor": "s->metadata_hdr.entry_count size cap (lines 29-30)", "disposition": "finding", "reason": "Load-bearing bound that gates the loop and per-entry copy; reviewed and confirmed safe (no overflow/underflow on 64- or 32-bit), reported as a verified-safe anchor."},
+    {"anchor": "for loop over entry_count / memcpy(&md_entry, buffer + offset, ...) (lines 35-37)", "disposition": "finding", "reason": "Named CWE-835 anchor; reviewed and confirmed bounded and in-bounds (counter strictly increases, source capped) — reported as verified-safe."},
+    {"anchor": "md_entry.item_id GUID dispatch + present bitmask (lines 41-100)", "disposition": "dismissed", "reason": "Duplicate-entry detection and per-item present flags are correct; storing entries is safe, though the stored .offset is validated nowhere (covered by the .offset finding)."},
+    {"anchor": "md_entry.data_bits & VHDX_META_FLAGS_IS_REQUIRED (line 102)", "disposition": "dismissed", "reason": "Correctly fails closed on unknown required entries per spec."},
+    {"anchor": "s->metadata_entries.present != META_ALL_PRESENT (line 110)", "disposition": "dismissed", "reason": "Ensures all mandatory slots are populated, making the later unconditional slot dereferences safe from uninitialized data."},
+    {"anchor": "file_parameters_entry.offset / virtual_disk_size_entry.offset / logical_sector_size_entry.offset / phys_sector_size_entry.offset used in bdrv_pread (lines 115-119, 150-170)", "disposition": "finding", "reason": "Attacker-controlled entry offsets used as absolute file read offsets with no range validation."},
+    {"anchor": "s->params.data_bits & VHDX_PARAMS_HAS_PARENT differencing check (lines 134-145)", "disposition": "dismissed", "reason": "Correctly rejects unsupported differencing files and the has_parent-without-locator combination."},
+    {"anchor": "s->logical_sector_size == 0 || s->params.block_size == 0 (line 179)", "disposition": "finding", "reason": "Zero-and-power-of-two-only validation; missing the spec range checks (part of the block_size/logical_sector_size finding)."},
+    {"anchor": "s->sectors_per_block = block_size / logical_sector_size (line 185)", "disposition": "finding", "reason": "Can evaluate to 0 when block_size < logical_sector_size, which then passes the power-of-two gate; feeds later division/shift."},
+    {"anchor": "s->chunk_ratio computation (lines 186-188)", "disposition": "finding", "reason": "Can also be 0 for out-of-range geometry and slip through the power-of-two gate (covered with sectors_per_block)."},
+    {"anchor": "power-of-two checks x & (x - 1) (lines 194-210)", "disposition": "finding", "reason": "The idiom accepts zero as a power of two, so a zero-valued derived geometry is not rejected."},
+    {"anchor": "vhdx_set_shift_bits(s) (line 212)", "disposition": "dismissed", "reason": "Latent consumer of the geometry; the actual defect is upstream (zero/out-of-range geometry reaching it), captured by the geometry findings."},
+    {"anchor": "qemu_vfree(buffer) at exit (line 217)", "disposition": "dismissed", "reason": "buffer is initialized on all paths reaching exit; single cleanup path, no leak or double free."}
+  ],
+  "findings": [
+    {
+      "title": "Missing range validation of attacker-controlled block_size and logical_sector_size (only zero + power-of-two checked)",
+      "anchor": "if (s->logical_sector_size == 0 || s->params.block_size == 0) ... power-of-two checks",
+      "file": "corpus/train/train_0230_cwe835.c",
+      "line": "179-210",
+      "code": "if (s->logical_sector_size == 0 || s->params.block_size == 0) {\n        ret = -EINVAL;\n        goto exit;\n    }\n\n    /* both block_size and sector_size are guaranteed powers of 2 */\n    s->sectors_per_block = s->params.block_size / s->logical_sector_size;",
+      "bug_class": "Missing input validation of a specified quantity leading to out-of-bounds access / DoS",
+      "cwe": "CWE-20",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0230_cwe835.c (and downstream address-translation code in the implementation, file not provided)",
+      "invariant": "block_size and logical_sector_size, read from untrusted metadata, must be validated against the VHDX spec ranges (block_size 1 MiB..256 MiB, logical_sector_size 512 or 4096) before any geometry is derived or used, not merely checked for zero and power-of-two.",
+      "failure_mode": "A crafted VHDX supplies out-of-range but power-of-two values (e.g. logical_sector_size = 2^31, or an oversized block_size). They pass every check and are used pervasively in later sector/block offset math, allocation sizing, and shift counts, producing out-of-bounds access or excessive memory consumption (denial of service) when the image is opened.",
+      "cve_analog": "CVE-2014-0148",
+      "what_to_confirm": "Confirm whether the implementation elsewhere clamps block_size to [1 MiB, 256 MiB] and logical_sector_size to {512, 4096}; if not, these values flow unbounded into vhdx_set_shift_bits and read/write address computation."
+    },
+    {
+      "title": "Power-of-two check accepts zero, allowing sectors_per_block / chunk_ratio == 0 to pass validation",
+      "anchor": "if (s->sectors_per_block & (s->sectors_per_block - 1)) / if (s->chunk_ratio & (s->chunk_ratio - 1))",
+      "file": "corpus/train/train_0230_cwe835.c",
+      "line": "185-205",
+      "code": "s->sectors_per_block = s->params.block_size / s->logical_sector_size;\n    s->chunk_ratio = (VHDX_MAX_SECTORS_PER_BLOCK) *\n                     (uint64_t)s->logical_sector_size /\n                     (uint64_t)s->params.block_size;\n[...]\n    if (s->sectors_per_block & (s->sectors_per_block - 1)) {\n        ret = -EINVAL;\n        goto exit;\n    }\n    if (s->chunk_ratio & (s->chunk_ratio - 1)) {\n        ret = -EINVAL;\n        goto exit;\n    }",
+      "bug_class": "Improper validation (power-of-two idiom admits 0) leading to divide-by-zero / bad shift",
+      "cwe": "CWE-369",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0230_cwe835.c and vhdx_set_shift_bits / block address code (implementation, file not provided)",
+      "invariant": "Derived geometry values used later as divisors or shift bases must be rejected when zero; the x & (x-1) idiom must be paired with an explicit non-zero check because it classifies 0 as a power of two.",
+      "failure_mode": "Because block_size and logical_sector_size are not range-bounded, an attacker sets block_size < logical_sector_size so the integer division yields sectors_per_block = 0 (or drives chunk_ratio to 0). Zero passes the 0 & (0-1) == 0 power-of-two gate, so a zero geometry value reaches vhdx_set_shift_bits and later block/chunk translation where it is used as a divisor or shift base, causing divide-by-zero or degenerate addressing at read/write time.",
+      "cve_analog": "CVE-2014-0148",
+      "what_to_confirm": "Confirm that sectors_per_block and chunk_ratio cannot be 0 after this block (they can, as shown), and whether vhdx_set_shift_bits or the I/O path divides/shifts by them."
+    },
+    {
+      "title": "Metadata entry .offset used as absolute file read offset without range validation",
+      "anchor": "s->metadata_entries.*_entry.offset + s->metadata_rt.file_offset in bdrv_pread",
+      "file": "corpus/train/train_0230_cwe835.c",
+      "line": "115-170",
+      "code": "ret = bdrv_pread(bs->file,\n                     s->metadata_entries.file_parameters_entry.offset\n                                         + s->metadata_rt.file_offset,\n                     &s->params,\n                     sizeof(s->params));",
+      "bug_class": "Missing validation of untrusted offset before use as an I/O offset (potential over-read / misparse)",
+      "cwe": "CWE-20",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0230_cwe835.c (bdrv_pread performs the actual file access in the implementation, file not provided)",
+      "invariant": "Each metadata entry .offset copied from the untrusted table must be validated to lie within the metadata region and to not overflow when added to s->metadata_rt.file_offset before it is used as a read offset.",
+      "failure_mode": "An attacker sets an entry's .offset to any value; it is added only to the region base and passed straight to bdrv_pread, so geometry is read from an attacker-chosen file location (or, via a small offset, from unrelated header bytes), causing the driver to parse block_size/sector_size from bytes the attacker positioned, or to error out. On mixed 32/64-bit arithmetic the addition could also wrap. bdrv_pread bounds fully out-of-file reads, limiting this to in-file over-read/confusion rather than memory corruption.",
+      "cve_analog": "CVE-2014-0148",
+      "what_to_confirm": "Confirm whether any caller validates entry.offset against the metadata region size before these bdrv_pread calls; as shown, none is present in this function."
+    }
+  ],
+  "audit_checklist": [
+    "Verify block_size is clamped to the VHDX spec range [1 MiB, 256 MiB] and logical_sector_size to {512, 4096} before any geometry is derived (CVE-2014-0148).",
+    "Add an explicit non-zero check for sectors_per_block and chunk_ratio; the x & (x-1) power-of-two idiom passes 0, and block_size < logical_sector_size makes sectors_per_block 0.",
+    "Range-check every metadata entry .offset against the metadata region bounds (and guard offset + file_offset against wrap) before using it as a bdrv_pread offset.",
+    "Confirm vhdx_set_shift_bits() and the read/write address translation cannot divide or shift by a zero or out-of-range geometry value.",
+    "Confirm entry_count * sizeof(md_entry) cannot overflow size_t on 32-bit targets and that the loop's buffer + offset accesses remain within VHDX_METADATA_TABLE_MAX_SIZE (verified safe as written).",
+    "Confirm the 8-byte 'metadata' signature and META_ALL_PRESENT gates are the complete set of structural preconditions relied on downstream."
+  ]
+}

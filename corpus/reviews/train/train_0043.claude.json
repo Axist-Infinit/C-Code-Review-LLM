@@ -1,0 +1,229 @@
+{
+  "subsystem": "yajl_string_decode() — the JSON string-unescaping routine of YAJL (Yet Another JSON Library), a widely embedded streaming JSON parser. This function takes a raw JSON string token (with backslash escape sequences still encoded) and expands the escapes (\\n, \\t, \\uXXXX, UTF-16 surrogate pairs, ...) into their decoded bytes, appending the result to a growable yajl_buf. It is the decode half of the parser's string handling, run on every string value and object key.",
+  "provenance": "Identified by the exact function name yajl_string_decode and its helpers yajl_buf / yajl_buf_append, hexToDigit, and Utf32toUtf8, which are the internal symbols of YAJL's yajl_encode.c/yajl_buf.c. The surrogate-reconstruction bit pattern (((codepoint & 0x3F) << 10) | ((((codepoint >> 6) & 0xF) + 1) << 16) | (surrogate & 0x3FF)) is verbatim YAJL source. The banner comment /* sample: primevul_c_train_2558_vuln */ marks it as a PrimeVul vulnerable sample; the surrounding filename hint is ignored and the code is judged on its merits.",
+  "trust_boundary": "str and len come from the JSON lexer, which extracted the string token from an untrusted byte stream (network socket, file, API body). The bytes of str are fully attacker-controlled: an attacker crafts the exact escape sequences. The lexer has validated that the token is a syntactically well-formed JSON string (matched quotes, each \\u followed by four hex digits), but — critically — it does NOT guarantee that a UTF-16 high surrogate is followed by a low surrogate, and it does not pad the buffer beyond the token. Everything the decoder reads past a validated escape (the surrogate continuation, and any read that crosses len) is therefore hostile and unbounded.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0043_cwe134.c",
+      "lines": "2-6",
+      "code": "void yajl_string_decode(yajl_buf buf, const unsigned char * str,\n                        unsigned int len)\n{\n    unsigned int beg = 0;\n    unsigned int end = 0;    ",
+      "explanation": "The entry point receives the output buffer buf, a pointer str to the raw (still-escaped) JSON string body, and its length len. It maintains two unsigned cursors into str: beg marks the start of the current unescaped run that has not yet been flushed to buf, and end is the scan position. The design is a classic copy-in-runs scanner: literal (non-escaped) bytes are accumulated as a [beg, end) slice and copied wholesale, while an escape sequence triggers a flush of the pending slice followed by emission of the decoded bytes. Both cursors are unsigned int, matching len."
+    },
+    {
+      "file": "corpus/train/train_0043_cwe134.c",
+      "lines": "8-9",
+      "code": "    while (end < len) {\n        if (str[end] == '\\\\') {",
+      "explanation": "The main loop advances end across the input while it is strictly less than len — this is the ONLY bound in the whole routine. On each iteration it dereferences str[end] and tests for a backslash. Note the bound is checked once per iteration at the top; the body can advance end by many bytes (up to ~11 for a surrogate pair) before the condition is re-evaluated, so any read performed inside the escape handlers relies on data being present, not on the loop guard."
+    },
+    {
+      "file": "corpus/train/train_0043_cwe134.c",
+      "lines": "10-13",
+      "code": "            char utf8Buf[5];\n            const char * unescaped = \"?\";\n            yajl_buf_append(buf, str + beg, end - beg);\n            switch (str[++end]) {",
+      "explanation": "On seeing a backslash the handler declares a 5-byte stack scratch buffer utf8Buf for holding a UTF-8 encoding, initialises unescaped to the fallback \"?\", and flushes the pending literal run [beg, end) into buf via yajl_buf_append. It then pre-increments end (stepping over the backslash) and switches on the escape selector byte str[end]. Because end was just incremented, this reads the byte immediately after the backslash; the loop guard was for the backslash position, not this one."
+    },
+    {
+      "file": "corpus/train/train_0043_cwe134.c",
+      "lines": "14-21",
+      "code": "                case 'r': unescaped = \"\\r\"; break;\n                case 'n': unescaped = \"\\n\"; break;\n                case '\\\\': unescaped = \"\\\\\"; break;\n                case '/': unescaped = \"/\"; break;\n                case '\"': unescaped = \"\\\"\"; break;\n                case 'f': unescaped = \"\\f\"; break;\n                case 'b': unescaped = \"\\b\"; break;\n                case 't': unescaped = \"\\t\"; break;",
+      "explanation": "The simple single-character escapes map their selector to a one-byte C string literal stored in unescaped. These are the JSON-standard short escapes. Each just sets the pointer and breaks out to the common append at line 57; no further input is consumed here, so end still points at the selector byte and will be advanced once at line 58."
+    },
+    {
+      "file": "corpus/train/train_0043_cwe134.c",
+      "lines": "22-25",
+      "code": "                case 'u': {\n                    unsigned int codepoint = 0;\n                    hexToDigit(&codepoint, str + ++end);\n                    end+=3;",
+      "explanation": "The \\u case decodes a 16-bit code unit. It pre-increments end to point at the first of the four hex digits, then calls hexToDigit(&codepoint, str + end), which reads FOUR hex characters starting at str+end and accumulates them into codepoint (0x0000-0xFFFF). It then does end+=3, so end now points at the LAST of the four hex digits (the +1 from ++end plus 3 = the fourth digit). No check is made that four bytes actually remain before len; the decoder trusts that the lexer already validated the four-hex-digit shape of the escape."
+    },
+    {
+      "file": "corpus/train/train_0043_cwe134.c",
+      "lines": "26-36",
+      "code": "                    /* check if this is a surrogate */\n                    if ((codepoint & 0xFC00) == 0xD800) {\n                        end++;\n                        if (str[end] == '\\\\' && str[end + 1] == 'u') {\n                            unsigned int surrogate = 0;\n                            hexToDigit(&surrogate, str + end + 2);\n                            codepoint =\n                                (((codepoint & 0x3F) << 10) | \n                                 ((((codepoint >> 6) & 0xF) + 1) << 16) | \n                                 (surrogate & 0x3FF));\n                            end += 5;",
+      "explanation": "If the decoded unit falls in the UTF-16 high-surrogate range (0xD800-0xDBFF, tested via (codepoint & 0xFC00) == 0xD800), the code expects a following low surrogate to form a supplementary-plane character. It does end++ to step past the last hex digit, then peeks str[end] and str[end+1] hoping to find the literal sequence \\u introducing the second unit. If found it calls hexToDigit(&surrogate, str + end + 2) to read the low unit's four hex digits, reconstructs the 21-bit code point via the surrogate-combining bit math, and advances end += 5 to cover the backslash, the 'u', the four hex digits minus the earlier increments. Crucially, the presence, and hex validity, of this SECOND \\uXXXX is not something the lexer is required to have validated — a lone high surrogate is valid JSON."
+    },
+    {
+      "file": "corpus/train/train_0043_cwe134.c",
+      "lines": "37-41",
+      "code": "                        } else {\n                            unescaped = \"?\";\n                            break;\n                        }\n                    }",
+      "explanation": "If the byte(s) after a high surrogate are NOT a \\u introducer, the code treats the sequence as an unpaired surrogate, sets unescaped to the replacement \"?\", and breaks out of the switch to the common append path. Reaching this else already required dereferencing str[end] and str[end+1] at line 29, so the safety of even taking this branch depends on those two reads being in-bounds."
+    },
+    {
+      "file": "corpus/train/train_0043_cwe134.c",
+      "lines": "43-53",
+      "code": "                    Utf32toUtf8(codepoint, utf8Buf);\n                    unescaped = utf8Buf;\n\n                    if (codepoint == 0) {\n                        yajl_buf_append(buf, unescaped, 1);\n                        beg = ++end;\n                        continue;\n                    }\n\n                    break;\n                }",
+      "explanation": "The assembled code point (either the plain 16-bit value or the surrogate-combined 21-bit value) is encoded to UTF-8 into the 5-byte utf8Buf by Utf32toUtf8, and unescaped is pointed at it. A special case handles an embedded NUL (\\u0000): because strlen would stop at the NUL and report length 0, the code explicitly appends exactly one byte, advances beg = ++end, and continues the loop, bypassing the strlen-based append. For any non-zero code point it breaks to the common append, which will use strlen(utf8Buf). This relies on Utf32toUtf8 NUL-terminating utf8Buf for the strlen path to be correct."
+    },
+    {
+      "file": "corpus/train/train_0043_cwe134.c",
+      "lines": "54-56",
+      "code": "                default:\n                    assert(\"this should never happen\" == NULL);\n            }",
+      "explanation": "The default case asserts unconditionally (a non-NULL string literal compared to NULL is always false), encoding the contract that the lexer only ever hands the decoder a validated escape selector. This is a debug-only guard: with NDEBUG defined (typical release builds) the assert expands to nothing, the default falls through doing nothing, and unescaped retains its initial \"?\"."
+    },
+    {
+      "file": "corpus/train/train_0043_cwe134.c",
+      "lines": "57-63",
+      "code": "            yajl_buf_append(buf, unescaped, (unsigned int)strlen(unescaped));\n            beg = ++end;\n        } else {\n            end++;\n        }\n    }\n    yajl_buf_append(buf, str + beg, end - beg);",
+      "explanation": "The common tail appends the decoded bytes: strlen(unescaped) bytes from unescaped. It then sets beg = ++end so the next literal run starts just past the consumed escape. The else branch (non-escape byte) simply advances end by one, keeping the byte inside the pending [beg, end) run. After the loop, the trailing literal run [beg, end) is flushed with a final yajl_buf_append. Note end - beg is computed as an unsigned length here and at line 12."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0043_cwe134.c",
+      "lines": "27-36",
+      "code": "                    if ((codepoint & 0xFC00) == 0xD800) {\n                        end++;\n                        if (str[end] == '\\\\' && str[end + 1] == 'u') {\n                            unsigned int surrogate = 0;\n                            hexToDigit(&surrogate, str + end + 2);",
+      "explanation": "PRIMARY BUG — heap buffer over-read via an unpaired/truncated high surrogate. A lone high surrogate such as the six-byte token \"\\uD800\" is perfectly valid JSON syntax, so the lexer accepts it and calls the decoder with end pointing at the last hex digit and no further bytes belonging to the token. The surrogate branch then does end++ and dereferences str[end] and str[end+1] (line 29) — the first byte past the token, i.e. past the validated region, and potentially past the allocation. If those out-of-bounds bytes happen to be '\\\\' and 'u', hexToDigit(&surrogate, str + end + 2) reads FOUR MORE bytes beyond the buffer. An attacker who positions such a truncated surrogate at the tail of a heap allocation causes a controlled out-of-bounds read whose decoded value flows into the output — an information-disclosure / crash primitive. The invariant the implementation must uphold: before reading the surrogate continuation it MUST verify end + 5 <= len (and, ideally, that the second unit is a low surrogate 0xDC00-0xDFFF). This matches the published YAJL heap over-read."
+    },
+    {
+      "file": "corpus/train/train_0043_cwe134.c",
+      "lines": "22-25",
+      "code": "                case 'u': {\n                    unsigned int codepoint = 0;\n                    hexToDigit(&codepoint, str + ++end);\n                    end+=3;",
+      "explanation": "The primary \\u decode reads four hex digits via hexToDigit(&codepoint, str + end) and blindly advances end+=3 with no check that four bytes remain (end + 4 <= len). This is safe ONLY under the assumption that the lexer guaranteed four hex digits inside the token; the decoder itself provides no bound. If this function is ever reached with a token whose four-hex-digit shape was not fully validated, or after the surrogate path has already pushed end near len, the read walks off the buffer. Because end+=3 can also push end beyond len, the subsequent loop iteration and the final flush operate on a cursor that no longer reflects real data. Invariant: every \\uXXXX read must be gated by a remaining-length check inside this function rather than delegated to the caller."
+    },
+    {
+      "file": "corpus/train/train_0043_cwe134.c",
+      "lines": "13",
+      "code": "            switch (str[++end]) {",
+      "explanation": "The escape-selector read str[++end] assumes a byte follows the backslash. If a backslash is the final byte of the buffer (end == len-1 on entry), ++end makes end == len and str[len] is read one past the end — an out-of-bounds read of the selector. A JSON string cannot legally end on a bare backslash, so the lexer normally prevents this, but the decoder performs no defensive check; the read is a latent over-read that manifests if the token boundary is ever wrong by one. Invariant: end + 1 < len (or a validated selector) before dereferencing str[++end]."
+    },
+    {
+      "file": "corpus/train/train_0043_cwe134.c",
+      "lines": "8",
+      "code": "    while (end < len) {",
+      "explanation": "Structural weakness that amplifies every over-read above: the sole bounds check is the once-per-iteration end < len at the loop head, yet the escape handlers advance end by up to 5+ bytes (end+=3, end++, end += 5) and read at str[end], str[end+1], str+end+2 without re-checking against len. The decoder is written as if len were merely advisory and the lexer's token validation were the real safety boundary. Consequently end can finish the loop GREATER than len; the final yajl_buf_append(buf, str + beg, end - beg) at line 63 then copies end - beg bytes, over-reading past str when end overran len. Invariant: no read or copy may use an index/length derived from end without confirming it stays within [0, len]."
+    },
+    {
+      "file": "corpus/train/train_0043_cwe134.c",
+      "lines": "54-55",
+      "code": "                default:\n                    assert(\"this should never happen\" == NULL);",
+      "explanation": "Using assert as the only handling for an unexpected escape selector means the validation vanishes in release builds (NDEBUG). If, through a lexer bug or a code path that feeds this function partially-validated data, an unknown escape byte reaches the switch, the default silently falls through with unescaped still \"?\", masking the corruption rather than failing safe, and in a debug build it aborts the whole process (a denial-of-service if the invariant can ever be violated). Invariant: unexpected selectors must be rejected with a real error return, not an assert that compiles away."
+    },
+    {
+      "file": "corpus/train/train_0043_cwe134.c",
+      "lines": "32-35",
+      "code": "                            codepoint =\n                                (((codepoint & 0x3F) << 10) | \n                                 ((((codepoint >> 6) & 0xF) + 1) << 16) | \n                                 (surrogate & 0x3FF));",
+      "explanation": "The surrogate combination never verifies that the second unit is actually a low surrogate (0xDC00-0xDFFF); it just takes surrogate & 0x3FF. A high surrogate paired with an arbitrary \\uXXXX (e.g. \\uD800\\u0041) is silently combined into a bogus code point and emitted as UTF-8, producing malformed output that downstream consumers may mis-handle. This is a correctness / spec-conformance defect rather than a memory-safety hole (the result stays <= 0x10FFFF, which Utf32toUtf8 encodes in <= 4 bytes, fitting utf8Buf[5]), so it is low severity, but it means the decoder accepts and normalises invalid UTF-16 instead of rejecting it."
+    }
+  ],
+  "summary": "A JSON string unescaper that delegates all bounds safety to the lexer. Its one real memory-safety defect is a heap out-of-bounds read when a high UTF-16 surrogate is not followed by a valid low surrogate within the buffer: lines 28-31 read str[end], str[end+1] and four further hex bytes past the validated token, matching the published YAJL over-read (CVE-2017-16516). Several other reads (the \\u hex fetch, the escape selector, and the final flush) are also unbounded within this function and rely entirely on caller validation; an unexpected escape is guarded only by an assert that disappears under NDEBUG.",
+  "reviewed_anchors": [
+    {"anchor": "yajl_string_decode(yajl_buf buf, const unsigned char * str, unsigned int len) signature (lines 2-3)", "disposition": "finding", "reason": "len is the only bound and is not consulted by the internal escape handlers"},
+    {"anchor": "unsigned int beg / unsigned int end (lines 5-6)", "disposition": "dismissed", "reason": "beg <= end always holds (beg is only assigned end or ++end), so end - beg does not underflow; the risk is end exceeding len, captured under the loop/flush finding"},
+    {"anchor": "while (end < len) loop guard (line 8)", "disposition": "finding", "reason": "single top-of-loop check while the body advances end by many bytes without re-checking"},
+    {"anchor": "str[end] == '\\\\' (line 9)", "disposition": "dismissed", "reason": "guarded by end < len at the loop head; in-bounds"},
+    {"anchor": "char utf8Buf[5] fixed stack buffer (line 10)", "disposition": "dismissed", "reason": "code points reachable here are <= 0x10FFFF, encoding to at most 4 bytes + NUL, which fits 5; Utf32toUtf8 does not overflow it given the bounded input"},
+    {"anchor": "const char * unescaped = \"?\" (line 11)", "disposition": "dismissed", "reason": "benign fallback pointer; used as replacement for invalid sequences"},
+    {"anchor": "yajl_buf_append(buf, str + beg, end - beg) intermediate flush (line 12)", "disposition": "dismissed", "reason": "reached with end < len and beg <= end, so the slice is in-bounds"},
+    {"anchor": "switch (str[++end]) escape selector read (line 13)", "disposition": "finding", "reason": "reads str[end] after incrementing with no end < len re-check; over-read if backslash is the last byte"},
+    {"anchor": "simple escape cases 'r','n','\\\\','/','\"','f','b','t' (lines 14-21)", "disposition": "dismissed", "reason": "map selector to constant one-byte strings; consume no further input, no memory contract"},
+    {"anchor": "hexToDigit(&codepoint, str + ++end); end+=3 (lines 24-25)", "disposition": "finding", "reason": "reads four hex bytes and advances end with no remaining-length check inside this function"},
+    {"anchor": "(codepoint & 0xFC00) == 0xD800 surrogate test (line 27)", "disposition": "dismissed", "reason": "correct high-surrogate detection; the hazard is the continuation it enables, filed separately"},
+    {"anchor": "str[end] == '\\\\' && str[end + 1] == 'u'; hexToDigit(&surrogate, str + end + 2); end += 5 (lines 28-36)", "disposition": "finding", "reason": "PRIMARY out-of-bounds read: dereferences up to end+5 past a validated token when a high surrogate is unpaired/truncated"},
+    {"anchor": "codepoint reconstruction bit math (lines 32-35)", "disposition": "finding", "reason": "does not validate the second unit is a low surrogate; accepts invalid UTF-16 (correctness, low severity)"},
+    {"anchor": "else { unescaped = \"?\"; break; } (lines 37-40)", "disposition": "dismissed", "reason": "safe fallback, but only reached after the out-of-bounds reads on line 29 already occurred"},
+    {"anchor": "Utf32toUtf8(codepoint, utf8Buf); unescaped = utf8Buf (lines 43-44)", "disposition": "dismissed", "reason": "encodes a code point <= 0x10FFFF into utf8Buf[5]; assumes NUL-termination for the later strlen, which is an implementation contract not shown to be violated"},
+    {"anchor": "codepoint == 0 embedded-NUL branch (lines 46-50)", "disposition": "dismissed", "reason": "correctly handles \\u0000 by appending exactly one byte instead of relying on strlen"},
+    {"anchor": "default: assert(\"this should never happen\" == NULL) (lines 54-55)", "disposition": "finding", "reason": "assert-as-validation compiles out under NDEBUG, leaving an unexpected selector unhandled / DoS in debug builds"},
+    {"anchor": "yajl_buf_append(buf, unescaped, (unsigned int)strlen(unescaped)) (line 57)", "disposition": "dismissed", "reason": "length derives from strlen of a decoded literal or NUL-terminated utf8Buf; not directly attacker-controlled beyond the utf8Buf termination assumption"},
+    {"anchor": "beg = ++end (lines 48, 58)", "disposition": "dismissed", "reason": "cursor bookkeeping; keeps beg <= end but can carry end past len, covered by the loop/flush finding"},
+    {"anchor": "final yajl_buf_append(buf, str + beg, end - beg) (line 63)", "disposition": "finding", "reason": "if an escape near the tail advanced end past len, this copies end - beg bytes past the buffer end"}
+  ],
+  "findings": [
+    {
+      "title": "Heap out-of-bounds read on unpaired/truncated UTF-16 high surrogate",
+      "anchor": "if (str[end] == '\\\\' && str[end + 1] == 'u') { ... hexToDigit(&surrogate, str + end + 2); ... end += 5;",
+      "file": "corpus/train/train_0043_cwe134.c",
+      "line": "28-36",
+      "code": "                        end++;\n                        if (str[end] == '\\\\' && str[end + 1] == 'u') {\n                            unsigned int surrogate = 0;\n                            hexToDigit(&surrogate, str + end + 2);\n                            codepoint =\n                                (((codepoint & 0x3F) << 10) | \n                                 ((((codepoint >> 6) & 0xF) + 1) << 16) | \n                                 (surrogate & 0x3FF));\n                            end += 5;",
+      "bug_class": "Out-of-bounds read (missing bounds check on surrogate continuation)",
+      "cwe": "CWE-125",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0043_cwe134.c (yajl_string_decode)",
+      "invariant": "Before reading the second code unit of a surrogate pair the code must verify end + 5 <= len, and should verify the second unit is a low surrogate (0xDC00-0xDFFF); reads str[end], str[end+1] and str+end+2..+5 must never cross len.",
+      "failure_mode": "A JSON string containing a high surrogate with no (or a truncated) following low surrogate — e.g. the token \"\\uD800\" positioned at the end of an allocation — is valid JSON, so the lexer passes it in. The decoder detects the high surrogate, does end++, then reads str[end] and str[end+1] past the token, and if those out-of-bounds bytes are '\\' and 'u' it reads four more hex bytes via hexToDigit. This over-reads up to 6 bytes past the buffer, leaking adjacent heap contents into the decoded output or crashing on an unmapped page.",
+      "cve_analog": "CVE-2017-16516",
+      "what_to_confirm": "Whether a remaining-length guard (end + 6 <= len or equivalent) exists before line 29, and whether the lexer guarantees a complete surrogate pair; if not, this is a directly reachable OOB read."
+    },
+    {
+      "title": "Unbounded \\u hex read and cursor advance without remaining-length check",
+      "anchor": "hexToDigit(&codepoint, str + ++end); end+=3;",
+      "file": "corpus/train/train_0043_cwe134.c",
+      "line": "24-25",
+      "code": "                    hexToDigit(&codepoint, str + ++end);\n                    end+=3;",
+      "bug_class": "Out-of-bounds read (length delegated entirely to caller)",
+      "cwe": "CWE-125",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0043_cwe134.c (yajl_string_decode)",
+      "invariant": "hexToDigit must only be called when at least four bytes remain: end + 4 <= len; this function must enforce it rather than trusting the lexer.",
+      "failure_mode": "hexToDigit reads four hex characters from str+end and the code then does end+=3 with no check that four bytes are present. If the four-hex-digit shape was not fully validated upstream, or the cursor was pushed near len by a preceding surrogate step, the read walks past the buffer and end is advanced beyond len, corrupting subsequent iteration bounds.",
+      "cve_analog": "",
+      "what_to_confirm": "That the lexer always validates exactly four hex digits per \\u within the token, and that end can never enter this case within four bytes of len."
+    },
+    {
+      "title": "Escape-selector read one past end for a trailing backslash",
+      "anchor": "switch (str[++end])",
+      "file": "corpus/train/train_0043_cwe134.c",
+      "line": "13",
+      "code": "            switch (str[++end]) {",
+      "bug_class": "Out-of-bounds read (off-by-one on terminal backslash)",
+      "cwe": "CWE-125",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0043_cwe134.c (yajl_string_decode)",
+      "invariant": "There must be a byte after the backslash before dereferencing: end + 1 < len when str[end] is a backslash.",
+      "failure_mode": "If a backslash is the final byte of str (end == len-1), ++end yields end == len and str[len] is read one byte past the buffer. A well-formed JSON token cannot end on a bare backslash, so this is latent under a correct lexer, but the decoder performs no defensive check and over-reads if the token boundary is ever off by one.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether the lexer can ever hand this function a token whose last byte is an unescaped backslash."
+    },
+    {
+      "title": "Cursor can exceed len; final flush over-reads",
+      "anchor": "while (end < len) ... yajl_buf_append(buf, str + beg, end - beg);",
+      "file": "corpus/train/train_0043_cwe134.c",
+      "line": "8-63",
+      "code": "    while (end < len) {\n...\n    yajl_buf_append(buf, str + beg, end - beg);",
+      "bug_class": "Out-of-bounds read (length computed from an overrun cursor)",
+      "cwe": "CWE-125",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0043_cwe134.c (yajl_string_decode)",
+      "invariant": "end must remain <= len at all times so that end - beg is a valid in-buffer length for the final append; the loop body must clamp or re-check every advance of end.",
+      "failure_mode": "The only bound is checked once at the top of the loop, yet the escape handlers advance end by up to 5+ bytes (end+=3, end++, end += 5) without re-checking. end can therefore finish greater than len, and the final yajl_buf_append(buf, str + beg, end - beg) copies end - beg bytes — more than remain in str — reading past the end of the buffer.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether any escape path can leave end > len at loop exit, and whether yajl_buf_append copies exactly the requested (possibly over-long) length from str."
+    },
+    {
+      "title": "Unexpected escape selector guarded only by an assert (compiled out under NDEBUG)",
+      "anchor": "default: assert(\"this should never happen\" == NULL);",
+      "file": "corpus/train/train_0043_cwe134.c",
+      "line": "54-55",
+      "code": "                default:\n                    assert(\"this should never happen\" == NULL);",
+      "bug_class": "Reachable assertion / missing input validation",
+      "cwe": "CWE-617",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0043_cwe134.c (yajl_string_decode)",
+      "invariant": "An unexpected escape selector must fail safe with a real error return in all build configurations, not rely on assert which vanishes when NDEBUG is defined.",
+      "failure_mode": "In release builds the assert is a no-op, so an unknown escape byte falls through the default with unescaped left as \"?\", masking any upstream validation failure; in debug builds the same input aborts the process (denial of service). Either way the correctness of the routine depends on a debug-only guard for an invariant the code does not itself enforce.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether NDEBUG is defined in production builds and whether any code path can deliver an unvalidated escape selector to this switch."
+    },
+    {
+      "title": "Surrogate second unit not validated as a low surrogate",
+      "anchor": "codepoint = (((codepoint & 0x3F) << 10) | ((((codepoint >> 6) & 0xF) + 1) << 16) | (surrogate & 0x3FF));",
+      "file": "corpus/train/train_0043_cwe134.c",
+      "line": "32-35",
+      "code": "                            codepoint =\n                                (((codepoint & 0x3F) << 10) | \n                                 ((((codepoint >> 6) & 0xF) + 1) << 16) | \n                                 (surrogate & 0x3FF));",
+      "bug_class": "Improper input validation (malformed UTF-16 accepted)",
+      "cwe": "CWE-20",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0043_cwe134.c (yajl_string_decode)",
+      "invariant": "The second code unit must be verified to lie in the low-surrogate range 0xDC00-0xDFFF before combining; otherwise invalid UTF-16 is silently normalised.",
+      "failure_mode": "The reconstruction takes surrogate & 0x3FF with no range check, so a high surrogate followed by any \\uXXXX (e.g. \\uD800\\u0041) produces a bogus but bounded (<= 0x10FFFF) code point emitted as UTF-8. This is a spec-conformance/output-integrity defect, not a memory-safety hole, but it means the decoder emits garbage instead of a replacement character for invalid input.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether downstream consumers rely on the decoder rejecting or replacing invalid surrogate pairs rather than combining them."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm a remaining-length guard (end + 6 <= len) exists before reading the surrogate continuation at line 29; without it CVE-2017-16516-style OOB read is live.",
+    "Verify the lexer guarantees a complete, in-buffer surrogate pair — not just a syntactically valid lone \\uD800 — before this decoder runs.",
+    "Check that every \\u decode (line 24) and cursor advance (end+=3, end++, end += 5) is bounded so end never exceeds len.",
+    "Confirm the final yajl_buf_append(str + beg, end - beg) at line 63 cannot be reached with end > len.",
+    "Verify Utf32toUtf8 always NUL-terminates utf8Buf so the strlen(unescaped) append at line 57 does not over-read the stack buffer.",
+    "Confirm production builds do not rely on the line 55 assert for escape-selector validation (NDEBUG behaviour).",
+    "Add low-surrogate range validation (0xDC00-0xDFFF) for the second unit before combining at lines 32-35."
+  ]
+}

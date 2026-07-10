@@ -1,0 +1,194 @@
+{
+  "subsystem": "ICU4C (International Components for Unicode) common library string handling. Specifically the private worker routine UnicodeString::doAppend(const UChar*, int32_t, int32_t), the shared implementation behind UnicodeString::append() and operator+=. It grows a UTF-16 (UChar) string object by copying srcLength code units from a caller-supplied buffer onto the end of the existing string, reallocating the backing array when necessary.",
+  "provenance": "Identified by the class-qualified method name UnicodeString::doAppend and its UChar/int32_t signature, the ICU-specific helpers u_strlen, us_arrayCopy, cloneArrayIfNeeded, getGrowCapacity, getArrayStart, isBufferWritable, setToBogus, and setLength, and the ICU idioms (isWritable/isBogus, the UChar 16-bit code unit type). The sample banner filename train_0006_cwe190.cpp and the provenance tag 'primevul_validation_0346_vuln' further confirm this is the ICU common/unistr.cpp doAppend implementation. This is the exact function fixed in ICU 67 for CVE-2020-10531.",
+  "trust_boundary": "doAppend is an internal method but sits at the bottom of every public append path (append(const UChar*, int32_t), append(const UnicodeString&), operator+=, appendString, and the getAppendBuffer/append pattern). Its inputs — srcChars, srcStart, and especially srcLength — flow from application code that may itself be feeding attacker-controlled data: file/document lengths, network payload sizes, decoded/decompressed text lengths, or lengths derived from other overflow-prone arithmetic. The security-critical quantity is srcLength (a 32-bit signed length) combined with the object's current length(); if their sum can be driven near INT32_MAX the append becomes hostile. The existing srcString buffer contents are trusted, but the length metadata governing the copy is the untrusted lever.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0006_cwe190.cpp",
+      "lines": "2",
+      "code": "UnicodeString::doAppend(const UChar *srcChars, int32_t srcStart, int32_t srcLength) {",
+      "explanation": "This is the definition of ICU's private append worker. srcChars is a pointer to a buffer of UChar (16-bit UTF-16 code units); srcStart is an offset (in code units) into that buffer from which copying should begin; srcLength is the number of code units to append, with the special convention that a negative value means 'NUL-terminated, measure it yourself'. The method returns *this (a UnicodeString&) so appends can be chained. Because both srcStart and srcLength are int32_t, all length arithmetic in the body is 32-bit signed and can overflow."
+    },
+    {
+      "file": "corpus/train/train_0006_cwe190.cpp",
+      "lines": "3-5",
+      "code": "if(!isWritable() || srcLength == 0 || srcChars == NULL) {\n    return *this;\n  }",
+      "explanation": "The early-out guard. If the target object is not writable (bogus/aliased read-only), or the caller explicitly asked to append zero characters, or the source pointer is NULL, the function does nothing and returns the unchanged string. Note this guard only rejects srcLength == 0 exactly; a negative srcLength is allowed through here (it is the 'auto-measure' sentinel handled below), and a large positive srcLength is also allowed through unchecked."
+    },
+    {
+      "file": "corpus/train/train_0006_cwe190.cpp",
+      "lines": "9",
+      "code": "srcChars += srcStart;",
+      "explanation": "The source pointer is advanced by srcStart code units so all subsequent logic can treat srcChars as the true start of the region to copy; the comment above tells the reader srcStart must not be used again. There is no validation that srcStart is non-negative or that srcChars+srcStart still points inside the caller's allocation — doAppend trusts its callers to have range-checked srcStart against the source buffer."
+    },
+    {
+      "file": "corpus/train/train_0006_cwe190.cpp",
+      "lines": "11-16",
+      "code": "if(srcLength < 0) {\n    // get the srcLength if necessary\n    if((srcLength = u_strlen(srcChars)) == 0) {\n      return *this;\n    }\n  }",
+      "explanation": "Implements the negative-length convention: when the caller passes srcLength < 0, the source is treated as a NUL-terminated UChar string and its length is measured with u_strlen. If the measured length is zero, there is nothing to append and the function returns. After this block srcLength is guaranteed to be a positive int32_t, but it can be as large as u_strlen reports (up to INT32_MAX-1), or as large as the caller passed if it was already positive."
+    },
+    {
+      "file": "corpus/train/train_0006_cwe190.cpp",
+      "lines": "18-19",
+      "code": "int32_t oldLength = length();\n  int32_t newLength = oldLength + srcLength;",
+      "explanation": "oldLength captures the current number of code units in the string. newLength is computed as the sum of the current length and the number of code units to append — this is the total size the backing array must hold after the append. This single addition is the crux of the routine's memory safety: newLength is what every downstream capacity decision and the final setLength(newLength) rely on. Both operands are 32-bit signed, so the sum is a 32-bit signed addition with no overflow guard."
+    },
+    {
+      "file": "corpus/train/train_0006_cwe190.cpp",
+      "lines": "22-33",
+      "code": "const UChar* oldArray = getArrayStart();\n  if (isBufferWritable() &&\n      oldArray < srcChars + srcLength &&\n      srcChars < oldArray + oldLength) {\n    // Copy into a new UnicodeString and start over\n    UnicodeString copy(srcChars, srcLength);\n    if (copy.isBogus()) {\n      setToBogus();\n      return *this;\n    }\n    return doAppend(copy.getArrayStart(), 0, srcLength);\n  }",
+      "explanation": "The self-append / overlap guard. oldArray is the start of this object's own backing buffer. The two pointer comparisons ([oldArray, oldArray+oldLength) overlapping [srcChars, srcChars+srcLength)) detect the case where the source range overlaps the destination's own storage — e.g. str.append(str). In that case appending in place could reallocate the destination and invalidate srcChars mid-copy, so the code first materializes an independent copy of the source (UnicodeString copy(srcChars, srcLength)), checks that allocation succeeded (isBogus), and then recurses with the copy's storage and srcStart 0. This is a correctness/aliasing safeguard, not a length check."
+    },
+    {
+      "file": "corpus/train/train_0006_cwe190.cpp",
+      "lines": "36-37",
+      "code": "if((newLength <= getCapacity() && isBufferWritable()) ||\n      cloneArrayIfNeeded(newLength, getGrowCapacity(newLength))) {",
+      "explanation": "The reallocation decision. If the already-allocated capacity is large enough to hold newLength AND the buffer is writable in place, the existing array is reused. Otherwise cloneArrayIfNeeded(newLength, getGrowCapacity(newLength)) is called to (re)allocate a buffer big enough for newLength code units (getGrowCapacity computes a growth-padded target). Whichever branch succeeds, the code below assumes the backing array now has room for newLength UChars. This branch is where a corrupted (e.g. negative) newLength silently defeats the growth: a negative newLength satisfies newLength <= getCapacity() and takes the reuse path without allocating anything."
+    },
+    {
+      "file": "corpus/train/train_0006_cwe190.cpp",
+      "lines": "38-49",
+      "code": "UChar *newArray = getArrayStart();\n    // Do not copy characters when\n    //   UChar *buffer=str.getAppendBuffer(...);\n    // is followed by\n    //   str.append(buffer, length);\n    // or\n    //   str.appendString(buffer, length)\n    // or similar.\n    if(srcChars != newArray + oldLength) {\n      us_arrayCopy(srcChars, 0, newArray, oldLength, srcLength);\n    }\n    setLength(newLength);",
+      "explanation": "The actual mutation. newArray is the (possibly reallocated) destination buffer. The srcChars != newArray + oldLength test skips the copy in the getAppendBuffer optimization, where the caller already wrote directly into the string's append region so the bytes are already in place. Otherwise us_arrayCopy(srcChars, 0, newArray, oldLength, srcLength) copies srcLength code units from srcChars into newArray starting at index oldLength — i.e. it writes newArray[oldLength .. oldLength+srcLength-1]. Finally setLength(newLength) records the new logical length. The write bound here is oldLength + srcLength code units, exactly the newLength value computed at line 19 and used to size the buffer at line 36."
+    },
+    {
+      "file": "corpus/train/train_0006_cwe190.cpp",
+      "lines": "51-52",
+      "code": "return *this;\n}",
+      "explanation": "Returns the (now longer) string to support chaining. If neither the capacity check nor cloneArrayIfNeeded succeeded (allocation failure), the block at 38-49 is skipped and the string is returned unchanged — an out-of-memory path that leaves the object valid."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0006_cwe190.cpp",
+      "lines": "18-19",
+      "code": "int32_t oldLength = length();\n  int32_t newLength = oldLength + srcLength;",
+      "explanation": "Signed 32-bit integer overflow. oldLength and srcLength are both int32_t and both can be large (oldLength up to the current INT32-bounded string length; srcLength up to INT32_MAX-1 from a caller or from u_strlen at line 13). When oldLength + srcLength exceeds INT32_MAX the addition overflows: it is technically undefined behavior, and on real compilers wraps to a negative newLength. There is NO check that newLength >= oldLength (a sum smaller than either operand is the tell-tale of overflow) and no clamp against a maximum string length before newLength is used to size the buffer. This is the root defect (CWE-190) and it directly poisons the capacity logic at line 36 and the copy length at line 47. This is CVE-2020-10531, fixed in ICU 67 by adding an overflow guard that sets the string bogus when the sum overflows."
+    },
+    {
+      "file": "corpus/train/train_0006_cwe190.cpp",
+      "lines": "36-47",
+      "code": "if((newLength <= getCapacity() && isBufferWritable()) ||\n      cloneArrayIfNeeded(newLength, getGrowCapacity(newLength))) {\n    UChar *newArray = getArrayStart();\n...\n      us_arrayCopy(srcChars, 0, newArray, oldLength, srcLength);",
+      "explanation": "Heap buffer overflow — the exploitation of the line-19 overflow. When newLength wrapped negative, the test newLength <= getCapacity() is TRUE (a negative value is <= any capacity), so the reuse branch is taken and cloneArrayIfNeeded is never called: the backing array is NOT grown. Yet us_arrayCopy at line 47 still copies the full, un-wrapped srcLength code units starting at oldLength, writing far past the end of the small existing buffer. Because srcLength is enormous (near INT32_MAX) while the buffer holds only oldLength code units, this is a massive out-of-bounds heap write (CWE-787) attacker-influenced through the length that produced the overflow. The invariant the implementation must uphold: reject/bogus the append whenever oldLength + srcLength overflows or exceeds the maximum representable string length, BEFORE using newLength for the capacity check or the copy."
+    },
+    {
+      "file": "corpus/train/train_0006_cwe190.cpp",
+      "lines": "49",
+      "code": "setLength(newLength);",
+      "explanation": "Corrupted length metadata. Even in cases where the copy did not immediately crash, setLength(newLength) records the wrapped/negative newLength as the object's logical length. A negative or nonsensical length stored in the UnicodeString then propagates to every subsequent operation on the object (indexing, further appends, extraction), turning a single overflow into persistent state corruption and additional out-of-bounds reads/writes downstream. The fix must ensure newLength is a validated non-negative in-range value before it is ever stored."
+    },
+    {
+      "file": "corpus/train/train_0006_cwe190.cpp",
+      "lines": "9",
+      "code": "srcChars += srcStart;",
+      "explanation": "Unvalidated source offset (latent, caller-dependent). srcStart is added to srcChars with no bound check. If a caller passes a srcStart that is negative or larger than the source buffer, srcChars is moved outside the valid region and the subsequent u_strlen (line 13) and us_arrayCopy (line 47) perform out-of-bounds reads (CWE-125). doAppend places the entire burden of validating srcStart on its callers; the public append wrappers are responsible for clamping srcStart into [0, srcBufferLength]. Confirm every caller path does so."
+    },
+    {
+      "file": "corpus/train/train_0006_cwe190.cpp",
+      "lines": "23-25",
+      "code": "if (isBufferWritable() &&\n      oldArray < srcChars + srcLength &&\n      srcChars < oldArray + oldLength) {",
+      "explanation": "Pointer arithmetic on an attacker-influenced length. srcChars + srcLength is computed for the overlap test using the same large srcLength involved in the overflow. Forming a pointer past the end of the source object is undefined behavior and, with a huge srcLength, the comparison can wrap or mis-evaluate, causing the self-append safeguard to be skipped or wrongly taken. This is a secondary consequence of not bounding srcLength up front; it is not itself the primary memory-safety hole but reinforces that srcLength must be validated before any arithmetic uses it."
+    }
+  ],
+  "summary": "This is ICU4C's UnicodeString::doAppend, the core string-append worker. It computes newLength = oldLength + srcLength (line 19) in 32-bit signed arithmetic with no overflow guard; a caller-controlled srcLength near INT32_MAX makes newLength wrap negative, which passes the 'newLength <= getCapacity()' capacity check (line 36) so the buffer is never grown, yet us_arrayCopy (line 47) still copies the full srcLength code units — a remotely-reachable heap buffer overflow. This is CVE-2020-10531 (fixed in ICU 67). Secondary issues: the wrapped length is also stored via setLength, and srcStart (line 9) is added to the source pointer without validation.",
+  "reviewed_anchors": [
+    {"anchor": "doAppend(const UChar *srcChars, int32_t srcStart, int32_t srcLength) signature", "disposition": "finding", "reason": "int32_t length parameters flow into unchecked additive arithmetic that sizes a heap copy"},
+    {"anchor": "srcLength parameter (int32_t)", "disposition": "finding", "reason": "attacker-influenced length; drives the overflowing sum and the copy count"},
+    {"anchor": "srcStart parameter used at line 9 (srcChars += srcStart)", "disposition": "finding", "reason": "added to source pointer with no bound check; latent OOB read on hostile caller"},
+    {"anchor": "line 3 guard (!isWritable() || srcLength == 0 || srcChars == NULL)", "disposition": "dismissed", "reason": "input rejection guard; only excludes exact-zero length and NULL, carries no unsafe write itself"},
+    {"anchor": "srcLength < 0 auto-measure via u_strlen (lines 11-16)", "disposition": "dismissed", "reason": "resolves negative sentinel to a bounded positive length; the hazard is the later addition, not the measurement"},
+    {"anchor": "oldLength = length() (line 18)", "disposition": "dismissed", "reason": "reads existing validated length; safe operand on its own"},
+    {"anchor": "newLength = oldLength + srcLength (line 19)", "disposition": "finding", "reason": "unguarded signed 32-bit addition — the root integer overflow (CWE-190)"},
+    {"anchor": "self-append overlap check (lines 22-33)", "disposition": "finding", "reason": "pointer arithmetic srcChars + srcLength on a huge length is UB and can mis-evaluate the safeguard"},
+    {"anchor": "UnicodeString copy(srcChars, srcLength) and recursion (lines 27,32)", "disposition": "dismissed", "reason": "aliasing safeguard; recursion passes srcStart 0 and the same length, no new contract beyond srcLength itself"},
+    {"anchor": "capacity check newLength <= getCapacity() / cloneArrayIfNeeded (lines 36-37)", "disposition": "finding", "reason": "a negative wrapped newLength satisfies the check and skips reallocation — the mechanism that turns the overflow into an OOB write"},
+    {"anchor": "srcChars != newArray + oldLength optimization (line 46)", "disposition": "dismissed", "reason": "getAppendBuffer copy-skip; correctness optimization, no unsafe write introduced"},
+    {"anchor": "us_arrayCopy(srcChars, 0, newArray, oldLength, srcLength) (line 47)", "disposition": "finding", "reason": "copies srcLength code units into a buffer sized by the corrupted newLength — the actual out-of-bounds write (CWE-787)"},
+    {"anchor": "setLength(newLength) (line 49)", "disposition": "finding", "reason": "stores the wrapped/negative length as object state, propagating corruption"}
+  ],
+  "findings": [
+    {
+      "title": "Integer overflow in newLength = oldLength + srcLength leads to heap buffer overflow",
+      "anchor": "int32_t newLength = oldLength + srcLength;",
+      "file": "corpus/train/train_0006_cwe190.cpp",
+      "line": "19",
+      "code": "int32_t newLength = oldLength + srcLength;",
+      "bug_class": "Integer overflow leading to heap buffer overflow (undersized allocation, oversized copy)",
+      "cwe": "CWE-190",
+      "severity": "critical",
+      "where_it_lives": "corpus/train/train_0006_cwe190.cpp (ICU common/unistr.cpp doAppend)",
+      "invariant": "The total length must be validated before use: reject or set the string bogus when oldLength + srcLength overflows int32_t or exceeds the maximum representable string length (e.g. check newLength < 0 || newLength < oldLength before sizing the buffer).",
+      "failure_mode": "A caller-influenced srcLength near INT32_MAX (passed directly or measured by u_strlen) makes oldLength + srcLength overflow 32-bit signed arithmetic and wrap to a negative newLength. The negative newLength then satisfies 'newLength <= getCapacity()' at line 36, so cloneArrayIfNeeded is skipped and the backing array is NOT enlarged, while us_arrayCopy at line 47 still copies the full srcLength code units starting at oldLength — writing far past the small existing heap buffer. Result: attacker-influenced out-of-bounds heap write (CWE-787), memory corruption, and potential remote code execution when srcLength derives from untrusted document/network sizes.",
+      "cve_analog": "CVE-2020-10531",
+      "what_to_confirm": "Confirm no guard rejects an overflowing/oversized newLength between line 19 and the line-36 capacity check; verify the shipped fix (ICU 67) adds a check that sets the string bogus on overflow."
+    },
+    {
+      "title": "Wrapped newLength defeats capacity check, so oversized us_arrayCopy overflows the un-grown buffer",
+      "anchor": "if((newLength <= getCapacity() && isBufferWritable()) || cloneArrayIfNeeded(...)) { ... us_arrayCopy(srcChars, 0, newArray, oldLength, srcLength);",
+      "file": "corpus/train/train_0006_cwe190.cpp",
+      "line": "36-47",
+      "code": "if((newLength <= getCapacity() && isBufferWritable()) ||\n      cloneArrayIfNeeded(newLength, getGrowCapacity(newLength))) {\n    UChar *newArray = getArrayStart();\n    if(srcChars != newArray + oldLength) {\n      us_arrayCopy(srcChars, 0, newArray, oldLength, srcLength);\n    }",
+      "bug_class": "Out-of-bounds heap write (undersized destination, full-length copy)",
+      "cwe": "CWE-787",
+      "severity": "critical",
+      "where_it_lives": "corpus/train/train_0006_cwe190.cpp (ICU common/unistr.cpp doAppend)",
+      "invariant": "The value used to decide whether to grow the buffer must be the same monotonically-correct total that bounds the copy; a length that is smaller than oldLength must never pass the capacity check, and the copy count (srcLength) must fit within the allocated capacity minus oldLength.",
+      "failure_mode": "Because newLength was corrupted to a negative value by the line-19 overflow, 'newLength <= getCapacity()' is trivially true and reallocation is skipped, but us_arrayCopy still copies the true (huge) srcLength code units into the small buffer at offset oldLength. This is the concrete out-of-bounds write realizing the CWE-190 root cause. Even absent overflow, this branch assumes newLength correctly reflects srcLength; any mismatch between the sizing value and the copy length is exploitable.",
+      "cve_analog": "CVE-2020-10531",
+      "what_to_confirm": "Verify that whenever the reuse branch is taken, getCapacity() truly accommodates oldLength + srcLength, and that no code path allows the copy length to exceed capacity - oldLength."
+    },
+    {
+      "title": "Corrupted newLength stored via setLength, propagating length corruption to the object",
+      "anchor": "setLength(newLength);",
+      "file": "corpus/train/train_0006_cwe190.cpp",
+      "line": "49",
+      "code": "setLength(newLength);",
+      "bug_class": "State corruption via unvalidated length assignment",
+      "cwe": "CWE-190",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0006_cwe190.cpp (ICU common/unistr.cpp doAppend)",
+      "invariant": "Only a validated, non-negative, in-range length may be committed as the object's logical length.",
+      "failure_mode": "The wrapped/negative newLength from line 19 is written as the string's length. Subsequent operations (indexing, extract, further appends) then trust a nonsensical length, causing additional out-of-bounds reads/writes and turning a one-shot overflow into persistent object-state corruption. Fixing line 19 also fixes this, but it demonstrates the blast radius of the missing guard.",
+      "cve_analog": "CVE-2020-10531",
+      "what_to_confirm": "Confirm setLength rejects or asserts on negative/oversized values, or that newLength is guaranteed valid before reaching this call after the overflow fix."
+    },
+    {
+      "title": "srcStart added to source pointer without bounds validation (latent OOB read)",
+      "anchor": "srcChars += srcStart;",
+      "file": "corpus/train/train_0006_cwe190.cpp",
+      "line": "9",
+      "code": "srcChars += srcStart;",
+      "bug_class": "Out-of-bounds read via unvalidated pointer offset",
+      "cwe": "CWE-125",
+      "severity": "medium",
+      "where_it_lives": "implementation (callers not provided)",
+      "invariant": "Every caller must guarantee 0 <= srcStart <= srcBufferLength and that srcChars+srcStart still lies within the source allocation; doAppend performs no such check.",
+      "failure_mode": "A negative or too-large srcStart moves srcChars outside the caller's buffer. The later u_strlen (line 13, when srcLength<0) and us_arrayCopy (line 47) then read out of bounds, leaking adjacent heap memory or crashing. Because doAppend is private, the risk depends on the public append wrappers correctly clamping srcStart; this is a latent contract to audit rather than a self-contained bug in the shown code.",
+      "cve_analog": "",
+      "what_to_confirm": "Audit all public append/appendString/operator+= entry points to confirm srcStart is range-checked against the source buffer length before doAppend is invoked."
+    },
+    {
+      "title": "Pointer arithmetic srcChars + srcLength in the self-append guard is UB for huge lengths",
+      "anchor": "oldArray < srcChars + srcLength && srcChars < oldArray + oldLength",
+      "file": "corpus/train/train_0006_cwe190.cpp",
+      "line": "23-25",
+      "code": "if (isBufferWritable() &&\n      oldArray < srcChars + srcLength &&\n      srcChars < oldArray + oldLength) {",
+      "bug_class": "Undefined pointer arithmetic / mis-evaluated overlap check",
+      "cwe": "CWE-190",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0006_cwe190.cpp (ICU common/unistr.cpp doAppend)",
+      "invariant": "srcLength must be validated as a sane, in-range length before it is used to form the pointer srcChars + srcLength; overlap detection must not rely on pointer arithmetic that can overflow.",
+      "failure_mode": "With srcLength near INT32_MAX, srcChars + srcLength forms a pointer far past the source object (undefined behavior) and the comparison may wrap or mis-evaluate, causing the self-append safeguard to be skipped or wrongly triggered. This is a downstream symptom of the same unbounded srcLength; bounding srcLength up front removes it.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm srcLength is validated before line 19/line 24 so the overlap-check pointer arithmetic stays within a single object."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm a guard exists between line 19 and the line-36 capacity check that detects oldLength + srcLength overflow (e.g. newLength < 0 || newLength < oldLength) and sets the string bogus / returns without copying — the CVE-2020-10531 fix.",
+    "Verify getCapacity()/cloneArrayIfNeeded truly guarantee the destination holds oldLength + srcLength UChars before us_arrayCopy runs, and that a negative newLength can never satisfy 'newLength <= getCapacity()'.",
+    "Check that setLength rejects negative or oversized lengths, or that newLength is provably valid at line 49 after the overflow fix.",
+    "Audit every public append entry point (append(const UChar*, int32_t), appendString, operator+=, getAppendBuffer users) to confirm srcStart is clamped to [0, srcLength/buffer bound] before doAppend is called.",
+    "Confirm ICU's kMaxCapacity / maximum string length cap is enforced so srcLength (including u_strlen results) cannot drive newLength beyond the representable range.",
+    "Verify the self-append overlap path materializes an independent copy correctly and that srcLength is bounded before the pointer arithmetic at lines 24-25 is evaluated."
+  ]
+}

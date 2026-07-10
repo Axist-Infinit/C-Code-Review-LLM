@@ -1,0 +1,262 @@
+{
+  "subsystem": "Teeworlds game client network message dispatcher. CClient::ProcessServerPacket is the client-side handler that parses a fully-received chunk from the server: it demultiplexes the message id and the 'system' flag, then dispatches to per-message handlers for map change / map download, RCON, ping/timing and — most importantly — snapshot (delta-compressed game-state) reassembly and decompression.",
+  "provenance": "Identified by symbol and idiom: the class/method CClient::ProcessServerPacket, the CUnpacker/CMsgPacker/CNetChunk types, NETMSG_* enum names (NETMSG_MAP_CHANGE, NETMSG_MAP_DATA, NETMSG_SNAP/SNAPSINGLE/SNAPEMPTY, NETMSG_RCON_*), CSnapshot, m_SnapshotDelta.UnpackDelta, CVariableInt::Decompress, MAX_SNAPSHOT_PACKSIZE, and helpers str_format/str_copy/mem_copy/io_write are all distinctive of the Teeworlds engine (engine/client/client.cpp). The banner comment 'sample: primevul_train_3233_vuln' and the filename train_0224_cwe787.cpp indicate an out-of-bounds-write (CWE-787) sample.",
+  "trust_boundary": "Everything in the CUnpacker is attacker-controlled. Line 5 wraps the raw network chunk (pPacket->m_pData / pPacket->m_DataSize) delivered by a remote server the client connected to. A malicious or spoofed server (or an off-path attacker able to inject UDP for a connectionless/unauthenticated path) fully controls every integer and blob returned by Unpacker.GetInt()/GetString()/GetRaw(): the message id, the system flag, and all snapshot header fields (NumParts, Part, PartSize, Crc, GameTick/DeltaTick) and their payloads. The client trusts the server here, so these fields are hostile input that must be range-checked before they index or size any fixed buffer.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0224_cwe787.cpp",
+      "lines": "2-5",
+      "code": "void CClient::ProcessServerPacket(CNetChunk *pPacket)\n{\n\tCUnpacker Unpacker;\n\tUnpacker.Reset(pPacket->m_pData, pPacket->m_DataSize);",
+      "explanation": "Entry point for a reassembled network chunk received from the server. pPacket carries the raw bytes (m_pData) and their length (m_DataSize). A CUnpacker is constructed on the stack and Reset() points it at the untrusted buffer with its length. From here on, every GetInt/GetString/GetRaw call walks a cursor through this attacker-supplied buffer and sets an internal error flag when it would read past m_DataSize. This is the trust boundary: all data extracted below originates from the remote peer."
+    },
+    {
+      "file": "corpus/train/train_0224_cwe787.cpp",
+      "lines": "8-13",
+      "code": "\tint Msg = Unpacker.GetInt();\n\tint Sys = Msg&1;\n\tMsg >>= 1;\n\n\tif(Unpacker.Error())\n\t\treturn;",
+      "explanation": "The first varint is the message id. Its low bit is split off as the 'system' flag (Sys) and the id itself is the remaining bits (Msg >>= 1). If unpacking the first int already overran the buffer, Error() is set and the function returns. Sys selects between engine/system messages (the big if(Sys) block) and game messages (handed to GameClient()->OnMessage). Msg then selects the specific NETMSG_* handler."
+    },
+    {
+      "file": "corpus/train/train_0224_cwe787.cpp",
+      "lines": "15-26",
+      "code": "\tif(Sys)\n\t{\n\t\t// system message\n\t\tif((pPacket->m_Flags&NET_CHUNKFLAG_VITAL) != 0 && Msg == NETMSG_MAP_CHANGE)\n\t\t{\n\t\t\tconst char *pMap = Unpacker.GetString(CUnpacker::SANITIZE_CC|CUnpacker::SKIP_START_WHITESPACES);\n\t\t\tint MapCrc = Unpacker.GetInt();\n\t\t\tint MapSize = Unpacker.GetInt();\n\t\t\tconst char *pError = 0;\n\n\t\t\tif(Unpacker.Error())\n\t\t\t\treturn;",
+      "explanation": "System branch. The MAP_CHANGE handler (only honored on a VITAL chunk) unpacks the new map's name, CRC and size. GetString with SANITIZE_CC|SKIP_START_WHITESPACES returns a NUL-terminated pointer into the unpacker buffer, with control characters sanitized and leading whitespace skipped. MapCrc and MapSize are raw varints. The Error() gate ensures pMap/MapCrc/MapSize were fully present before use."
+    },
+    {
+      "file": "corpus/train/train_0224_cwe787.cpp",
+      "lines": "28-42",
+      "code": "\t\t\t// check for valid standard map\n\t\t\tif(!m_MapChecker.IsMapValid(pMap, MapCrc, MapSize))\n\t\t\t\tpError = \"invalid standard map\";\n\n\t\t\tfor(int i = 0; pMap[i]; i++) // protect the player from nasty map names\n\t\t\t{\n\t\t\t\tif(pMap[i] == '/' || pMap[i] == '\\\\')\n\t\t\t\t\tpError = \"strange character in map name\";\n\t\t\t}\n\n\t\t\tif(MapSize < 0)\n\t\t\t\tpError = \"invalid map size\";\n\n\t\t\tif(pError)\n\t\t\t\tDisconnectWithReason(pError);",
+      "explanation": "Validation of the map descriptor. IsMapValid checks the name/CRC/size against the built-in standard maps. The loop scans the name for path separators ('/' or '\\\\') to prevent the server from steering the download filename outside the intended directory. MapSize is rejected if negative. Any failure records a pError string and triggers DisconnectWithReason. Note MapSize is checked only for negativity here, not for an upper bound."
+    },
+    {
+      "file": "corpus/train/train_0224_cwe787.cpp",
+      "lines": "44-79",
+      "code": "\t\t\telse\n\t\t\t{\n\t\t\t\tpError = LoadMapSearch(pMap, MapCrc);\n\n\t\t\t\tif(!pError)\n\t\t\t\t{\n\t\t\t\t\tm_pConsole->Print(IConsole::OUTPUT_LEVEL_ADDINFO, \"client/network\", \"loading done\");\n\t\t\t\t\tSendReady();\n\t\t\t\t}\n\t\t\t\telse\n\t\t\t\t{\n\t\t\t\t\tstr_format(m_aMapdownloadFilename, sizeof(m_aMapdownloadFilename), \"downloadedmaps/%s_%08x.map\", pMap, MapCrc);\n\n\t\t\t\t\tchar aBuf[256];\n\t\t\t\t\tstr_format(aBuf, sizeof(aBuf), \"starting to download map to '%s'\", m_aMapdownloadFilename);\n\t\t\t\t\tm_pConsole->Print(IConsole::OUTPUT_LEVEL_ADDINFO, \"client/network\", aBuf);\n\n\t\t\t\t\tm_MapdownloadChunk = 0;\n\t\t\t\t\tstr_copy(m_aMapdownloadName, pMap, sizeof(m_aMapdownloadName));\n\t\t\t\t\tif(m_MapdownloadFile)\n\t\t\t\t\t\tio_close(m_MapdownloadFile);\n\t\t\t\t\tm_MapdownloadFile = Storage()->OpenFile(m_aMapdownloadFilename, IOFLAG_WRITE, IStorage::TYPE_SAVE);\n\t\t\t\t\tm_MapdownloadCrc = MapCrc;\n\t\t\t\t\tm_MapdownloadTotalsize = MapSize;\n\t\t\t\t\tm_MapdownloadAmount = 0;\n\n\t\t\t\t\tCMsgPacker Msg(NETMSG_REQUEST_MAP_DATA);\n\t\t\t\t\tMsg.AddInt(m_MapdownloadChunk);\n\t\t\t\t\tSendMsgEx(&Msg, MSGFLAG_VITAL|MSGFLAG_FLUSH);",
+      "explanation": "If the map is not already available locally, the client sets up a download. str_format builds the on-disk filename 'downloadedmaps/<name>_<crc>.map' into the fixed member buffer m_aMapdownloadFilename (bounded by sizeof), the map name is copied with str_copy into m_aMapdownloadName (also bounded), the download state (CRC, expected total size = MapSize, amount = 0, chunk = 0) is recorded, a file is opened for writing, and the client asks the server for the first data chunk via NETMSG_REQUEST_MAP_DATA. str_format/str_copy are the size-bounded Teeworlds helpers, so these string writes truncate rather than overflow."
+    },
+    {
+      "file": "corpus/train/train_0224_cwe787.cpp",
+      "lines": "81-95",
+      "code": "\t\telse if((pPacket->m_Flags&NET_CHUNKFLAG_VITAL) != 0 && Msg == NETMSG_MAP_DATA)\n\t\t{\n\t\t\tint Last = Unpacker.GetInt();\n\t\t\tint MapCRC = Unpacker.GetInt();\n\t\t\tint Chunk = Unpacker.GetInt();\n\t\t\tint Size = Unpacker.GetInt();\n\t\t\tconst unsigned char *pData = Unpacker.GetRaw(Size);\n\n\t\t\t// check fior errors\n\t\t\tif(Unpacker.Error() || Size <= 0 || MapCRC != m_MapdownloadCrc || Chunk != m_MapdownloadChunk || !m_MapdownloadFile)\n\t\t\t\treturn;\n\n\t\t\tio_write(m_MapdownloadFile, pData, Size);\n\n\t\t\tm_MapdownloadAmount += Size;",
+      "explanation": "The MAP_DATA handler consumes one download chunk: a 'last chunk' flag, the CRC and chunk index (which must match the pending download state), a Size, and Size raw bytes via GetRaw(Size). GetRaw returns NULL / sets Error() if Size exceeds the bytes remaining in the packet, so pData is valid for exactly Size bytes. The guard rejects the chunk unless it belongs to the active download (matching CRC and chunk index) and Size>0. The Size bytes are then appended to the open file with io_write and m_MapdownloadAmount is advanced. Because GetRaw bounds Size to the packet and the write target is a file, this copy is not a memory-safety overflow — but note there is no check that m_MapdownloadAmount stays within m_MapdownloadTotalsize."
+    },
+    {
+      "file": "corpus/train/train_0224_cwe787.cpp",
+      "lines": "97-133",
+      "code": "\t\t\tif(Last)\n\t\t\t{\n\t\t\t\tconst char *pError;\n\t\t\t\tm_pConsole->Print(IConsole::OUTPUT_LEVEL_ADDINFO, \"client/network\", \"download complete, loading map\");\n\n\t\t\t\tif(m_MapdownloadFile)\n\t\t\t\t\tio_close(m_MapdownloadFile);\n\t\t\t\tm_MapdownloadFile = 0;\n\t\t\t\tm_MapdownloadAmount = 0;\n\t\t\t\tm_MapdownloadTotalsize = -1;\n\n\t\t\t\t// load map\n\t\t\t\tpError = LoadMap(m_aMapdownloadName, m_aMapdownloadFilename, m_MapdownloadCrc);\n\t\t\t\tif(!pError)\n\t\t\t\t{\n\t\t\t\t\tm_pConsole->Print(IConsole::OUTPUT_LEVEL_ADDINFO, \"client/network\", \"loading done\");\n\t\t\t\t\tSendReady();\n\t\t\t\t}\n\t\t\t\telse\n\t\t\t\t\tDisconnectWithReason(pError);\n\t\t\t}\n\t\t\telse\n\t\t\t{\n\t\t\t\t// request new chunk\n\t\t\t\tm_MapdownloadChunk++;\n\n\t\t\t\tCMsgPacker Msg(NETMSG_REQUEST_MAP_DATA);\n\t\t\t\tMsg.AddInt(m_MapdownloadChunk);\n\t\t\t\tSendMsgEx(&Msg, MSGFLAG_VITAL|MSGFLAG_FLUSH);",
+      "explanation": "When the server signals the last chunk, the file is closed, download state reset, and LoadMap is called on the freshly written file; success sends READY, failure disconnects. Otherwise the client increments the expected chunk counter and requests the next chunk. This is a lock-step download loop driven entirely by server-supplied Last/Chunk values."
+    },
+    {
+      "file": "corpus/train/train_0224_cwe787.cpp",
+      "lines": "135-181",
+      "code": "\t\telse if((pPacket->m_Flags&NET_CHUNKFLAG_VITAL) != 0 && Msg == NETMSG_CON_READY)\n\t\t{\n\t\t\tGameClient()->OnConnected();\n\t\t}\n\t\telse if(Msg == NETMSG_PING)\n\t\t{\n\t\t\tCMsgPacker Msg(NETMSG_PING_REPLY);\n\t\t\tSendMsgEx(&Msg, 0);\n\t\t}\n\t\telse if((pPacket->m_Flags&NET_CHUNKFLAG_VITAL) != 0 && Msg == NETMSG_RCON_CMD_ADD)\n\t\t{\n\t\t\tconst char *pName = Unpacker.GetString(CUnpacker::SANITIZE_CC);\n\t\t\tconst char *pHelp = Unpacker.GetString(CUnpacker::SANITIZE_CC);\n\t\t\tconst char *pParams = Unpacker.GetString(CUnpacker::SANITIZE_CC);\n\t\t\tif(Unpacker.Error() == 0)\n\t\t\t\tm_pConsole->RegisterTemp(pName, pParams, CFGFLAG_SERVER, pHelp);\n\t\t}\n\t\telse if((pPacket->m_Flags&NET_CHUNKFLAG_VITAL) != 0 && Msg == NETMSG_RCON_CMD_REM)\n\t\t{\n\t\t\tconst char *pName = Unpacker.GetString(CUnpacker::SANITIZE_CC);\n\t\t\tif(Unpacker.Error() == 0)\n\t\t\t\tm_pConsole->DeregisterTemp(pName);\n\t\t}\n\t\telse if((pPacket->m_Flags&NET_CHUNKFLAG_VITAL) != 0 && Msg == NETMSG_RCON_AUTH_STATUS)\n\t\t{\n\t\t\tint Result = Unpacker.GetInt();\n\t\t\tif(Unpacker.Error() == 0)\n\t\t\t\tm_RconAuthed = Result;\n\t\t\tint Old = m_UseTempRconCommands;\n\t\t\tm_UseTempRconCommands = Unpacker.GetInt();\n\t\t\tif(Unpacker.Error() != 0)\n\t\t\t\tm_UseTempRconCommands = 0;\n\t\t\tif(Old != 0 && m_UseTempRconCommands == 0)\n\t\t\t\tm_pConsole->DeregisterTempAll();\n\t\t}\n\t\telse if((pPacket->m_Flags&NET_CHUNKFLAG_VITAL) != 0 && Msg == NETMSG_RCON_LINE)\n\t\t{\n\t\t\tconst char *pLine = Unpacker.GetString();\n\t\t\tif(Unpacker.Error() == 0)\n\t\t\t\tGameClient()->OnRconLine(pLine);\n\t\t}",
+      "explanation": "Control/RCON messages. CON_READY notifies the gameclient of connection. PING replies with PING_REPLY. RCON_CMD_ADD/REM register or remove temporary remote-console commands presented by the server (names/help/params sanitized as SANITIZE_CC strings, gated on Error()==0). RCON_AUTH_STATUS lets the server set the client's m_RconAuthed flag and the temp-command flag; RCON_LINE forwards a console line to the UI. These are string/int reads validated through the Error() flag; the strings are sanitized and NUL-terminated by GetString, so they are comparatively low risk (RCON_AUTH_STATUS trusting the server to declare the client authed is a design property of the protocol, not a memory bug)."
+    },
+    {
+      "file": "corpus/train/train_0224_cwe787.cpp",
+      "lines": "176-201",
+      "code": "\t\telse if(Msg == NETMSG_PING_REPLY)\n\t\t{\n\t\t\tchar aBuf[256];\n\t\t\tstr_format(aBuf, sizeof(aBuf), \"latency %.2f\", (time_get() - m_PingStartTime)*1000 / (float)time_freq());\n\t\t\tm_pConsole->Print(IConsole::OUTPUT_LEVEL_STANDARD, \"client/network\", aBuf);\n\t\t}\n\t\telse if(Msg == NETMSG_INPUTTIMING)\n\t\t{\n\t\t\tint InputPredTick = Unpacker.GetInt();\n\t\t\tint TimeLeft = Unpacker.GetInt();\n\n\t\t\t// adjust our prediction time\n\t\t\tint64 Target = 0;\n\t\t\tfor(int k = 0; k < 200; k++)\n\t\t\t{\n\t\t\t\tif(m_aInputs[k].m_Tick == InputPredTick)\n\t\t\t\t{\n\t\t\t\t\tTarget = m_aInputs[k].m_PredictedTime + (time_get() - m_aInputs[k].m_Time);\n\t\t\t\t\tTarget = Target - (int64)(((TimeLeft-PREDICTION_MARGIN)/1000.0f)*time_freq());\n\t\t\t\t\tbreak;\n\t\t\t\t}\n\t\t\t}\n\n\t\t\tif(Target)\n\t\t\t\tm_PredictedTime.Update(&m_InputtimeMarginGraph, Target, TimeLeft, 1);",
+      "explanation": "PING_REPLY formats a latency string into a local 256-byte buffer (bounded str_format). INPUTTIMING reads a predicted input tick and a time-left value and searches the fixed 200-entry m_aInputs ring for a matching tick to adjust the client's predicted time. The loop bound (k < 200) is a compile-time constant, so the array index is in range regardless of server input; only InputPredTick/TimeLeft (values, not indices) are attacker-controlled, so this handler is index-safe."
+    },
+    {
+      "file": "corpus/train/train_0224_cwe787.cpp",
+      "lines": "202-229",
+      "code": "\t\telse if(Msg == NETMSG_SNAP || Msg == NETMSG_SNAPSINGLE || Msg == NETMSG_SNAPEMPTY)\n\t\t{\n\t\t\tint NumParts = 1;\n\t\t\tint Part = 0;\n\t\t\tint GameTick = Unpacker.GetInt();\n\t\t\tint DeltaTick = GameTick-Unpacker.GetInt();\n\t\t\tint PartSize = 0;\n\t\t\tint Crc = 0;\n\t\t\tint CompleteSize = 0;\n\t\t\tconst char *pData = 0;\n\n\t\t\t// we are not allowed to process snapshot yet\n\t\t\tif(State() < IClient::STATE_LOADING)\n\t\t\t\treturn;\n\n\t\t\tif(Msg == NETMSG_SNAP)\n\t\t\t{\n\t\t\t\tNumParts = Unpacker.GetInt();\n\t\t\t\tPart = Unpacker.GetInt();\n\t\t\t}\n\n\t\t\tif(Msg != NETMSG_SNAPEMPTY)\n\t\t\t{\n\t\t\t\tCrc = Unpacker.GetInt();\n\t\t\t\tPartSize = Unpacker.GetInt();\n\t\t\t}\n\n\t\t\tpData = (const char *)Unpacker.GetRaw(PartSize);",
+      "explanation": "The snapshot handler. A single game snapshot may be split into several parts; the server sends GameTick and (GameTick - DeltaTick) to identify the snapshot and its delta baseline. For a multi-part NETMSG_SNAP, NumParts (how many parts total) and Part (this part's index) are read as raw varints; for non-empty snapshots Crc and PartSize (this part's payload length) are read; then PartSize raw bytes are grabbed with GetRaw(PartSize) into pData. GetRaw bounds PartSize against the packet, but crucially NumParts and Part are consumed with NO range validation before they are used below as an array index and a shift amount."
+    },
+    {
+      "file": "corpus/train/train_0224_cwe787.cpp",
+      "lines": "231-244",
+      "code": "\t\t\tif(Unpacker.Error())\n\t\t\t\treturn;\n\n\t\t\tif(GameTick >= m_CurrentRecvTick)\n\t\t\t{\n\t\t\t\tif(GameTick != m_CurrentRecvTick)\n\t\t\t\t{\n\t\t\t\t\tm_SnapshotParts = 0;\n\t\t\t\t\tm_CurrentRecvTick = GameTick;\n\t\t\t\t}\n\n\t\t\t\t// TODO: clean this up abit\n\t\t\t\tmem_copy((char*)m_aSnapshotIncommingData + Part*MAX_SNAPSHOT_PACKSIZE, pData, PartSize);\n\t\t\t\tm_SnapshotParts |= 1<<Part;",
+      "explanation": "After the Error() gate, if this snapshot is newer than or equal to the last received tick, each part's payload is copied into a reassembly buffer at offset Part*MAX_SNAPSHOT_PACKSIZE, and a bit for Part is set in the m_SnapshotParts mask so the code can tell when all parts have arrived. m_aSnapshotIncommingData is a fixed-size member buffer sized for the maximum legitimate number of parts (MAX_SNAPSHOT_PACKSIZE * a small MAX_PARTS). The destination offset and the copy length are both taken directly from unvalidated server fields (Part and PartSize) — this is the core of the vulnerability."
+    },
+    {
+      "file": "corpus/train/train_0224_cwe787.cpp",
+      "lines": "246-262",
+      "code": "\t\t\t\tif(m_SnapshotParts == (unsigned)((1<<NumParts)-1))\n\t\t\t\t{\n\t\t\t\t\tstatic CSnapshot Emptysnap;\n\t\t\t\t\tCSnapshot *pDeltaShot = &Emptysnap;\n\t\t\t\t\tint PurgeTick;\n\t\t\t\t\tvoid *pDeltaData;\n\t\t\t\t\tint DeltaSize;\n\t\t\t\t\tunsigned char aTmpBuffer2[CSnapshot::MAX_SIZE];\n\t\t\t\t\tunsigned char aTmpBuffer3[CSnapshot::MAX_SIZE];\n\t\t\t\t\tCSnapshot *pTmpBuffer3 = (CSnapshot*)aTmpBuffer3;\t// Fix compiler warning for strict-aliasing\n\t\t\t\t\tint SnapSize;\n\n\t\t\t\t\tCompleteSize = (NumParts-1) * MAX_SNAPSHOT_PACKSIZE + PartSize;",
+      "explanation": "When the received-parts mask equals (1<<NumParts)-1 (all parts present), the code assembles the full compressed snapshot. Two stack buffers of CSnapshot::MAX_SIZE are declared to hold the decompressed intermediate and final snapshot. CompleteSize is computed as (NumParts-1)*MAX_SNAPSHOT_PACKSIZE + PartSize — the total number of assembled bytes in m_aSnapshotIncommingData. Because NumParts and PartSize are unvalidated, this arithmetic is attacker-controlled and can overflow or exceed the buffer sizes fed to the decompressor below."
+    },
+    {
+      "file": "corpus/train/train_0224_cwe787.cpp",
+      "lines": "264-302",
+      "code": "\t\t\t\t\t// reset snapshoting\n\t\t\t\t\tm_SnapshotParts = 0;\n\n\t\t\t\t\t// find snapshot that we should use as delta\n\t\t\t\t\tEmptysnap.Clear();\n\n\t\t\t\t\t// find delta\n\t\t\t\t\tif(DeltaTick >= 0)\n\t\t\t\t\t{\n\t\t\t\t\t\tint DeltashotSize = m_SnapshotStorage.Get(DeltaTick, 0, &pDeltaShot, 0);\n\n\t\t\t\t\t\tif(DeltashotSize < 0)\n\t\t\t\t\t\t{\n\t\t\t\t\t\t\t// couldn't find the delta snapshots that the server used\n\t\t\t\t\t\t\t// to compress this snapshot. force the server to resync\n\t\t\t\t\t\t\tif(g_Config.m_Debug)\n\t\t\t\t\t\t\t{\n\t\t\t\t\t\t\t\tchar aBuf[256];\n\t\t\t\t\t\t\t\tstr_format(aBuf, sizeof(aBuf), \"error, couldn't find the delta snapshot\");\n\t\t\t\t\t\t\t\tm_pConsole->Print(IConsole::OUTPUT_LEVEL_DEBUG, \"client\", aBuf);\n\t\t\t\t\t\t\t}\n\n\t\t\t\t\t\t\t// ack snapshot\n\t\t\t\t\t\t\t// TODO: combine this with the input message\n\t\t\t\t\t\t\tm_AckGameTick = -1;\n\t\t\t\t\t\t\treturn;\n\t\t\t\t\t\t}\n\t\t\t\t\t}\n\n\t\t\t\t\t// decompress snapshot\n\t\t\t\t\tpDeltaData = m_SnapshotDelta.EmptyDelta();\n\t\t\t\t\tDeltaSize = sizeof(int)*3;\n\n\t\t\t\t\tif(CompleteSize)\n\t\t\t\t\t{\n\t\t\t\t\t\tint IntSize = CVariableInt::Decompress(m_aSnapshotIncommingData, CompleteSize, aTmpBuffer2);\n\n\t\t\t\t\t\tif(IntSize < 0) // failure during decompression, bail\n\t\t\t\t\t\t\treturn;\n\n\t\t\t\t\t\tpDeltaData = aTmpBuffer2;\n\t\t\t\t\t\tDeltaSize = IntSize;\n\t\t\t\t\t}",
+      "explanation": "The delta baseline snapshot for DeltaTick is looked up (server-chosen); if it is unknown the client acks -1 and returns to force a resync. Then, if CompleteSize is non-zero, the assembled compressed bytes in m_aSnapshotIncommingData are run through CVariableInt::Decompress, writing the decompressed variable-ints into aTmpBuffer2 (CSnapshot::MAX_SIZE). Decompress is told to read CompleteSize input bytes; it has no knowledge of the size of the aTmpBuffer2 output buffer, so the amount it writes is bounded only by the input it decodes."
+    },
+    {
+      "file": "corpus/train/train_0224_cwe787.cpp",
+      "lines": "304-347",
+      "code": "\t\t\t\t\t// unpack delta\n\t\t\t\t\tSnapSize = m_SnapshotDelta.UnpackDelta(pDeltaShot, pTmpBuffer3, pDeltaData, DeltaSize);\n\t\t\t\t\tif(SnapSize < 0)\n\t\t\t\t\t{\n\t\t\t\t\t\tm_pConsole->Print(IConsole::OUTPUT_LEVEL_DEBUG, \"client\", \"delta unpack failed!\");\n\t\t\t\t\t\treturn;\n\t\t\t\t\t}\n\n\t\t\t\t\tif(Msg != NETMSG_SNAPEMPTY && pTmpBuffer3->Crc() != Crc)\n\t\t\t\t\t{\n...\n\t\t\t\t\t// add new\n\t\t\t\t\tm_SnapshotStorage.Add(GameTick, time_get(), SnapSize, pTmpBuffer3, 1);",
+      "explanation": "The decompressed data is applied against the delta baseline via UnpackDelta into aTmpBuffer3 (pTmpBuffer3), producing the final snapshot of SnapSize bytes; failure bails. The reconstructed snapshot's CRC is compared with the server-declared Crc (with an error counter that eventually forces a resync). On success old snapshots are purged and the new snapshot is added to m_SnapshotStorage, optionally recorded to a demo, and prediction/game-time bookkeeping runs; after two received snapshots the client transitions to STATE_ONLINE. UnpackDelta and Decompress are latent surfaces whose own bounds checking must be trusted, but their inputs are already attacker-shaped by the unvalidated CompleteSize above."
+    },
+    {
+      "file": "corpus/train/train_0224_cwe787.cpp",
+      "lines": "390-401",
+      "code": "\telse\n\t{\n\t\tif((pPacket->m_Flags&NET_CHUNKFLAG_VITAL) != 0)\n\t\t{\n\t\t\t// game message\n\t\t\tif(m_DemoRecorder.IsRecording())\n\t\t\t\tm_DemoRecorder.RecordMessage(pPacket->m_pData, pPacket->m_DataSize);\n\n\t\t\tGameClient()->OnMessage(Msg, &Unpacker);\n\t\t}\n\t}\n}",
+      "explanation": "Non-system (game) messages on a VITAL chunk are optionally recorded to the demo and then dispatched to GameClient()->OnMessage with the message id and the still-positioned unpacker, so the game layer parses the remaining payload. This forwards the untrusted unpacker deeper into the game code (a further attack surface outside this file)."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0224_cwe787.cpp",
+      "lines": "243",
+      "code": "mem_copy((char*)m_aSnapshotIncommingData + Part*MAX_SNAPSHOT_PACKSIZE, pData, PartSize);",
+      "explanation": "Primary out-of-bounds write (CWE-787). Part comes straight from Unpacker.GetInt() at line 220 and is never range-checked; it is multiplied by MAX_SNAPSHOT_PACKSIZE to form the destination offset into the fixed member buffer m_aSnapshotIncommingData. A malicious server can send NETMSG_SNAP with a large (or negative) Part — e.g. Part = 1000, or a negative value that becomes a huge signed offset — so the write lands arbitrarily far before or after the buffer. PartSize is likewise attacker-controlled: although GetRaw(PartSize) at line 229 only guarantees pData holds PartSize bytes that are present in the packet, PartSize itself is bounded only by the UDP packet size (up to ~64 KB), which can exceed MAX_SNAPSHOT_PACKSIZE, so even Part=0 overflows the per-part slot. The result is a fully controlled memory corruption from a single network packet, before any CRC or decompression check runs. Invariant the implementation must uphold: reject the snapshot unless 0 <= Part < MAX_PARTS, 1 <= NumParts <= MAX_PARTS, and 0 <= PartSize <= MAX_SNAPSHOT_PACKSIZE BEFORE this copy (the upstream fix adds exactly `if(Part < 0 || NumParts < 1 || PartSize < 0 || PartSize > MAX_SNAPSHOT_PACKSIZE) return;`)."
+    },
+    {
+      "file": "corpus/train/train_0224_cwe787.cpp",
+      "lines": "219-229",
+      "code": "\t\t\t\tNumParts = Unpacker.GetInt();\n\t\t\t\tPart = Unpacker.GetInt();\n...\n\t\t\t\tPartSize = Unpacker.GetInt();\n\t\t\t}\n\n\t\t\tpData = (const char *)Unpacker.GetRaw(PartSize);",
+      "explanation": "Root cause / missing input validation (CWE-20). NumParts, Part and PartSize are read as unbounded signed varints and the only subsequent gate is Unpacker.Error() at line 231, which merely confirms the bytes were present — it does NOT constrain their VALUES. Nothing here enforces the protocol maximum on the number of parts, the part index, or a single part's size. Every downstream use (the mem_copy offset, the shift amounts, the CompleteSize arithmetic, and the Decompress input length) inherits these unchecked values. This is the single guard whose absence enables all the memory-safety findings below; it is the exact line the upstream security fix hardens."
+    },
+    {
+      "file": "corpus/train/train_0224_cwe787.cpp",
+      "lines": "244-246",
+      "code": "\t\t\t\tm_SnapshotParts |= 1<<Part;\n\n\t\t\t\tif(m_SnapshotParts == (unsigned)((1<<NumParts)-1))",
+      "explanation": "Undefined / oversized shift (CWE-682, related CWE-190). 1<<Part and 1<<NumParts shift by attacker-controlled counts. If Part or NumParts is >= 32 (or negative), the shift is undefined behavior in C++ and in practice produces a wrong mask, so the 'all parts received' test can be satisfied prematurely or never, and combined with the OOB mem_copy lets an attacker choose which parts are considered present. Even absent the mem_copy bug, a large NumParts makes (1<<NumParts)-1 meaningless. Invariant: NumParts and Part must be validated to a small MAX_PARTS (well under the bit width of m_SnapshotParts) before being used as shift distances."
+    },
+    {
+      "file": "corpus/train/train_0224_cwe787.cpp",
+      "lines": "258",
+      "code": "CompleteSize = (NumParts-1) * MAX_SNAPSHOT_PACKSIZE + PartSize;",
+      "explanation": "Signed integer overflow / oversized length (CWE-190). With NumParts and PartSize unbounded, (NumParts-1)*MAX_SNAPSHOT_PACKSIZE can overflow a 32-bit int (wrapping to a negative or small value) or produce a CompleteSize far larger than the m_aSnapshotIncommingData buffer that was actually populated. This value is then handed to CVariableInt::Decompress at line 295 as the count of input bytes to read, so a too-large CompleteSize causes Decompress to read past the end of m_aSnapshotIncommingData (out-of-bounds read, CWE-125) and to emit a correspondingly large amount of output. Invariant: CompleteSize must be derived from validated NumParts/PartSize and must not exceed the populated length of m_aSnapshotIncommingData."
+    },
+    {
+      "file": "corpus/train/train_0224_cwe787.cpp",
+      "lines": "295",
+      "code": "int IntSize = CVariableInt::Decompress(m_aSnapshotIncommingData, CompleteSize, aTmpBuffer2);",
+      "explanation": "Out-of-bounds write into the fixed decompression buffer (CWE-787). aTmpBuffer2 is a stack array of CSnapshot::MAX_SIZE (line 253), but Decompress is invoked with only the input pointer and input length (CompleteSize) — there is no output-capacity argument. The number of bytes written to aTmpBuffer2 is governed by how many variable-ints decode from the attacker-controlled input, which via the unvalidated CompleteSize/part data is not bounded to MAX_SIZE. A crafted compressed stream can therefore make Decompress write past aTmpBuffer2, smashing the stack. This is a latent overflow in the decompressor contract that this call site cannot make safe without first bounding CompleteSize and ensuring the decoder stops at MAX_SIZE. Invariant: the decompressed output must be capped at CSnapshot::MAX_SIZE regardless of input."
+    },
+    {
+      "file": "corpus/train/train_0224_cwe787.cpp",
+      "lines": "90-95",
+      "code": "\t\t\tif(Unpacker.Error() || Size <= 0 || MapCRC != m_MapdownloadCrc || Chunk != m_MapdownloadChunk || !m_MapdownloadFile)\n\t\t\t\treturn;\n\n\t\t\tio_write(m_MapdownloadFile, pData, Size);\n\n\t\t\tm_MapdownloadAmount += Size;",
+      "explanation": "Unbounded download / missing resource limit (CWE-770), lower severity. The MAP_DATA loop appends Size bytes per chunk and advances m_MapdownloadAmount, but never checks it against m_MapdownloadTotalsize (MapSize). A malicious server can stream an effectively unlimited number of chunks (each with matching CRC/Chunk) and fill the client's disk, or supply a map far larger than advertised. This is a denial-of-service / disk-exhaustion issue rather than memory corruption: GetRaw(Size) bounds pData to Size bytes and the target is a file, so there is no buffer overflow here — hence it ranks below the snapshot findings."
+    }
+  ],
+  "summary": "A malicious or spoofed Teeworlds server can achieve a fully controlled out-of-bounds write on the connecting client via the NETMSG_SNAP snapshot reassembly path: Part, NumParts and PartSize are read from the packet with no range validation and then drive the destination offset (Part*MAX_SNAPSHOT_PACKSIZE) and length of a mem_copy into a fixed buffer (line 243), plus oversized bit-shifts, an overflowing CompleteSize, and an unbounded Decompress into a stack buffer. This is a critical remote memory-corruption bug reachable from a single packet; the surrounding map-download and RCON handlers are comparatively safe.",
+  "reviewed_anchors": [
+    {"anchor": "Unpacker.Reset(pPacket->m_pData, pPacket->m_DataSize) (line 5)", "disposition": "dismissed", "reason": "Trust-boundary entry; correctly binds the unpacker to the packet length, not itself a bug."},
+    {"anchor": "int Msg = Unpacker.GetInt(); Sys = Msg&1; Msg >>= 1 (lines 8-10)", "disposition": "dismissed", "reason": "Message demux; Error() gate at line 12 guards use."},
+    {"anchor": "pMap = Unpacker.GetString(SANITIZE_CC|SKIP_START_WHITESPACES) (line 20)", "disposition": "dismissed", "reason": "Sanitized, NUL-terminated, error-checked (line 25); path-separator scan at 32-36 blocks traversal."},
+    {"anchor": "MapCrc / MapSize = Unpacker.GetInt() (lines 21-22)", "disposition": "dismissed", "reason": "MapSize rejected if negative (line 38); stored as download totalsize, not used to size a buffer here."},
+    {"anchor": "for(int i=0; pMap[i]; i++) map-name scan (lines 32-36)", "disposition": "dismissed", "reason": "Reads a validated, NUL-terminated unpacker string; bounded by the terminator."},
+    {"anchor": "str_format(m_aMapdownloadFilename, sizeof(...), ...) (line 54)", "disposition": "dismissed", "reason": "Size-bounded Teeworlds helper; truncates rather than overflows."},
+    {"anchor": "str_copy(m_aMapdownloadName, pMap, sizeof(...)) (line 61)", "disposition": "dismissed", "reason": "Size-bounded copy into a fixed member; safe."},
+    {"anchor": "MAP_DATA Size=GetInt / pData=GetRaw(Size) / io_write (lines 86-93)", "disposition": "finding", "reason": "Size>0 and GetRaw bound the memory copy, but total download is never capped against m_MapdownloadTotalsize (resource DoS)."},
+    {"anchor": "m_MapdownloadAmount += Size (line 95)", "disposition": "finding", "reason": "Accumulates without an upper bound vs totalsize; disk-exhaustion vector (covered by the MAP_DATA finding)."},
+    {"anchor": "RCON_CMD_ADD pName/pHelp/pParams GetString (lines 146-150)", "disposition": "dismissed", "reason": "SANITIZE_CC strings, Error()-gated; register temp commands, not a memory bug."},
+    {"anchor": "RCON_AUTH_STATUS m_RconAuthed = Result (lines 160-162)", "disposition": "dismissed", "reason": "Server-declared auth state is a protocol design property, not a buffer/memory contract."},
+    {"anchor": "INPUTTIMING loop m_aInputs[k], k<200 (lines 189-191)", "disposition": "dismissed", "reason": "Fixed compile-time loop bound; InputPredTick is compared, not used as an index."},
+    {"anchor": "GameTick / DeltaTick = GetInt (lines 206-207)", "disposition": "dismissed", "reason": "Used as ticks/compares and DeltaTick>=0 guarded before storage lookup; not an index/size of a fixed buffer."},
+    {"anchor": "NumParts = Unpacker.GetInt() (line 219)", "disposition": "finding", "reason": "Unvalidated part count drives shift and CompleteSize; must be bounded to MAX_PARTS."},
+    {"anchor": "Part = Unpacker.GetInt() (line 220)", "disposition": "finding", "reason": "Unvalidated index used as mem_copy offset and shift distance; root of the OOB write."},
+    {"anchor": "PartSize = Unpacker.GetInt() / pData = GetRaw(PartSize) (lines 226-229)", "disposition": "finding", "reason": "GetRaw bounds pData but PartSize can exceed MAX_SNAPSHOT_PACKSIZE and feeds mem_copy length and CompleteSize."},
+    {"anchor": "mem_copy(m_aSnapshotIncommingData + Part*MAX_SNAPSHOT_PACKSIZE, pData, PartSize) (line 243)", "disposition": "finding", "reason": "Attacker-controlled destination offset and length into a fixed buffer: the critical OOB write."},
+    {"anchor": "m_SnapshotParts |= 1<<Part / (1<<NumParts)-1 (lines 244-246)", "disposition": "finding", "reason": "Shift by attacker-controlled counts >= 32 or negative is undefined behavior / wrong mask."},
+    {"anchor": "aTmpBuffer2[CSnapshot::MAX_SIZE] / aTmpBuffer3[CSnapshot::MAX_SIZE] (lines 253-254)", "disposition": "finding", "reason": "Fixed decompression buffers whose fill depends on unbounded CompleteSize/decoded input (see Decompress finding)."},
+    {"anchor": "CompleteSize = (NumParts-1)*MAX_SNAPSHOT_PACKSIZE + PartSize (line 258)", "disposition": "finding", "reason": "Signed overflow / oversized length from unchecked NumParts/PartSize feeds Decompress."},
+    {"anchor": "CVariableInt::Decompress(m_aSnapshotIncommingData, CompleteSize, aTmpBuffer2) (line 295)", "disposition": "finding", "reason": "No output-capacity bound; oversized/overread input can overflow aTmpBuffer2."},
+    {"anchor": "m_SnapshotDelta.UnpackDelta(pDeltaShot, pTmpBuffer3, pDeltaData, DeltaSize) (line 305)", "disposition": "dismissed", "reason": "Latent surface in the delta unpacker; inputs are already shaped by upstream findings and its bounds live in a file not provided."},
+    {"anchor": "GameClient()->OnMessage(Msg, &Unpacker) (line 398)", "disposition": "dismissed", "reason": "Forwards the untrusted unpacker to the game layer; that parsing surface is outside this file."}
+  ],
+  "findings": [
+    {
+      "title": "Remote out-of-bounds write in snapshot reassembly (attacker-controlled offset and length)",
+      "anchor": "mem_copy((char*)m_aSnapshotIncommingData + Part*MAX_SNAPSHOT_PACKSIZE, pData, PartSize);",
+      "file": "corpus/train/train_0224_cwe787.cpp",
+      "line": "243",
+      "code": "mem_copy((char*)m_aSnapshotIncommingData + Part*MAX_SNAPSHOT_PACKSIZE, pData, PartSize);",
+      "bug_class": "Out-of-bounds write (unvalidated index and length into fixed buffer)",
+      "cwe": "CWE-787",
+      "severity": "critical",
+      "where_it_lives": "corpus/train/train_0224_cwe787.cpp",
+      "invariant": "Before this copy the code must enforce 0 <= Part < MAX_PARTS, 1 <= NumParts <= MAX_PARTS, and 0 <= PartSize <= MAX_SNAPSHOT_PACKSIZE, so both the destination offset (Part*MAX_SNAPSHOT_PACKSIZE) and the length (PartSize) stay within m_aSnapshotIncommingData.",
+      "failure_mode": "A malicious/spoofed server sends NETMSG_SNAP with a large or negative Part and/or a PartSize larger than MAX_SNAPSHOT_PACKSIZE. Part is read unvalidated at line 220 and multiplied by MAX_SNAPSHOT_PACKSIZE to form the write offset; PartSize is read at line 226. GetRaw only guarantees pData holds PartSize present bytes, not that PartSize fits the per-part slot. The mem_copy then writes attacker data at an attacker-chosen offset past m_aSnapshotIncommingData, corrupting adjacent memory from a single packet before any CRC/decompress validation runs — a remotely triggerable, controllable memory-corruption primitive.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm no `if(Part < 0 || NumParts < 1 || NumParts > CSnapshot::MAX_PARTS || PartSize < 0 || PartSize > MAX_SNAPSHOT_PACKSIZE) return;` guard exists before line 243, and the declared size of m_aSnapshotIncommingData (MAX_SNAPSHOT_PACKSIZE * MAX_PARTS)."
+    },
+    {
+      "title": "Missing range validation of NumParts/Part/PartSize before use",
+      "anchor": "NumParts = Unpacker.GetInt(); Part = Unpacker.GetInt(); ... PartSize = Unpacker.GetInt();",
+      "file": "corpus/train/train_0224_cwe787.cpp",
+      "line": "219-229",
+      "code": "\t\t\t\tNumParts = Unpacker.GetInt();\n\t\t\t\tPart = Unpacker.GetInt();\n\t\t\t}\n\n\t\t\tif(Msg != NETMSG_SNAPEMPTY)\n\t\t\t{\n\t\t\t\tCrc = Unpacker.GetInt();\n\t\t\t\tPartSize = Unpacker.GetInt();\n\t\t\t}\n\n\t\t\tpData = (const char *)Unpacker.GetRaw(PartSize);",
+      "bug_class": "Missing input validation (unbounded protocol counters/lengths)",
+      "cwe": "CWE-20",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0224_cwe787.cpp",
+      "invariant": "All three server-supplied snapshot fields must be validated to their protocol maxima immediately after unpacking and before any of them is used as an index, shift amount, or size.",
+      "failure_mode": "The only post-unpack check is Unpacker.Error() at line 231, which confirms presence but never constrains value. The unvalidated NumParts/Part/PartSize then flow into the mem_copy (line 243), the 1<<Part / 1<<NumParts shifts (lines 244-246), the CompleteSize arithmetic (line 258), and the Decompress length (line 295). This single missing gate is the shared root cause of the memory-safety findings; adding it neutralizes all of them.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify the fixed build inserts a bounds guard on NumParts, Part and PartSize between line 229 and line 243."
+    },
+    {
+      "title": "Out-of-bounds write in variable-int snapshot decompression",
+      "anchor": "int IntSize = CVariableInt::Decompress(m_aSnapshotIncommingData, CompleteSize, aTmpBuffer2);",
+      "file": "corpus/train/train_0224_cwe787.cpp",
+      "line": "295",
+      "code": "int IntSize = CVariableInt::Decompress(m_aSnapshotIncommingData, CompleteSize, aTmpBuffer2);",
+      "bug_class": "Out-of-bounds write (decompression without output-capacity bound)",
+      "cwe": "CWE-787",
+      "severity": "high",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "Decompress must never write more than CSnapshot::MAX_SIZE bytes to aTmpBuffer2, and CompleteSize must not exceed the number of bytes actually populated in m_aSnapshotIncommingData.",
+      "failure_mode": "aTmpBuffer2 is a stack array of CSnapshot::MAX_SIZE (line 253), but the Decompress call passes only an input pointer and input length (CompleteSize) with no output-capacity argument. Because CompleteSize is derived from unvalidated NumParts/PartSize (line 258) and the input bytes are attacker-controlled, a crafted compressed stream can decode to more than MAX_SIZE output bytes, overflowing aTmpBuffer2 and smashing the stack; an oversized CompleteSize also causes an out-of-bounds read of m_aSnapshotIncommingData.",
+      "cve_analog": "",
+      "what_to_confirm": "Inspect CVariableInt::Decompress to confirm whether it stops writing at CSnapshot::MAX_SIZE (an output limit) or only iterates over the input length; and confirm CompleteSize is bounded before this call."
+    },
+    {
+      "title": "Integer overflow / oversized length in CompleteSize computation",
+      "anchor": "CompleteSize = (NumParts-1) * MAX_SNAPSHOT_PACKSIZE + PartSize;",
+      "file": "corpus/train/train_0224_cwe787.cpp",
+      "line": "258",
+      "code": "CompleteSize = (NumParts-1) * MAX_SNAPSHOT_PACKSIZE + PartSize;",
+      "bug_class": "Integer overflow feeding a length",
+      "cwe": "CWE-190",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0224_cwe787.cpp",
+      "invariant": "NumParts and PartSize must be pre-validated so this product/sum cannot overflow a 32-bit int and cannot exceed the populated size of m_aSnapshotIncommingData.",
+      "failure_mode": "With NumParts and PartSize unbounded, (NumParts-1)*MAX_SNAPSHOT_PACKSIZE can wrap a signed 32-bit int to a negative or small value, or produce a CompleteSize larger than the actual buffer content. This corrupted length is passed to Decompress (line 295) as the input byte count, causing either an out-of-bounds read of m_aSnapshotIncommingData or downstream misbehavior. It is a distinct arithmetic defect that compounds finding #3.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm whether NumParts/PartSize are range-limited before line 258 and whether the product is computed in a width that cannot overflow for the validated maxima."
+    },
+    {
+      "title": "Undefined/oversized left-shift with attacker-controlled Part and NumParts",
+      "anchor": "m_SnapshotParts |= 1<<Part;  ...  if(m_SnapshotParts == (unsigned)((1<<NumParts)-1))",
+      "file": "corpus/train/train_0224_cwe787.cpp",
+      "line": "244-246",
+      "code": "\t\t\t\tm_SnapshotParts |= 1<<Part;\n\n\t\t\t\tif(m_SnapshotParts == (unsigned)((1<<NumParts)-1))",
+      "bug_class": "Undefined behavior / incorrect shift (out-of-range shift count)",
+      "cwe": "CWE-682",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0224_cwe787.cpp",
+      "invariant": "Part and NumParts must be validated to a small MAX_PARTS (well below the bit width of m_SnapshotParts) before being used as shift distances.",
+      "failure_mode": "1<<Part and 1<<NumParts shift by unvalidated server counts. A Part or NumParts >= 32 (or negative) is undefined behavior in C++ and in practice yields a garbage mask, so the 'all parts received' comparison can trigger with only one crafted part present — combining with the mem_copy at line 243 to let an attacker both write out of bounds and force immediate processing of the malformed snapshot.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the type/width of m_SnapshotParts and that NumParts/Part are bounded below that width before these shifts."
+    },
+    {
+      "title": "Map download has no size cap (disk exhaustion)",
+      "anchor": "io_write(m_MapdownloadFile, pData, Size); m_MapdownloadAmount += Size;",
+      "file": "corpus/train/train_0224_cwe787.cpp",
+      "line": "93-95",
+      "code": "\t\t\tio_write(m_MapdownloadFile, pData, Size);\n\n\t\t\tm_MapdownloadAmount += Size;",
+      "bug_class": "Uncontrolled resource consumption",
+      "cwe": "CWE-770",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0224_cwe787.cpp",
+      "invariant": "The accumulated download (m_MapdownloadAmount) should be bounded against the advertised m_MapdownloadTotalsize (and a sane maximum) so a server cannot stream unlimited data to disk.",
+      "failure_mode": "The MAP_DATA loop writes each chunk's Size bytes to the open file and advances m_MapdownloadAmount, but never compares it to m_MapdownloadTotalsize. A malicious server that keeps sending matching-CRC/-chunk MAP_DATA can fill the client's disk. This is a denial-of-service, not memory corruption: GetRaw(Size) bounds pData and the destination is a file, so there is no buffer overflow here.",
+      "cve_analog": "",
+      "what_to_confirm": "Check whether later revisions add a `m_MapdownloadAmount > m_MapdownloadTotalsize` (or absolute cap) rejection before io_write."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm a bounds guard on Part, NumParts and PartSize (e.g. Part>=0 && Part<MAX_PARTS, NumParts in [1,MAX_PARTS], 0<=PartSize<=MAX_SNAPSHOT_PACKSIZE) exists between lines 229 and 243.",
+    "Verify the declared size of m_aSnapshotIncommingData (MAX_SNAPSHOT_PACKSIZE * MAX_PARTS) and that Part*MAX_SNAPSHOT_PACKSIZE + PartSize can never exceed it.",
+    "Inspect CVariableInt::Decompress: does it enforce an output limit of CSnapshot::MAX_SIZE, or is its write count driven only by the input length CompleteSize?",
+    "Confirm CompleteSize (line 258) cannot overflow a 32-bit int and cannot exceed the bytes actually written into m_aSnapshotIncommingData.",
+    "Check the width of m_SnapshotParts and that NumParts/Part are bounded below that width before the 1<<Part / 1<<NumParts shifts.",
+    "Verify m_MapdownloadAmount is capped against m_MapdownloadTotalsize before io_write to prevent unbounded disk writes.",
+    "Confirm GetString return values (pMap, RCON names) are always NUL-terminated and never NULL on the Error()==0 path before dereference."
+  ]
+}

@@ -1,0 +1,252 @@
+Files under review: corpus/train/train_0361_cwe369.cpp
+
+<<<BEGIN_UNTRUSTED_CODE>>>
+/* ===== FILE: corpus/train/train_0361_cwe369.cpp ===== */
+   1| /* sample: primevul_train_2191_vuln */
+   2|   void operator()(OpKernelContext* context, const T1* input_data,
+   3|                   int input_batches, int input_height, int input_width,
+   4|                   int input_depth, int input_offset, const T2* filter_data,
+   5|                   int filter_height, int filter_width, int filter_count,
+   6|                   int filter_offset, int stride, Padding padding,
+   7|                   T3* output_data, int output_height, int output_width,
+   8|                   int output_shift, int output_offset, int output_mult) {
+   9|     if (input_offset < 0) {
+  10|       // Only log the first few occurrences of this warning.
+  11|       static int warning_count = 0;
+  12|       if (warning_count < 10) {
+  13|         ++warning_count;
+  14|         LOG(WARNING)
+  15|             << "For kernel '" << context->op_kernel().name() << "' from input '"
+  16|             << context->op_kernel().requested_input(0)
+  17|             << "': Zero is not representable in the quantized range used by the"
+  18|             << " input. This means QuantizedConv2d has to fall back to a slow"
+  19|             << " implementation, since the border of zero values can't be"
+  20|             << " represented easily. You should try to construct graphs that"
+  21|             << " avoid this situation.";
+  22|       }
+  23|       ReferenceConvFunctor<T1, T2, T3> conv_functor;
+  24|       conv_functor(context, input_data, input_batches, input_height,
+  25|                    input_width, input_depth, input_offset, filter_data,
+  26|                    filter_height, filter_width, filter_count, filter_offset,
+  27|                    stride, padding, output_data, output_height, output_width,
+  28|                    output_shift, output_offset, output_mult);
+  29|       return;
+  30|     }
+  31| 
+  32|     CHECK_GT(output_width, 0);
+  33|     CHECK_GT(output_height, 0);
+  34|     int filter_left_offset;
+  35|     int filter_top_offset;
+  36|     if (padding == VALID) {
+  37|       filter_left_offset =
+  38|           ((output_width - 1) * stride + filter_width - input_width + 1) / 2;
+  39|       filter_top_offset =
+  40|           ((output_height - 1) * stride + filter_height - input_height + 1) / 2;
+  41|     } else {
+  42|       filter_left_offset =
+  43|           ((output_width - 1) * stride + filter_width - input_width) / 2;
+  44|       filter_top_offset =
+  45|           ((output_height - 1) * stride + filter_height - input_height) / 2;
+  46|     }
+  47| 
+  48|     // The im2col buffer has # of patches rows, and # of filters cols.
+  49|     // It's laid out like this, in row major order in memory:
+  50|     //        < filter value count >
+  51|     //   ^   +---------------------+
+  52|     // patch |                     |
+  53|     // count |                     |
+  54|     //   v   +---------------------+
+  55|     // Each patch row contains a filter_width x filter_height patch of the
+  56|     // input, with the depth channel as the most contiguous in memory, followed
+  57|     // by the width, then the height. This is the standard memory order in the
+  58|     // image world if it helps to visualize it.
+  59|     const int filter_value_count = filter_width * filter_height * input_depth;
+  60|     const int64 patches_per_chunk =
+  61|         kMaxChunkSize / (filter_value_count * sizeof(T1));
+  62|     const int64 chunk_value_count =
+  63|         (kMaxChunkSize + (sizeof(T1) - 1)) / sizeof(T1);
+  64|     // TODO(petewarden) - Memory allocation can be very slow on Android. Can we
+  65|     // optimize this by keeping the scratch buffer around?
+  66|     // Because memory allocation is very expensive on mobile platforms, try to
+  67|     // allocate a persistent buffer that will be kept around between calls. We
+  68|     // use TensorFlow's resource management to ensure that the memory will be
+  69|     // released when the session is over.
+  70|     Im2ColBufferResource<T1, chunk_value_count>* im2col_buffer_resource;
+  71|     std::function<Status(Im2ColBufferResource<T1, chunk_value_count>**)>
+  72|         creator = [](Im2ColBufferResource<T1, chunk_value_count>** resource) {
+  73| #ifdef _MSC_VER
+  74|           // MSVC complains about the capture of chunk_value_count which oddly
+  75|           // works fine in conv_ops_using_gemm.cc for example.
+  76|           // Define chunk_value_count inside the lambda for now.
+  77|           const int64 chunk_value_count =
+  78|               (kMaxChunkSize + (sizeof(T1) - 1)) / sizeof(T1);
+  79| #endif
+  80|           *resource = new Im2ColBufferResource<T1, chunk_value_count>();
+  81|           return Status::OK();
+  82|         };
+  83|     OP_REQUIRES_OK(context, context->resource_manager()->LookupOrCreate(
+  84|                                 "Conv2d", "im2col_buffer",
+  85|                                 &im2col_buffer_resource, creator));
+  86|     // This means that multiple ops can't be run simultaneously on different
+  87|     // threads, because we have a single shared resource. The platforms this is
+  88|     // aimed at have intra-op parallelism as their focus though, so it shouldn't
+  89|     // be an issue.
+  90|     mutex_lock lock_buffer(im2col_buffer_resource->mu);
+  91|     core::ScopedUnref unref_buffer(im2col_buffer_resource);
+  92|     T1* im2col_buffer = im2col_buffer_resource->data;
+  93| 
+  94|     const int64 patch_count = (input_batches * output_height * output_width);
+  95|     const int64 chunk_count =
+  96|         (patch_count + (patches_per_chunk - 1)) / patches_per_chunk;
+  97| 
+  98|     for (int64 chunk_index = 0; chunk_index < chunk_count; ++chunk_index) {
+  99|       const int64 patch_index_start = chunk_index * patches_per_chunk;
+ 100|       const int64 patch_index_end =
+ 101|           std::min(patch_index_start + patches_per_chunk, patch_count);
+ 102|       for (int64 patch_index = patch_index_start; patch_index < patch_index_end;
+ 103|            ++patch_index) {
+ 104|         const int64 batch = patch_index / (output_height * output_width);
+ 105|         const int64 out_y = (patch_index / output_width) % output_height;
+ 106|         const int64 out_x = patch_index % output_width;
+ 107|         const T1* input_batch_start =
+ 108|             input_data + (batch * input_height * input_width * input_depth);
+ 109|         const int in_y_origin = (out_y * stride) - filter_top_offset;
+ 110|         const int in_x_origin = (out_x * stride) - filter_left_offset;
+ 111|         const int patch_index_within_chunk = patch_index % patches_per_chunk;
+ 112|         T1* im2col_patch_start =
+ 113|             im2col_buffer + (patch_index_within_chunk * filter_value_count);
+ 114|         for (int filter_y = 0; filter_y < filter_height; ++filter_y) {
+ 115|           const int in_y = in_y_origin + filter_y;
+ 116|           T1* im2col_row_start =
+ 117|               im2col_patch_start + (filter_y * filter_width * input_depth);
+ 118|           // If we're off the top or the bottom of the input, fill the
+ 119|           // whole row with zeroes.
+ 120|           if ((in_y < 0) || (in_y >= input_height)) {
+ 121|             // On Android, memset and memcpy are significantly faster than the
+ 122|             // more modern std::set and std::copy equivalents.
+ 123|             memset(im2col_row_start, input_offset,
+ 124|                    (filter_width * input_depth));
+ 125|           } else {
+ 126|             // What we're doing here is trying to copy and fill the im2col
+ 127|             // buffer as efficiently as possible, using functions to set or
+ 128|             // duplicate values en masse. We know we don't have to worry about
+ 129|             // vertical edges because we dealt with that case above, so we
+ 130|             // just need to handle filters that overlap the left or right
+ 131|             // edges. Here's what that looks like:
+ 132|             //
+ 133|             // < left_zero_count > < center_copy_count > < right_zero_count >
+ 134|             // +------------------+---------------------+--------------------+
+ 135|             // |     (filter)     |       (image)       |      (filter)      |
+ 136|             // +------------------+---------------------+--------------------+
+ 137|             // in_x_origin        0                 input_width       in_x_end
+ 138|             //
+ 139|             // In reality it's unlikely that a filter patch will be wider
+ 140|             // than an input, but this shows all the edge cases.
+ 141|             // We use memset() to set the left and right sections to zeroes
+ 142|             // and memcpy() to copy over the input data for the center. These
+ 143|             // are preferred to std::fill and std::copy because they're much
+ 144|             // faster on Android.
+ 145|             const int in_x_end = in_x_origin + filter_width;
+ 146|             const int left_zero_count = std::max(0, 0 - in_x_origin);
+ 147|             const int right_zero_count = std::max(0, in_x_end - input_width);
+ 148|             const int center_copy_count =
+ 149|                 filter_width - (left_zero_count + right_zero_count);
+ 150|             if (left_zero_count > 0) {
+ 151|               T1* im2col_left_start = im2col_row_start;
+ 152|               memset(im2col_left_start, input_offset,
+ 153|                      (left_zero_count * input_depth));
+ 154|             }
+ 155|             if (center_copy_count > 0) {
+ 156|               const T1* input_row_start =
+ 157|                   input_batch_start + (in_y * input_width * input_depth) +
+ 158|                   (std::max(0, in_x_origin) * input_depth);
+ 159|               T1* im2col_center_start =
+ 160|                   im2col_row_start + (left_zero_count * input_depth);
+ 161|               memcpy(im2col_center_start, input_row_start,
+ 162|                      (center_copy_count * input_depth));
+ 163|             }
+ 164|             if (right_zero_count > 0) {
+ 165|               T1* im2col_right_start =
+ 166|                   im2col_row_start +
+ 167|                   ((left_zero_count + center_copy_count) * input_depth);
+ 168|               memset(im2col_right_start, input_offset,
+ 169|                      (right_zero_count * input_depth));
+ 170|             }
+ 171|           }
+ 172|         }
+ 173|       }
+ 174|       // Now we've assembled a set of image patches into a matrix, apply a
+ 175|       // GEMM matrix multiply of the patches as rows, times the filter
+ 176|       // weights in columns, to get partial results in the output matrix.
+ 177|       const int how_many_patches = patch_index_end - patch_index_start;
+ 178|       const bool transpose_a = false;
+ 179|       const bool transpose_b = false;
+ 180|       const bool transpose_c = false;
+ 181|       const int m = how_many_patches;
+ 182|       const int n = filter_count;
+ 183|       const int k = filter_value_count;
+ 184|       const int lda = filter_value_count;
+ 185|       const int ldb = filter_count;
+ 186|       const int ldc = filter_count;
+ 187|       T3* chunk_output_data = output_data + (patch_index_start * filter_count);
+ 188| 
+ 189|       if (meta::IsSupportedAndEnabled() && std::is_same<T1, quint8>() &&
+ 190|           std::is_same<T2, quint8>() && std::is_same<T3, qint32>() &&
+ 191|           (output_offset == 0) && (output_mult == 1) && (output_shift == 0) &&
+ 192|           (transpose_c == false) && (k <= 2048)) {
+ 193|         meta::QuantizedGemm(context, transpose_a, transpose_b, im2col_buffer,
+ 194|                             filter_data, chunk_output_data, m, n, k,
+ 195|                             -input_offset, -filter_offset, lda, ldb, ldc);
+ 196|       } else if (std::is_same<T1, quint8>() && std::is_same<T2, quint8>() &&
+ 197|                  std::is_same<T3, qint32>() && (output_offset == 0) &&
+ 198|                  (output_mult == 1) && (output_shift == 0)) {
+ 199|         // The gemmlowp optimized library only works for a particular set of
+ 200|         // data types, so check if we meet those requirements and fall back to a
+ 201|         // slower reference implementation if not.
+ 202|         const uint8* im2col_data_as_uint8 = &(im2col_buffer->value);
+ 203|         const uint8* filter_data_as_uint8 = &(filter_data->value);
+ 204|         int32* output_data_as_int32 = &(chunk_output_data->value);
+ 205|         // All of the transpose_* variables are currently compile-time consts,
+ 206|         // so we could just hard-code these values too, but that would break if
+ 207|         // anybody changed those values in the future (e.g. to match the ability
+ 208|         // of MatMul to specify them as attributes). We're using a verbose
+ 209|         // approach of deriving the order values from the transpose variables to
+ 210|         // be able to catch any changes like that.
+ 211|         static const gemmlowp::MapOrder ResultOrder =
+ 212|             !transpose_c ? gemmlowp::MapOrder::RowMajor
+ 213|                          : gemmlowp::MapOrder::ColMajor;
+ 214|         static const gemmlowp::MapOrder LhsOrder =
+ 215|             !transpose_a ? gemmlowp::MapOrder::RowMajor
+ 216|                          : gemmlowp::MapOrder::ColMajor;
+ 217|         static const gemmlowp::MapOrder RhsOrder =
+ 218|             !transpose_b ? gemmlowp::MapOrder::RowMajor
+ 219|                          : gemmlowp::MapOrder::ColMajor;
+ 220|         gemmlowp::MatrixMap<const std::uint8_t, LhsOrder> lhs(
+ 221|             im2col_data_as_uint8, m, k, lda);
+ 222|         gemmlowp::MatrixMap<const std::uint8_t, RhsOrder> rhs(
+ 223|             filter_data_as_uint8, k, n, ldb);
+ 224|         gemmlowp::MatrixMap<std::int32_t, ResultOrder> result(
+ 225|             output_data_as_int32, m, n, ldc);
+ 226|         const std::tuple<> empty_pipeline = {};
+ 227| 
+ 228|         auto& worker_threads =
+ 229|             *(context->device()->tensorflow_cpu_worker_threads());
+ 230|         TensorflowGemmContext context(worker_threads.num_threads,
+ 231|                                       worker_threads.workers);
+ 232|         gemmlowp::GemmWithOutputPipeline<std::uint8_t, std::int32_t,
+ 233|                                          gemmlowp::DefaultL8R8BitDepthParams>(
+ 234|             &context, lhs, rhs, &result, -input_offset, -filter_offset,
+ 235|             empty_pipeline);
+ 236|         // Since gemmlowp uses assembly to write to the output, msan won't
+ 237|         // detect the output buffer as written to, so we mark it manually.
+ 238|         TF_ANNOTATE_MEMORY_IS_INITIALIZED(output_data_as_int32,
+ 239|                                           m * n * sizeof(int32));
+ 240|       } else {
+ 241|         ReferenceGemm<T1, T2, T3>(
+ 242|             transpose_a, transpose_b, transpose_c, m, n, k, im2col_buffer,
+ 243|             input_offset, lda, filter_data, filter_offset, ldb,
+ 244|             chunk_output_data, output_shift, output_offset, output_mult, ldc);
+ 245|       }
+ 246|     }
+ 247|   }
+<<<END_UNTRUSTED_CODE>>>

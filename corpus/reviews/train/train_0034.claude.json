@@ -1,0 +1,252 @@
+{
+  "subsystem": "SDDM (Simple Desktop Display Manager) greeter launcher. This is the Greeter::start() method of the daemon-side helper that spawns the graphical login greeter process (the sddm-greeter binary). It runs inside the SDDM daemon, which itself runs as root, and is responsible for constructing the greeter's process environment and either launching it directly via QProcess (test mode) or via the PAM-backed Auth helper as the unprivileged 'sddm' user (production mode).",
+  "provenance": "Identified from the code itself: the class/method name Greeter::start(), the sddm-greeter binary path built from the BIN_INSTALL_DIR macro (line 33/66), the setUser(\"sddm\") call (line 100), the SDDM-specific singletons daemonApp, mainConfig, m_display->seat()/sessionType(), and the daemonApp->displayManager()->seatPath()/sessionPath() calls. The sample banner names it corpus/train/train_0034_cwe284.cpp (CWE-284 Improper Access Control) and the header 'primevul_train_2771_vuln' marks it as a PrimeVul vulnerable sample. This matches SDDM's daemon/Greeter.cpp Greeter::start().",
+  "trust_boundary": "The SDDM daemon runs as root and this method assembles the environment and command line for a child login greeter. The trust boundary is (a) the daemon's own inherited process environment, from which LD_LIBRARY_PATH, QT_PLUGIN_PATH, QML2_IMPORT_PATH and XDG_DATA_DIRS are copied wholesale into the child (lines 74-82); (b) the on-disk configuration (mainConfig.Users.DefaultPath, mainConfig.Theme.CursorTheme) which drives PATH and XCURSOR_THEME; and (c) display/seat state (m_display->name(), m_socket, m_theme, m_authPath) that flows into the greeter command and X authority path. Anything that can influence the root daemon's environment, the config files, or the seat/display values controls how a privileged process launches a login UI, so those inputs are the hostile surface for an access-control / privilege-boundary review.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0034_cwe284.cpp",
+      "lines": "2-5",
+      "code": "    bool Greeter::start() {\n        // check flag\n        if (m_started)\n            return false;",
+      "explanation": "Greeter::start() is the entry point that launches the graphical greeter. It returns a bool success flag. The first thing it does is guard against being started twice: if the member flag m_started is already true it returns false immediately. This once-guard is important because the method allocates heap objects (a QProcess or an Auth) and wires up signal/slot connections; without the guard a second call would leak and double-wire those objects."
+    },
+    {
+      "file": "corpus/train/train_0034_cwe284.cpp",
+      "lines": "7-9",
+      "code": "        if (daemonApp->testing()) {\n            // create process\n            m_process = new QProcess(this);",
+      "explanation": "The method forks into two entirely different launch strategies based on daemonApp->testing(). In test mode it launches the greeter directly as a QProcess (line 9) that is a child QObject of 'this' (the parent pointer), so Qt's parent/child ownership will free it when the Greeter is destroyed. Crucially, in this branch there is NO privilege separation: the greeter runs with the same user/credentials as whatever process created the QProcess. The production branch (line 54 onward) instead runs the greeter through the Auth/PAM helper as the dedicated 'sddm' user."
+    },
+    {
+      "file": "corpus/train/train_0034_cwe284.cpp",
+      "lines": "11-15",
+      "code": "            // delete process on finish\n            connect(m_process, SIGNAL(finished(int,QProcess::ExitStatus)), this, SLOT(finished()));\n\n            connect(m_process, SIGNAL(readyReadStandardOutput()), SLOT(onReadyReadStandardOutput()));\n            connect(m_process, SIGNAL(readyReadStandardError()), SLOT(onReadyReadStandardError()));",
+      "explanation": "Three signal/slot connections are established on the freshly created QProcess. The comment 'delete process on finish' plus the finished() slot indicate that when the child exits the Greeter's finished() slot destroys/cleans up m_process. The other two connections route the child's stdout and stderr to onReadyReadStandardOutput()/onReadyReadStandardError(), which read from m_process. This wiring creates a lifetime coupling: the object that the readyRead slots dereference (m_process) is the same object the finished() slot tears down, and all three are delivered asynchronously through the Qt event loop."
+    },
+    {
+      "file": "corpus/train/train_0034_cwe284.cpp",
+      "lines": "17-25",
+      "code": "            // log message\n            qDebug() << \"Greeter starting...\";\n\n            // set process environment\n            QProcessEnvironment env = QProcessEnvironment::systemEnvironment();\n            env.insert(QStringLiteral(\"DISPLAY\"), m_display->name());\n            env.insert(QStringLiteral(\"XAUTHORITY\"), m_authPath);\n            env.insert(QStringLiteral(\"XCURSOR_THEME\"), mainConfig.Theme.CursorTheme.get());\n            m_process->setProcessEnvironment(env);",
+      "explanation": "In test mode the child's environment starts as a full copy of the daemon's system environment (QProcessEnvironment::systemEnvironment()) and then overlays three keys: DISPLAY (the X display name), XAUTHORITY (the path to the X authority cookie file, m_authPath, which grants access to the X server), and XCURSOR_THEME (from config). setProcessEnvironment then applies this to the QProcess. Because it starts from the WHOLE system environment, every variable the daemon inherited — including dynamic-loader and Qt plugin search paths — is passed through unfiltered."
+    },
+    {
+      "file": "corpus/train/train_0034_cwe284.cpp",
+      "lines": "28-33",
+      "code": "            QStringList args;\n            if (daemonApp->testing())\n                args << QStringLiteral(\"--test-mode\");\n            args << QStringLiteral(\"--socket\") << m_socket\n                 << QStringLiteral(\"--theme\") << m_theme;\n            m_process->start(QStringLiteral(\"%1/sddm-greeter\").arg(QStringLiteral(BIN_INSTALL_DIR)), args);",
+      "explanation": "The greeter command line is assembled as a QStringList: --test-mode (redundantly re-checking testing()), then --socket <m_socket> and --theme <m_theme>. The program path is built from the compile-time BIN_INSTALL_DIR macro joined with 'sddm-greeter'. It is launched with QProcess::start(program, arguments), which passes each list element as a separate argv entry WITHOUT going through a shell — so this form is not vulnerable to shell metacharacter injection, and each of m_socket/m_theme stays a single argument regardless of embedded spaces."
+    },
+    {
+      "file": "corpus/train/train_0034_cwe284.cpp",
+      "lines": "35-47",
+      "code": "            //if we fail to start bail immediately, and don't block in waitForStarted\n            if (m_process->state() == QProcess::NotRunning) {\n                qCritical() << \"Greeter failed to launch.\";\n                return false;\n            }\n            // wait for greeter to start\n            if (!m_process->waitForStarted()) {\n                // log message\n                qCritical() << \"Failed to start greeter.\";\n\n                // return fail\n                return false;\n            }",
+      "explanation": "After start() the code checks m_process->state(); if the process never entered a running state it logs and returns false without blocking. Otherwise it calls waitForStarted() (a blocking wait) and returns false on failure. Both failure paths return before m_started is set, leaving the object in a not-started state. Note that a failed start still leaves m_process allocated and connected; on a later successful call the once-guard prevents re-entry only if m_started was set, which it is not on these early returns."
+    },
+    {
+      "file": "corpus/train/train_0034_cwe284.cpp",
+      "lines": "49-53",
+      "code": "            // log message\n            qDebug() << \"Greeter started.\";\n\n            // set flag\n            m_started = true;",
+      "explanation": "On the success path the method logs 'Greeter started.' and sets m_started = true, arming the once-guard from line 4 so subsequent start() calls short-circuit. This completes the test-mode branch."
+    },
+    {
+      "file": "corpus/train/train_0034_cwe284.cpp",
+      "lines": "54-62",
+      "code": "        } else {\n            // authentication\n            m_auth = new Auth(this);\n            m_auth->setVerbose(true);\n            connect(m_auth, SIGNAL(requestChanged()), this, SLOT(onRequestChanged()));\n            connect(m_auth, SIGNAL(session(bool)), this, SLOT(onSessionStarted(bool)));\n            connect(m_auth, SIGNAL(finished(Auth::HelperExitStatus)), this, SLOT(onHelperFinished(Auth::HelperExitStatus)));\n            connect(m_auth, SIGNAL(info(QString,Auth::Info)), this, SLOT(authInfo(QString,Auth::Info)));\n            connect(m_auth, SIGNAL(error(QString,Auth::Error)), this, SLOT(authError(QString,Auth::Error)));",
+      "explanation": "The production (non-testing) branch allocates an Auth object (heap, parented to this so Qt owns it) which drives PAM-based authentication and privilege-dropping. setVerbose(true) enables detailed logging. Five signals are wired to Greeter slots covering conversation requests, session start, helper finish, and info/error messages. Unlike the test branch, this path will actually change the greeter's effective user, so it is the privilege-boundary-relevant code path."
+    },
+    {
+      "file": "corpus/train/train_0034_cwe284.cpp",
+      "lines": "64-68",
+      "code": "            // greeter command\n            QStringList args;\n            args << QStringLiteral(\"%1/sddm-greeter\").arg(QStringLiteral(BIN_INSTALL_DIR));\n            args << QStringLiteral(\"--socket\") << m_socket\n                 << QStringLiteral(\"--theme\") << m_theme;",
+      "explanation": "The greeter command is again assembled as a QStringList, but here the program path is the FIRST list element (args[0]) rather than a separate program argument. The list holds the binary path, --socket <m_socket>, --theme <m_theme>. This list is later flattened with join(' ') (line 102) into a single string for the Auth helper, which is a materially different execution model from the QProcess(program, args) form used in test mode."
+    },
+    {
+      "file": "corpus/train/train_0034_cwe284.cpp",
+      "lines": "70-82",
+      "code": "            // greeter environment\n            QProcessEnvironment env;\n            QProcessEnvironment sysenv = QProcessEnvironment::systemEnvironment();\n\n            insertEnvironmentList({QStringLiteral(\"LANG\"), QStringLiteral(\"LANGUAGE\"),\n                                   QStringLiteral(\"LC_CTYPE\"), QStringLiteral(\"LC_NUMERIC\"), QStringLiteral(\"LC_TIME\"), QStringLiteral(\"LC_COLLATE\"),\n                                   QStringLiteral(\"LC_MONETARY\"), QStringLiteral(\"LC_MESSAGES\"), QStringLiteral(\"LC_PAPER\"), QStringLiteral(\"LC_NAME\"),\n                                   QStringLiteral(\"LC_ADDRESS\"), QStringLiteral(\"LC_TELEPHONE\"), QStringLiteral(\"LC_MEASUREMENT\"), QStringLiteral(\"LC_IDENTIFICATION\"),\n                                   QStringLiteral(\"LD_LIBRARY_PATH\"),\n                                   QStringLiteral(\"QML2_IMPORT_PATH\"),\n                                   QStringLiteral(\"QT_PLUGIN_PATH\"),\n                                   QStringLiteral(\"XDG_DATA_DIRS\")\n            }, sysenv, env);",
+      "explanation": "Unlike the test branch, the production branch builds env from EMPTY (QProcessEnvironment env;) and then selectively copies a whitelist of keys from the daemon's system environment (sysenv) via insertEnvironmentList. Most of the whitelist is locale (LANG/LC_*), which is benign, but it also copies four security-sensitive search-path variables: LD_LIBRARY_PATH (dynamic linker search path), QML2_IMPORT_PATH and QT_PLUGIN_PATH (Qt code-loading search paths), and XDG_DATA_DIRS. These four control which shared objects / plugins the sddm-greeter process will load at startup. The starting-empty design shows the authors intended to sanitize the environment, but the presence of loader/plugin search paths in the whitelist means whatever the root daemon inherited for those keys is forwarded to the greeter."
+    },
+    {
+      "file": "corpus/train/train_0034_cwe284.cpp",
+      "lines": "84-94",
+      "code": "            env.insert(QStringLiteral(\"PATH\"), mainConfig.Users.DefaultPath.get());\n            env.insert(QStringLiteral(\"DISPLAY\"), m_display->name());\n            env.insert(QStringLiteral(\"XAUTHORITY\"), m_authPath);\n            env.insert(QStringLiteral(\"XCURSOR_THEME\"), mainConfig.Theme.CursorTheme.get());\n            env.insert(QStringLiteral(\"XDG_SEAT\"), m_display->seat()->name());\n            env.insert(QStringLiteral(\"XDG_SEAT_PATH\"), daemonApp->displayManager()->seatPath(m_display->seat()->name()));\n            env.insert(QStringLiteral(\"XDG_SESSION_PATH\"), daemonApp->displayManager()->sessionPath(QStringLiteral(\"Session%1\").arg(daemonApp->newSessionId())));\n            env.insert(QStringLiteral(\"XDG_VTNR\"), QString::number(m_display->terminalId()));\n            env.insert(QStringLiteral(\"XDG_SESSION_CLASS\"), QStringLiteral(\"greeter\"));\n            env.insert(QStringLiteral(\"XDG_SESSION_TYPE\"), m_display->sessionType());\n            m_auth->insertEnvironment(env);",
+      "explanation": "The remaining environment is assembled explicitly: PATH from the configured mainConfig.Users.DefaultPath, DISPLAY, XAUTHORITY (X cookie path m_authPath), XCURSOR_THEME from config, and a set of XDG_* variables describing the seat, session path, VT number, session class ('greeter') and session type. env is then handed to the Auth helper via insertEnvironment, which will apply it to the greeter it spawns as the sddm user. PATH and XCURSOR_THEME are config-driven; the XDG_* values come from display/seat manager state."
+    },
+    {
+      "file": "corpus/train/train_0034_cwe284.cpp",
+      "lines": "99-103",
+      "code": "            // start greeter\n            m_auth->setUser(QStringLiteral(\"sddm\"));\n            m_auth->setGreeter(true);\n            m_auth->setSession(args.join(QLatin1Char(' ')));\n            m_auth->start();",
+      "explanation": "The Auth helper is configured to run as user 'sddm' (setUser), flagged as a greeter session (setGreeter), and given the session command via setSession(args.join(' ')). This join is the key difference from the test branch: the QStringList (program path, --socket, m_socket, --theme, m_theme) is collapsed into a single space-delimited STRING, which the Auth/PAM helper will later have to re-split into arguments (or hand to a shell) before exec. m_auth->start() then launches the whole flow. Running as 'sddm' is the intended privilege drop from the root daemon."
+    },
+    {
+      "file": "corpus/train/train_0034_cwe284.cpp",
+      "lines": "106-108",
+      "code": "        // return success\n        return true;\n    }",
+      "explanation": "Both branches converge to return true. Note that in the production branch m_started is never set to true (only the test branch sets it at line 53), so the once-guard at line 4 does not actually protect the production path — a second call would allocate a second Auth object and re-run the whole launch. The method reports success as soon as the launch was initiated, not when the greeter is confirmed running (the Auth path is asynchronous)."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0034_cwe284.cpp",
+      "lines": "78-82",
+      "code": "                                   QStringLiteral(\"LD_LIBRARY_PATH\"),\n                                   QStringLiteral(\"QML2_IMPORT_PATH\"),\n                                   QStringLiteral(\"QT_PLUGIN_PATH\"),\n                                   QStringLiteral(\"XDG_DATA_DIRS\")\n            }, sysenv, env);",
+      "explanation": "The environment sanitizer copies LD_LIBRARY_PATH, QML2_IMPORT_PATH and QT_PLUGIN_PATH from the daemon's inherited system environment straight into the greeter's environment. These are all code-loading search paths: LD_LIBRARY_PATH steers the dynamic linker, and QML2_IMPORT_PATH/QT_PLUGIN_PATH steer which QML modules and Qt plugins sddm-greeter dlopen()s at startup. If any of these variables were set in the environment the root SDDM daemon was launched with (e.g. via a tampered systemd unit drop-in, a login/pam environment file, or a poisoned parent), that untrusted directory becomes a controlled-search-path primitive: a malicious .so/plugin placed there is loaded into the greeter, which runs before any user authenticates — i.e., code execution on the pre-login trust boundary (Improper Access Control / untrusted search path). The whitelist starting from an EMPTY environment shows intent to sanitize, but forwarding loader/plugin path variables defeats that intent. The invariant: security-sensitive search-path variables must be dropped (not whitelisted) when launching a privileged pre-auth process, or reset to trusted absolute defaults."
+    },
+    {
+      "file": "corpus/train/train_0034_cwe284.cpp",
+      "lines": "11-15",
+      "code": "            // delete process on finish\n            connect(m_process, SIGNAL(finished(int,QProcess::ExitStatus)), this, SLOT(finished()));\n\n            connect(m_process, SIGNAL(readyReadStandardOutput()), SLOT(onReadyReadStandardOutput()));\n            connect(m_process, SIGNAL(readyReadStandardError()), SLOT(onReadyReadStandardError()));",
+      "explanation": "The finished() slot is documented to delete m_process ('delete process on finish'), while onReadyReadStandardOutput()/onReadyReadStandardError() read from that same m_process. If the child exits while unread stdout/stderr is still buffered, Qt may still have a readyRead signal queued (or the slots may run during the same event-loop turn). Should finished() free (or deleteLater) m_process and a readyRead slot then dereference m_process, that is a use-after-free / stale-pointer dereference in a root-adjacent daemon. This is a latent lifetime contract the implementation must uphold: the finished() handler must either flush and disconnect the readyRead signals before freeing, or null out m_process and have the readyRead slots guard against it. The header/wiring alone cannot prove the slot body is safe, so this must be confirmed in finished()."
+    },
+    {
+      "file": "corpus/train/train_0034_cwe284.cpp",
+      "lines": "102",
+      "code": "            m_auth->setSession(args.join(QLatin1Char(' ')));",
+      "explanation": "In the production branch the argument vector (program path, --socket, m_socket, --theme, m_theme) is flattened into one space-separated string and passed to the PAM helper via setSession. Whether this is safe depends entirely on how the Auth backend consumes it: if it re-splits on whitespace (or hands it to /bin/sh -c), then any space or shell metacharacter inside m_socket or m_theme changes the argument boundaries or injects a command. m_theme is the theme name (config/display-derived) and m_socket is the socket path; if either can contain a space, the greeter is invoked with corrupted arguments, and if the helper uses a shell, it is argument/command injection into a process that transitions privilege to the sddm user. Contrast with the test branch (line 33) which passes a real argv list to QProcess and is immune to this. Invariant: the Auth session command must be conveyed as a structured argv, or every element must be validated/quoted before joining. Confirm how Auth::setSession tokenizes and execs the string."
+    },
+    {
+      "file": "corpus/train/train_0034_cwe284.cpp",
+      "lines": "21-25",
+      "code": "            QProcessEnvironment env = QProcessEnvironment::systemEnvironment();\n            env.insert(QStringLiteral(\"DISPLAY\"), m_display->name());\n            env.insert(QStringLiteral(\"XAUTHORITY\"), m_authPath);\n            env.insert(QStringLiteral(\"XCURSOR_THEME\"), mainConfig.Theme.CursorTheme.get());\n            m_process->setProcessEnvironment(env);",
+      "explanation": "The test-mode branch does NOT sanitize the environment at all: it starts from the complete systemEnvironment() and only overlays three keys, so LD_LIBRARY_PATH/QT_PLUGIN_PATH/etc. pass through in full. It also does not go through Auth, so the greeter runs with the SAME credentials as the caller rather than being dropped to 'sddm'. While this branch is gated on daemonApp->testing(), the inconsistency is itself a risk: the two branches have divergent privilege and environment-hardening models, and any deployment or bug that reaches the test path (or an attacker who can flip testing()) launches an unsanitized, non-privilege-dropped greeter. Invariant: test vs production launch must not silently weaken the environment/privilege posture that production relies on."
+    },
+    {
+      "file": "corpus/train/train_0034_cwe284.cpp",
+      "lines": "84",
+      "code": "            env.insert(QStringLiteral(\"PATH\"), mainConfig.Users.DefaultPath.get());",
+      "explanation": "PATH is taken directly from the configuration value mainConfig.Users.DefaultPath and XCURSOR_THEME from mainConfig.Theme.CursorTheme (line 87). These become the search path and cursor theme for a process that runs during the login phase. If the SDDM config file (or a config directory an unprivileged user can influence) is not strictly root-owned and root-only-writable, an attacker who can set DefaultPath to a writable directory controls the PATH used by the greeter and any child it spawns, enabling PATH-based binary hijacking at the login trust boundary. This is a latent access-control dependency: the safety of this line rests on the file permissions and parsing of the config subsystem, which must guarantee these values are trusted."
+    },
+    {
+      "file": "corpus/train/train_0034_cwe284.cpp",
+      "lines": "23",
+      "code": "            env.insert(QStringLiteral(\"XAUTHORITY\"), m_authPath);",
+      "explanation": "XAUTHORITY is set to m_authPath, the path of the X authority cookie that grants access to the X server. The greeter is given this path so it can connect. The access-control contract is that m_authPath points to a file that is readable only by the intended (sddm/greeter) principal and contains a cookie scoped to this display; if the authority file is world-readable, predictably named, or shared beyond the greeter, any local user could read the cookie and connect to the greeter's X server (keystroke sniffing / screen capture of the login prompt). This line only forwards the path — the risk lives in how the file is created and permissioned by the display setup code, which must be confirmed."
+    }
+  ],
+  "summary": "This is SDDM's root daemon code that launches the pre-authentication login greeter. It has no memory-corruption bug in the shown lines, but it carries several access-control (CWE-284) contracts: it forwards code-loading search-path variables (LD_LIBRARY_PATH, QT_PLUGIN_PATH, QML2_IMPORT_PATH) from the root daemon's environment into the greeter, it flattens the greeter argv into a single string for the PAM helper (argument/command-injection surface if any element contains separators), and it depends on config-supplied PATH and the XAUTHORITY file being trustworthy. The strongest concern is untrusted search-path propagation into a privileged pre-login process.",
+  "reviewed_anchors": [
+    {"anchor": "bool Greeter::start() (line 2)", "disposition": "dismissed", "reason": "Method signature/entry point; no parameters carry untrusted data, contract risks live in its body."},
+    {"anchor": "m_started guard (lines 4, 53)", "disposition": "dismissed", "reason": "Once-guard; benign, though note it is only set in the test branch (line 53), so it does not protect the production path — a correctness gap, not a direct security bug."},
+    {"anchor": "daemonApp->testing() branch selector (lines 7, 29)", "disposition": "finding", "reason": "Selects between an unsanitized, non-privilege-dropped launch and the hardened one; divergent posture is a risk."},
+    {"anchor": "m_process = new QProcess(this) (line 9)", "disposition": "dismissed", "reason": "Qt parent-owned single object; allocated with new and freed via Qt/delete, not new[]; the CWE-762 note does not apply. Lifetime risk is captured under the finished()/readyRead anchor."},
+    {"anchor": "connect finished() -> deletes m_process (line 12)", "disposition": "finding", "reason": "Deletes the object that the readyRead slots dereference; asynchronous use-after-free contract."},
+    {"anchor": "connect readyReadStandardOutput/Error (lines 14-15)", "disposition": "finding", "reason": "Slots read m_process after it may be freed by finished(); part of the lifetime finding."},
+    {"anchor": "QProcessEnvironment::systemEnvironment() test branch (line 21)", "disposition": "finding", "reason": "Test branch inherits the full environment unsanitized; part of the environment-hardening inconsistency finding."},
+    {"anchor": "env.insert DISPLAY m_display->name() (lines 22, 85)", "disposition": "dismissed", "reason": "Display name is local display state, not a buffer or attacker-length field; low value."},
+    {"anchor": "env.insert XAUTHORITY m_authPath (lines 23, 86)", "disposition": "finding", "reason": "Forwards X server access cookie path; access-control depends on file permissions of m_authPath."},
+    {"anchor": "env.insert XCURSOR_THEME mainConfig.Theme.CursorTheme.get() (lines 24, 87)", "disposition": "dismissed", "reason": "Config-driven cosmetic value; covered generally by the config-trust (PATH) finding; low direct risk."},
+    {"anchor": "m_process->setProcessEnvironment(env) (line 25)", "disposition": "dismissed", "reason": "Applies the env built above; risk is in the env contents, tracked under the test-branch finding."},
+    {"anchor": "args QStringList / --test-mode/--socket m_socket/--theme m_theme (lines 28-32)", "disposition": "dismissed", "reason": "Passed to QProcess::start as a real argv list; not shell-interpreted, each element stays one argument — safe form."},
+    {"anchor": "m_process->start(BIN_INSTALL_DIR/sddm-greeter, args) (line 33)", "disposition": "dismissed", "reason": "Program path from compile-time macro, args as list; no injection surface in this form."},
+    {"anchor": "m_process->state()==NotRunning / waitForStarted() (lines 36, 41)", "disposition": "dismissed", "reason": "Failure handling with early returns; no security contract, but leaves m_started unset on failure (benign here)."},
+    {"anchor": "m_auth = new Auth(this) (line 56)", "disposition": "dismissed", "reason": "Qt parent-owned single allocation via new (not new[]); freed by Qt; no mismatched-free contract."},
+    {"anchor": "connect Auth signals (lines 58-62)", "disposition": "dismissed", "reason": "Standard signal wiring to Greeter slots; no direct contract beyond correct slot bodies."},
+    {"anchor": "args build with program path first (lines 65-68)", "disposition": "finding", "reason": "This list is later join()'d into one string; the flattening is the injection surface."},
+    {"anchor": "insertEnvironmentList whitelist incl LD_LIBRARY_PATH/QML2_IMPORT_PATH/QT_PLUGIN_PATH/XDG_DATA_DIRS (lines 74-82)", "disposition": "finding", "reason": "Copies code-loading search paths from the root daemon environment into the pre-auth greeter — untrusted search path / access control."},
+    {"anchor": "env.insert PATH mainConfig.Users.DefaultPath.get() (line 84)", "disposition": "finding", "reason": "Config-supplied PATH for a login-phase process; binary-hijack risk if config is not root-only."},
+    {"anchor": "env.insert XDG_SEAT/XDG_SEAT_PATH/XDG_SESSION_PATH/XDG_VTNR/XDG_SESSION_CLASS/XDG_SESSION_TYPE (lines 88-93)", "disposition": "dismissed", "reason": "Derived from display/seat manager state and constants; informational session metadata, no direct memory/access contract."},
+    {"anchor": "m_auth->insertEnvironment(env) (line 94)", "disposition": "dismissed", "reason": "Hands the assembled env to Auth; risk is in env contents (tracked under the LD_LIBRARY_PATH and PATH findings)."},
+    {"anchor": "m_auth->setUser(\"sddm\") (line 100)", "disposition": "dismissed", "reason": "Hardcoded privilege-drop target; correct intent, no injectable value."},
+    {"anchor": "m_auth->setGreeter(true) (line 101)", "disposition": "dismissed", "reason": "Boolean mode flag; no contract."},
+    {"anchor": "m_auth->setSession(args.join(' ')) (line 102)", "disposition": "finding", "reason": "Flattens argv to a single string for the PAM helper; argument/command-injection surface if elements contain separators."},
+    {"anchor": "m_auth->start() / return true (lines 103-107)", "disposition": "dismissed", "reason": "Kick-off and success return; asynchronous, no direct contract beyond those already captured."}
+  ],
+  "findings": [
+    {
+      "title": "Code-loading search-path variables forwarded from root daemon into pre-auth greeter",
+      "anchor": "insertEnvironmentList({... LD_LIBRARY_PATH, QML2_IMPORT_PATH, QT_PLUGIN_PATH ...}, sysenv, env)",
+      "file": "corpus/train/train_0034_cwe284.cpp",
+      "line": "74-82",
+      "code": "            insertEnvironmentList({QStringLiteral(\"LANG\"), QStringLiteral(\"LANGUAGE\"),\n                                   QStringLiteral(\"LC_CTYPE\"), QStringLiteral(\"LC_NUMERIC\"), QStringLiteral(\"LC_TIME\"), QStringLiteral(\"LC_COLLATE\"),\n                                   QStringLiteral(\"LC_MONETARY\"), QStringLiteral(\"LC_MESSAGES\"), QStringLiteral(\"LC_PAPER\"), QStringLiteral(\"LC_NAME\"),\n                                   QStringLiteral(\"LC_ADDRESS\"), QStringLiteral(\"LC_TELEPHONE\"), QStringLiteral(\"LC_MEASUREMENT\"), QStringLiteral(\"LC_IDENTIFICATION\"),\n                                   QStringLiteral(\"LD_LIBRARY_PATH\"),\n                                   QStringLiteral(\"QML2_IMPORT_PATH\"),\n                                   QStringLiteral(\"QT_PLUGIN_PATH\"),\n                                   QStringLiteral(\"XDG_DATA_DIRS\")\n            }, sysenv, env);",
+      "bug_class": "Improper access control via untrusted search path propagation into privileged process",
+      "cwe": "CWE-426",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0034_cwe284.cpp (Greeter::start) plus the insertEnvironmentList helper (file not provided)",
+      "invariant": "When launching a privileged, pre-authentication process, dynamic-loader and plugin search-path variables (LD_LIBRARY_PATH, QT_PLUGIN_PATH, QML2_IMPORT_PATH) must be dropped or reset to trusted absolute defaults, never copied through from the parent daemon's inherited environment.",
+      "failure_mode": "If the root SDDM daemon inherited any of LD_LIBRARY_PATH/QT_PLUGIN_PATH/QML2_IMPORT_PATH pointing at an attacker-writable directory (tampered systemd unit, pam_env file, poisoned parent), that directory is forwarded to sddm-greeter, which dlopen()s a malicious .so/plugin from it and executes attacker code at the login screen before any user authenticates.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm whether insertEnvironmentList unconditionally copies these keys from sysenv, and whether any deployment path can seed LD_LIBRARY_PATH/QT_PLUGIN_PATH/QML2_IMPORT_PATH in the daemon's environment; verify these should be whitelisted at all."
+    },
+    {
+      "title": "Greeter argv flattened to a single string for the PAM/Auth helper (argument/command injection surface)",
+      "anchor": "m_auth->setSession(args.join(QLatin1Char(' ')))",
+      "file": "corpus/train/train_0034_cwe284.cpp",
+      "line": "102",
+      "code": "            m_auth->setSession(args.join(QLatin1Char(' ')));",
+      "bug_class": "Argument/command injection via unstructured session string",
+      "cwe": "CWE-88",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0034_cwe284.cpp (Greeter::start) and the Auth::setSession/helper exec path (file not provided)",
+      "invariant": "The greeter command must reach exec as a structured argument vector; if it must be a single string, every element (m_socket, m_theme, program path) must be validated to contain no whitespace/shell metacharacters, or be shell-quoted, before joining.",
+      "failure_mode": "args (program path, --socket, m_socket, --theme, m_theme) is collapsed with join(' ') into one string; if the Auth helper re-splits on whitespace or runs it via a shell, a space or metacharacter embedded in m_theme or m_socket corrupts argument boundaries or injects a command into the process that transitions to the sddm user. The test branch (line 33) avoids this by passing a real argv list to QProcess.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm how Auth::setSession tokenizes and executes the string (argv vs shell) and whether m_theme/m_socket can contain spaces or shell metacharacters."
+    },
+    {
+      "title": "Use-after-free: finished() frees m_process that stdout/stderr slots still dereference",
+      "anchor": "connect(m_process, SIGNAL(finished(...)), this, SLOT(finished())) with readyRead slots on m_process",
+      "file": "corpus/train/train_0034_cwe284.cpp",
+      "line": "11-15",
+      "code": "            // delete process on finish\n            connect(m_process, SIGNAL(finished(int,QProcess::ExitStatus)), this, SLOT(finished()));\n\n            connect(m_process, SIGNAL(readyReadStandardOutput()), SLOT(onReadyReadStandardOutput()));\n            connect(m_process, SIGNAL(readyReadStandardError()), SLOT(onReadyReadStandardError()));",
+      "bug_class": "Use-after-free / stale pointer via callback-driven object destruction",
+      "cwe": "CWE-416",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided) — the finished(), onReadyReadStandardOutput(), onReadyReadStandardError() slot bodies",
+      "invariant": "The finished() handler that destroys m_process must first flush/disconnect the readyRead connections (or null the pointer and have the readyRead slots guard it) so that no queued readyRead delivery dereferences a freed QProcess.",
+      "failure_mode": "The child exits with unread stdout/stderr buffered; Qt may still deliver readyReadStandardOutput/Error whose slots read m_process after finished() has deleted it, causing a use-after-free in the root-adjacent daemon.",
+      "cve_analog": "",
+      "what_to_confirm": "Inspect the finished() slot: does it delete/deleteLater m_process and does it disconnect or guard the readyRead slots; verify onReadyReadStandardOutput/Error cannot run against a freed m_process."
+    },
+    {
+      "title": "Config-supplied PATH used for login-phase greeter (binary hijack if config not root-only)",
+      "anchor": "env.insert(QStringLiteral(\"PATH\"), mainConfig.Users.DefaultPath.get())",
+      "file": "corpus/train/train_0034_cwe284.cpp",
+      "line": "84",
+      "code": "            env.insert(QStringLiteral(\"PATH\"), mainConfig.Users.DefaultPath.get());",
+      "bug_class": "Improper access control / untrusted search path from configuration",
+      "cwe": "CWE-426",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0034_cwe284.cpp (Greeter::start) and the config subsystem (file not provided)",
+      "invariant": "mainConfig.Users.DefaultPath must be sourced only from root-owned, non-user-writable configuration and must not point at any directory a non-root user can write to, since it becomes the PATH of a login-phase process.",
+      "failure_mode": "If the SDDM config (or an override dir) is writable or influenceable by a local user, setting DefaultPath to an attacker-controlled directory hijacks any relative-name binary lookup performed by the greeter or its children during login.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify file ownership/permissions and parsing of the config that backs mainConfig.Users.DefaultPath, and whether any non-root path can influence it."
+    },
+    {
+      "title": "Test-mode launch skips environment sanitization and privilege drop",
+      "anchor": "if (daemonApp->testing()) { ... QProcessEnvironment::systemEnvironment() ... m_process->start(...) }",
+      "file": "corpus/train/train_0034_cwe284.cpp",
+      "line": "7-33",
+      "code": "        if (daemonApp->testing()) {\n            // create process\n            m_process = new QProcess(this);\n...\n            QProcessEnvironment env = QProcessEnvironment::systemEnvironment();\n...\n            m_process->start(QStringLiteral(\"%1/sddm-greeter\").arg(QStringLiteral(BIN_INSTALL_DIR)), args);",
+      "bug_class": "Inconsistent security posture between code paths (improper access control)",
+      "cwe": "CWE-284",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0034_cwe284.cpp (Greeter::start)",
+      "invariant": "A test/debug launch path must not run with a weaker environment/privilege model than production, and must be unreachable in a production deployment.",
+      "failure_mode": "The testing() branch inherits the full unsanitized system environment (line 21) and runs the greeter directly without dropping to the sddm user, unlike production. Any condition that makes testing() true in a deployed system (misconfiguration, forced flag) launches an unhardened, non-privilege-dropped greeter.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm daemonApp->testing() cannot be enabled in production and that reaching this branch is impossible outside the test harness."
+    },
+    {
+      "title": "XAUTHORITY cookie path exposed to greeter depends on file permissions",
+      "anchor": "env.insert(QStringLiteral(\"XAUTHORITY\"), m_authPath)",
+      "file": "corpus/train/train_0034_cwe284.cpp",
+      "line": "23",
+      "code": "            env.insert(QStringLiteral(\"XAUTHORITY\"), m_authPath);",
+      "bug_class": "Improper access control over X server authority",
+      "cwe": "CWE-284",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0034_cwe284.cpp (Greeter::start) and the X authority file setup (file not provided)",
+      "invariant": "m_authPath must reference an authority file readable only by the greeter principal and containing a cookie scoped to this display; it must not be world-readable or predictably located.",
+      "failure_mode": "If the authority file at m_authPath is world-readable or shared beyond the greeter, any local user can read the cookie and connect to the greeter's X server, enabling keystroke capture or screen scraping of the login prompt.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify how m_authPath is created and permissioned (mode 0600, correct owner) and that the cookie is display-scoped and rotated per session."
+    }
+  ],
+  "audit_checklist": [
+    "Inspect insertEnvironmentList: confirm whether LD_LIBRARY_PATH/QT_PLUGIN_PATH/QML2_IMPORT_PATH are copied from the daemon environment, and remove loader/plugin search paths from the whitelist or reset them to trusted defaults for the pre-auth greeter.",
+    "Trace Auth::setSession and its helper: determine whether the joined session string is re-split on whitespace or passed to a shell, and validate/quote m_socket and m_theme accordingly.",
+    "Read the finished() slot and the readyRead slots: ensure m_process is disconnected/nulled or guarded before deletion so no queued stdout/stderr signal dereferences freed memory.",
+    "Verify file ownership and permissions of the SDDM config backing mainConfig.Users.DefaultPath and mainConfig.Theme.CursorTheme; ensure no non-root user can influence PATH/XCURSOR_THEME for the login process.",
+    "Confirm daemonApp->testing() is unreachable in production and that the test branch's unsanitized environment / missing privilege drop cannot be triggered in a deployed system.",
+    "Check creation and mode of the XAUTHORITY file at m_authPath (owner, 0600, display-scoped cookie) to prevent local X server access.",
+    "Confirm m_started is set on the production (Auth) path too, or otherwise prevent double-start from allocating a second Auth object and relaunching the greeter."
+  ]
+}

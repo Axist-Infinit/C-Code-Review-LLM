@@ -1,0 +1,241 @@
+{
+  "subsystem": "TensorFlow CPU kernel implementation of the FractionalMaxPool op — specifically the OpKernel::Compute() body that reads a 4-D input tensor, derives an output shape from a per-dimension pooling ratio, generates randomized row/column pooling boundaries, and computes the fractional max-pooling by taking element-wise maxima over Eigen column maps. It is the runtime numeric core of the tf.nn.fractional_max_pool operator.",
+  "provenance": "Identified by TensorFlow-specific types and idioms: OpKernelContext* context, the Compute(...) override, OP_REQUIRES / OP_REQUIRES_OK with errors::InvalidArgument, context->input(0), Tensor / TensorShape / tensor.flat<T>(), GuardedPhiloxRandom, and the GeneratePoolingSequence helper. The Eigen::Map matrix typedefs, the comment referencing 'the shape function in core/ops/nn_ops.cc', and the pooling_ratio_/pseudo_random_/overlapping_/seed_ members are the exact signature of tensorflow/core/kernels/fractional_max_pool_op.cc. The banner 'sample: primevul_test_0055_vuln' and file name '...cwe369.cpp' further tag it as a PrimeVul FractionalMaxPool sample flagged for divide-by-zero.",
+  "trust_boundary": "This kernel runs whatever graph the caller supplies. In TensorFlow's threat model a malicious SavedModel / GraphDef / serving request controls (a) the shape and dtype of the input tensor tensor_in = context->input(0), including individual dimension sizes, and (b) the op attributes captured as members: pooling_ratio_ (a float per dimension), seed_, seed2_, pseudo_random_, and overlapping_. All of these cross the trust boundary. The kernel only validates that tensor_in.dims() == 4; every dimension value and every pooling_ratio_ entry is otherwise hostile and can be chosen to force division by zero, degenerate/empty pooling sequences, integer overflow in shape arithmetic, and out-of-bounds Eigen column indexing.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0238_cwe369.cpp",
+      "lines": "2-6",
+      "code": "  void Compute(OpKernelContext* context) override {\n    typedef Eigen::Map<const Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>>\n        ConstEigenMatrixMap;\n    typedef Eigen::Map<Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>>\n        EigenMatrixMap;",
+      "explanation": "This is the OpKernel::Compute override for the FractionalMaxPool op, invoked once per execution with an OpKernelContext that carries the op's inputs, outputs, and attributes. The two typedefs define lightweight Eigen views over raw, contiguous tensor memory: ConstEigenMatrixMap is a read-only column-major matrix view of the input buffer, EigenMatrixMap a writable view of the output buffer. Because these are Map types they do not own or bounds-check memory — every column/row index used against them must be independently proven in range, which makes the later index arithmetic security-critical."
+    },
+    {
+      "file": "corpus/train/train_0238_cwe369.cpp",
+      "lines": "8-12",
+      "code": "    constexpr int tensor_in_and_out_dims = 4;\n\n    const Tensor& tensor_in = context->input(0);\n    OP_REQUIRES(context, tensor_in.dims() == tensor_in_and_out_dims,\n                errors::InvalidArgument(\"tensor_in must be 4-dimensional\"));",
+      "explanation": "tensor_in_and_out_dims fixes the rank at 4 (batch, height, width, channel). tensor_in is bound to input 0, the attacker-supplied data tensor. The only structural validation is OP_REQUIRES that the rank equals 4; on failure OP_REQUIRES sets an error status and returns. Crucially this checks only the NUMBER of dimensions, not the VALUE of any dimension — a dimension may still be 0 (or, after later arithmetic, produce degenerate sizes), and nothing here validates the pooling_ratio_ attribute."
+    },
+    {
+      "file": "corpus/train/train_0238_cwe369.cpp",
+      "lines": "14-18",
+      "code": "    std::vector<int> input_size(tensor_in_and_out_dims);\n    std::vector<int> output_size(tensor_in_and_out_dims);\n    for (int i = 0; i < tensor_in_and_out_dims; ++i) {\n      input_size[i] = tensor_in.dim_size(i);\n    }",
+      "explanation": "Two four-element int vectors are allocated to hold the input and derived output extents. The loop copies each of the four input dimension sizes into input_size. Note the narrowing: tensor_in.dim_size(i) returns int64_t but is stored into a std::vector<int>, so any dimension exceeding INT_MAX is silently truncated. input_size[1] (height), input_size[2] (width), input_size[0] (batch) and input_size[3] (channel) are later multiplied together to size Eigen matrices, so these values feed directly into unchecked size arithmetic."
+    },
+    {
+      "file": "corpus/train/train_0238_cwe369.cpp",
+      "lines": "20-26",
+      "code": "    for (int i = 0; i < tensor_in_and_out_dims; ++i) {\n      // This must match the same logic in the shape function in\n      // core/ops/nn_ops.cc.\n      output_size[i] =\n          static_cast<int>(std::floor(input_size[i] / pooling_ratio_[i]));\n      DCHECK_GT(output_size[i], 0);\n    }",
+      "explanation": "The output extent for each dimension is computed as floor(input_size[i] / pooling_ratio_[i]) cast to int. pooling_ratio_ is a float vector taken directly from the op attribute (attacker-controlled). This is the central risk: pooling_ratio_[i] is a floating-point divisor that is never validated to be non-zero or >= 1. If it is 0, the division is IEEE division-by-zero yielding +inf, floor(inf) is inf, and static_cast<int>(inf) is undefined behavior producing a garbage/negative output_size. DCHECK_GT(output_size[i], 0) is the ONLY guard that output_size is positive, and DCHECK compiles to a no-op in release/production builds, so it provides no runtime protection. The resulting output_size values flow into GeneratePoolingSequence, the output TensorShape, the Eigen matrix dimensions, and the loop bounds."
+    },
+    {
+      "file": "corpus/train/train_0238_cwe369.cpp",
+      "lines": "28-36",
+      "code": "    // Generate pooling sequence.\n    std::vector<int64_t> height_cum_seq;\n    std::vector<int64_t> width_cum_seq;\n    GuardedPhiloxRandom generator;\n    generator.Init(seed_, seed2_);\n    height_cum_seq = GeneratePoolingSequence(input_size[1], output_size[1],\n                                             &generator, pseudo_random_);\n    width_cum_seq = GeneratePoolingSequence(input_size[2], output_size[2],\n                                            &generator, pseudo_random_);",
+      "explanation": "A Philox RNG is seeded from the seed_/seed2_ attributes, then GeneratePoolingSequence builds the cumulative boundary sequences for the height and width dimensions. Each call receives the input extent and the derived output extent (output_size[1] for height, output_size[2] for width). The returned vectors are the pooling window boundaries; the loop logic below assumes height_cum_seq.size() == output_size[1] + 1 and width_cum_seq.size() == output_size[2] + 1. Because output_size[1]/[2] were computed from the unvalidated pooling_ratio_ division, a degenerate output_size (0, negative, or garbage from the divide-by-zero path) is passed straight into this helper, which internally divides input by output to size windows and can itself divide by zero or return an empty/undersized sequence."
+    },
+    {
+      "file": "corpus/train/train_0238_cwe369.cpp",
+      "lines": "38-56",
+      "code": "    // Prepare output.\n    Tensor* output_tensor = nullptr;\n    OP_REQUIRES_OK(context, context->allocate_output(\n                                0,\n                                TensorShape({output_size[0], output_size[1],\n                                             output_size[2], output_size[3]}),\n                                &output_tensor));\n    Tensor* output_height_seq_tensor = nullptr;\n    OP_REQUIRES_OK(\n        context,\n        context->allocate_output(\n            1, TensorShape({static_cast<int64_t>(height_cum_seq.size())}),\n            &output_height_seq_tensor));\n    Tensor* output_width_seq_tensor = nullptr;\n    OP_REQUIRES_OK(\n        context,\n        context->allocate_output(\n            2, TensorShape({static_cast<int64_t>(width_cum_seq.size())}),\n            &output_width_seq_tensor));",
+      "explanation": "Three outputs are allocated: output 0 is the pooled tensor with shape (output_size[0..3]); outputs 1 and 2 are the height/width boundary sequences sized to the vector lengths. TensorShape construction will itself reject NEGATIVE dimensions (returning an error via OP_REQUIRES_OK), which catches the negative-output_size case; but a zero dimension is accepted and produces an empty output, and the divide path can also produce large positive garbage. This is a secondary validation gate, not a deliberate one — it happens to catch some but not all of the bad output_size values produced at line 24."
+    },
+    {
+      "file": "corpus/train/train_0238_cwe369.cpp",
+      "lines": "58-65",
+      "code": "    ConstEigenMatrixMap in_mat(tensor_in.flat<T>().data(), input_size[3],\n                               input_size[2] * input_size[1] * input_size[0]);\n\n    EigenMatrixMap out_mat(output_tensor->flat<T>().data(), output_size[3],\n                           output_size[2] * output_size[1] * output_size[0]);\n\n    // Initializes the output tensor with MIN<T>.\n    output_tensor->flat<T>().setConstant(Eigen::NumTraits<T>::lowest());",
+      "explanation": "Two Eigen column-major matrix views are constructed directly over the input and output buffers. in_mat has input_size[3] rows (channels) and input_size[2]*input_size[1]*input_size[0] columns (one column per spatial position across width*height*batch); out_mat is the same layout over the output. These row/column counts are computed as products of the int-typed size vectors, so the multiplications occur in 32-bit int arithmetic and can overflow to a small or negative value even though the underlying flat buffer is the full size — desynchronizing the matrix view's column count from the real allocation. The output is then initialized to the type's lowest value so subsequent cwiseMax accumulation works."
+    },
+    {
+      "file": "corpus/train/train_0238_cwe369.cpp",
+      "lines": "67-77",
+      "code": "    auto output_height_seq_flat = output_height_seq_tensor->flat<int64_t>();\n    auto output_width_seq_flat = output_width_seq_tensor->flat<int64_t>();\n\n    // Set output tensors.\n    for (int i = 0; i < height_cum_seq.size(); ++i) {\n      output_height_seq_flat(i) = height_cum_seq[i];\n    }\n\n    for (int i = 0; i < width_cum_seq.size(); ++i) {\n      output_width_seq_flat(i) = width_cum_seq[i];\n    }",
+      "explanation": "The boundary vectors are copied into the two auxiliary output tensors. The loop counter i is a signed int compared against height_cum_seq.size()/width_cum_seq.size() which are size_t — a signed/unsigned comparison. In practice the sequences are tiny so this is benign here, but if a sequence ever exceeded INT_MAX entries the int counter would overflow to a negative value and the loop would misbehave; it is a latent hygiene issue rather than the primary bug."
+    },
+    {
+      "file": "corpus/train/train_0238_cwe369.cpp",
+      "lines": "84-93",
+      "code": "    const int64_t height_max = input_size[1] - 1;\n    const int64_t width_max = input_size[2] - 1;\n    for (int64_t b = 0; b < input_size[0]; ++b) {\n      // height sequence.\n      for (int64_t hs = 0; hs < height_cum_seq.size() - 1; ++hs) {\n        // height start and end.\n        const int64_t height_start = height_cum_seq[hs];\n        int64_t height_end =\n            overlapping_ ? height_cum_seq[hs + 1] : height_cum_seq[hs + 1] - 1;\n        height_end = std::min(height_end, height_max);",
+      "explanation": "height_max/width_max are the maximum valid input row/column index. The outer loop iterates batches; the height loop iterates the pooling windows using the bound height_cum_seq.size() - 1. Because size() is unsigned (size_t), if height_cum_seq is EMPTY then size() - 1 underflows to SIZE_MAX and this loop runs essentially forever while indexing height_cum_seq[hs] far out of bounds. For each window, height_start and height_end are read from consecutive sequence entries (note the hs+1 access, requiring at least 2 entries), and height_end is clamped to height_max so the inner read index stays within the input rows — this clamp is what keeps the INPUT read side in bounds, but there is no corresponding clamp on the OUTPUT column index."
+    },
+    {
+      "file": "corpus/train/train_0238_cwe369.cpp",
+      "lines": "96-103",
+      "code": "        for (int64_t ws = 0; ws < width_cum_seq.size() - 1; ++ws) {\n          const int64_t out_offset =\n              (b * output_size[1] + hs) * output_size[2] + ws;\n          // width start and end.\n          const int64_t width_start = width_cum_seq[ws];\n          int64_t width_end =\n              overlapping_ ? width_cum_seq[ws + 1] : width_cum_seq[ws + 1] - 1;\n          width_end = std::min(width_end, width_max);",
+      "explanation": "The width window loop mirrors the height loop, with the same width_cum_seq.size() - 1 unsigned-underflow hazard when the sequence is empty. out_offset is the destination column in out_mat, computed as (b * output_size[1] + hs) * output_size[2] + ws. This offset is derived from the LOOP counters hs/ws (which range up to height_cum_seq.size()-2 / width_cum_seq.size()-2), NOT from output_size directly. If the pooling sequence length does not equal output_size+1 — which is exactly the invariant that the unvalidated output_size at line 24 can break — out_offset can exceed the number of columns out_mat was constructed with, and there is no clamp on out_offset."
+    },
+    {
+      "file": "corpus/train/train_0238_cwe369.cpp",
+      "lines": "104-114",
+      "code": "          for (int64_t h = height_start; h <= height_end; ++h) {\n            for (int64_t w = width_start; w <= width_end; ++w) {\n              const int64_t in_offset =\n                  (b * input_size[1] + h) * input_size[2] + w;\n              out_mat.col(out_offset) =\n                  out_mat.col(out_offset).cwiseMax(in_mat.col(in_offset));\n            }\n          }\n        }\n      }\n    }",
+      "explanation": "The innermost loops walk every input row h in [height_start, height_end] and column w in [width_start, width_end], compute the flattened input column in_offset, and fold that input column into the output column via element-wise maximum (cwiseMax) — the actual max-pool. Reads use in_mat.col(in_offset) and writes use out_mat.col(out_offset). The input index is protected by the height_max/width_max clamps above, but width_start comes straight from width_cum_seq[ws] with no lower clamp, and out_offset has no bound at all — so the safety of both the read and especially the WRITE depends entirely on GeneratePoolingSequence having returned well-formed sequences consistent with the allocated output_size, an invariant this function never checks."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0238_cwe369.cpp",
+      "lines": "23-25",
+      "code": "      output_size[i] =\n          static_cast<int>(std::floor(input_size[i] / pooling_ratio_[i]));\n      DCHECK_GT(output_size[i], 0);",
+      "explanation": "pooling_ratio_ is an op attribute fully controlled by the caller (a crafted model or request). Nothing in this Compute validates it. Setting pooling_ratio_[i] = 0.0 makes input_size[i] / pooling_ratio_[i] an IEEE divide-by-zero: the float result is +inf (or NaN if input is also 0), std::floor propagates inf/NaN, and static_cast<int>(inf/NaN) is undefined behavior that typically yields INT_MIN or an implementation-defined garbage value. This is the CWE-369 the sample is named for. Even without a hard zero, a very large pooling_ratio_ yields output_size == 0, and a garbage cast can yield a negative output_size. The only guard, DCHECK_GT, is stripped in release builds. The corrupt output_size then propagates into GeneratePoolingSequence (which divides input by output and can divide-by-zero or return an empty/degenerate sequence), the output TensorShape allocation, the Eigen matrix column counts, and the loop bounds — turning one unchecked attribute into crashes and memory-safety failures downstream. The implementation MUST OP_REQUIRES that every pooling_ratio_[i] > 0 (and realistically >= 1) and that the resulting output_size[i] > 0 before using them."
+    },
+    {
+      "file": "corpus/train/train_0238_cwe369.cpp",
+      "lines": "97-109",
+      "code": "          const int64_t out_offset =\n              (b * output_size[1] + hs) * output_size[2] + ws;\n              const int64_t in_offset =\n                  (b * input_size[1] + h) * input_size[2] + w;\n              out_mat.col(out_offset) =\n                  out_mat.col(out_offset).cwiseMax(in_mat.col(in_offset));",
+      "explanation": "out_mat was built with output_size[2]*output_size[1]*output_size[0] columns (line 61-62), but the write index out_offset is driven by the loop counters hs (< height_cum_seq.size()-1) and ws (< width_cum_seq.size()-1), i.e. by the RETURNED sequence lengths, not by output_size. The code silently assumes height_cum_seq.size() == output_size[1]+1 and width_cum_seq.size() == output_size[2]+1. Because output_size[1]/[2] were derived from the unvalidated pooling_ratio_ division at line 24, an attacker can drive them out of sync with the sequence lengths GeneratePoolingSequence actually produces (or the sequence generator itself can, on degenerate inputs, produce a longer sequence than output_size+1). When that happens out_offset exceeds the allocated column count and out_mat.col(out_offset) is an out-of-bounds heap WRITE (Eigen::Map does no bounds checking), corrupting adjacent heap memory with cwiseMax results — a CWE-787 remote heap overflow / memory corruption. The invariant the implementation MUST uphold: the pooling-sequence lengths exactly match output_size+1, or out_offset must be independently bounded against out_mat.cols()."
+    },
+    {
+      "file": "corpus/train/train_0238_cwe369.cpp",
+      "lines": "88-96",
+      "code": "      for (int64_t hs = 0; hs < height_cum_seq.size() - 1; ++hs) {\n        for (int64_t ws = 0; ws < width_cum_seq.size() - 1; ++ws) {",
+      "explanation": "height_cum_seq.size() and width_cum_seq.size() are size_t (unsigned). If GeneratePoolingSequence returns an EMPTY vector — which becomes reachable when output_size[1]/[2] is 0 or garbage from the divide-by-zero path — then size() - 1 underflows to SIZE_MAX (18446744073709551615). The loop condition hs < SIZE_MAX is then effectively always true, so the loop reads height_cum_seq[hs] / width_cum_seq[ws] (and hs+1) far past the end of the empty vector: an out-of-bounds READ that also drives out_offset arithmetic and out_mat writes. This is a classic CWE-191 unsigned-subtraction underflow. The implementation MUST reject the short/empty sequence (require size() >= 1, and >= 2 given the hs+1 access) BEFORE computing size() - 1, or use a signed size and a >= 1 guard."
+    },
+    {
+      "file": "corpus/train/train_0238_cwe369.cpp",
+      "lines": "58-62",
+      "code": "    ConstEigenMatrixMap in_mat(tensor_in.flat<T>().data(), input_size[3],\n                               input_size[2] * input_size[1] * input_size[0]);\n\n    EigenMatrixMap out_mat(output_tensor->flat<T>().data(), output_size[3],\n                           output_size[2] * output_size[1] * output_size[0]);",
+      "explanation": "The column counts are the products input_size[2]*input_size[1]*input_size[0] and output_size[2]*output_size[1]*output_size[0], evaluated in 32-bit int (the vectors are std::vector<int>). An attacker who supplies large-but-individually-legal dimensions can make these products overflow int (CWE-190), wrapping to a small or negative column count. The resulting Eigen::Map then describes a matrix far smaller than the real buffer while the loops still index columns up to the true spatial extent, producing out-of-bounds reads/writes; a negative dimension passed to Eigen is itself undefined. Additionally input_size came from a narrowing int64_t->int store at line 17, so a >INT_MAX dimension is already truncated before this point. The implementation MUST compute these extents in 64-bit and validate that the products fit the allocated buffer."
+    },
+    {
+      "file": "corpus/train/train_0238_cwe369.cpp",
+      "lines": "10-12",
+      "code": "    const Tensor& tensor_in = context->input(0);\n    OP_REQUIRES(context, tensor_in.dims() == tensor_in_and_out_dims,\n                errors::InvalidArgument(\"tensor_in must be 4-dimensional\"));",
+      "explanation": "The only structural check is that the rank is 4; individual dimension VALUES are never validated. A dimension of 0 (a legal but empty tensor) flows into input_size and into the height_max = input_size[1] - 1 / width_max = input_size[2] - 1 computations at lines 84-85, making height_max/width_max == -1. Combined with unclamped lower bounds (width_start from the sequence) and the degenerate sequences reachable via the pooling_ratio_ path, this produces empty or inverted loop ranges and feeds the same out-of-bounds arithmetic. The implementation SHOULD validate that each spatial dimension is >= 1 (and that pooling is well-defined) rather than relying solely on the rank check."
+    },
+    {
+      "file": "corpus/train/train_0238_cwe369.cpp",
+      "lines": "71-76",
+      "code": "    for (int i = 0; i < height_cum_seq.size(); ++i) {\n      output_height_seq_flat(i) = height_cum_seq[i];\n    }\n\n    for (int i = 0; i < width_cum_seq.size(); ++i) {\n      output_width_seq_flat(i) = width_cum_seq[i];\n    }",
+      "explanation": "The loop counter i is a signed int compared to an unsigned size_t (height_cum_seq.size()/width_cum_seq.size()), triggering a signed/unsigned comparison. It is benign for realistic sequence sizes, but if a sequence ever held more than INT_MAX entries the int would overflow to a negative value (UB) and the loop and the flat(i) write would go wrong. This is a low-severity hygiene defect; the counter should be int64_t/size_t to match size(). Listed for completeness per the anchor enumeration."
+    }
+  ],
+  "summary": "This FractionalMaxPool Compute() takes an attacker-controlled 4-D tensor and a per-dimension pooling_ratio_ attribute, validating only the rank. The output extent is computed as floor(input/pooling_ratio_) with no check that pooling_ratio_ is non-zero, so a zero (or degenerate) ratio produces an IEEE divide-by-zero and a garbage/negative/zero output_size (CWE-369); the only guard is a release-stripped DCHECK. That corrupt output_size propagates into an empty pooling sequence (unsigned size()-1 underflow, CWE-191), int-overflowing Eigen matrix dimensions (CWE-190), and an out_mat column write index driven by sequence length rather than the allocated column count (out-of-bounds heap write, CWE-787). Overall: a high-severity, attacker-reachable memory-safety and denial-of-service surface rooted in the unvalidated pooling_ratio_ division.",
+  "reviewed_anchors": [
+    {"anchor": "void Compute(OpKernelContext* context) override", "disposition": "dismissed", "reason": "Standard OpKernel entry point; the risk is in the body, not the signature itself."},
+    {"anchor": "ConstEigenMatrixMap / EigenMatrixMap typedefs (lines 3-6)", "disposition": "dismissed", "reason": "Type aliases for non-bounds-checked Eigen::Map views; enabling factor cited in the OOB findings but not a standalone contract."},
+    {"anchor": "constexpr int tensor_in_and_out_dims = 4 (line 8)", "disposition": "dismissed", "reason": "Compile-time constant rank; safe."},
+    {"anchor": "const Tensor& tensor_in = context->input(0) (line 10)", "disposition": "finding", "reason": "Attacker-controlled input; only rank is validated, dimension values are not."},
+    {"anchor": "OP_REQUIRES tensor_in.dims() == 4 (line 11-12)", "disposition": "finding", "reason": "Validates rank only, not dimension magnitudes — incomplete input validation."},
+    {"anchor": "std::vector<int> input_size / output_size (lines 14-15)", "disposition": "finding", "reason": "int-typed extents; int64_t dim_size narrowed on store and later multiplied, enabling integer overflow."},
+    {"anchor": "input_size[i] = tensor_in.dim_size(i) (line 17)", "disposition": "finding", "reason": "int64_t -> int narrowing of an attacker-controlled dimension."},
+    {"anchor": "output_size[i] = static_cast<int>(std::floor(input_size[i] / pooling_ratio_[i])) (lines 23-24)", "disposition": "finding", "reason": "Unvalidated float divisor pooling_ratio_ enables divide-by-zero (CWE-369) and degenerate output_size — the primary bug."},
+    {"anchor": "DCHECK_GT(output_size[i], 0) (line 25)", "disposition": "finding", "reason": "Debug-only assertion compiled out in release; provides no runtime protection for output_size > 0."},
+    {"anchor": "pooling_ratio_[i] (line 24)", "disposition": "finding", "reason": "Attacker-controlled attribute used as a divisor with no zero/range check."},
+    {"anchor": "GuardedPhiloxRandom generator; generator.Init(seed_, seed2_) (lines 31-32)", "disposition": "dismissed", "reason": "RNG seeding from attributes; determinism/seed control is not a memory-safety contract here."},
+    {"anchor": "GeneratePoolingSequence(input_size[1], output_size[1], ...) (lines 33-36)", "disposition": "finding", "reason": "Receives unvalidated output_size; can divide-by-zero internally or return an empty/mismatched sequence feeding the loop bounds."},
+    {"anchor": "allocate_output with TensorShape({output_size[0..3]}) (lines 40-44)", "disposition": "dismissed", "reason": "TensorShape rejects negative dims, partially catching bad output_size; zero dims accepted but handled as empty — secondary gate, not the root issue."},
+    {"anchor": "allocate_output height/width seq tensors sized to seq.size() (lines 45-56)", "disposition": "dismissed", "reason": "Sizes derived from vector lengths; no independent attacker size field."},
+    {"anchor": "ConstEigenMatrixMap in_mat(..., input_size[3], input_size[2]*input_size[1]*input_size[0]) (lines 58-59)", "disposition": "finding", "reason": "Column count is an int product that can overflow (CWE-190), desyncing the view from the buffer."},
+    {"anchor": "EigenMatrixMap out_mat(..., output_size[3], output_size[2]*output_size[1]*output_size[0]) (lines 61-62)", "disposition": "finding", "reason": "Defines the write-side column bound; int-product overflow and mismatch vs out_offset enable OOB write."},
+    {"anchor": "output_tensor->flat<T>().setConstant(...lowest()) (line 65)", "disposition": "dismissed", "reason": "Initialization over the allocated flat buffer; safe."},
+    {"anchor": "for (int i = 0; i < height_cum_seq.size(); ++i) copy loops (lines 71-77)", "disposition": "finding", "reason": "Signed int counter vs unsigned size() — low-severity signed/unsigned overflow hygiene."},
+    {"anchor": "height_max = input_size[1] - 1 / width_max = input_size[2] - 1 (lines 84-85)", "disposition": "dismissed", "reason": "Provides the input-side clamp; becomes -1 only via the already-flagged unvalidated-dimension path."},
+    {"anchor": "for (int64_t hs = 0; hs < height_cum_seq.size() - 1; ...) (line 88)", "disposition": "finding", "reason": "Unsigned size()-1 underflows to SIZE_MAX when the sequence is empty (CWE-191)."},
+    {"anchor": "for (int64_t ws = 0; ws < width_cum_seq.size() - 1; ...) (line 96)", "disposition": "finding", "reason": "Same unsigned underflow hazard for the width sequence."},
+    {"anchor": "out_offset = (b * output_size[1] + hs) * output_size[2] + ws (lines 97-98)", "disposition": "finding", "reason": "Write index driven by sequence length not out_mat.cols(); unbounded -> OOB heap write (CWE-787)."},
+    {"anchor": "height_start/height_end/width_start/width_end from *_cum_seq (lines 90-92, 100-102)", "disposition": "dismissed", "reason": "height_end/width_end are clamped to height_max/width_max; the *_start values lack a lower clamp but the resulting read risk is covered by the sequence-integrity findings."},
+    {"anchor": "in_offset = (b * input_size[1] + h) * input_size[2] + w (lines 106-107)", "disposition": "dismissed", "reason": "Read index; h/w bounded by the height_max/width_max clamps, so in-range given valid input dims."},
+    {"anchor": "out_mat.col(out_offset).cwiseMax(in_mat.col(in_offset)) (lines 108-109)", "disposition": "finding", "reason": "The actual OOB read/write site; unchecked Eigen::Map column access executing the out_offset/in_offset arithmetic."}
+  ],
+  "findings": [
+    {
+      "title": "Divide-by-zero / unchecked pooling_ratio_ produces invalid output_size",
+      "anchor": "output_size[i] = static_cast<int>(std::floor(input_size[i] / pooling_ratio_[i]));",
+      "file": "corpus/train/train_0238_cwe369.cpp",
+      "line": "23-25",
+      "code": "      output_size[i] =\n          static_cast<int>(std::floor(input_size[i] / pooling_ratio_[i]));\n      DCHECK_GT(output_size[i], 0);",
+      "bug_class": "Divide by zero / missing input validation on attacker-controlled divisor",
+      "cwe": "CWE-369",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0238_cwe369.cpp (and implementation of GeneratePoolingSequence, file not provided)",
+      "invariant": "Every pooling_ratio_[i] must be validated > 0 (realistically >= 1) and each resulting output_size[i] must be validated > 0 with a real OP_REQUIRES (not DCHECK) before being used to generate sequences, allocate outputs, or size Eigen maps.",
+      "failure_mode": "A crafted model/request sets pooling_ratio_[i] = 0.0 (or a huge value). input_size[i] / pooling_ratio_[i] is an IEEE divide-by-zero yielding +inf/NaN; std::floor propagates it and static_cast<int>(inf/NaN) is undefined behavior producing garbage/negative/zero output_size. The only positivity guard, DCHECK_GT, is compiled out in release builds. The corrupt output_size then feeds GeneratePoolingSequence (which divides input by output and can itself divide-by-zero or emit a degenerate sequence), the output allocation, and every downstream loop bound — yielding crashes/DoS and enabling the memory-safety findings below.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm no OP_REQUIRES on pooling_ratio_ or output_size exists before line 23 in the shipped kernel, and that DCHECK_GT is the only positivity check; confirm GeneratePoolingSequence's behavior when output_size is 0/negative."
+    },
+    {
+      "title": "Out-of-bounds heap write: out_mat column index driven by sequence length, not allocated columns",
+      "anchor": "out_mat.col(out_offset) = out_mat.col(out_offset).cwiseMax(in_mat.col(in_offset));",
+      "file": "corpus/train/train_0238_cwe369.cpp",
+      "line": "97-109",
+      "code": "          const int64_t out_offset =\n              (b * output_size[1] + hs) * output_size[2] + ws;\n              out_mat.col(out_offset) =\n                  out_mat.col(out_offset).cwiseMax(in_mat.col(in_offset));",
+      "bug_class": "Out-of-bounds write (index/allocation desynchronization)",
+      "cwe": "CWE-787",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0238_cwe369.cpp",
+      "invariant": "height_cum_seq.size() must equal output_size[1]+1 and width_cum_seq.size() must equal output_size[2]+1 (so hs/ws stay within the columns out_mat was allocated with), or out_offset must be explicitly bounded against out_mat.cols() before the write.",
+      "failure_mode": "out_mat is constructed with output_size[2]*output_size[1]*output_size[0] columns, but out_offset is built from the loop counters hs (< height_cum_seq.size()-1) and ws (< width_cum_seq.size()-1). If the sequence lengths do not match output_size+1 — reachable because output_size came from the unvalidated pooling_ratio_ division, or because GeneratePoolingSequence returns a longer sequence on degenerate inputs — out_offset exceeds the allocated column count. Eigen::Map performs no bounds checking, so out_mat.col(out_offset) writes cwiseMax results past the output buffer, corrupting adjacent heap memory (remote heap overflow).",
+      "cve_analog": "",
+      "what_to_confirm": "Verify GeneratePoolingSequence always returns exactly output_size+1 entries for all reachable output_size values, or that a bound check on out_offset vs out_mat.cols() exists in the shipped kernel."
+    },
+    {
+      "title": "Unsigned underflow of height_cum_seq.size()-1 / width_cum_seq.size()-1 on empty sequence",
+      "anchor": "for (int64_t hs = 0; hs < height_cum_seq.size() - 1; ++hs)",
+      "file": "corpus/train/train_0238_cwe369.cpp",
+      "line": "88-96",
+      "code": "      for (int64_t hs = 0; hs < height_cum_seq.size() - 1; ++hs) {\n        for (int64_t ws = 0; ws < width_cum_seq.size() - 1; ++ws) {",
+      "bug_class": "Unsigned integer underflow leading to out-of-bounds read",
+      "cwe": "CWE-191",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0238_cwe369.cpp",
+      "invariant": "The code must confirm height_cum_seq.size() >= 2 and width_cum_seq.size() >= 2 (the hs+1/ws+1 accesses require at least two entries) BEFORE evaluating size() - 1; or use a signed length with an explicit >= 1 guard.",
+      "failure_mode": "If GeneratePoolingSequence returns an empty vector (reachable when output_size is 0/garbage via the pooling_ratio_ path), height_cum_seq.size() - 1 underflows from 0 to SIZE_MAX because size() is unsigned. The loop condition hs < SIZE_MAX is then effectively always true and height_cum_seq[hs] / height_cum_seq[hs+1] read arbitrarily far past the empty vector — an out-of-bounds read that also feeds out_offset and the out_mat write.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm whether GeneratePoolingSequence can ever return an empty (or single-element) vector for attacker-reachable output_size, and that no size>=2 guard precedes these loops."
+    },
+    {
+      "title": "Integer overflow in Eigen matrix column-count arithmetic",
+      "anchor": "input_size[2] * input_size[1] * input_size[0] / output_size[2] * output_size[1] * output_size[0]",
+      "file": "corpus/train/train_0238_cwe369.cpp",
+      "line": "58-62",
+      "code": "    ConstEigenMatrixMap in_mat(tensor_in.flat<T>().data(), input_size[3],\n                               input_size[2] * input_size[1] * input_size[0]);\n\n    EigenMatrixMap out_mat(output_tensor->flat<T>().data(), output_size[3],\n                           output_size[2] * output_size[1] * output_size[0]);",
+      "bug_class": "Integer overflow in size computation (32-bit product)",
+      "cwe": "CWE-190",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0238_cwe369.cpp",
+      "invariant": "The column extent must be computed in a 64-bit type and validated to equal the true number of spatial positions in the allocated buffer; dimensions must be non-negative.",
+      "failure_mode": "input_size/output_size are std::vector<int>, so the triple products are evaluated in 32-bit int. Large but individually legal dimensions make the product overflow to a small or negative column count, while the loops still index columns up to the real spatial extent. The Eigen::Map then describes a matrix inconsistent with the buffer, producing out-of-bounds reads/writes (a negative extent to Eigen is itself undefined). The int64_t->int narrowing at line 17 compounds this.",
+      "cve_analog": "",
+      "what_to_confirm": "Check whether the shipped code guards the product against int overflow or computes it in int64_t, and whether upstream shape inference caps these dimensions."
+    },
+    {
+      "title": "Positivity of output_size enforced only by a debug-stripped DCHECK",
+      "anchor": "DCHECK_GT(output_size[i], 0);",
+      "file": "corpus/train/train_0238_cwe369.cpp",
+      "line": "25",
+      "code": "      DCHECK_GT(output_size[i], 0);",
+      "bug_class": "Reliance on debug-only assertion for a security invariant",
+      "cwe": "CWE-617",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0238_cwe369.cpp",
+      "invariant": "Any invariant that must hold on attacker-controlled data at runtime must be enforced with OP_REQUIRES (or equivalent runtime check), never DCHECK, which is a no-op in release/production builds.",
+      "failure_mode": "In production TensorFlow builds DCHECK_GT is compiled out, so a zero or negative output_size (from the pooling_ratio_ divide path) passes unchecked into sequence generation, allocation, and the Eigen maps. The assertion gives a false sense of validation while providing no runtime protection.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the release build strips DCHECK_GT and that no companion OP_REQUIRES enforces output_size > 0."
+    },
+    {
+      "title": "Signed/unsigned comparison in sequence-copy loops",
+      "anchor": "for (int i = 0; i < height_cum_seq.size(); ++i)",
+      "file": "corpus/train/train_0238_cwe369.cpp",
+      "line": "71-76",
+      "code": "    for (int i = 0; i < height_cum_seq.size(); ++i) {\n      output_height_seq_flat(i) = height_cum_seq[i];\n    }\n\n    for (int i = 0; i < width_cum_seq.size(); ++i) {\n      output_width_seq_flat(i) = width_cum_seq[i];\n    }",
+      "bug_class": "Signed/unsigned comparison and potential signed-int loop overflow",
+      "cwe": "CWE-190",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0238_cwe369.cpp",
+      "invariant": "Loop counters iterating a container should match the container's size_type (size_t/int64_t) so the comparison is unsigned-safe and cannot overflow.",
+      "failure_mode": "i is a signed int compared to an unsigned size_t. For realistic sequence sizes this is harmless, but a sequence with more than INT_MAX entries would overflow i to a negative value (undefined behavior) and corrupt the copy. Low severity, flagged for hygiene and completeness.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm sequence lengths are always small in practice; still prefer int64_t/size_t counters."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm an OP_REQUIRES enforces pooling_ratio_[i] > 0 (and >= 1) for every dimension BEFORE the division at line 23-24, not just the debug-only DCHECK.",
+    "Confirm output_size[i] is validated > 0 at runtime before it feeds GeneratePoolingSequence, allocate_output, and the Eigen matrix construction.",
+    "Inspect GeneratePoolingSequence: verify it cannot divide by zero and that it returns exactly output_size+1 entries (never empty) for all attacker-reachable input_size/output_size pairs.",
+    "Verify out_offset is bounded against out_mat.cols() (or that sequence lengths provably equal output_size+1) before the out_mat.col(out_offset) write to prevent OOB heap writes.",
+    "Guard against SIZE_MAX underflow of height_cum_seq.size()-1 / width_cum_seq.size()-1 by requiring size() >= 2 before the pooling loops.",
+    "Compute the Eigen column extents (input_size[2]*[1]*[0], output_size[2]*[1]*[0]) in int64_t and validate against the allocated buffer to prevent int32 overflow.",
+    "Validate individual input dimension values (>= 1) rather than only tensor_in.dims() == 4, and avoid the int64_t->int narrowing of dim_size at line 17.",
+    "Switch the sequence-copy loop counters from int to a size-matching type to remove the signed/unsigned comparison."
+  ]
+}

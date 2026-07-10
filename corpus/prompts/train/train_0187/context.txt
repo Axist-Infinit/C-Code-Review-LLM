@@ -1,0 +1,240 @@
+Files under review: corpus/train/train_0187_cwe354.cpp
+
+<<<BEGIN_UNTRUSTED_CODE>>>
+/* ===== FILE: corpus/train/train_0187_cwe354.cpp ===== */
+   1| /* sample: primevul_test_0087_fixed */
+   2|   void ComputeAsync(OpKernelContext* context, DoneCallback done) final {
+   3|     const Tensor& input = context->input(0);
+   4|     const Tensor& rhs = context->input(1);
+   5|     const int ndims = input.dims();
+   6|     const int64 n = input.dim_size(ndims - 1);
+   7|     const int64 nrhs = rhs.dim_size(ndims - 1);
+   8|     // Validate inputs.
+   9|     OP_REQUIRES_ASYNC(
+  10|         context, ndims >= 2,
+  11|         errors::InvalidArgument("Input must have rank >= 2, got ", ndims),
+  12|         done);
+  13|     OP_REQUIRES_ASYNC(context, rhs.dims() == ndims,
+  14|                       errors::InvalidArgument(
+  15|                           "Input and right-hand side must have same rank, got ",
+  16|                           ndims, " != ", rhs.dims()),
+  17|                       done);
+  18|     OP_REQUIRES_ASYNC(
+  19|         context, input.dim_size(ndims - 2) == n,
+  20|         errors::InvalidArgument("Input matrices must be squares, got ",
+  21|                                 input.dim_size(ndims - 2), " != ", n),
+  22|         done);
+  23|     OP_REQUIRES_ASYNC(context, rhs.dim_size(ndims - 2) == n,
+  24|                       errors::InvalidArgument(
+  25|                           "Input matrix and right-hand side must have the "
+  26|                           "same number of rows, got ",
+  27|                           n, " != ", rhs.dim_size(ndims - 2)),
+  28|                       done);
+  29|     for (int dim = 0; dim < ndims - 2; dim++) {
+  30|       OP_REQUIRES_ASYNC(
+  31|           context, input.dim_size(dim) == rhs.dim_size(dim),
+  32|           errors::InvalidArgument(
+  33|               "All input tensors must have the same outer dimensions."),
+  34|           done);
+  35|     }
+  36| 
+  37|     // Allocate output.
+  38|     Tensor* output;
+  39|     OP_REQUIRES_OK_ASYNC(
+  40|         context,
+  41|         context->forward_input_or_allocate_output({1}, 0, rhs.shape(), &output),
+  42|         done);
+  43| 
+  44|     // To be consistent with the MatrixInverse op, we define the solution for
+  45|     // an empty set of equations as the empty matrix.
+  46|     if (input.NumElements() == 0 || rhs.NumElements() == 0) {
+  47|       done();
+  48|       return;
+  49|     }
+  50| 
+  51|     // TODO(rmlarsen): Convert to std::make_unique when available.
+  52|     std::unique_ptr<CudaSolver> solver(new CudaSolver(context));
+  53| 
+  54|     // Make a copy of the input for the factorization step, or, if adjoint_ is
+  55|     // false, try to reuse the input buffer if this op owns it exclusively.
+  56|     Tensor input_copy;
+  57|     const GPUDevice& device = context->eigen_device<GPUDevice>();
+  58|     if (adjoint_) {
+  59|       // For the adjoint case, it is simpler to always make a transposed copy up
+  60|       // front.
+  61|       OP_REQUIRES_OK_ASYNC(
+  62|           context,
+  63|           solver->allocate_scoped_tensor(DataTypeToEnum<Scalar>::value,
+  64|                                          input.shape(), &input_copy),
+  65|           done);
+  66|       OP_REQUIRES_OK_ASYNC(context,
+  67|                            DoMatrixTranspose(device, input, &input_copy), done);
+  68|     } else {
+  69|       OP_REQUIRES_OK_ASYNC(
+  70|           context,
+  71|           solver->forward_input_or_allocate_scoped_tensor(
+  72|               {0}, DataTypeToEnum<Scalar>::value, input.shape(), &input_copy),
+  73|           done);
+  74|       if (!input.SharesBufferWith(input_copy)) {
+  75|         device.memcpy(input_copy.flat<Scalar>().data(),
+  76|                       input.flat<Scalar>().data(),
+  77|                       input.NumElements() * sizeof(Scalar));
+  78|       }
+  79|     }
+  80|     auto input_copy_reshaped = input_copy.template flat_inner_dims<Scalar, 3>();
+  81|     const int64 batch_size = input_copy_reshaped.dimension(0);
+  82| 
+  83|     // Allocate pivots on the device.
+  84|     Tensor pivots;
+  85|     OP_REQUIRES_OK_ASYNC(
+  86|         context,
+  87|         solver->allocate_scoped_tensor(DataTypeToEnum<int>::value,
+  88|                                        TensorShape{batch_size, n}, &pivots),
+  89|         done);
+  90|     auto pivots_mat = pivots.template matrix<int>();
+  91| 
+  92|     // 1. Compute the partially pivoted LU factorization(s) of the
+  93|     // matrix/matrices.
+  94|     std::vector<DeviceLapackInfo> dev_info;
+  95|     auto input_copy_ptrs = solver->GetScratchSpace<uint8>(
+  96|         sizeof(Scalar*) * batch_size, "input_copt_ptrs",
+  97|         /* on_host */ true);
+  98|     const int kMaxMatrixSizeToBatchSizeRatio = 128;
+  99|     const bool use_batched_solver =
+ 100|         n <= kMaxMatrixSizeToBatchSizeRatio * batch_size;
+ 101|     if (use_batched_solver) {
+ 102|       // For small matrices or large batch sizes, we use the batched interface
+ 103|       // from cuBlas.
+ 104|       const Scalar** input_copy_ptrs_base =
+ 105|           reinterpret_cast<const Scalar**>(input_copy_ptrs.mutable_data());
+ 106|       for (int batch = 0; batch < batch_size; ++batch) {
+ 107|         input_copy_ptrs_base[batch] = &input_copy_reshaped(batch, 0, 0);
+ 108|       }
+ 109|       dev_info.push_back(
+ 110|           solver->GetDeviceLapackInfo(batch_size, "getrfBatched"));
+ 111|       OP_REQUIRES_OK_ASYNC(
+ 112|           context,
+ 113|           solver->GetrfBatched(n, input_copy_ptrs_base, n, pivots_mat.data(),
+ 114|                                &dev_info.back(), batch_size),
+ 115|           done);
+ 116|     } else {
+ 117|       // For small batch sizes or large matrices, we use the non-batched
+ 118|       // interface from cuSolver, which is much faster for large matrices.
+ 119|       dev_info.push_back(solver->GetDeviceLapackInfo(batch_size, "getrf"));
+ 120|       for (int batch = 0; batch < batch_size; ++batch) {
+ 121|         OP_REQUIRES_OK_ASYNC(
+ 122|             context,
+ 123|             solver->Getrf(n, n, &input_copy_reshaped(batch, 0, 0), n,
+ 124|                           &pivots_mat(batch, 0), &dev_info.back()(batch)),
+ 125|             done);
+ 126|       }
+ 127|     }
+ 128| 
+ 129|     // 2. Make a transposed copy of the right-hand sides. This is necessary
+ 130|     // because cuBLAS assumes column-major storage while TensorFlow TF uses
+ 131|     // row-major.
+ 132|     TensorShape transposed_rhs_shape(rhs.shape());
+ 133|     transposed_rhs_shape.RemoveLastDims(2);
+ 134|     transposed_rhs_shape.AddDim(nrhs);
+ 135|     transposed_rhs_shape.AddDim(n);
+ 136|     Tensor transposed_rhs;
+ 137|     OP_REQUIRES_OK_ASYNC(
+ 138|         context,
+ 139|         solver->allocate_scoped_tensor(DataTypeToEnum<Scalar>::value,
+ 140|                                        transposed_rhs_shape, &transposed_rhs),
+ 141|         done);
+ 142|     if (nrhs > 1) {
+ 143|       OP_REQUIRES_OK_ASYNC(
+ 144|           context, DoMatrixTranspose(device, rhs, &transposed_rhs), done);
+ 145|     } else {
+ 146|       device.memcpy(transposed_rhs.flat<Scalar>().data(),
+ 147|                     rhs.flat<Scalar>().data(),
+ 148|                     rhs.NumElements() * sizeof(Scalar));
+ 149|     }
+ 150| 
+ 151|     // 3. Solve op(A) X = B (in column major form).
+ 152|     // We use a trick here: If adjoint_ is true, we converted A to column major
+ 153|     // form above. If adjoint is false then I leave A in row-major form and use
+ 154|     // trans_a = CUBLAS_OP_T to effectively transform it to column-major on the
+ 155|     // fly. (This means that we actually use the LU-factorization of A^T in that
+ 156|     // case, but that is equally good for solving AX=B). This way we save an
+ 157|     // explicit transpose in the more common case of adjoint_ == false.
+ 158|     auto input_copy_ptr_array = solver->GetScratchSpace<uint8>(
+ 159|         sizeof(Scalar*) * batch_size, "input_copy_ptr_array",
+ 160|         /* on_host */ true);
+ 161|     auto transposed_rhs_ptr_array = solver->GetScratchSpace<uint8>(
+ 162|         sizeof(Scalar*) * batch_size, "transposed_rhs_ptr_array",
+ 163|         /* on_host */ true);
+ 164|     auto transposed_rhs_reshaped =
+ 165|         transposed_rhs.template flat_inner_dims<Scalar, 3>();
+ 166|     if (use_batched_solver) {
+ 167|       const Scalar** input_copy_ptrs_base =
+ 168|           reinterpret_cast<const Scalar**>(input_copy_ptr_array.mutable_data());
+ 169|       const Scalar** transposed_rhs_ptrs_base =
+ 170|           reinterpret_cast<const Scalar**>(
+ 171|               transposed_rhs_ptr_array.mutable_data());
+ 172|       for (int batch = 0; batch < batch_size; ++batch) {
+ 173|         input_copy_ptrs_base[batch] = &input_copy_reshaped(batch, 0, 0);
+ 174|         transposed_rhs_ptrs_base[batch] = &transposed_rhs_reshaped(batch, 0, 0);
+ 175|       }
+ 176|       int host_info = 0;
+ 177|       OP_REQUIRES_OK_ASYNC(
+ 178|           context,
+ 179|           solver->GetrsBatched(adjoint_ ? CUBLAS_OP_C : CUBLAS_OP_T, n, nrhs,
+ 180|                                input_copy_ptrs_base, n, pivots_mat.data(),
+ 181|                                transposed_rhs_ptrs_base, n, &host_info,
+ 182|                                batch_size),
+ 183|           done);
+ 184|       OP_REQUIRES_ASYNC(
+ 185|           context, host_info == 0,
+ 186|           errors::InvalidArgument("The ", -host_info,
+ 187|                                   "'th argument to cublas*getrsBatched had "
+ 188|                                   "an illegal value."),
+ 189|           done);
+ 190|     } else {
+ 191|       dev_info.push_back(solver->GetDeviceLapackInfo(batch_size, "getrs"));
+ 192|       for (int batch = 0; batch < batch_size; ++batch) {
+ 193|         OP_REQUIRES_OK_ASYNC(
+ 194|             context,
+ 195|             solver->Getrs(adjoint_ ? CUBLAS_OP_C : CUBLAS_OP_T, n, nrhs,
+ 196|                           &input_copy_reshaped(batch, 0, 0), n,
+ 197|                           &pivots_mat(batch, 0),
+ 198|                           &transposed_rhs_reshaped(batch, 0, 0), n,
+ 199|                           &dev_info.back()(batch)),
+ 200|             done);
+ 201|       }
+ 202|     }
+ 203| 
+ 204|     // 4. Transpose X to get the final result in row-major form.
+ 205|     if (nrhs > 1) {
+ 206|       OP_REQUIRES_OK_ASYNC(
+ 207|           context, DoMatrixTranspose(device, transposed_rhs, output), done);
+ 208|     } else {
+ 209|       device.memcpy(output->flat<Scalar>().data(),
+ 210|                     transposed_rhs.flat<Scalar>().data(),
+ 211|                     transposed_rhs.NumElements() * sizeof(Scalar));
+ 212|     }
+ 213| 
+ 214|     // Callback for checking info after kernels finish. Also capture the
+ 215|     // temporary Tensors/ScratchSpace so they don't get deallocated before the
+ 216|     // kernels run. TODO(rmlarsen): Use move capture once C++14 becomes
+ 217|     // available.
+ 218|     auto info_checker = [context, done, dev_info](
+ 219|                             const Status& status,
+ 220|                             const std::vector<HostLapackInfo>& host_infos) {
+ 221|       if (!status.ok() && errors::IsInvalidArgument(status) &&
+ 222|           !host_infos.empty()) {
+ 223|         for (int i = 0; i < host_infos[0].size(); ++i) {
+ 224|           // Match the CPU error message for singular matrices. Otherwise
+ 225|           // just print the original error message from the status below.
+ 226|           OP_REQUIRES_ASYNC(context, host_infos[0].data()[i] <= 0,
+ 227|                             errors::InvalidArgument(kErrMsg), done);
+ 228|         }
+ 229|       }
+ 230|       OP_REQUIRES_OK_ASYNC(context, status, done);
+ 231|       done();
+ 232|     };
+ 233|     CudaSolver::CheckLapackInfoAndDeleteSolverAsync(std::move(solver), dev_info,
+ 234|                                                     std::move(info_checker));
+ 235|   }
+<<<END_UNTRUSTED_CODE>>>

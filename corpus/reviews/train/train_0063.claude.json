@@ -1,0 +1,180 @@
+{
+  "subsystem": "Ceph distributed storage — MonClient (monitor client) msgr2 authentication server-side handler. MonClient::handle_auth_request is the callback invoked when a peer presents a CephX authorizer during connection setup; it validates the authorizer, drives the challenge/response anti-replay handshake, and admits or rejects the peer.",
+  "provenance": "Identified from the fully-qualified method name MonClient::handle_auth_request and Ceph-specific types and idioms: AuthConnectionMeta, AuthAuthorizeHandler, bufferlist, rotating_secrets, cct (CephContext), lderr/ldout/dendl logging macros, HAVE_FEATURE()/CEPHX_V2 feature bits, peer_global_id, peer_caps_info, session_key, connection_secret, and cephx_service_require_version. The sample banner (train_0063_cwe294.cpp, primevul_train_3216_vuln) and the CephX challenge/authorizer semantics point to the CephX msgr2 authorizer verification path.",
+  "trust_boundary": "The peer on the other end of Connection *con is untrusted and remote: it is any host that can open a msgr2 connection to this daemon. Everything the peer sends crosses the trust boundary here — most importantly the const bufferlist& payload (the raw authorizer blob, fully attacker-controlled: contents, length, and even emptiness), the advertised auth_method, and the peer's advertised feature set queried via con->get_features(). auth_meta->auth_mode is read directly from payload[0]. The authorizer is a bearer credential transported on a network an attacker may be able to sniff, so replay and downgrade are in-scope threats. rotating_secrets, cct/config, and the AuthAuthorizeHandler are trusted local state.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0063_cwe294.cpp",
+      "lines": "2-9",
+      "code": "int MonClient::handle_auth_request(\n  Connection *con,\n  AuthConnectionMeta *auth_meta,\n  bool more,\n  uint32_t auth_method,\n  const bufferlist& payload,\n  bufferlist *reply)\n{",
+      "explanation": "The server-side entry point for authenticating an incoming peer under the msgr2 protocol. con is the connection object (carries peer identity, features, and the fields verify_authorizer will populate). auth_meta holds per-connection authentication state including auth_mode, the authorizer_challenge nonce, session_key and connection_secret. more indicates whether this is a continuation frame of an in-progress handshake (a reply to a challenge) rather than the first request. auth_method selects which CephX authorizer handler to use. payload is the raw, attacker-supplied authorizer bytes. reply is an out-parameter the handler fills with the response (e.g. a challenge). The int return encodes: 1 = authenticated, 0 = more data needed (challenge sent), negative errno = rejected."
+    },
+    {
+      "file": "corpus/train/train_0063_cwe294.cpp",
+      "lines": "10",
+      "code": "auth_meta->auth_mode = payload[0];",
+      "explanation": "The first byte of the untrusted payload is read and stored as the authentication mode. bufferlist::operator[](0) indexes into the received buffer; this is the very first use of attacker-controlled data and it assumes the payload contains at least one byte. The mode selects between authorizer sub-modes handled below."
+    },
+    {
+      "file": "corpus/train/train_0063_cwe294.cpp",
+      "lines": "11-14",
+      "code": "if (auth_meta->auth_mode < AUTH_MODE_AUTHORIZER ||\n    auth_meta->auth_mode > AUTH_MODE_AUTHORIZER_MAX) {\n  return -EACCES;\n}",
+      "explanation": "A range gate on the mode byte just read: if it is below AUTH_MODE_AUTHORIZER or above AUTH_MODE_AUTHORIZER_MAX the request is refused with -EACCES. This restricts processing to the authorizer family of modes and rejects garbage or out-of-band mode values before any handler is selected."
+    },
+    {
+      "file": "corpus/train/train_0063_cwe294.cpp",
+      "lines": "15-21",
+      "code": "AuthAuthorizeHandler *ah = get_auth_authorize_handler(con->get_peer_type(),\n\t\t\t\t\t\tauth_method);\nif (!ah) {\n  lderr(cct) << __func__ << \" no AuthAuthorizeHandler found for auth method \"\n\t       << auth_method << dendl;\n  return -EOPNOTSUPP;\n}",
+      "explanation": "Resolves the concrete authorizer handler for the peer's type (mon/osd/mds/client) and the requested auth_method. get_auth_authorize_handler is a registry lookup; if no handler matches (unsupported or unknown method) the code logs at error level and returns -EOPNOTSUPP. This ensures ah is non-NULL before it is dereferenced later for verify_authorizer, so a bogus auth_method cannot itself cause a NULL dereference here."
+    },
+    {
+      "file": "corpus/train/train_0063_cwe294.cpp",
+      "lines": "23-32",
+      "code": "auto ac = &auth_meta->authorizer_challenge;\nif (!HAVE_FEATURE(con->get_features(), CEPHX_V2)) {\n  if (cct->_conf->cephx_service_require_version >= 2) {\n    ldout(cct,10) << __func__ << \" client missing CEPHX_V2 (\"\n\t\t    << \"cephx_service_requre_version = \"\n\t\t    << cct->_conf->cephx_service_require_version << \")\" << dendl;\n    return -EACCES;\n  }\n  ac = nullptr;\n}",
+      "explanation": "This block wires up the anti-replay challenge. ac is a pointer to auth_meta->authorizer_challenge, the nonce the server can require the client to echo back. The design intent: passing a non-NULL ac to verify_authorizer enables challenge/response — on first contact the server generates a nonce, refuses the (challengeless) authorizer, and forces the client to re-submit an authorizer that incorporates the nonce, defeating replay of a captured authorizer. The CEPHX_V2 feature bit indicates the peer supports this challenge protocol. If the peer does NOT advertise CEPHX_V2: when the admin has set cephx_service_require_version >= 2 the connection is hard-rejected with -EACCES; otherwise ac is set to nullptr, which DISABLES the challenge for that connection. So the challenge is only enforced for peers that advertise CEPHX_V2, or when the service is configured to demand v2."
+    },
+    {
+      "file": "corpus/train/train_0063_cwe294.cpp",
+      "lines": "34",
+      "code": "bool was_challenge = (bool)auth_meta->authorizer_challenge;",
+      "explanation": "Captures, BEFORE verification, whether a challenge nonce is already present on this connection (i.e. whether we already issued one on a prior frame). This snapshot is the state used afterward to distinguish 'we just now generated a fresh challenge' from 'the client is responding to a challenge we issued earlier', which is essential to the one-shot handshake logic at lines 51-54."
+    },
+    {
+      "file": "corpus/train/train_0063_cwe294.cpp",
+      "lines": "35-46",
+      "code": "bool isvalid = ah->verify_authorizer(\n  cct,\n  rotating_secrets.get(),\n  payload,\n  auth_meta->get_connection_secret_length(),\n  reply,\n  &con->peer_name,\n  &con->peer_global_id,\n  &con->peer_caps_info,\n  &auth_meta->session_key,\n  &auth_meta->connection_secret,\n  ac);",
+      "explanation": "The core cryptographic check. verify_authorizer decrypts/validates the payload authorizer against rotating_secrets, and on success fills the out-parameters that establish the peer's authenticated identity and capabilities: peer_name, peer_global_id (the cluster-wide identity used for authorization), peer_caps_info (the granted capabilities), and the negotiated session_key / connection_secret (with get_connection_secret_length() giving the desired secret length). Crucially it also receives ac: when ac is non-NULL and the authorizer lacks/mismatches the required nonce, verify_authorizer is expected to write a fresh challenge into *ac and return false; when ac is NULL no challenge is demanded. isvalid is the pass/fail verdict."
+    },
+    {
+      "file": "corpus/train/train_0063_cwe294.cpp",
+      "lines": "47-50",
+      "code": "if (isvalid) {\n  handle_authentication_dispatcher->ms_handle_authentication(con);\n  return 1;\n}",
+      "explanation": "On a valid authorizer the peer is admitted: ms_handle_authentication notifies the dispatcher that the connection is now authenticated (installing the peer identity/caps that verify_authorizer produced), and the function returns 1 to signal success to the messenger. From this point the peer is treated as the identity encoded in the authorizer."
+    },
+    {
+      "file": "corpus/train/train_0063_cwe294.cpp",
+      "lines": "51-54",
+      "code": "if (!more && !was_challenge && auth_meta->authorizer_challenge) {\n  ldout(cct,10) << __func__ << \" added challenge on \" << con << dendl;\n  return 0;\n}",
+      "explanation": "The challenge-issuing branch, reached only when verification failed. It fires when this is NOT a continuation frame (!more), there was NO pre-existing challenge (!was_challenge), yet verify_authorizer has now populated auth_meta->authorizer_challenge. That combination means 'first attempt, we just generated a nonce' — so return 0 to send the challenge in reply and ask the client to try again with the nonce embedded. On the client's follow-up (more/was_challenge true) this branch is skipped so a still-invalid authorizer falls through to rejection instead of looping."
+    },
+    {
+      "file": "corpus/train/train_0063_cwe294.cpp",
+      "lines": "55-56",
+      "code": "ldout(cct,10) << __func__ << \" bad authorizer on \" << con << dendl;\nreturn -EACCES;",
+      "explanation": "The terminal rejection path: verification failed and we are not in the fresh-challenge case, so the authorizer is simply bad (wrong secret, replay of a nonce'd authorizer, or a failed challenge response). The event is logged and -EACCES denies the connection."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0063_cwe294.cpp",
+      "lines": "24-32",
+      "code": "if (!HAVE_FEATURE(con->get_features(), CEPHX_V2)) {\n  if (cct->_conf->cephx_service_require_version >= 2) {\n    ldout(cct,10) << __func__ << \" client missing CEPHX_V2 (\"\n\t\t    << \"cephx_service_requre_version = \"\n\t\t    << cct->_conf->cephx_service_require_version << \")\" << dendl;\n    return -EACCES;\n  }\n  ac = nullptr;\n}",
+      "explanation": "Capture-replay authentication bypass via feature downgrade. Whether the anti-replay challenge is enforced is gated on a bit the PEER itself advertises: HAVE_FEATURE(con->get_features(), CEPHX_V2). An attacker who has sniffed a legitimate authorizer off the wire can replay it while simply NOT advertising CEPHX_V2 in its feature set; unless the operator has explicitly raised cephx_service_require_version to >= 2, the code takes the ac = nullptr path, so verify_authorizer is invoked with no challenge and the captured authorizer is accepted with no nonce proof of freshness. The security invariant is that anti-replay must NOT be defeatable by an attacker-chosen feature flag: challenge enforcement should be driven by the server's policy, not by what the client claims to support, and the safe default must fail closed. This is exactly the CephX replay-attack class (CVE-2018-1128): the challenge is the sole freshness check, and here it is optional at the attacker's discretion. Impact: an on-path attacker authenticates as, and gains the capabilities of, a captured principal."
+    },
+    {
+      "file": "corpus/train/train_0063_cwe294.cpp",
+      "lines": "10",
+      "code": "auth_meta->auth_mode = payload[0];",
+      "explanation": "Out-of-bounds read on an empty payload. payload is fully attacker-controlled and may carry zero bytes; indexing payload[0] before any length/emptiness check reads past the end of an empty bufferlist. Depending on the bufferlist implementation this is an out-of-bounds read (returning arbitrary adjacent memory as the mode byte) or an assertion/exception that aborts the connection-handling path — a remotely triggerable crash / DoS by a peer that simply sends an empty authorizer frame. The invariant: verify payload.length() >= 1 (reject short input) BEFORE dereferencing payload[0]. Even though the following range check (lines 11-14) usually rejects a wild mode value, the unsafe memory access has already happened at the read itself."
+    },
+    {
+      "file": "corpus/train/train_0063_cwe294.cpp",
+      "lines": "51-54",
+      "code": "if (!more && !was_challenge && auth_meta->authorizer_challenge) {\n  ldout(cct,10) << __func__ << \" added challenge on \" << con << dendl;\n  return 0;\n}",
+      "explanation": "The anti-replay guarantee lives entirely in the interaction between was_challenge and verify_authorizer's use of ac, and this branch only issues a challenge on the FIRST frame (!more && !was_challenge). If ac was nulled at lines 24-32, auth_meta->authorizer_challenge is never populated, this branch is never taken, and control falls straight through the isvalid check to accept-or-reject with no challenge round-trip — the replay window described above. Even with CEPHX_V2 present, the correctness of the state machine depends on verify_authorizer reliably (a) writing a fresh, unpredictable nonce into *ac on first contact and (b) on the follow-up frame requiring the returned authorizer to bind that exact nonce. If the implementation ever accepts an authorizer whose embedded challenge does not match the one issued for THIS connection, replay is possible despite the flag. This is a latent implementation contract the header/logic here cannot itself guarantee."
+    },
+    {
+      "file": "corpus/train/train_0063_cwe294.cpp",
+      "lines": "35-46",
+      "code": "bool isvalid = ah->verify_authorizer(\n  cct,\n  rotating_secrets.get(),\n  payload,\n  auth_meta->get_connection_secret_length(),\n  reply,\n  &con->peer_name,\n  &con->peer_global_id,\n  &con->peer_caps_info,\n  &auth_meta->session_key,\n  &auth_meta->connection_secret,\n  ac);",
+      "explanation": "This single call is the whole trust decision: it both validates the credential and populates the identity (peer_global_id) and capabilities (peer_caps_info) that authorize every subsequent request. Two latent hazards ride on it. First, get_connection_secret_length() supplies a length that the implementation uses when producing connection_secret; if that value is attacker-influenced or unchecked it can drive an over-large secret allocation/copy in the implementation (bounds contract not visible here). Second, all of peer_name/peer_global_id/peer_caps_info are written from the decoded authorizer — if verify_authorizer fills them before fully validating the signature, or on partial failure, stale/attacker-chosen identity could leak into con. The invariant: verify_authorizer must populate identity/caps ONLY on a cryptographically verified authorizer, and must treat get_connection_secret_length() as a bounded, server-sane value. These are implementation contracts (verify_authorizer body not provided)."
+    }
+  ],
+  "summary": "This is Ceph's msgr2 server-side CephX authorizer handler. The dominant issue is a capture-replay authentication bypass (CWE-294): the anti-replay challenge is enabled only when the untrusted peer advertises the CEPHX_V2 feature, so unless cephx_service_require_version>=2 an on-path attacker can replay a sniffed authorizer by simply not advertising CEPHX_V2 (ac=nullptr, no nonce enforced) — the CVE-2018-1128 class. Secondary: an unchecked payload[0] read is an out-of-bounds read / remote crash on an empty authorizer. The correctness of the whole handshake further depends on verify_authorizer's unseen challenge-binding contract.",
+  "reviewed_anchors": [
+    {"anchor": "handle_auth_request(Connection*, AuthConnectionMeta*, bool more, uint32_t auth_method, const bufferlist& payload, bufferlist *reply) — signature (lines 2-8)", "disposition": "finding", "reason": "Server-side auth entry; payload, auth_method, and con->get_features() are all attacker-controlled and drive the trust decision."},
+    {"anchor": "auth_meta->auth_mode = payload[0]; (line 10)", "disposition": "finding", "reason": "Indexes untrusted bufferlist without an emptiness/length check — OOB read / DoS."},
+    {"anchor": "auth_mode range check < AUTH_MODE_AUTHORIZER || > AUTH_MODE_AUTHORIZER_MAX (lines 11-14)", "disposition": "dismissed", "reason": "Correct bounds gate on the mode value; rejects out-of-range modes. Does not fix the already-executed OOB read but is itself sound."},
+    {"anchor": "get_auth_authorize_handler(con->get_peer_type(), auth_method) + !ah null check (lines 15-21)", "disposition": "dismissed", "reason": "Handler lookup is null-checked before use, so a bad auth_method returns -EOPNOTSUPP rather than dereferencing NULL."},
+    {"anchor": "auto ac = &auth_meta->authorizer_challenge; (line 23)", "disposition": "finding", "reason": "The challenge pointer is the anti-replay control; its later nulling is the core weakness."},
+    {"anchor": "HAVE_FEATURE(con->get_features(), CEPHX_V2) gate + ac = nullptr (lines 24-32)", "disposition": "finding", "reason": "Anti-replay enforcement is gated on a peer-advertised feature bit and fails open unless the service requires v2 — capture-replay bypass."},
+    {"anchor": "cephx_service_require_version >= 2 hard-reject (lines 25-30)", "disposition": "dismissed", "reason": "This is the safe branch (fail-closed when policy demands v2); the weakness is that it is not the default."},
+    {"anchor": "bool was_challenge = (bool)auth_meta->authorizer_challenge; (line 34)", "disposition": "finding", "reason": "Pre-verify snapshot central to the one-shot challenge handshake; correctness depends on verify_authorizer's nonce contract."},
+    {"anchor": "ah->verify_authorizer(..., get_connection_secret_length(), ..., ac) (lines 35-46)", "disposition": "finding", "reason": "Single call performs credential validation AND identity/caps population; latent contracts on challenge binding and connection-secret length live in the unseen implementation."},
+    {"anchor": "auth_meta->get_connection_secret_length() argument (line 39)", "disposition": "finding", "reason": "Length passed into verify_authorizer for connection_secret; bounded-value contract not visible here."},
+    {"anchor": "isvalid -> ms_handle_authentication(con); return 1 (lines 47-50)", "disposition": "dismissed", "reason": "Standard success dispatch; carries no independent contract beyond isvalid being trustworthy."},
+    {"anchor": "if (!more && !was_challenge && auth_meta->authorizer_challenge) return 0 (lines 51-54)", "disposition": "finding", "reason": "Challenge-issuing state machine; only fires when ac was non-NULL, so downgrade bypasses it entirely."},
+    {"anchor": "final ldout + return -EACCES (lines 55-56)", "disposition": "dismissed", "reason": "Terminal deny path; correct fail-closed behavior for a bad authorizer."}
+  ],
+  "findings": [
+    {
+      "title": "Capture-replay authentication bypass via attacker-controlled CEPHX_V2 downgrade (challenge disabled)",
+      "anchor": "if (!HAVE_FEATURE(con->get_features(), CEPHX_V2)) { ... ac = nullptr; }",
+      "file": "corpus/train/train_0063_cwe294.cpp",
+      "line": "24-32",
+      "code": "if (!HAVE_FEATURE(con->get_features(), CEPHX_V2)) {\n  if (cct->_conf->cephx_service_require_version >= 2) {\n    ldout(cct,10) << __func__ << \" client missing CEPHX_V2 (\"\n\t\t    << \"cephx_service_requre_version = \"\n\t\t    << cct->_conf->cephx_service_require_version << \")\" << dendl;\n    return -EACCES;\n  }\n  ac = nullptr;\n}",
+      "bug_class": "Authentication bypass by capture-replay (anti-replay challenge made optional by client-advertised feature bit)",
+      "cwe": "CWE-294",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0063_cwe294.cpp (challenge enforcement) with the actual replay decision in the AuthAuthorizeHandler::verify_authorizer implementation (file not provided)",
+      "invariant": "Anti-replay challenge enforcement must be driven by server policy and fail closed; it must not be disableable by a feature bit the untrusted peer chooses to advertise (or omit). A peer must never be able to opt out of the nonce challenge merely by not claiming CEPHX_V2.",
+      "failure_mode": "An on-path attacker sniffs a valid CephX authorizer from a legitimate peer, then opens a new connection and replays it while withholding the CEPHX_V2 feature bit. With the default cephx_service_require_version (< 2), the code sets ac = nullptr, so verify_authorizer performs no nonce/challenge check and accepts the replayed authorizer, granting the attacker the captured principal's identity (peer_global_id) and capabilities (peer_caps_info).",
+      "cve_analog": "CVE-2018-1128",
+      "what_to_confirm": "Confirm the deployed default of cephx_service_require_version and whether verify_authorizer enforces any freshness when ac is NULL; verify there is no server-policy path that requires the challenge regardless of the peer's advertised features."
+    },
+    {
+      "title": "Out-of-bounds read of first authorizer byte without length check",
+      "anchor": "auth_meta->auth_mode = payload[0];",
+      "file": "corpus/train/train_0063_cwe294.cpp",
+      "line": "10",
+      "code": "auth_meta->auth_mode = payload[0];",
+      "bug_class": "Out-of-bounds read on empty/undersized attacker buffer",
+      "cwe": "CWE-125",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0063_cwe294.cpp",
+      "invariant": "Reject payloads shorter than 1 byte (require payload.length() >= 1) BEFORE indexing payload[0]; never dereference attacker-controlled buffer positions without first bounding them against the received length.",
+      "failure_mode": "A peer sends an empty (zero-length) authorizer frame. payload[0] reads past the end of the bufferlist, yielding either arbitrary adjacent memory as the auth_mode (undefined behavior) or an assertion/exception that aborts the auth path — a remotely triggerable crash / denial of service. The subsequent range check cannot help because the unsafe read has already occurred.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm bufferlist::operator[] behavior on an out-of-range index in this build and that no length guard precedes line 10; add a payload.length() check that rejects short frames before the read."
+    },
+    {
+      "title": "Anti-replay correctness depends on unseen verify_authorizer challenge-binding contract",
+      "anchor": "ah->verify_authorizer(..., ac); with was_challenge state machine",
+      "file": "corpus/train/train_0063_cwe294.cpp",
+      "line": "34-54",
+      "code": "bool was_challenge = (bool)auth_meta->authorizer_challenge;\n  bool isvalid = ah->verify_authorizer(\n    cct,\n    rotating_secrets.get(),\n    payload,\n    auth_meta->get_connection_secret_length(),\n    reply,\n    &con->peer_name,\n    &con->peer_global_id,\n    &con->peer_caps_info,\n    &auth_meta->session_key,\n    &auth_meta->connection_secret,\n    ac);",
+      "bug_class": "Latent authentication/replay weakness — challenge nonce must be freshly generated and strictly bound per connection",
+      "cwe": "CWE-294",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided) — AuthAuthorizeHandler::verify_authorizer",
+      "invariant": "When ac is non-NULL, verify_authorizer must (1) generate a fresh, unpredictable challenge into *ac on first contact and refuse the challengeless authorizer, and (2) on the follow-up frame require the presented authorizer to cryptographically bind exactly the challenge issued for THIS connection; it must never accept an authorizer whose challenge is absent, stale, guessable, or from another connection.",
+      "failure_mode": "If verify_authorizer generates predictable nonces, reuses them across connections, or accepts an authorizer whose embedded challenge does not match the one issued for this connection, an attacker can defeat the challenge even when CEPHX_V2 is negotiated, restoring the replay bypass despite the local logic here appearing correct.",
+      "cve_analog": "CVE-2018-1128",
+      "what_to_confirm": "Inspect verify_authorizer to confirm challenge nonces are cryptographically random, per-connection, and strictly compared against the authorizer on the continuation frame."
+    },
+    {
+      "title": "Unbounded connection-secret length passed into verify_authorizer / identity populated from untrusted authorizer",
+      "anchor": "auth_meta->get_connection_secret_length()",
+      "file": "corpus/train/train_0063_cwe294.cpp",
+      "line": "39",
+      "code": "auth_meta->get_connection_secret_length(),",
+      "bug_class": "Unvalidated length / identity-before-verify contract in downstream implementation",
+      "cwe": "CWE-20",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided) — verify_authorizer / connection_secret handling",
+      "invariant": "get_connection_secret_length() must return a server-bounded value, and peer_name/peer_global_id/peer_caps_info/session_key/connection_secret must be written ONLY after the authorizer is cryptographically verified — never on a partial or failed verification.",
+      "failure_mode": "If the secret length is attacker-influenced and unchecked, the implementation may allocate/copy an over-large connection_secret; if identity/caps out-parameters are populated before signature validation completes, attacker-chosen identity could leak onto the connection on a failure path.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm get_connection_secret_length() is bounded by a server constant and that verify_authorizer writes the identity/caps out-parameters only on a fully verified authorizer."
+    }
+  ],
+  "audit_checklist": [
+    "Verify challenge enforcement cannot be disabled by the peer's advertised feature set: make anti-replay driven by server policy (fail-closed default), not by HAVE_FEATURE(CEPHX_V2).",
+    "Confirm the deployed default of cephx_service_require_version and whether operators are expected/required to set it to >= 2 to be safe against replay.",
+    "Add a payload.length() >= 1 guard before reading payload[0] at line 10; confirm bufferlist::operator[] out-of-range behavior in this build.",
+    "Inspect verify_authorizer: nonces must be cryptographically random, per-connection, and strictly matched on the continuation frame; no acceptance of stale/guessable/cross-connection challenges.",
+    "Verify verify_authorizer populates peer_name/peer_global_id/peer_caps_info/session_key/connection_secret ONLY after full cryptographic verification, never on partial/failed paths.",
+    "Confirm get_connection_secret_length() returns a value bounded by a server-side constant before it drives any secret allocation/copy.",
+    "Confirm the !more / !was_challenge state machine cannot be driven into a loop or into skipping the challenge across reconnects."
+  ]
+}

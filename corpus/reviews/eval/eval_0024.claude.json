@@ -1,0 +1,184 @@
+{
+  "subsystem": "TensorFlow Lite (TFLite) built-in kernel for element-wise comparison operators on quantized tensors. This is the ComparisonQuantized helper that prepares affine-requantization parameters (offset, multiplier, shift) for the UInt8/Int8 quantized code path and then dispatches to the reference_ops comparison kernels (ComparisonWithScaling / BroadcastComparison4DSlowWithScaling) that produce a boolean output tensor. It is the per-invocation compute path of ops such as EQUAL / NOT_EQUAL / GREATER / LESS on quantized inputs.",
+  "provenance": "Identified by TFLite-specific type names and API: TfLiteTensor, kTfLiteUInt8/kTfLiteInt8, params.zero_point, params.scale, QuantizeMultiplierSmallerThanOneExp, ComparisonParams, GetTensorShape/GetTensorData<T>, and the reference_ops:: namespace with ComparisonWithScaling / BroadcastComparison4DSlowWithScaling. These are the public symbols of tensorflow/lite/kernels and tensorflow/lite/kernels/internal/reference/comparisons.h. The sample banner (corpus/eval/eval_0024_cwe703.cpp) and the CWE-703 filename hint at improper handling of an exceptional condition. The template parameters input_dtype and opname (used at lines 27/32 but never declared in the snippet) show this body was extracted from a function template whose 'template <typename input_dtype, ComparisonFn opname>' declaration line was elided.",
+  "trust_boundary": "The TfLiteTensor metadata and buffers here are attacker-controllable: a TFLite model file (its FlatBuffer) and the runtime input buffers are supplied by whoever provides the model / feeds the interpreter. That means input1->type, input2->type, input1->params.zero_point, input2->params.zero_point, input1->params.scale, input2->params.scale, the tensor shapes returned by GetTensorShape, and the raw data pointers from GetTensorData are all values a hostile model author chooses. Quantization parameters (scale/zero_point) are stored verbatim in the model and are NOT sanitized by this function; the only gate present is a check on input1->type. Everything downstream trusts that the model-declared scale is a valid affine scale and that input2/output have compatible types and allocations.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/eval/eval_0024_cwe703.cpp",
+      "lines": "2-3",
+      "code": "void ComparisonQuantized(const TfLiteTensor* input1, const TfLiteTensor* input2,\n                         TfLiteTensor* output, bool requires_broadcast) {",
+      "explanation": "The function signature takes two read-only input tensors (input1, input2), a writable output tensor, and a flag requires_broadcast that says whether the two inputs have mismatched shapes needing NumPy-style broadcasting. It returns void; all results are written into *output. Although not shown, the surrounding declaration is a function template parameterized by input_dtype (the C++ element type, e.g. uint8_t or int8_t) and opname (the comparison functor), because both are referenced at lines 27 and 32. The three TfLiteTensor pointers are the trust boundary: their type tags, quantization params, shapes, and data buffers all originate from the untrusted model and its inputs."
+    },
+    {
+      "file": "corpus/eval/eval_0024_cwe703.cpp",
+      "lines": "4",
+      "code": "if (input1->type == kTfLiteUInt8 || input1->type == kTfLiteInt8) {",
+      "explanation": "The entire body is gated on input1's element type being 8-bit unsigned or 8-bit signed quantized. Note precisely what is and is NOT checked: only input1->type is inspected. input2->type and output->type are never validated here. There is also no else branch, so when input1->type is anything other than these two values, the function falls through and returns without writing output at all. This single predicate is the only input-validation gate in the function."
+    },
+    {
+      "file": "corpus/eval/eval_0024_cwe703.cpp",
+      "lines": "5-7",
+      "code": "auto input1_offset = -input1->params.zero_point;\n    auto input2_offset = -input2->params.zero_point;\n    const int left_shift = 8;",
+      "explanation": "For affine (asymmetric) quantization, a real value r is reconstructed as r = scale * (q - zero_point). The comparison kernels want the negated zero_point as an additive offset, so input1_offset = -zero_point and input2_offset = -zero_point are computed for both inputs. zero_point is an int32 field of TfLiteQuantizationParams, taken straight from the model. left_shift = 8 is a fixed pre-shift applied to both operands before the fixed-point multiply, giving extra headroom so the two differently-scaled operands can be compared in a common fixed-point domain. Note input2's params are read here even though only input1->type was gated at line 4."
+    },
+    {
+      "file": "corpus/eval/eval_0024_cwe703.cpp",
+      "lines": "9-16",
+      "code": "int32 input1_multiplier;\n    int input1_shift;\n    QuantizeMultiplierSmallerThanOneExp(input1->params.scale,\n                                        &input1_multiplier, &input1_shift);\n    int32 input2_multiplier;\n    int input2_shift;\n    QuantizeMultiplierSmallerThanOneExp(input2->params.scale,\n                                        &input2_multiplier, &input2_shift);",
+      "explanation": "Each input's floating-point scale is converted into a fixed-point representation: a 32-bit integer multiplier plus a right-shift exponent, so the runtime can requantize using integer math only. QuantizeMultiplierSmallerThanOneExp is the specialized variant used when the effective multiplier is known to be in the half-open range (0, 1); it decomposes scale into multiplier * 2^-shift. Internally this routine contains TFLITE_CHECK/DCHECK guards asserting the input double is strictly between 0 and 1 (it computes std::frexp and checks the exponent is <= 0). Both input scales are attacker-supplied model constants and are passed in with no prior range check."
+    },
+    {
+      "file": "corpus/eval/eval_0024_cwe703.cpp",
+      "lines": "18-25",
+      "code": "ComparisonParams op_params;\n    op_params.left_shift = left_shift;\n    op_params.input1_offset = input1_offset;\n    op_params.input1_multiplier = input1_multiplier;\n    op_params.input1_shift = input1_shift;\n    op_params.input2_offset = input2_offset;\n    op_params.input2_multiplier = input2_multiplier;\n    op_params.input2_shift = input2_shift;",
+      "explanation": "A ComparisonParams plain-old-data struct is populated with the requantization plan: the common left_shift, and per-input offset/multiplier/shift triples. This struct is pure numeric plumbing passed by value into the reference kernel; it carries no buffer or length itself. The values are exactly the ones derived above, so any bad scale/zero_point propagates unchanged into the kernel's per-element fixed-point arithmetic."
+    },
+    {
+      "file": "corpus/eval/eval_0024_cwe703.cpp",
+      "lines": "26-36",
+      "code": "if (requires_broadcast) {\n      reference_ops::BroadcastComparison4DSlowWithScaling<input_dtype, opname>(\n          op_params, GetTensorShape(input1), GetTensorData<input_dtype>(input1),\n          GetTensorShape(input2), GetTensorData<input_dtype>(input2),\n          GetTensorShape(output), GetTensorData<bool>(output));\n    } else {\n      reference_ops::ComparisonWithScaling<input_dtype, opname>(\n          op_params, GetTensorShape(input1), GetTensorData<input_dtype>(input1),\n          GetTensorShape(input2), GetTensorData<input_dtype>(input2),\n          GetTensorShape(output), GetTensorData<bool>(output));\n    }",
+      "explanation": "Depending on requires_broadcast, the code calls either the 4D broadcasting comparison or the plain element-wise comparison. Both are templated on input_dtype and opname. Each is handed op_params plus three (shape, data) pairs: input1 and input2 are read as arrays of input_dtype, and output is written as an array of bool. GetTensorShape returns the RuntimeShape driving the iteration bounds; GetTensorData<T> is an unchecked reinterpret of the tensor's raw buffer to T*. Correctness of every memory access inside the kernel depends on the shapes matching the actual buffer allocations and on input2/output truly being of the assumed element types — none of which is re-verified here."
+    },
+    {
+      "file": "corpus/eval/eval_0024_cwe703.cpp",
+      "lines": "37-38",
+      "code": "}\n}",
+      "explanation": "Closing braces for the type-gate if-block and the function. There is no else clause and no default handling: if input1->type is neither kTfLiteUInt8 nor kTfLiteInt8, the function returns having done nothing, silently leaving output untouched."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/eval/eval_0024_cwe703.cpp",
+      "lines": "11-16",
+      "code": "QuantizeMultiplierSmallerThanOneExp(input1->params.scale,\n                                        &input1_multiplier, &input1_shift);\n    int32 input2_multiplier;\n    int input2_shift;\n    QuantizeMultiplierSmallerThanOneExp(input2->params.scale,\n                                        &input2_multiplier, &input2_shift);",
+      "explanation": "input1->params.scale and input2->params.scale are read directly from the untrusted model and passed to QuantizeMultiplierSmallerThanOneExp with no validation that they lie in the expected (0, 1) range. This is the CWE-703 exceptional-condition mishandling the filename points at. QuantizeMultiplierSmallerThanOneExp asserts (TFLITE_CHECK) that its argument's exponent is <= 0, i.e. that 0 < scale < 1. A model that declares a scale of 0.0, a negative scale, a NaN/Inf scale, or any scale >= 1.0 drives that internal check to fail, which calls std::abort — a remotely reachable assertion / denial of service. Even without the abort, a zero or subnormal scale yields a degenerate multiplier feeding the fixed-point path. The implementation must clamp/validate scale (0 < scale < 1, finite) BEFORE calling the quantize helper, or handle out-of-range scales gracefully instead of aborting."
+    },
+    {
+      "file": "corpus/eval/eval_0024_cwe703.cpp",
+      "lines": "4",
+      "code": "if (input1->type == kTfLiteUInt8 || input1->type == kTfLiteInt8) {",
+      "explanation": "Only input1->type is checked, yet input2 is subsequently dereferenced for its quantization params (lines 6, 15) and, critically, its data buffer is reinterpreted as input_dtype (the type chosen from input1) at lines 28-29 and 33-34. If a malicious model sets input1 to Int8 but input2 to a wider type (e.g. Float32 or Int32), GetTensorData<input_dtype>(input2) reinterprets input2's buffer as 8-bit elements while the shape iteration is driven by GetTensorShape(input2); type confusion here causes out-of-bounds reads or misinterpreted values. The invariant is that both inputs must be the SAME quantized 8-bit type; this must be enforced (ideally in Prepare, but it is not re-checked here). CWE-843 type confusion leading to CWE-125 over-read."
+    },
+    {
+      "file": "corpus/eval/eval_0024_cwe703.cpp",
+      "lines": "4-37",
+      "code": "if (input1->type == kTfLiteUInt8 || input1->type == kTfLiteInt8) {",
+      "explanation": "The if has no else. When input1->type is neither UInt8 nor Int8 (but the caller still routed a quantized-comparison op here), the function returns without ever writing *output. The output tensor's buffer is left in whatever state it had — uninitialized on first use, or stale from a previous invocation. Downstream ops then read a bool output that was never produced, yielding non-deterministic results or use of uninitialized memory (CWE-457 / CWE-908). A robust implementation must guarantee the type gate is exhaustive for every type the op registration accepts, or fail loudly (return kTfLiteError) rather than silently no-op."
+    },
+    {
+      "file": "corpus/eval/eval_0024_cwe703.cpp",
+      "lines": "5-6",
+      "code": "auto input1_offset = -input1->params.zero_point;\n    auto input2_offset = -input2->params.zero_point;",
+      "explanation": "zero_point is a model-supplied int32. Negating INT32_MIN (-2147483648) is signed-integer overflow (undefined behavior); more practically, a zero_point far outside the legal quantized range for an 8-bit tensor (which should be within [-128,127] for Int8 or [0,255] for UInt8) produces an offset that, combined with left_shift=8 and the multiplier, can overflow the intermediate int32 fixed-point accumulation inside the kernel, giving wrong comparison results. Impact is low (correctness / UB) rather than memory-unsafety here, but the implementation should validate zero_point is within the type's representable range. CWE-190."
+    },
+    {
+      "file": "corpus/eval/eval_0024_cwe703.cpp",
+      "lines": "28-35",
+      "code": "op_params, GetTensorShape(input1), GetTensorData<input_dtype>(input1),\n          GetTensorShape(input2), GetTensorData<input_dtype>(input2),\n          GetTensorShape(output), GetTensorData<bool>(output));",
+      "explanation": "The output buffer is written as bool (GetTensorData<bool>(output)) and the number of elements written is governed by GetTensorShape(output) / the broadcast of the input shapes, not by the allocated size of output. If output->type is not kTfLiteBool or output was allocated for a different element count than the (possibly broadcast) result shape implies, the kernel writes past the allocation — an out-of-bounds write (CWE-787). Nothing in this function confirms output->type == kTfLiteBool or that output's allocation matches the broadcast output shape; that must be guaranteed by Prepare and is worth confirming."
+    }
+  ],
+  "summary": "A TFLite quantized comparison kernel that trusts model-supplied quantization parameters without validating them. The primary issue (matching the CWE-703 label) is that attacker-controlled input scales are passed straight into QuantizeMultiplierSmallerThanOneExp, whose internal (0,1)-range assertion aborts the process on a hostile scale — a reachable-assertion denial of service. Secondary latent issues: only input1's type is gated (input2/output types unchecked → type confusion / OOB), and the exhaustive-else is missing (silent no-op leaves output uninitialized).",
+  "reviewed_anchors": [
+    {"anchor": "ComparisonQuantized(const TfLiteTensor* input1, const TfLiteTensor* input2, TfLiteTensor* output, bool requires_broadcast) — signature", "disposition": "finding", "reason": "Entry point taking untrusted tensors; missing cross-tensor type/allocation validation (see input2/output findings)."},
+    {"anchor": "if (input1->type == kTfLiteUInt8 || input1->type == kTfLiteInt8) (line 4)", "disposition": "finding", "reason": "Only input1 type is gated; no else branch — drives both the type-confusion and silent-no-op findings."},
+    {"anchor": "input1_offset = -input1->params.zero_point (line 5)", "disposition": "finding", "reason": "Negation of unvalidated int32 zero_point; INT32_MIN UB and out-of-range offset (CWE-190), low severity."},
+    {"anchor": "input2_offset = -input2->params.zero_point (line 6)", "disposition": "finding", "reason": "Same negation/overflow class; also reads input2 params though only input1->type was checked."},
+    {"anchor": "const int left_shift = 8 (line 7)", "disposition": "dismissed", "reason": "Fixed compile-time constant; carries no attacker-controlled contract."},
+    {"anchor": "int32 input1_multiplier; int input1_shift; (lines 9-10)", "disposition": "dismissed", "reason": "Local output variables for the quantize helper; no contract of their own."},
+    {"anchor": "QuantizeMultiplierSmallerThanOneExp(input1->params.scale, ...) (lines 11-12)", "disposition": "finding", "reason": "Unvalidated attacker scale reaches an internal (0,1) assertion — reachable-abort DoS, the primary CWE-703 finding."},
+    {"anchor": "int32 input2_multiplier; int input2_shift; (lines 13-14)", "disposition": "dismissed", "reason": "Local output variables for the quantize helper; no contract of their own."},
+    {"anchor": "QuantizeMultiplierSmallerThanOneExp(input2->params.scale, ...) (lines 15-16)", "disposition": "finding", "reason": "Same unvalidated-scale abort hazard for input2; folded into the primary scale-validation finding."},
+    {"anchor": "ComparisonParams op_params + field assignments (lines 18-25)", "disposition": "dismissed", "reason": "POD struct passed by value; pure numeric plumbing with no buffer/length semantics of its own."},
+    {"anchor": "requires_broadcast branch selecting Broadcast/plain kernel (lines 26-36)", "disposition": "dismissed", "reason": "Control-flow selection only; the memory risks live in the operands it forwards, covered below."},
+    {"anchor": "GetTensorData<input_dtype>(input2) (lines 29, 34)", "disposition": "finding", "reason": "Reinterprets input2 as input1's type without checking input2->type — type confusion / OOB read (CWE-843/CWE-125)."},
+    {"anchor": "GetTensorData<bool>(output) (lines 30, 35)", "disposition": "finding", "reason": "Writes output as bool bounded by result shape, not by output allocation/type — potential OOB write (CWE-787)."},
+    {"anchor": "template parameters input_dtype, opname (used lines 27, 32)", "disposition": "dismissed", "reason": "Elided template header; grounding note only — the dtype-selection risk is captured by the input2 type-confusion finding."},
+    {"anchor": "GetTensorShape(input1/input2/output) (lines 28-35)", "disposition": "dismissed", "reason": "Shape accessors; their misuse risk is subsumed by the output OOB-write and input2 type-confusion findings."}
+  ],
+  "findings": [
+    {
+      "title": "Unvalidated quantization scale aborts process (reachable assertion / DoS)",
+      "anchor": "QuantizeMultiplierSmallerThanOneExp(input1->params.scale, &input1_multiplier, &input1_shift) and the identical input2 call",
+      "file": "corpus/eval/eval_0024_cwe703.cpp",
+      "line": "11-16",
+      "code": "QuantizeMultiplierSmallerThanOneExp(input1->params.scale,\n                                        &input1_multiplier, &input1_shift);\n    int32 input2_multiplier;\n    int input2_shift;\n    QuantizeMultiplierSmallerThanOneExp(input2->params.scale,\n                                        &input2_multiplier, &input2_shift);",
+      "bug_class": "Improper handling of exceptional condition / reachable assertion (abort on out-of-range scale)",
+      "cwe": "CWE-703",
+      "severity": "high",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "Every input scale passed to QuantizeMultiplierSmallerThanOneExp must be finite and strictly within (0, 1); the kernel must validate 0 < params.scale < 1 (and finite) before calling, and return kTfLiteError on violation rather than allowing the helper's internal TFLITE_CHECK to abort.",
+      "failure_mode": "A hostile TFLite model declares input1 or input2 with params.scale set to 0.0, a negative value, NaN/Inf, or any value >= 1.0. QuantizeMultiplierSmallerThanOneExp's internal exponent assertion (it requires the frexp exponent <= 0) fails and calls std::abort, crashing the interpreter/host process on parse-and-run of the model — a remotely reachable denial of service with no memory corruption but full process termination. Also folds in CWE-617 (reachable assertion).",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm QuantizeMultiplierSmallerThanOneExp aborts (TFLITE_CHECK/DCHECK) for scale <= 0 or scale >= 1, and that neither this function nor the op's Prepare validates params.scale range before the call."
+    },
+    {
+      "title": "input2 element type never validated — type confusion / out-of-bounds read",
+      "anchor": "GetTensorData<input_dtype>(input2) gated only by input1->type",
+      "file": "corpus/eval/eval_0024_cwe703.cpp",
+      "line": "4",
+      "code": "if (input1->type == kTfLiteUInt8 || input1->type == kTfLiteInt8) {",
+      "bug_class": "Type confusion leading to out-of-bounds read",
+      "cwe": "CWE-843",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "input1->type and input2->type must be equal (both the same 8-bit quantized type) and must match the template input_dtype before either buffer is reinterpreted as input_dtype[]; this must be enforced (e.g. in Prepare) so the runtime element size matches the declared type.",
+      "failure_mode": "Only input1->type is checked at line 4. input2->params are read at lines 6/15 and input2's buffer is reinterpreted as input_dtype at lines 29/34 while iteration is driven by GetTensorShape(input2). A model with input1=Int8 but input2 of a wider type (Float32/Int32) makes the kernel treat input2's larger elements as 8-bit, reading beyond correct element boundaries and, combined with a shape declaring more elements than the buffer holds under the assumed dtype, over-reading past the allocation (CWE-125).",
+      "cve_analog": "",
+      "what_to_confirm": "Check whether the op's Prepare enforces input1->type == input2->type == output-compatible type; if not, this function trusts a mismatch."
+    },
+    {
+      "title": "Missing else on type gate leaves output tensor unwritten",
+      "anchor": "if (input1->type == kTfLiteUInt8 || input1->type == kTfLiteInt8) { ... } with no else",
+      "file": "corpus/eval/eval_0024_cwe703.cpp",
+      "line": "4-37",
+      "code": "if (input1->type == kTfLiteUInt8 || input1->type == kTfLiteInt8) {",
+      "bug_class": "Use of uninitialized / unwritten output on unhandled type path",
+      "cwe": "CWE-457",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "For every input1->type the op registration accepts, this function must either fully populate *output or return an explicit error; it must never silently return leaving output unwritten.",
+      "failure_mode": "If ComparisonQuantized is reached with input1->type other than UInt8/Int8 (e.g. via a registration path or type that Prepare failed to reject), the function falls through the if and returns without writing output. Downstream consumers then read a bool output tensor that is uninitialized (first use) or stale (reused arena buffer), producing non-deterministic comparison results or reads of uninitialized memory (CWE-908).",
+      "cve_analog": "",
+      "what_to_confirm": "Verify the caller/Prepare guarantees only UInt8/Int8 reach this path, or that a float/other-type branch exists elsewhere; otherwise output is left undefined."
+    },
+    {
+      "title": "Output written as bool bounded by result shape, not output allocation",
+      "anchor": "GetTensorData<bool>(output) with GetTensorShape(output)",
+      "file": "corpus/eval/eval_0024_cwe703.cpp",
+      "line": "30",
+      "code": "GetTensorShape(output), GetTensorData<bool>(output));",
+      "bug_class": "Out-of-bounds write (output type/size assumption)",
+      "cwe": "CWE-787",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "output->type must be kTfLiteBool and output must be allocated for exactly the (possibly broadcast) result element count implied by the input shapes before the kernel writes it.",
+      "failure_mode": "The comparison kernel writes one bool per result element, with the count derived from the input/output shapes rather than from output's byte allocation. If output->type is not bool, or output was allocated for a smaller element count than the broadcast result implies (a shape/allocation mismatch a malicious model can arrange), the kernel writes past the output buffer — heap out-of-bounds write.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm Prepare sets output->type = kTfLiteBool and resizes output to the broadcast shape of input1/input2 so the kernel's element count cannot exceed the allocation."
+    },
+    {
+      "title": "Negation of unvalidated zero_point (integer overflow / out-of-range offset)",
+      "anchor": "input1_offset = -input1->params.zero_point; input2_offset = -input2->params.zero_point;",
+      "file": "corpus/eval/eval_0024_cwe703.cpp",
+      "line": "5-6",
+      "code": "auto input1_offset = -input1->params.zero_point;\n    auto input2_offset = -input2->params.zero_point;",
+      "bug_class": "Integer overflow / undefined behavior on negation",
+      "cwe": "CWE-190",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "params.zero_point must lie within the representable range of the quantized type ([-128,127] for Int8, [0,255] for UInt8) so that negation and the subsequent fixed-point accumulation cannot overflow int32.",
+      "failure_mode": "zero_point is an unvalidated int32 from the model. Negating INT32_MIN is signed-overflow UB; more practically, an out-of-range zero_point produces an offset that, scaled by left_shift=8 and the multiplier inside the kernel, overflows the int32 intermediate and yields incorrect (attacker-influenced) comparison outputs. Impact is correctness/UB rather than memory unsafety in this function.",
+      "cve_analog": "",
+      "what_to_confirm": "Check whether Prepare constrains params.zero_point to the type's legal range; if not, the negation and downstream accumulation trust arbitrary int32 values."
+    }
+  ],
+  "audit_checklist": [
+    "Does QuantizeMultiplierSmallerThanOneExp (or its caller/Prepare) validate 0 < params.scale < 1 and finite for BOTH inputs before use, and return kTfLiteError instead of aborting on violation?",
+    "Is input1->type == input2->type enforced (and matching template input_dtype) so input2's buffer is never reinterpreted at the wrong element size?",
+    "Is the type gate at line 4 exhaustive for every type the op accepts, or does an unhandled type silently leave output unwritten?",
+    "Does Prepare set output->type = kTfLiteBool and resize output to the broadcast result shape so the kernel cannot write past the output allocation?",
+    "Is params.zero_point constrained to the quantized type's legal range to avoid negation UB and int32 accumulation overflow?",
+    "Are input1/input2/output buffer allocations confirmed to match their declared shapes before GetTensorData<T> reinterpretation and iteration?"
+  ]
+}

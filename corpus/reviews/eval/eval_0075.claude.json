@@ -1,0 +1,153 @@
+{
+  "subsystem": "Samba SMB client (libsmb) GENSEC/SPNEGO session-setup state machine. This is the tevent async completion callback cli_session_setup_gensec_remote_done(), fired when the client has exchanged one GENSEC security blob with the SMB server. It receives the server's reply blob, decides whether authentication is complete, handles the special 'guest'/anonymous case, and either finishes the handshake (cli_session_setup_gensec_ready) or drives the next local GENSEC step (cli_session_setup_gensec_local_next).",
+  "provenance": "Identified by Samba-specific naming and types: the cli_session_setup_gensec_* function family, the tevent async request idiom (struct tevent_req, tevent_req_callback_data, tevent_req_data, tevent_req_nterror), NTSTATUS return codes (NT_STATUS_IS_OK, NT_STATUS_MORE_PROCESSING_REQUIRED), the talloc allocator (TALLOC_FREE), Samba's data_blob type (data_blob_free, data_blob_null), and the smbXcli_* connection/session API (smbXcli_conn_protocol, smbXcli_session_is_guest, PROTOCOL_SMB2_02, smb1.session/smb2.session). This is the client-side SPNEGO session-setup code that lives in Samba's source3/libsmb/cliconnect.c. The banner comment '/* sample: primevul_c_train_2720_fixed */' marks it as a post-fix snapshot of a labeled sample.",
+  "trust_boundary": "The remote SMB server across the network is the untrusted producer. cli_sesssetup_blob_recv() (lines 15-16) parses a server-supplied wire response, yielding the server's continuation blob (state->blob_in), receive buffers, and an NTSTATUS. Critically, the session object's guest/anonymous state consumed at line 36 via smbXcli_session_is_guest() is derived from server-controlled SMB2 SessionFlags (SMB2_SESSION_FLAG_IS_GUEST / _IS_NULL) in the SESSION_SETUP response. A malicious or man-in-the-middle server therefore controls the status, the reply blob, and the guest indication that steer this callback's authentication-completion decision.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/eval/eval_0075_cwe94.c",
+      "lines": "2-9",
+      "code": "static void cli_session_setup_gensec_remote_done(struct tevent_req *subreq)\n{\n\tstruct tevent_req *req =\n\t\ttevent_req_callback_data(subreq,\n\t\tstruct tevent_req);\n\tstruct cli_session_setup_gensec_state *state =\n\t\ttevent_req_data(req,\n\t\tstruct cli_session_setup_gensec_state);",
+      "explanation": "This is a tevent completion callback for an inner subrequest (subreq) that sent/received one GENSEC blob to/from the server. tevent_req_callback_data() recovers the parent request req that was stashed when the subreq was created, and tevent_req_data() recovers the per-request state structure (cli_session_setup_gensec_state) that holds the whole session-setup working set. Both req and state are talloc-allocated objects; state is a child of req and lives as long as req does. Everything the callback needs (input/output blobs, readiness flags, the cli connection pointer) hangs off state."
+    },
+    {
+      "file": "corpus/eval/eval_0075_cwe94.c",
+      "lines": "10-13",
+      "code": "\tNTSTATUS status;\n\n\tTALLOC_FREE(state->inbuf);\n\tTALLOC_FREE(state->recv_iov);",
+      "explanation": "A local NTSTATUS is declared for the recv result. TALLOC_FREE frees and NULLs the previous round's received buffer (state->inbuf) and the received iovec array (state->recv_iov). These are freed BEFORE the new recv call so the fresh buffers returned by cli_sesssetup_blob_recv() can be stored into the same fields without leaking the prior allocation. TALLOC_FREE also sets the pointers to NULL, so a later free is idempotent."
+    },
+    {
+      "file": "corpus/eval/eval_0075_cwe94.c",
+      "lines": "15-18",
+      "code": "\tstatus = cli_sesssetup_blob_recv(subreq, state, &state->blob_in,\n\t\t\t\t\t &state->inbuf, &state->recv_iov);\n\tTALLOC_FREE(subreq);\n\tdata_blob_free(&state->blob_out);",
+      "explanation": "cli_sesssetup_blob_recv() unpacks the server's response carried by subreq: it returns an NTSTATUS and fills state->blob_in (the server's GENSEC continuation token), state->inbuf (the backing packet buffer), and state->recv_iov (the parsed iovecs). The second argument 'state' is the talloc parent the new buffers are attached to. Only after the data has been extracted is subreq freed with TALLOC_FREE(subreq), which is the correct ordering (the returned blob may point into memory owned by subreq's children reparented onto state). data_blob_free(&state->blob_out) then releases the OUTGOING blob the client had just sent, since it is no longer needed."
+    },
+    {
+      "file": "corpus/eval/eval_0075_cwe94.c",
+      "lines": "19-24",
+      "code": "\tif (!NT_STATUS_IS_OK(status) &&\n\t    !NT_STATUS_EQUAL(status, NT_STATUS_MORE_PROCESSING_REQUIRED))\n\t{\n\t\ttevent_req_nterror(req, status);\n\t\treturn;\n\t}",
+      "explanation": "This is the error gate. In SPNEGO/GENSEC, two statuses are 'good': NT_STATUS_OK means the exchange succeeded, and NT_STATUS_MORE_PROCESSING_REQUIRED means the server wants another round-trip. Any other status is a hard failure: tevent_req_nterror(req, status) marks the parent request failed (which schedules/invokes its completion callback) and the function returns immediately. The immediate return after nterror is important because nterror can synchronously trigger the caller's callback, which may free req/state; returning avoids touching freed memory."
+    },
+    {
+      "file": "corpus/eval/eval_0075_cwe94.c",
+      "lines": "26-34",
+      "code": "\tif (NT_STATUS_IS_OK(status)) {\n\t\tstruct smbXcli_session *session = NULL;\n\t\tbool is_guest = false;\n\n\t\tif (smbXcli_conn_protocol(state->cli->conn) >= PROTOCOL_SMB2_02) {\n\t\t\tsession = state->cli->smb2.session;\n\t\t} else {\n\t\t\tsession = state->cli->smb1.session;\n\t\t}",
+      "explanation": "When the exchange has fully succeeded (status OK), the code determines which session object represents this connection. smbXcli_conn_protocol() reports the negotiated dialect; PROTOCOL_SMB2_02 and higher use the SMB2/3 session stored in state->cli->smb2.session, while older dialects use state->cli->smb1.session. The chosen session is the authenticated principal object whose flags (including the guest/anonymous indicator set from the server's session-setup response) will be inspected next. session is initialized to NULL and is expected to be non-NULL once negotiation reached this point."
+    },
+    {
+      "file": "corpus/eval/eval_0075_cwe94.c",
+      "lines": "36-49",
+      "code": "\t\tis_guest = smbXcli_session_is_guest(session);\n\t\tif (is_guest) {\n\t\t\t/*\n\t\t\t * We can't finish the gensec handshake, we don't\n\t\t\t * have a negotiated session key.\n\t\t\t *\n\t\t\t * So just pretend we are completely done.\n\t\t\t *\n\t\t\t * Note that smbXcli_session_is_guest()\n\t\t\t * always returns false if we require signing.\n\t\t\t */\n\t\t\tstate->blob_in = data_blob_null;\n\t\t\tstate->local_ready = true;\n\t\t}",
+      "explanation": "This is the security-critical special case. smbXcli_session_is_guest(session) reports whether the server granted GUEST/anonymous access (a state driven by the server's SMB2 SessionFlags). If guest, the client cannot complete the GENSEC handshake because a guest session has NO negotiated session key, so the code short-circuits: it discards the server's continuation blob (state->blob_in = data_blob_null) and declares the LOCAL side finished (state->local_ready = true), i.e. it 'pretends we are completely done'. The comment documents the load-bearing invariant that makes this safe: smbXcli_session_is_guest() must return false whenever the client requires signing — otherwise a server could claim guest to skip key negotiation while the client still believes it is on a protected connection."
+    },
+    {
+      "file": "corpus/eval/eval_0075_cwe94.c",
+      "lines": "51-52",
+      "code": "\t\tstate->remote_ready = true;\n\t}",
+      "explanation": "Regardless of the guest branch, once status is OK the REMOTE side of the handshake is marked complete (state->remote_ready = true). The two-flag design (local_ready and remote_ready) models GENSEC's independent local-produced and remote-consumed token streams; the exchange is finished only when both have converged. This closes the NT_STATUS_IS_OK block."
+    },
+    {
+      "file": "corpus/eval/eval_0075_cwe94.c",
+      "lines": "54-60",
+      "code": "\tif (state->local_ready && state->remote_ready) {\n\t\tcli_session_setup_gensec_ready(req);\n\t\treturn;\n\t}\n\n\tcli_session_setup_gensec_local_next(req);\n}",
+      "explanation": "Final dispatch. If BOTH sides are ready the handshake is complete and cli_session_setup_gensec_ready(req) finalizes the authenticated session (establishing signing/sealing state, marking req done) and returns. Otherwise the client still owes the server another token, so cli_session_setup_gensec_local_next(req) runs the next local GENSEC step to produce it. Note the guest branch reached this point with local_ready forced true and remote_ready just set true, so a guest response drives straight into cli_session_setup_gensec_ready() with an empty/absent session key."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/eval/eval_0075_cwe94.c",
+      "lines": "36-49",
+      "code": "\t\tis_guest = smbXcli_session_is_guest(session);\n\t\tif (is_guest) {\n\t\t\t/*\n\t\t\t * We can't finish the gensec handshake, we don't\n\t\t\t * have a negotiated session key.\n\t\t\t *\n\t\t\t * So just pretend we are completely done.\n\t\t\t *\n\t\t\t * Note that smbXcli_session_is_guest()\n\t\t\t * always returns false if we require signing.\n\t\t\t */\n\t\t\tstate->blob_in = data_blob_null;\n\t\t\tstate->local_ready = true;\n\t\t}",
+      "explanation": "This is the central security contract and matches the real Samba client signing-downgrade class (CVE-2016-2119). The guest indicator consumed here is derived from server-controlled SMB2 SessionFlags (SMB2_SESSION_FLAG_IS_GUEST). When guest, the client deliberately abandons GENSEC key negotiation, throws away the server blob, forces local_ready = true, and (with remote_ready set at line 51) proceeds to cli_session_setup_gensec_ready() — completing 'authentication' with NO negotiated session key and therefore NO message signing. If smbXcli_session_is_guest() does NOT correctly return false when the client requires signing, a malicious or man-in-the-middle server can simply flip the guest flag in its SESSION_SETUP reply to downgrade a mandatory-signing connection to an unsigned, unauthenticated one, defeating integrity protection and enabling full MITM tampering of subsequent SMB traffic. The invariant the implementation MUST uphold is: smbXcli_session_is_guest() returns false whenever signing (or any session-key-dependent protection) is required, and this callback must never honor a server-asserted guest state to bypass key establishment on a protected connection."
+    },
+    {
+      "file": "corpus/eval/eval_0075_cwe94.c",
+      "lines": "30-36",
+      "code": "\t\tif (smbXcli_conn_protocol(state->cli->conn) >= PROTOCOL_SMB2_02) {\n\t\t\tsession = state->cli->smb2.session;\n\t\t} else {\n\t\t\tsession = state->cli->smb1.session;\n\t\t}\n\n\t\tis_guest = smbXcli_session_is_guest(session);",
+      "explanation": "session is initialized to NULL and set from either smb2.session or smb1.session, then passed unconditionally to smbXcli_session_is_guest(session) with no NULL check. If a hostile server drives the state machine into an unexpected ordering (e.g. reporting NT_STATUS_OK before a session object has been allocated for the negotiated dialect, or a dialect/branch mismatch), session can be NULL and smbXcli_session_is_guest() may dereference it, crashing the client (denial of service). This is latent — it depends on smbXcli_session_is_guest()'s NULL-tolerance, which is not shown — but the pointer feeding it is fully attacker-influenced by the negotiated protocol and session-setup sequencing."
+    },
+    {
+      "file": "corpus/eval/eval_0075_cwe94.c",
+      "lines": "15-18",
+      "code": "\tstatus = cli_sesssetup_blob_recv(subreq, state, &state->blob_in,\n\t\t\t\t\t &state->inbuf, &state->recv_iov);\n\tTALLOC_FREE(subreq);\n\tdata_blob_free(&state->blob_out);",
+      "explanation": "state->blob_in is populated directly from the untrusted server response by cli_sesssetup_blob_recv(). Downstream, in the non-guest path, this attacker-controlled blob is handed to the local GENSEC engine via cli_session_setup_gensec_local_next(req). The safety of the whole flow therefore depends on cli_sesssetup_blob_recv() correctly bounding the blob length against the actual received buffer and on the GENSEC/SPNEGO decoder treating blob_in as hostile (length-checked ASN.1/token parsing). Additionally, the recv-then-free ordering (extract from subreq at 15-16, TALLOC_FREE(subreq) at 17) must guarantee blob_in/inbuf/recv_iov are reparented onto 'state' before subreq dies; if any returned pointer still aliased subreq-owned memory, line 17 would create a use-after-free/dangling blob consumed later. The shown ordering is the correct Samba idiom, so this is an invariant to confirm rather than a demonstrated bug."
+    },
+    {
+      "file": "corpus/eval/eval_0075_cwe94.c",
+      "lines": "19-24",
+      "code": "\tif (!NT_STATUS_IS_OK(status) &&\n\t    !NT_STATUS_EQUAL(status, NT_STATUS_MORE_PROCESSING_REQUIRED))\n\t{\n\t\ttevent_req_nterror(req, status);\n\t\treturn;\n\t}",
+      "explanation": "tevent_req_nterror(req, status) can synchronously invoke the parent request's completion callback, which may TALLOC_FREE(req) and thus state (a child of req). The code correctly returns immediately afterward, so no use-after-free occurs here. This is called out to confirm the re-entrancy discipline: every path that calls tevent_req_nterror(), cli_session_setup_gensec_ready(), or cli_session_setup_gensec_local_next() returns without touching req/state again (lines 23, 56, 59-60 all end the function), which is the invariant that keeps this callback safe against callback-driven object destruction (CWE-416 if violated)."
+    }
+  ],
+  "summary": "This Samba libsmb GENSEC session-setup callback's dominant risk is a server-controlled authentication/signing downgrade: on a server-asserted GUEST session it forces local_ready and completes the handshake with no negotiated session key, so the entire integrity guarantee rests on the latent invariant that smbXcli_session_is_guest() returns false whenever signing is required (the real CVE-2016-2119 class). Secondary latent risks are a possible NULL-session dereference feeding smbXcli_session_is_guest(), and reliance on cli_sesssetup_blob_recv()/the GENSEC decoder to bound the untrusted server blob. The visible callback-reentrancy discipline (immediate return after nterror/ready/next) appears correct.",
+  "reviewed_anchors": [
+    {"anchor": "cli_session_setup_gensec_remote_done(struct tevent_req *subreq) signature (line 2)", "disposition": "dismissed", "reason": "tevent callback entry; carries no buffer/length contract itself, its risk is realized in the body."},
+    {"anchor": "tevent_req_callback_data(subreq, struct tevent_req) (lines 4-6)", "disposition": "dismissed", "reason": "Standard req recovery from subreq callback data; type-checked accessor, no attacker-controlled sizing."},
+    {"anchor": "tevent_req_data(req, struct cli_session_setup_gensec_state) (lines 7-9)", "disposition": "dismissed", "reason": "Recovers per-request state; talloc child of req, lifetime tied to req, no direct hazard."},
+    {"anchor": "TALLOC_FREE(state->inbuf) / TALLOC_FREE(state->recv_iov) (lines 12-13)", "disposition": "dismissed", "reason": "Frees prior-round buffers before re-populating; TALLOC_FREE NULLs the pointer, so idempotent and not a double-free."},
+    {"anchor": "cli_sesssetup_blob_recv(subreq, state, &state->blob_in, &state->inbuf, &state->recv_iov) (lines 15-16)", "disposition": "finding", "reason": "Populates state->blob_in from the untrusted server response; downstream GENSEC parsing must treat it as hostile and length-bounded."},
+    {"anchor": "TALLOC_FREE(subreq) (line 17)", "disposition": "dismissed", "reason": "Freed only after recv extracts/reparents the returned buffers onto state; correct recv-then-free ordering."},
+    {"anchor": "data_blob_free(&state->blob_out) (line 18)", "disposition": "dismissed", "reason": "Frees the already-sent outgoing blob; no attacker control over lifetime here."},
+    {"anchor": "status gate: !NT_STATUS_IS_OK && !NT_STATUS_EQUAL(..., NT_STATUS_MORE_PROCESSING_REQUIRED) + tevent_req_nterror (lines 19-24)", "disposition": "finding", "reason": "nterror can free req/state via the completion callback; safe only because of the immediate return — a re-entrancy invariant worth confirming."},
+    {"anchor": "session selection: smbXcli_conn_protocol(state->cli->conn) >= PROTOCOL_SMB2_02 ? smb2.session : smb1.session (lines 30-34)", "disposition": "finding", "reason": "session may be NULL and is passed unchecked to smbXcli_session_is_guest(); potential NULL deref DoS."},
+    {"anchor": "is_guest = smbXcli_session_is_guest(session) (line 36)", "disposition": "finding", "reason": "Server-controlled guest state drives skipping of key negotiation; central signing-downgrade contract."},
+    {"anchor": "is_guest block: state->blob_in = data_blob_null; state->local_ready = true (lines 37-49)", "disposition": "finding", "reason": "Completes setup with no session key on server assertion of guest; the downgrade/MITM surface (CVE-2016-2119 class)."},
+    {"anchor": "state->remote_ready = true (line 51)", "disposition": "dismissed", "reason": "Marks remote side done after status OK; the readiness-flag semantics are inseparable from the guest finding, tracked there."},
+    {"anchor": "readiness dispatch: if (local_ready && remote_ready) cli_session_setup_gensec_ready(req); else cli_session_setup_gensec_local_next(req) (lines 54-60)", "disposition": "dismissed", "reason": "Correct two-flag convergence dispatch; each branch returns without further req/state access, so no reentrancy UAF here (impact captured by the guest finding)."}
+  ],
+  "findings": [
+    {
+      "title": "Server-asserted GUEST session downgrades a signing-required connection to keyless/unsigned (client MITM)",
+      "anchor": "is_guest = smbXcli_session_is_guest(session); if (is_guest) { state->blob_in = data_blob_null; state->local_ready = true; }",
+      "file": "corpus/eval/eval_0075_cwe94.c",
+      "line": "36-49",
+      "code": "is_guest = smbXcli_session_is_guest(session);\n\t\tif (is_guest) {\n\t\t\t/*\n\t\t\t * We can't finish the gensec handshake, we don't\n\t\t\t * have a negotiated session key.\n\t\t\t *\n\t\t\t * So just pretend we are completely done.\n\t\t\t *\n\t\t\t * Note that smbXcli_session_is_guest()\n\t\t\t * always returns false if we require signing.\n\t\t\t */\n\t\t\tstate->blob_in = data_blob_null;\n\t\t\tstate->local_ready = true;\n\t\t}",
+      "bug_class": "Authentication/signing downgrade via server-controlled session flag",
+      "cwe": "CWE-287",
+      "severity": "high",
+      "where_it_lives": "implementation (file not provided) — smbXcli_session_is_guest() in libcli/smb/smbXcli_base.c",
+      "invariant": "smbXcli_session_is_guest() MUST return false whenever the client requires signing (or otherwise depends on a session key); the guest short-circuit that sets local_ready=true and completes cli_session_setup_gensec_ready() with no session key must never be reachable on a protection-required connection.",
+      "failure_mode": "A malicious or man-in-the-middle SMB server sets the guest indicator (SMB2 SessionFlags SMB2_SESSION_FLAG_IS_GUEST) in its SESSION_SETUP response. If smbXcli_session_is_guest() honors that flag even when signing is required, this callback discards the GENSEC continuation, forces local_ready=true, and finalizes the session with no negotiated key and therefore no message signing — silently downgrading a mandatory-signing/authenticated connection to an unsigned, spoofable one and enabling full man-in-the-middle tampering of subsequent traffic. The in-code comment is the authors' own evidence that this exact hazard was addressed.",
+      "cve_analog": "CVE-2016-2119",
+      "what_to_confirm": "That smbXcli_session_is_guest() unconditionally returns false when signing is required/negotiated, and that no path lets a server-supplied guest/null flag bypass session-key establishment on a connection that demanded signing."
+    },
+    {
+      "title": "Possible NULL session dereference passed to smbXcli_session_is_guest()",
+      "anchor": "session = state->cli->smb2.session / smb1.session; is_guest = smbXcli_session_is_guest(session);",
+      "file": "corpus/eval/eval_0075_cwe94.c",
+      "line": "30-36",
+      "code": "if (smbXcli_conn_protocol(state->cli->conn) >= PROTOCOL_SMB2_02) {\n\t\t\tsession = state->cli->smb2.session;\n\t\t} else {\n\t\t\tsession = state->cli->smb1.session;\n\t\t}\n\n\t\tis_guest = smbXcli_session_is_guest(session);",
+      "bug_class": "NULL pointer dereference",
+      "cwe": "CWE-476",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided) — smbXcli_session_is_guest()",
+      "invariant": "session must be non-NULL before smbXcli_session_is_guest() dereferences it, or the callee must tolerate NULL and return false.",
+      "failure_mode": "session is initialized to NULL and assigned from smb2.session or smb1.session with no NULL check before line 36. If a hostile server steers the async sequence into an unexpected ordering that reaches NT_STATUS_OK before the dialect's session object is populated, smbXcli_session_is_guest(NULL) may dereference the pointer and crash the client (denial of service).",
+      "cve_analog": "",
+      "what_to_confirm": "Whether smbXcli_session_is_guest() null-checks its argument, and whether the state machine can reach NT_STATUS_OK here with smb1.session/smb2.session still NULL."
+    },
+    {
+      "title": "Untrusted server blob (blob_in) forwarded to GENSEC without local length/format guard shown",
+      "anchor": "status = cli_sesssetup_blob_recv(subreq, state, &state->blob_in, &state->inbuf, &state->recv_iov);",
+      "file": "corpus/eval/eval_0075_cwe94.c",
+      "line": "15-16",
+      "code": "status = cli_sesssetup_blob_recv(subreq, state, &state->blob_in,\n\t\t\t\t\t &state->inbuf, &state->recv_iov);",
+      "bug_class": "Untrusted input into security-token parser (validation dependency)",
+      "cwe": "CWE-20",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided) — cli_sesssetup_blob_recv() and the GENSEC/SPNEGO token decoder invoked by cli_session_setup_gensec_local_next()",
+      "invariant": "cli_sesssetup_blob_recv() must bound the returned blob_in length to the bytes actually received, and the GENSEC/SPNEGO decoder must treat blob_in as hostile, length-checked, self-describing data; the recv-then-free ordering must have reparented blob_in/inbuf onto state before TALLOC_FREE(subreq).",
+      "failure_mode": "state->blob_in is filled straight from the server response and later fed to the local GENSEC step. If the recv routine mis-sizes the blob or the decoder trusts embedded ASN.1/token lengths, a malformed server token could drive out-of-bounds reads in the SPNEGO/NTLMSSP parser. No underflow or overflow is visible in THIS callback; the risk is entirely delegated to the recv/decode implementations, so this is a latent contract to verify, not a demonstrated bug.",
+      "cve_analog": "",
+      "what_to_confirm": "That blob_in.length reflects only received bytes, that the GENSEC decoder bounds every embedded length against blob_in, and that blob_in/inbuf are owned by state (not subreq) before line 17 frees subreq."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm smbXcli_session_is_guest() returns false whenever signing is required so a server-set guest/null flag cannot bypass session-key establishment (CVE-2016-2119).",
+    "Verify no path lets the guest short-circuit (local_ready=true, empty blob_in) finalize cli_session_setup_gensec_ready() on a connection that demanded signing/sealing.",
+    "Check that session (smb1.session/smb2.session) cannot be NULL when passed to smbXcli_session_is_guest(), or that the callee null-checks.",
+    "Confirm cli_sesssetup_blob_recv() bounds blob_in to actually-received bytes and reparents blob_in/inbuf/recv_iov onto state before TALLOC_FREE(subreq).",
+    "Confirm the downstream GENSEC/SPNEGO decoder treats blob_in as untrusted and length-checks every embedded token/ASN.1 length.",
+    "Verify every exit that calls tevent_req_nterror(), cli_session_setup_gensec_ready(), or cli_session_setup_gensec_local_next() returns without further use of req/state (no callback-driven use-after-free, CWE-416).",
+    "Confirm the local_ready/remote_ready convergence cannot complete the handshake with a still-required outstanding local token."
+  ]
+}

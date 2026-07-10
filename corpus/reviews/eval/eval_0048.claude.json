@@ -1,0 +1,245 @@
+{
+  "subsystem": "Linux kernel eBPF subsystem — the map_create() helper behind the BPF_MAP_CREATE command of the bpf(2) syscall. It validates a userspace-supplied union bpf_attr, allocates a struct bpf_map of the requested type, wires up its BTF (type) metadata, LSM allocation, ID, memcg accounting, and finally installs a file descriptor that userspace uses to reference the map.",
+  "provenance": "Identified by naming and API: static int map_create(union bpf_attr *attr) is the well-known BPF_MAP_CREATE handler in kernel/bpf/syscall.c. Corroborating symbols include CHECK_ATTR(BPF_MAP_CREATE), bpf_map_attr_numa_node, bpf_get_file_flag, find_and_alloc_map, bpf_obj_name_cpy, btf_get_by_fd/btf_is_kernel/map_check_btf, security_bpf_map_alloc, bpf_map_alloc_id, bpf_map_save_memcg, bpf_map_new_fd, bpf_map_put_with_uref, and the BPF_MAP_TYPE_STRUCT_OPS / NUMA_NO_NODE constants. The header comment /* sample: primevul_c_train_2894_fixed */ marks it as the FIXED revision of a PrimeVul sample; the containing file is named eval_0048_cwe307.c, but CWE-307 (excessive auth attempts) has no bearing on this code and appears to be a noisy dataset label — the code is judged on its merits.",
+  "trust_boundary": "The single parameter union bpf_attr *attr is fully attacker-controlled: it is copied in from userspace by the bpf(2) syscall entry (sys_bpf) before map_create runs. Every field read here is hostile input — map_type, map_flags, numa_node, map_name[], btf_fd, btf_key_type_id, btf_value_type_id, btf_vmlinux_value_type_id, and all the reserved fields the union overlays. An unprivileged or namespaced process (subject to the kernel's bpf capability policy) can drive this path repeatedly with arbitrary field combinations. Everything downstream (find_and_alloc_map, map_check_btf, bpf_obj_name_cpy) must treat these values as adversarial. The map object itself becomes reachable by other userspace threads the moment bpf_map_alloc_id() publishes it (line 84), which opens a concurrency/lifetime boundary in addition to the input boundary.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/eval/eval_0048_cwe307.c",
+      "lines": "2-7",
+      "code": "static int map_create(union bpf_attr *attr)\n{\n\tint numa_node = bpf_map_attr_numa_node(attr);\n\tstruct bpf_map *map;\n\tint f_flags;\n\tint err;",
+      "explanation": "The function takes a single pointer to union bpf_attr, the syscall argument block copied from userspace. It immediately extracts numa_node via bpf_map_attr_numa_node(attr), which decodes the NUMA hint bits out of attr->map_flags (BPF_F_NUMA_NODE). The remaining locals are: map, the bpf_map object that will be allocated; f_flags, the open-file flags (O_RDONLY/O_WRONLY/O_RDWR/O_CLOEXEC) derived from attr->map_flags; and err, the running error code. Note that numa_node is captured at entry, before any validation of attr, so its value is provisional until the range check at lines 25-28."
+    },
+    {
+      "file": "corpus/eval/eval_0048_cwe307.c",
+      "lines": "9-11",
+      "code": "\terr = CHECK_ATTR(BPF_MAP_CREATE);\n\tif (err)\n\t\treturn -EINVAL;",
+      "explanation": "CHECK_ATTR(BPF_MAP_CREATE) is a macro that verifies every field of the bpf_attr union that is NOT part of the BPF_MAP_CREATE command layout is zero (it does a bounds-checked scan from the last valid field to the end of the union). This is the primary anti-forward-compat / anti-garbage gate: it rejects a call that sets reserved or out-of-command bytes, ensuring the kernel never interprets stale union bytes as a meaningful parameter. On any nonzero leftover it returns -EINVAL."
+    },
+    {
+      "file": "corpus/eval/eval_0048_cwe307.c",
+      "lines": "13-19",
+      "code": "\tif (attr->btf_vmlinux_value_type_id) {\n\t\tif (attr->map_type != BPF_MAP_TYPE_STRUCT_OPS ||\n\t\t    attr->btf_key_type_id || attr->btf_value_type_id)\n\t\t\treturn -EINVAL;\n\t} else if (attr->btf_key_type_id && !attr->btf_value_type_id) {\n\t\treturn -EINVAL;\n\t}",
+      "explanation": "This enforces the BTF type-id consistency contract. If the caller supplies btf_vmlinux_value_type_id (meaning the map value is a kernel struct described by vmlinux BTF), then the map MUST be of type BPF_MAP_TYPE_STRUCT_OPS and MUST NOT also carry user btf_key_type_id / btf_value_type_id — otherwise -EINVAL. Otherwise (no vmlinux value id), a btf_key_type_id supplied without a matching btf_value_type_id is rejected, because a keyed BTF map needs both type ids to be meaningful. This closes off illegal combinations of the three attacker-controlled BTF id fields before any allocation happens."
+    },
+    {
+      "file": "corpus/eval/eval_0048_cwe307.c",
+      "lines": "21-23",
+      "code": "\tf_flags = bpf_get_file_flag(attr->map_flags);\n\tif (f_flags < 0)\n\t\treturn f_flags;",
+      "explanation": "bpf_get_file_flag translates the access-mode bits of the attacker-controlled attr->map_flags into VFS open flags. It rejects flag combinations it does not understand by returning a negative errno, which is propagated verbatim. This validates map_flags before the flags are later handed to bpf_map_new_fd (line 90) to create the descriptor."
+    },
+    {
+      "file": "corpus/eval/eval_0048_cwe307.c",
+      "lines": "25-28",
+      "code": "\tif (numa_node != NUMA_NO_NODE &&\n\t    ((unsigned int)numa_node >= nr_node_ids ||\n\t     !node_online(numa_node)))\n\t\treturn -EINVAL;",
+      "explanation": "This is the NUMA validation gate for the numa_node captured at line 4. NUMA_NO_NODE (-1) is the sentinel meaning 'no preference' and is accepted without further checks via the short-circuit. Otherwise the value is cast to unsigned int and compared against nr_node_ids, which simultaneously rejects negative node ids (they wrap to huge unsigned values) and out-of-range positive ids; only if that passes is node_online(numa_node) evaluated (thanks to || short-circuit) to confirm the node is actually present. This prevents an attacker-chosen node id from indexing per-node arrays out of bounds in the allocator."
+    },
+    {
+      "file": "corpus/eval/eval_0048_cwe307.c",
+      "lines": "30-33",
+      "code": "\t/* find map type and init map: hashtable vs rbtree vs bloom vs ... */\n\tmap = find_and_alloc_map(attr);\n\tif (IS_ERR(map))\n\t\treturn PTR_ERR(map);",
+      "explanation": "find_and_alloc_map(attr) dispatches on attr->map_type to the per-type map_alloc callback (hash, array, rbtree, bloom filter, etc.), which allocates and zero-initialises a struct bpf_map (typically via bpf_map_area_alloc, which zeroes the region) and sets map->ops. On failure it returns an ERR_PTR, which IS_ERR detects and PTR_ERR converts back to the negative errno returned to userspace. After this point map is a live, type-specific object; the zeroing here is what makes later map->btf / map->ops accesses on the error path defined."
+    },
+    {
+      "file": "corpus/eval/eval_0048_cwe307.c",
+      "lines": "35-38",
+      "code": "\terr = bpf_obj_name_cpy(map->name, attr->map_name,\n\t\t\t       sizeof(attr->map_name));\n\tif (err < 0)\n\t\tgoto free_map;",
+      "explanation": "The attacker-supplied name buffer attr->map_name (BPF_OBJ_NAME_LEN = 16 bytes) is copied into map->name, bounded by sizeof(attr->map_name). bpf_obj_name_cpy is responsible for validating that the name contains only permitted characters (printable/isalnum plus a few) and for NUL-terminating the destination; it returns the copied length or a negative errno. A validation failure jumps to the free_map cleanup label. This is the classic fixed-size-source-to-fixed-size-destination copy, both sides 16 bytes, so the size argument is correct by construction here."
+    },
+    {
+      "file": "corpus/eval/eval_0048_cwe307.c",
+      "lines": "40-44",
+      "code": "\tatomic64_set(&map->refcnt, 1);\n\tatomic64_set(&map->usercnt, 1);\n\tmutex_init(&map->freeze_mutex);\n\n\tmap->spin_lock_off = -EINVAL;",
+      "explanation": "The object's reference counts are primed: refcnt (kernel-internal holders) and usercnt (userspace holders) both to 1, matching the single fd about to be created. freeze_mutex is initialised to serialise BPF_MAP_FREEZE. spin_lock_off is set to -EINVAL as a sentinel meaning 'no bpf_spin_lock field known yet'; map_check_btf may later overwrite it with the byte offset of a spin_lock inside the value type. These initialisations must all complete before the map is published (line 84)."
+    },
+    {
+      "file": "corpus/eval/eval_0048_cwe307.c",
+      "lines": "45-78",
+      "code": "\tif (attr->btf_key_type_id || attr->btf_value_type_id ||\n\t    /* Even the map's value is a kernel's struct,\n\t     * the bpf_prog.o must have BTF to begin with\n\t     * to figure out the corresponding kernel's\n\t     * counter part.  Thus, attr->btf_fd has\n\t     * to be valid also.\n\t     */\n\t    attr->btf_vmlinux_value_type_id) {\n\t\tstruct btf *btf;\n\n\t\tbtf = btf_get_by_fd(attr->btf_fd);\n\t\tif (IS_ERR(btf)) {\n\t\t\terr = PTR_ERR(btf);\n\t\t\tgoto free_map;\n\t\t}\n\t\tif (btf_is_kernel(btf)) {\n\t\t\tbtf_put(btf);\n\t\t\terr = -EACCES;\n\t\t\tgoto free_map;\n\t\t}\n\t\tmap->btf = btf;\n\n\t\tif (attr->btf_value_type_id) {\n\t\t\terr = map_check_btf(map, btf, attr->btf_key_type_id,\n\t\t\t\t\t    attr->btf_value_type_id);\n\t\t\tif (err)\n\t\t\t\tgoto free_map;\n\t\t}\n\n\t\tmap->btf_key_type_id = attr->btf_key_type_id;\n\t\tmap->btf_value_type_id = attr->btf_value_type_id;\n\t\tmap->btf_vmlinux_value_type_id =\n\t\t\tattr->btf_vmlinux_value_type_id;\n\t}",
+      "explanation": "If any of the three BTF id fields is set, the map is associated with a BTF blob referenced by attr->btf_fd. btf_get_by_fd resolves the fd to a struct btf and takes a reference; failure aborts to free_map. The critical gate is btf_is_kernel(btf): if the fd points at kernel/vmlinux/module BTF, the code drops the reference and returns -EACCES, refusing to let userspace attach kernel type information to an ordinary map (which would enable type confusion between a user map's value and a kernel struct). Only a non-kernel (user-loaded) BTF is stored in map->btf. When btf_value_type_id is present, map_check_btf validates the key/value type ids against the BTF and the map's size/layout (also discovering spin_lock/timer offsets); on any error it jumps to free_map, where the just-stored map->btf reference will be released. Finally the validated type ids are recorded on the map."
+    },
+    {
+      "file": "corpus/eval/eval_0048_cwe307.c",
+      "lines": "80-88",
+      "code": "\terr = security_bpf_map_alloc(map);\n\tif (err)\n\t\tgoto free_map;\n\n\terr = bpf_map_alloc_id(map);\n\tif (err)\n\t\tgoto free_map_sec;\n\n\tbpf_map_save_memcg(map);",
+      "explanation": "security_bpf_map_alloc invokes the LSM hook so security modules (SELinux, etc.) can allocate and attach their per-map state; failure unwinds to free_map. bpf_map_alloc_id assigns the map a globally visible integer ID and inserts it into the idr — this is the PUBLICATION point: from here another thread can look the map up via BPF_MAP_GET_FD_BY_ID and take a userspace reference. Its failure unwinds to free_map_sec (note the different label, because the LSM state now needs freeing too). bpf_map_save_memcg pins the memory cgroup for accurate accounting of the map's allocations."
+    },
+    {
+      "file": "corpus/eval/eval_0048_cwe307.c",
+      "lines": "90-102",
+      "code": "\terr = bpf_map_new_fd(map, f_flags);\n\tif (err < 0) {\n\t\t/* failed to allocate fd.\n\t\t * bpf_map_put_with_uref() is needed because the above\n\t\t * bpf_map_alloc_id() has published the map\n\t\t * to the userspace and the userspace may\n\t\t * have refcnt-ed it through BPF_MAP_GET_FD_BY_ID.\n\t\t */\n\t\tbpf_map_put_with_uref(map);\n\t\treturn err;\n\t}\n\n\treturn err;",
+      "explanation": "bpf_map_new_fd installs an anon-inode file descriptor for the map with the previously computed f_flags and returns the fd number (>= 0) to userspace. If it fails, the cleanup is deliberately NOT the goto-label path: because the map was already published by bpf_map_alloc_id, another thread may already hold a uref on it, so the code calls bpf_map_put_with_uref(map), which drops BOTH the usercnt and refcnt taken at lines 40-41 and lets the refcount machinery free the map only once the last holder releases it. On success err holds the fd, returned at line 102."
+    },
+    {
+      "file": "corpus/eval/eval_0048_cwe307.c",
+      "lines": "104-109",
+      "code": "free_map_sec:\n\tsecurity_bpf_map_free(map);\nfree_map:\n\tbtf_put(map->btf);\n\tmap->ops->map_free(map);\n\treturn err;",
+      "explanation": "The two-tier cleanup used for failures BEFORE the map is published. free_map_sec first releases the LSM state (only reachable when security_bpf_map_alloc had succeeded), then falls through to free_map. free_map drops the BTF reference with btf_put(map->btf) — safe because map->btf is either NULL (map was zero-allocated and BTF was never attached) or the exact reference stored at line 65 — and then calls the type-specific map->ops->map_free(map) to tear down and free the object. Because these labels are only reached before bpf_map_alloc_id succeeds, there is no ID to release and no risk of racing a userspace uref holder."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/eval/eval_0048_cwe307.c",
+      "lines": "2-4",
+      "code": "static int map_create(union bpf_attr *attr)\n{\n\tint numa_node = bpf_map_attr_numa_node(attr);",
+      "explanation": "attr is the raw union bpf_attr copied from userspace, so every field is adversarial and can be set to any bit pattern (map_type, the three btf_*_type_id fields, btf_fd, map_flags, numa_node, map_name). The whole function is essentially a validation funnel; the risk is any field that reaches an allocator, indexer, or copy before being bounded. The invariant the implementation must uphold is that no attr field is consumed for allocation sizing, array indexing, or memory copy until it has passed an explicit range/whitelist check — which is what lines 9-28 attempt. This step frames why the rest of the review scrutinises each consumer."
+    },
+    {
+      "file": "corpus/eval/eval_0048_cwe307.c",
+      "lines": "25-28",
+      "code": "\tif (numa_node != NUMA_NO_NODE &&\n\t    ((unsigned int)numa_node >= nr_node_ids ||\n\t     !node_online(numa_node)))\n\t\treturn -EINVAL;",
+      "explanation": "numa_node is attacker-controlled (decoded from map_flags) and is ultimately used as an index into per-node structures inside the map allocator. The safety of this gate hinges on two things being correct in the implementation: (1) the (unsigned int) cast must run BEFORE node_online is evaluated — it does, and the || short-circuit guarantees node_online is only called on an in-[0,nr_node_ids) value, preventing an out-of-bounds node bitmap read (CWE-125) inside node_online itself; and (2) NUMA_NO_NODE must be the ONLY negative value that bypasses the range test — it is, because any other negative id casts to a value >= nr_node_ids. The latent risk is a downstream allocator that trusts numa_node without re-checking against a node mask that changed after this test; here the check is correct and this anchor is defensive, not a live bug."
+    },
+    {
+      "file": "corpus/eval/eval_0048_cwe307.c",
+      "lines": "35-36",
+      "code": "\terr = bpf_obj_name_cpy(map->name, attr->map_name,\n\t\t\t       sizeof(attr->map_name));",
+      "explanation": "attr->map_name is 16 untrusted bytes with no guarantee of a NUL terminator. The copy is correctly bounded by sizeof(attr->map_name) into an equally sized map->name, so no overflow occurs at this call site. The LATENT contract lives in bpf_obj_name_cpy (implementation not shown): it MUST (a) reject non-printable/embedded-NUL-manipulated names and (b) guarantee map->name is NUL-terminated within BPF_OBJ_NAME_LEN. If it failed to terminate, later users that treat map->name as a C string (fdinfo, tracepoints, /proc) would over-read past the buffer (CWE-125) and leak adjacent kernel bytes to userspace. The size argument being sizeof(attr->map_name) rather than sizeof(map->name) is safe only because both are BPF_OBJ_NAME_LEN; if the destination were ever smaller this would be a classic CWE-120 mismatch to confirm."
+    },
+    {
+      "file": "corpus/eval/eval_0048_cwe307.c",
+      "lines": "55-64",
+      "code": "\t\tbtf = btf_get_by_fd(attr->btf_fd);\n\t\tif (IS_ERR(btf)) {\n\t\t\terr = PTR_ERR(btf);\n\t\t\tgoto free_map;\n\t\t}\n\t\tif (btf_is_kernel(btf)) {\n\t\t\tbtf_put(btf);\n\t\t\terr = -EACCES;\n\t\t\tgoto free_map;\n\t\t}",
+      "explanation": "attr->btf_fd is an attacker-chosen fd. Without the btf_is_kernel(btf) gate, userspace could pass the fd of kernel/vmlinux BTF and have it stored in map->btf, then have the map's value type resolved against kernel type ids — a type-confusion primitive letting a user map masquerade as containing a kernel struct (CWE-843 / CWE-20). This gate is exactly the hardening present in the 'fixed' sample: it rejects kernel BTF with -EACCES and, crucially, drops the reference (btf_put(btf)) taken by btf_get_by_fd before bailing, avoiding a refcount leak (CWE-401). The invariant: only user-loaded BTF may back a normal map, and every btf_get_by_fd success must be balanced by a btf_put on every exit path. Confirm no path stores map->btf = btf and ALSO calls btf_put(btf) (a double put would be CWE-415)."
+    },
+    {
+      "file": "corpus/eval/eval_0048_cwe307.c",
+      "lines": "84-100",
+      "code": "\terr = bpf_map_alloc_id(map);\n\tif (err)\n\t\tgoto free_map_sec;\n\n\tbpf_map_save_memcg(map);\n\n\terr = bpf_map_new_fd(map, f_flags);\n\tif (err < 0) {\n\t\t/* failed to allocate fd.\n\t\t * bpf_map_put_with_uref() is needed because the above\n\t\t * bpf_map_alloc_id() has published the map\n\t\t * to the userspace and the userspace may\n\t\t * have refcnt-ed it through BPF_MAP_GET_FD_BY_ID.\n\t\t */\n\t\tbpf_map_put_with_uref(map);\n\t\treturn err;\n\t}",
+      "explanation": "This is the object-lifetime / publish-before-install hazard. bpf_map_alloc_id publishes the map into the global idr, so a concurrent BPF_MAP_GET_FD_BY_ID can grab a reference in the window before bpf_map_new_fd installs the caller's fd. The bug CLASS if handled wrong is use-after-free / double-free (CWE-416 / CWE-415): if the fd allocation fails and the code used the goto free_map_sec/free_map path (which calls map->ops->map_free directly) instead of the refcounted bpf_map_put_with_uref, it would free a map another thread still holds, or free it twice. The shown fix is correct — it drops both counts via bpf_map_put_with_uref so the object is destroyed only when the last holder leaves. The invariant to uphold: after bpf_map_alloc_id succeeds, the map may ONLY be released through the refcount path, never via the direct map_free labels. Confirm that no error edge after line 84 reaches free_map/free_map_sec."
+    },
+    {
+      "file": "corpus/eval/eval_0048_cwe307.c",
+      "lines": "106-108",
+      "code": "free_map:\n\tbtf_put(map->btf);\n\tmap->ops->map_free(map);",
+      "explanation": "The free_map label is reached from several gotos, including line 38 (name copy fails) BEFORE map->btf is ever assigned. btf_put(map->btf) is only safe because find_and_alloc_map returns a zero-initialised object (map->btf == NULL, and btf_put tolerates NULL); if any map type were to allocate its struct without zeroing, this would be an uninitialised-pointer put (CWE-457 leading to CWE-416/-476). Likewise map->ops->map_free(map) dereferences map->ops, which the same allocation must have set. The invariant: every struct bpf_map handed back by find_and_alloc_map must have map->btf == NULL and map->ops populated before this label can run. Also confirm the BTF is not double-freed: the only place map->btf is set is line 65, and map_check_btf failure (line 71) reaching here must NOT have already dropped that reference."
+    },
+    {
+      "file": "corpus/eval/eval_0048_cwe307.c",
+      "lines": "9-11",
+      "code": "\terr = CHECK_ATTR(BPF_MAP_CREATE);\n\tif (err)\n\t\treturn -EINVAL;",
+      "explanation": "CHECK_ATTR is the only gate ensuring the reserved/out-of-command bytes of the union are zero. If this macro's field-range for BPF_MAP_CREATE is stale (e.g. a new field was added to the command layout but CHECK_ATTR's boundary wasn't updated), attacker-set bytes in the gap would be silently accepted and later interpreted, i.e. a missing-input-validation flaw (CWE-20). This is a whole-command validation contract rather than a memory-safety bug, but it is the backstop that lets every later field read assume 'unknown fields are zero'. Confirm the macro's last-checked field matches the actual tail of the BPF_MAP_CREATE portion of union bpf_attr."
+    }
+  ],
+  "summary": "This is the eBPF BPF_MAP_CREATE handler operating directly on an attacker-controlled union bpf_attr. The shown revision is the HARDENED one: input gates (CHECK_ATTR, BTF id consistency, map_flags, NUMA range), the btf_is_kernel type-confusion guard, and the publish-before-fd lifetime handling (bpf_map_put_with_uref on fd failure) are all present and correct. No live memory-safety bug is visible in this function; the residual risk is entirely LATENT and lives in the called implementations — bpf_obj_name_cpy NUL-termination, find_and_alloc_map zero-init and map->ops population, and BTF reference balancing on every error edge.",
+  "reviewed_anchors": [
+    {"anchor": "map_create(union bpf_attr *attr) — parameter attr", "disposition": "finding", "reason": "Sole, fully attacker-controlled input; the trust boundary for the whole function."},
+    {"anchor": "int numa_node = bpf_map_attr_numa_node(attr) (line 4)", "disposition": "finding", "reason": "Attacker-controlled node index used to index per-node arrays; validated later at 25-28."},
+    {"anchor": "CHECK_ATTR(BPF_MAP_CREATE) (line 9)", "disposition": "finding", "reason": "Whole-command reserved-field validation gate; stale boundary would admit unvalidated bytes (CWE-20)."},
+    {"anchor": "attr->btf_vmlinux_value_type_id / btf_key_type_id / btf_value_type_id consistency (lines 13-19)", "disposition": "dismissed", "reason": "Correctly enforces legal combinations and rejects the rest with -EINVAL; no memory contract broken."},
+    {"anchor": "attr->map_type != BPF_MAP_TYPE_STRUCT_OPS (line 14)", "disposition": "dismissed", "reason": "Enum comparison guarding vmlinux-BTF maps; not a buffer or size operation."},
+    {"anchor": "bpf_get_file_flag(attr->map_flags) (line 21)", "disposition": "dismissed", "reason": "Returns negative on bad flags and is checked; f_flags only used to open an fd, no memory sizing."},
+    {"anchor": "numa_node range check (unsigned int)numa_node >= nr_node_ids / node_online (lines 25-28)", "disposition": "finding", "reason": "Guards out-of-bounds node indexing; correctness of cast+short-circuit is security-relevant."},
+    {"anchor": "find_and_alloc_map(attr) + IS_ERR (lines 31-33)", "disposition": "finding", "reason": "Allocates the object whose zero-init and ops population the error path (line 107-108) depends on."},
+    {"anchor": "bpf_obj_name_cpy(map->name, attr->map_name, sizeof(attr->map_name)) (lines 35-36)", "disposition": "finding", "reason": "Fixed 16-byte untrusted name copy; NUL-termination/validation is a latent OOB-read contract."},
+    {"anchor": "atomic64_set refcnt/usercnt=1, mutex_init, spin_lock_off=-EINVAL (lines 40-44)", "disposition": "dismissed", "reason": "Constant initialisation of refcounts/locks; must precede publication but carries no attacker-controlled value."},
+    {"anchor": "btf_get_by_fd(attr->btf_fd) (line 55)", "disposition": "finding", "reason": "Resolves attacker fd and takes a reference that must be balanced on every exit; part of the btf_is_kernel gate."},
+    {"anchor": "btf_is_kernel(btf) reject with -EACCES + btf_put (lines 60-64)", "disposition": "finding", "reason": "Type-confusion guard blocking kernel BTF on a user map; central hardening of this sample."},
+    {"anchor": "map_check_btf(map, btf, btf_key_type_id, btf_value_type_id) (lines 68-69)", "disposition": "dismissed", "reason": "Validates BTF type ids/layout; its own internal bounds are out of scope of this file, error is propagated and cleaned up."},
+    {"anchor": "security_bpf_map_alloc(map) (line 80)", "disposition": "dismissed", "reason": "LSM hook; failure correctly unwinds to free_map before publication, no attacker sizing."},
+    {"anchor": "bpf_map_alloc_id(map) (line 84)", "disposition": "finding", "reason": "Publication point that creates the concurrency/lifetime window handled at lines 90-100."},
+    {"anchor": "bpf_map_save_memcg(map) (line 88)", "disposition": "dismissed", "reason": "Accounting bookkeeping; no untrusted input consumed."},
+    {"anchor": "bpf_map_new_fd(map, f_flags) + bpf_map_put_with_uref on failure (lines 90-100)", "disposition": "finding", "reason": "Post-publication fd install; must use refcounted put, not direct free — use-after-free/double-free contract."},
+    {"anchor": "free_map_sec / free_map labels: security_bpf_map_free, btf_put(map->btf), map->ops->map_free (lines 104-108)", "disposition": "finding", "reason": "Cleanup relies on map->btf being NULL-or-valid and map->ops set; only reachable pre-publication."}
+  ],
+  "findings": [
+    {
+      "title": "Post-publication fd-install failure must release the map via refcount, not direct free (use-after-free / double-free window)",
+      "anchor": "bpf_map_alloc_id(map) ... bpf_map_new_fd(map, f_flags) ... bpf_map_put_with_uref(map)",
+      "file": "corpus/eval/eval_0048_cwe307.c",
+      "line": "84-100",
+      "code": "\terr = bpf_map_alloc_id(map);\n\tif (err)\n\t\tgoto free_map_sec;\n\n\tbpf_map_save_memcg(map);\n\n\terr = bpf_map_new_fd(map, f_flags);\n\tif (err < 0) {\n\t\t/* failed to allocate fd.\n\t\t * bpf_map_put_with_uref() is needed because the above\n\t\t * bpf_map_alloc_id() has published the map\n\t\t * to the userspace and the userspace may\n\t\t * have refcnt-ed it through BPF_MAP_GET_FD_BY_ID.\n\t\t */\n\t\tbpf_map_put_with_uref(map);\n\t\treturn err;\n\t}",
+      "bug_class": "Use-after-free / double-free via publish-before-install (object lifetime)",
+      "cwe": "CWE-416",
+      "severity": "high",
+      "where_it_lives": "corpus/eval/eval_0048_cwe307.c (this function) with the free path in implementation (bpf_map_put_with_uref, file not provided)",
+      "invariant": "Once bpf_map_alloc_id() publishes the map into the idr, the object may only be torn down through the refcount path (bpf_map_put_with_uref); no error edge after line 84 may reach the direct free_map/free_map_sec labels that call map->ops->map_free() unconditionally.",
+      "failure_mode": "A concurrent BPF_MAP_GET_FD_BY_ID takes a uref on the just-published map. If bpf_map_new_fd then fails and the code freed the map directly (as the pre-publication path does) instead of dropping references, the map would be freed while the other thread still holds it (use-after-free) or freed a second time when that thread releases its ref (double-free). The shown code correctly avoids this by calling bpf_map_put_with_uref; the finding documents the contract because it is the crux of this 'fixed' sample and any regression re-opens a kernel-privilege UAF.",
+      "cve_analog": "",
+      "what_to_confirm": "That every error path reachable after bpf_map_alloc_id() (line 84) uses bpf_map_put_with_uref/refcount release and never falls through to map->ops->map_free() at line 108, and that bpf_map_put_with_uref drops both the usercnt and refcnt set at lines 40-41."
+    },
+    {
+      "title": "btf_is_kernel gate prevents kernel-BTF type confusion on a user map; reference must be balanced",
+      "anchor": "if (btf_is_kernel(btf)) { btf_put(btf); err = -EACCES; goto free_map; }",
+      "file": "corpus/eval/eval_0048_cwe307.c",
+      "line": "55-65",
+      "code": "\t\tbtf = btf_get_by_fd(attr->btf_fd);\n\t\tif (IS_ERR(btf)) {\n\t\t\terr = PTR_ERR(btf);\n\t\t\tgoto free_map;\n\t\t}\n\t\tif (btf_is_kernel(btf)) {\n\t\t\tbtf_put(btf);\n\t\t\terr = -EACCES;\n\t\t\tgoto free_map;\n\t\t}\n\t\tmap->btf = btf;",
+      "bug_class": "Type confusion / missing input validation on attacker-supplied BTF fd",
+      "cwe": "CWE-843",
+      "severity": "high",
+      "where_it_lives": "corpus/eval/eval_0048_cwe307.c (this function)",
+      "invariant": "Only user-loaded (non-kernel) BTF may be attached to an ordinary bpf_map, and the reference obtained by btf_get_by_fd must be released on every early-exit path before the map inherits ownership at map->btf = btf.",
+      "failure_mode": "attr->btf_fd is fully attacker-chosen. Absent the btf_is_kernel check, userspace could hand the kernel/vmlinux BTF fd to a normal map so its value type resolves against kernel type ids, creating a type-confusion primitive between user map data and kernel structs. The guard rejects this with -EACCES; note it also calls btf_put(btf) before bailing, so the get/put pair is balanced (omitting it would be a CWE-401 refcount leak; putting it twice after map->btf = btf would be CWE-415).",
+      "cve_analog": "",
+      "what_to_confirm": "That btf_is_kernel correctly identifies vmlinux/module BTF, and that no subsequent error path both keeps map->btf = btf and independently calls btf_put(btf) (which would double-drop the reference)."
+    },
+    {
+      "title": "Untrusted 16-byte map_name copy relies on bpf_obj_name_cpy to validate and NUL-terminate",
+      "anchor": "bpf_obj_name_cpy(map->name, attr->map_name, sizeof(attr->map_name))",
+      "file": "corpus/eval/eval_0048_cwe307.c",
+      "line": "35-36",
+      "code": "\terr = bpf_obj_name_cpy(map->name, attr->map_name,\n\t\t\t       sizeof(attr->map_name));",
+      "bug_class": "Out-of-bounds read from unterminated string (latent)",
+      "cwe": "CWE-125",
+      "severity": "medium",
+      "where_it_lives": "implementation (bpf_obj_name_cpy, file not provided)",
+      "invariant": "The destination map->name must be NUL-terminated within BPF_OBJ_NAME_LEN and contain only permitted characters, regardless of whether the 16-byte attacker source attr->map_name is terminated; destination size must be >= the size argument.",
+      "failure_mode": "attr->map_name carries 16 attacker bytes with no guaranteed terminator. The copy itself is bounded (sizeof(attr->map_name) = 16, matching map->name), so no overflow occurs here. But if bpf_obj_name_cpy fails to NUL-terminate or to reject control characters, later consumers that print map->name as a C string (fdinfo, tracepoints, /proc/*/fdinfo) over-read past the 16-byte field and leak adjacent kernel memory to userspace. The size argument being sizeof(attr->map_name) rather than sizeof(map->name) is only safe because both are BPF_OBJ_NAME_LEN.",
+      "cve_analog": "",
+      "what_to_confirm": "That bpf_obj_name_cpy always NUL-terminates map->name within BPF_OBJ_NAME_LEN, validates the character set, and that sizeof(map->name) == sizeof(attr->map_name) == BPF_OBJ_NAME_LEN."
+    },
+    {
+      "title": "Error-path btf_put/map_free assume find_and_alloc_map returns a zero-initialised object with ops set",
+      "anchor": "free_map: btf_put(map->btf); map->ops->map_free(map);",
+      "file": "corpus/eval/eval_0048_cwe307.c",
+      "line": "106-108",
+      "code": "free_map:\n\tbtf_put(map->btf);\n\tmap->ops->map_free(map);",
+      "bug_class": "Use of uninitialised pointer on early error path (latent)",
+      "cwe": "CWE-457",
+      "severity": "medium",
+      "where_it_lives": "implementation (find_and_alloc_map / per-type map_alloc, file not provided)",
+      "invariant": "Any struct bpf_map returned by find_and_alloc_map must have map->btf == NULL and map->ops populated before control can reach the free_map label, since free_map may be entered from line 38 before map->btf is ever assigned.",
+      "failure_mode": "Reaching free_map from the name-copy failure (line 38) runs btf_put(map->btf) while map->btf has not been set in this function. This is safe only because find_and_alloc_map zero-allocates the object (map->btf == NULL, and btf_put tolerates NULL) and sets map->ops. If any map type allocated its struct without zeroing, btf_put would dereference a garbage pointer and map->ops->map_free would call through an uninitialised function pointer (escalating to CWE-416/CWE-476). Also, map_check_btf failure (line 71) reaches here after map->btf = btf, so the single reference is dropped exactly once — confirm map_check_btf does not itself drop it.",
+      "cve_analog": "",
+      "what_to_confirm": "That every per-type map_alloc zeroes map->btf and sets map->ops before returning, and that no path that stored map->btf = btf also drops that reference before free_map runs."
+    },
+    {
+      "title": "numa_node validation must cast-then-compare before node_online to avoid OOB node-mask read",
+      "anchor": "if (numa_node != NUMA_NO_NODE && ((unsigned int)numa_node >= nr_node_ids || !node_online(numa_node)))",
+      "file": "corpus/eval/eval_0048_cwe307.c",
+      "line": "25-28",
+      "code": "\tif (numa_node != NUMA_NO_NODE &&\n\t    ((unsigned int)numa_node >= nr_node_ids ||\n\t     !node_online(numa_node)))\n\t\treturn -EINVAL;",
+      "bug_class": "Out-of-bounds read via unchecked index (guarded here)",
+      "cwe": "CWE-125",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0048_cwe307.c (this function)",
+      "invariant": "node_online() must only be called with a node id already proven to be in [0, nr_node_ids), and the only negative id allowed to skip the range check must be NUMA_NO_NODE.",
+      "failure_mode": "numa_node is attacker-controlled and feeds per-node allocation. The (unsigned int) cast folds negative ids into large unsigned values so they fail the >= nr_node_ids test, and the || short-circuit ensures node_online (which indexes the node_states bitmap) is only reached for in-range ids, preventing an out-of-bounds bitmap read. The code is correct; the finding records that reordering these operands or dropping the cast would reintroduce an OOB read/allocation on an attacker-chosen node.",
+      "cve_analog": "",
+      "what_to_confirm": "That nr_node_ids is the true upper bound of the node arrays indexed downstream and that no allocator re-reads numa_node without this bound."
+    },
+    {
+      "title": "CHECK_ATTR is the sole reserved-field gate; a stale boundary admits unvalidated attr bytes",
+      "anchor": "err = CHECK_ATTR(BPF_MAP_CREATE);",
+      "file": "corpus/eval/eval_0048_cwe307.c",
+      "line": "9-11",
+      "code": "\terr = CHECK_ATTR(BPF_MAP_CREATE);\n\tif (err)\n\t\treturn -EINVAL;",
+      "bug_class": "Missing/insufficient input validation of reserved fields",
+      "cwe": "CWE-20",
+      "severity": "low",
+      "where_it_lives": "implementation (CHECK_ATTR macro / bpf_attr layout, file not provided)",
+      "invariant": "CHECK_ATTR(BPF_MAP_CREATE) must reject any call that sets bytes of union bpf_attr outside the exact BPF_MAP_CREATE command layout, so every later field read may assume unknown fields are zero.",
+      "failure_mode": "If the command layout gains a field but CHECK_ATTR's checked range is not updated, attacker-set bytes in the gap pass unnoticed and may later be interpreted as a valid parameter, defeating the zero-fill assumption the rest of the function relies on. Not a direct memory-safety bug, but the backstop that all subsequent per-field validation trusts.",
+      "cve_analog": "",
+      "what_to_confirm": "That the field CHECK_ATTR treats as the tail of BPF_MAP_CREATE matches the actual last field of that command in the current union bpf_attr definition."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm no error edge after bpf_map_alloc_id() (line 84) reaches the free_map/free_map_sec labels; all post-publication failures must go through bpf_map_put_with_uref so the map is refcount-freed, never directly map_free'd (UAF/double-free).",
+    "Verify btf_is_kernel() reliably classifies vmlinux/module BTF and that the btf_get_by_fd reference is put exactly once on every exit — including that no path both keeps map->btf = btf and calls btf_put(btf).",
+    "Check bpf_obj_name_cpy always NUL-terminates map->name within BPF_OBJ_NAME_LEN, validates the character set, and that sizeof(map->name) == sizeof(attr->map_name) == BPF_OBJ_NAME_LEN.",
+    "Confirm find_and_alloc_map (and each per-type map_alloc) zero-initialises the object so map->btf == NULL and sets map->ops before any goto free_map can run from line 38.",
+    "Confirm map_check_btf() does not drop the btf reference it is passed, so free_map's btf_put(map->btf) is the single balanced release.",
+    "Verify nr_node_ids bounds all per-node arrays the map allocator indexes with numa_node, and that NUMA_NO_NODE is the only negative id that bypasses the range check.",
+    "Confirm CHECK_ATTR(BPF_MAP_CREATE)'s checked field range matches the current tail of the BPF_MAP_CREATE portion of union bpf_attr."
+  ]
+}

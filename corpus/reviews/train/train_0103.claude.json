@@ -1,0 +1,189 @@
+{
+  "subsystem": "Linux kernel x86 Intel performance-monitoring (perf) PEBS (Precise Event Based Sampling) drain path. The function intel_pmu_drain_pebs_nhm() walks the hardware-written PEBS record buffer (the Debug Store / DS area) after a PEBS interrupt, tallies how many records belong to each counter, and forwards them to the generic perf sampling machinery. It runs in interrupt/NMI context on the local CPU.",
+  "provenance": "Identified by symbol and type names that are unique to arch/x86/events/intel/ds.c in the Linux kernel: intel_pmu_drain_pebs_nhm, struct cpu_hw_events, struct debug_store, struct pebs_record_nhm, x86_pmu (the struct x86_pmu global), cpuc->ds, ds->pebs_buffer_base / pebs_index, PMU_FL_PEBS_ALL, INTEL_PMC_IDX_FIXED, MAX_FIXED_PEBS_EVENTS, for_each_set_bit, this_cpu_ptr, WARN_ON_ONCE, and the callback setup_pebs_fixed_sample_data. The header comment '/* sample: primevul_c_train_3454_vuln */' and the file name train_0103_cwe755.c are metadata, not part of the reviewed logic.",
+  "trust_boundary": "The bytes walked by this function are produced by the CPU's PEBS hardware, not by userspace directly, but two inputs cross a trust/validation boundary: (1) the PEBS record buffer between base=ds->pebs_buffer_base and top=ds->pebs_index and each record's p->status field are written by the hardware/microcode and are treated as data of unknown content; (2) the loop and array bounds are driven by x86_pmu.max_pebs_events, x86_pmu.num_counters_fixed and INTEL_PMC_IDX_FIXED, which are established from CPU model / CPUID enumeration at boot. The security-relevant hazard is a mismatch between a runtime-computed bound (size) and a compile-time fixed array size (counts[]/error[]): if the hardware advertises more fixed counters than the arrays were sized for, on-stack arrays are indexed and written out of bounds. This is a hardware-config-versus-fixed-buffer contract, not a network parser, but the consequence is stack memory corruption in NMI context.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0103_cwe755.c",
+      "lines": "2-11",
+      "code": "static void intel_pmu_drain_pebs_nhm(struct pt_regs *iregs, struct perf_sample_data *data)\n{\n\tstruct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);\n\tstruct debug_store *ds = cpuc->ds;\n\tstruct perf_event *event;\n\tvoid *base, *at, *top;\n\tshort counts[INTEL_PMC_IDX_FIXED + MAX_FIXED_PEBS_EVENTS] = {};\n\tshort error[INTEL_PMC_IDX_FIXED + MAX_FIXED_PEBS_EVENTS] = {};\n\tint bit, i, size;\n\tu64 mask;",
+      "explanation": "The function takes iregs (the interrupted register set, may be NULL) and data (a perf sample buffer). It fetches the per-CPU hardware-events state cpuc via this_cpu_ptr, and from it the Debug Store descriptor ds, which points at the hardware PEBS buffer. Two on-stack arrays counts[] and error[] are declared with a COMPILE-TIME fixed length of INTEL_PMC_IDX_FIXED + MAX_FIXED_PEBS_EVENTS and zero-initialised; counts[] tallies successfully-attributed PEBS records per counter index, error[] tallies records that could not be attributed (collisions/dropped). INTEL_PMC_IDX_FIXED is the index at which fixed-function counters start in the unified counter index space (32), and MAX_FIXED_PEBS_EVENTS is the maximum number of fixed counters the code was compiled to expect. bit/i/size are int indices and mask is the 64-bit set of counter bits to consider. The critical fact for the whole review is that the two arrays have a FIXED size baked in at compile time, while the loops below index them with a runtime-computed size.",
+      "file_note": ""
+    },
+    {
+      "file": "corpus/train/train_0103_cwe755.c",
+      "lines": "13-19",
+      "code": "\tif (!x86_pmu.pebs_active)\n\t\treturn;\n\n\tbase = (struct pebs_record_nhm *)(unsigned long)ds->pebs_buffer_base;\n\ttop = (struct pebs_record_nhm *)(unsigned long)ds->pebs_index;\n\n\tds->pebs_index = ds->pebs_buffer_base;",
+      "explanation": "If PEBS is not active on this PMU the function returns immediately. Otherwise base is set to the start of the hardware PEBS buffer (pebs_buffer_base) and top to the hardware's current write pointer (pebs_index) — the range [base, top) is the set of records the hardware deposited since the last drain. The code then resets pebs_index back to pebs_buffer_base, i.e. it drains and rearms the buffer for the next batch. base and top are cast from u64 DS fields through unsigned long to void*.",
+      "file_note": ""
+    },
+    {
+      "file": "corpus/train/train_0103_cwe755.c",
+      "lines": "21-26",
+      "code": "\tmask = (1ULL << x86_pmu.max_pebs_events) - 1;\n\tsize = x86_pmu.max_pebs_events;\n\tif (x86_pmu.flags & PMU_FL_PEBS_ALL) {\n\t\tmask |= ((1ULL << x86_pmu.num_counters_fixed) - 1) << INTEL_PMC_IDX_FIXED;\n\t\tsize = INTEL_PMC_IDX_FIXED + x86_pmu.num_counters_fixed;\n\t}",
+      "explanation": "This block computes the set of counter bits to consider (mask) and the iteration/array bound (size). Initially mask covers the max_pebs_events general-purpose PEBS counters and size = max_pebs_events. When the PMU has the PMU_FL_PEBS_ALL flag (newer Intel parts where fixed counters can also produce PEBS), the fixed counters are folded in: mask gets an additional num_counters_fixed bits shifted up to start at INTEL_PMC_IDX_FIXED, and — crucially — size is RECOMPUTED to INTEL_PMC_IDX_FIXED + x86_pmu.num_counters_fixed. size is later used both as the bit-scan width for for_each_set_bit and, transitively, as the maximum index written into counts[]/error[]. The safety of every array write below depends on this size never exceeding INTEL_PMC_IDX_FIXED + MAX_FIXED_PEBS_EVENTS, i.e. on num_counters_fixed <= MAX_FIXED_PEBS_EVENTS. Nothing here enforces that relationship.",
+      "file_note": ""
+    },
+    {
+      "file": "corpus/train/train_0103_cwe755.c",
+      "lines": "28-31",
+      "code": "\tif (unlikely(base >= top)) {\n\t\tintel_pmu_pebs_event_update_no_drain(cpuc, size);\n\t\treturn;\n\t}",
+      "explanation": "If the buffer is empty (write pointer not past the base) there are no records to process; the code calls intel_pmu_pebs_event_update_no_drain(cpuc, size) to update counters without draining and returns. Note that size is passed into that helper too, so an out-of-range size can propagate beyond this function.",
+      "file_note": ""
+    },
+    {
+      "file": "corpus/train/train_0103_cwe755.c",
+      "lines": "33-46",
+      "code": "\tfor (at = base; at < top; at += x86_pmu.pebs_record_size) {\n\t\tstruct pebs_record_nhm *p = at;\n\t\tu64 pebs_status;\n\n\t\tpebs_status = p->status & cpuc->pebs_enabled;\n\t\tpebs_status &= mask;\n\n\t\t/* PEBS v3 has more accurate status bits */\n\t\tif (x86_pmu.intel_cap.pebs_format >= 3) {\n\t\t\tfor_each_set_bit(bit, (unsigned long *)&pebs_status, size)\n\t\t\t\tcounts[bit]++;\n\n\t\t\tcontinue;\n\t\t}",
+      "explanation": "The main loop walks each hardware record from base to top, advancing by pebs_record_size per iteration. For each record p it reads p->status (a hardware-written bitmap of which counters overflowed to cause this record), ANDs it with the enabled PEBS counters and with mask so only in-scope bits survive. On PEBS format v3+ the status bits are considered authoritative: the code iterates every set bit up to width size via for_each_set_bit and increments counts[bit] for each. This is the first array-write site whose index bit is bounded only by size, not by the array length.",
+      "file_note": ""
+    },
+    {
+      "file": "corpus/train/train_0103_cwe755.c",
+      "lines": "48-63",
+      "code": "\t\t/*\n\t\t * On some CPUs the PEBS status can be zero when PEBS is\n\t\t * racing with clearing of GLOBAL_STATUS.\n\t\t *\n\t\t * Normally we would drop that record, but in the\n\t\t * case when there is only a single active PEBS event\n\t\t * we can assume it's for that event.\n\t\t */\n\t\tif (!pebs_status && cpuc->pebs_enabled &&\n\t\t\t!(cpuc->pebs_enabled & (cpuc->pebs_enabled-1)))\n\t\t\tpebs_status = cpuc->pebs_enabled;\n\n\t\tbit = find_first_bit((unsigned long *)&pebs_status,\n\t\t\t\t\tx86_pmu.max_pebs_events);\n\t\tif (bit >= x86_pmu.max_pebs_events)\n\t\t\tcontinue;",
+      "explanation": "For pre-v3 formats: if the status is zero but exactly one PEBS counter is enabled (the (x & (x-1)) test detects a single set bit), the record is attributed to that lone counter. Then find_first_bit scans pebs_status for the first set bit, bounded by max_pebs_events, and if none is within range the record is skipped. Note this path deliberately bounds the scan by max_pebs_events and explicitly rejects bit >= max_pebs_events — this is the correctly-guarded path and stands in contrast to the size-bounded paths.",
+      "file_note": ""
+    },
+    {
+      "file": "corpus/train/train_0103_cwe755.c",
+      "lines": "80-86",
+      "code": "\t\tif (pebs_status != (1ULL << bit)) {\n\t\t\tfor_each_set_bit(i, (unsigned long *)&pebs_status, size)\n\t\t\t\terror[i]++;\n\t\t\tcontinue;\n\t\t}\n\n\t\tcounts[bit]++;",
+      "explanation": "If more than one bit is set in pebs_status (a collision — the record cannot be uniquely attributed), the code marks every implicated counter by iterating for_each_set_bit up to width size and incrementing error[i]; the record is otherwise dropped. If exactly one bit is set, counts[bit]++ records a clean hit (bit here came from the max_pebs_events-bounded find_first_bit, so this particular counts[bit] is in range). The error[i]++ loop, however, is again bounded only by size.",
+      "file_note": ""
+    },
+    {
+      "file": "corpus/train/train_0103_cwe755.c",
+      "lines": "89-113",
+      "code": "\tfor_each_set_bit(bit, (unsigned long *)&mask, size) {\n\t\tif ((counts[bit] == 0) && (error[bit] == 0))\n\t\t\tcontinue;\n\n\t\tevent = cpuc->events[bit];\n\t\tif (WARN_ON_ONCE(!event))\n\t\t\tcontinue;\n\n\t\tif (WARN_ON_ONCE(!event->attr.precise_ip))\n\t\t\tcontinue;\n\n\t\t/* log dropped samples number */\n\t\tif (error[bit]) {\n\t\t\tperf_log_lost_samples(event, error[bit]);\n\n\t\t\tif (iregs && perf_event_account_interrupt(event))\n\t\t\t\tx86_pmu_stop(event, 0);\n\t\t}\n\n\t\tif (counts[bit]) {\n\t\t\t__intel_pmu_pebs_event(event, iregs, data, base,\n\t\t\t\t\t       top, bit, counts[bit],\n\t\t\t\t\t       setup_pebs_fixed_sample_data);\n\t\t}\n\t}",
+      "explanation": "The final loop iterates every bit set in mask up to width size and, for each counter with a non-zero count or error, retrieves the perf_event from cpuc->events[bit], sanity-checks it via WARN_ON_ONCE (event non-NULL and precise_ip set), logs any lost/dropped samples, optionally stops the event on interrupt-throttle, and finally delivers the accumulated PEBS samples to the generic layer via __intel_pmu_pebs_event with the per-counter count. Both counts[bit] and error[bit] are READ here and cpuc->events[bit] is read here, all with bit bounded by size.",
+      "file_note": ""
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0103_cwe755.c",
+      "lines": "8-9",
+      "code": "\tshort counts[INTEL_PMC_IDX_FIXED + MAX_FIXED_PEBS_EVENTS] = {};\n\tshort error[INTEL_PMC_IDX_FIXED + MAX_FIXED_PEBS_EVENTS] = {};",
+      "explanation": "counts[] and error[] have a fixed compile-time length of INTEL_PMC_IDX_FIXED + MAX_FIXED_PEBS_EVENTS, i.e. they reserve exactly MAX_FIXED_PEBS_EVENTS slots for fixed-function counters starting at index INTEL_PMC_IDX_FIXED. Every valid write to these arrays therefore requires the fixed-counter index to be strictly less than INTEL_PMC_IDX_FIXED + MAX_FIXED_PEBS_EVENTS. The implementation must guarantee that no bit index used to subscript these arrays ever reaches or exceeds their length. Because MAX_FIXED_PEBS_EVENTS is a fixed constant while the number of fixed counters actually present is discovered at runtime, this invariant is fragile.",
+      "file_note": ""
+    },
+    {
+      "file": "corpus/train/train_0103_cwe755.c",
+      "lines": "25",
+      "code": "\t\tsize = INTEL_PMC_IDX_FIXED + x86_pmu.num_counters_fixed;",
+      "explanation": "ROOT CAUSE. On a PMU_FL_PEBS_ALL PMU, size is set to INTEL_PMC_IDX_FIXED + x86_pmu.num_counters_fixed, where num_counters_fixed is the number of fixed-function counters enumerated from the hardware (CPUID/model tables). The counts[]/error[] arrays, however, are sized INTEL_PMC_IDX_FIXED + MAX_FIXED_PEBS_EVENTS. If num_counters_fixed > MAX_FIXED_PEBS_EVENTS — which happens on newer Intel parts that expose more fixed counters than the constant was set for — then size exceeds the array length. size is then used as the for_each_set_bit scan width at lines 42, 81 and 89, so bit/i can legally take values in [INTEL_PMC_IDX_FIXED+MAX_FIXED_PEBS_EVENTS, size), i.e. indices past the end of both stack arrays. There is no MIN()/clamp of size against the array size and no build-time assertion tying MAX_FIXED_PEBS_EVENTS to the maximum possible num_counters_fixed. This is the single defect from which all the out-of-bounds accesses below flow.",
+      "file_note": ""
+    },
+    {
+      "file": "corpus/train/train_0103_cwe755.c",
+      "lines": "42-43",
+      "code": "\t\t\tfor_each_set_bit(bit, (unsigned long *)&pebs_status, size)\n\t\t\t\tcounts[bit]++;",
+      "explanation": "Out-of-bounds STACK WRITE (site 1). On PEBS v3+, for_each_set_bit scans pebs_status for set bits up to width size and increments counts[bit]. When size > sizeof(counts)/sizeof(short) (see root cause at line 25), a set bit at index >= array length writes counts[bit]++ past the end of the counts[] stack array. pebs_status is derived from hardware-written p->status masked by mask; on a PMU_FL_PEBS_ALL part, mask legitimately contains bits up to INTEL_PMC_IDX_FIXED + num_counters_fixed - 1, so such indices are reachable. The impact is corruption of adjacent stack memory (error[], saved registers, canary) in NMI/interrupt context — memory corruption and potential control-flow compromise or crash. Invariant: the scan width and every array subscript must be clamped to the array length.",
+      "file_note": ""
+    },
+    {
+      "file": "corpus/train/train_0103_cwe755.c",
+      "lines": "81-82",
+      "code": "\t\t\tfor_each_set_bit(i, (unsigned long *)&pebs_status, size)\n\t\t\t\terror[i]++;",
+      "explanation": "Out-of-bounds STACK WRITE (site 2). On the collision path (pre-v3, multiple bits set), for_each_set_bit again uses width size and increments error[i]. Identical root cause: when size exceeds the error[] length, error[i]++ writes past the array end for any set bit at an out-of-range index. Same NMI-context stack-corruption impact as site 1.",
+      "file_note": ""
+    },
+    {
+      "file": "corpus/train/train_0103_cwe755.c",
+      "lines": "89-90",
+      "code": "\tfor_each_set_bit(bit, (unsigned long *)&mask, size) {\n\t\tif ((counts[bit] == 0) && (error[bit] == 0))",
+      "explanation": "Out-of-bounds STACK READ + subsequent OOB access (site 3). The summary loop scans mask up to width size; since mask itself is built with bits up to INTEL_PMC_IDX_FIXED + num_counters_fixed - 1 (line 24), bit can reach out-of-range indices whenever num_counters_fixed > MAX_FIXED_PEBS_EVENTS. The immediate read counts[bit]==0 && error[bit]==0 reads past the end of both stack arrays; if the out-of-bounds slot happens to be non-zero, execution proceeds to event = cpuc->events[bit] (line 93), reading past the intended fixed-counter range of the events[] array and then dereferencing whatever pointer is there — an out-of-bounds read that can lead to a wild pointer dereference. Invariant: bit must be bounded by the smallest of the array lengths, not by size.",
+      "file_note": ""
+    },
+    {
+      "file": "corpus/train/train_0103_cwe755.c",
+      "lines": "16-17",
+      "code": "\tbase = (struct pebs_record_nhm *)(unsigned long)ds->pebs_buffer_base;\n\ttop = (struct pebs_record_nhm *)(unsigned long)ds->pebs_index;",
+      "explanation": "The record loop bound top comes from ds->pebs_index, and each iteration advances by x86_pmu.pebs_record_size (line 33). The code assumes the hardware left pebs_index correctly aligned to record boundaries and within the allocated buffer. If ds->pebs_index were ever mis-set (buffer setup bug, or a stale value after CPU errata) so that (top - base) is not a whole multiple of pebs_record_size, the final iteration's *p read at line 37 could read partially past the buffer. This is a latent/defensive concern rather than the primary bug — pebs_index is hardware/driver-owned — but the implementation must ensure buffer bounds and record-size alignment are validated at setup.",
+      "file_note": ""
+    }
+  ],
+  "summary": "This is the Linux kernel Intel PEBS drain routine intel_pmu_drain_pebs_nhm(). Its central defect is a fixed-size-buffer-versus-runtime-bound mismatch: the on-stack counts[] and error[] arrays are sized INTEL_PMC_IDX_FIXED + MAX_FIXED_PEBS_EVENTS, but on PMU_FL_PEBS_ALL hardware the loop/index bound size is recomputed as INTEL_PMC_IDX_FIXED + x86_pmu.num_counters_fixed (line 25). When a CPU enumerates more fixed counters than MAX_FIXED_PEBS_EVENTS, size overruns the arrays and the for_each_set_bit loops at lines 42-43, 81-82 and 89-93 write and read past the ends of these stack arrays in NMI context — a stack out-of-bounds write (CWE-787) with kernel memory-corruption impact. The find_first_bit path (lines 60-63) is correctly bounded and is the contrast case.",
+  "reviewed_anchors": [
+    {"anchor": "short counts[INTEL_PMC_IDX_FIXED + MAX_FIXED_PEBS_EVENTS] (line 8)", "disposition": "finding", "reason": "Fixed-size stack buffer whose length is a compile-time constant but is indexed by the runtime-computed size; central to the OOB write."},
+    {"anchor": "short error[INTEL_PMC_IDX_FIXED + MAX_FIXED_PEBS_EVENTS] (line 9)", "disposition": "finding", "reason": "Second fixed-size stack buffer with the same compile-time length, indexed by size; OOB write target."},
+    {"anchor": "int bit, i, size (line 10)", "disposition": "finding", "reason": "size is the runtime bound that can exceed the array length; bit/i are the array subscripts driven by it."},
+    {"anchor": "u64 mask (line 11)", "disposition": "dismissed", "reason": "A 64-bit bitmask; bounded to 64 bits and only used as a scan mask/width source, not a buffer, but it seeds the oversized size via num_counters_fixed."},
+    {"anchor": "if (!x86_pmu.pebs_active) return; (lines 13-14)", "disposition": "dismissed", "reason": "Guard that no-ops when PEBS is inactive; carries no unsafe contract."},
+    {"anchor": "base/top from ds->pebs_buffer_base / ds->pebs_index (lines 16-17)", "disposition": "finding", "reason": "Loop bounds derived from hardware-written DS pointers; record-size alignment/bounds are assumed, a latent defensive concern."},
+    {"anchor": "ds->pebs_index = ds->pebs_buffer_base (line 19)", "disposition": "dismissed", "reason": "Rearm/reset of the hardware write pointer; no memory-safety contract."},
+    {"anchor": "mask = (1ULL << x86_pmu.max_pebs_events) - 1 (line 21)", "disposition": "dismissed", "reason": "Bitmask construction; max_pebs_events fits within the general-purpose PEBS range and within the arrays."},
+    {"anchor": "size = x86_pmu.max_pebs_events (line 22)", "disposition": "dismissed", "reason": "Non-PEBS_ALL bound; max_pebs_events is small and within the array length, so this branch is safe."},
+    {"anchor": "mask |= ((1ULL << x86_pmu.num_counters_fixed) - 1) << INTEL_PMC_IDX_FIXED (line 24)", "disposition": "finding", "reason": "Sets mask bits up to INTEL_PMC_IDX_FIXED + num_counters_fixed - 1, making out-of-range bit indices reachable in the line-89 loop."},
+    {"anchor": "size = INTEL_PMC_IDX_FIXED + x86_pmu.num_counters_fixed (line 25)", "disposition": "finding", "reason": "ROOT CAUSE: runtime bound can exceed the fixed array length when num_counters_fixed > MAX_FIXED_PEBS_EVENTS."},
+    {"anchor": "if (unlikely(base >= top)) { ... } (lines 28-30)", "disposition": "dismissed", "reason": "Empty-buffer guard; correct, but it forwards size to a helper (propagation noted in findings)."},
+    {"anchor": "for (at = base; at < top; at += x86_pmu.pebs_record_size) (line 33)", "disposition": "dismissed", "reason": "Record iteration is bounded by top; record-size/alignment concern captured under the base/top anchor."},
+    {"anchor": "pebs_status = p->status & cpuc->pebs_enabled; &= mask (lines 37-38)", "disposition": "dismissed", "reason": "Hardware status masked to in-scope counters; masking is correct, the hazard is the scan width, not this expression."},
+    {"anchor": "for_each_set_bit(bit, &pebs_status, size) counts[bit]++ (lines 42-43)", "disposition": "finding", "reason": "OOB stack write site 1 when size exceeds counts[] length."},
+    {"anchor": "single-bit fallback (x & (x-1)) test (lines 56-58)", "disposition": "dismissed", "reason": "Attribution heuristic on a bitmask; no memory-safety contract."},
+    {"anchor": "bit = find_first_bit(&pebs_status, x86_pmu.max_pebs_events); if (bit >= x86_pmu.max_pebs_events) continue (lines 60-63)", "disposition": "dismissed", "reason": "Correctly bounded by max_pebs_events with an explicit range reject; this is the safe/contrast path."},
+    {"anchor": "for_each_set_bit(i, &pebs_status, size) error[i]++ (lines 81-82)", "disposition": "finding", "reason": "OOB stack write site 2 when size exceeds error[] length."},
+    {"anchor": "counts[bit]++ (line 86)", "disposition": "dismissed", "reason": "bit here is the max_pebs_events-bounded find_first_bit result, so this specific write is in range."},
+    {"anchor": "for_each_set_bit(bit, &mask, size) { ... } (line 89)", "disposition": "finding", "reason": "OOB read of counts[bit]/error[bit] and subsequent cpuc->events[bit] when bit reaches out-of-range indices."},
+    {"anchor": "event = cpuc->events[bit] (line 93)", "disposition": "finding", "reason": "Indexing the events[] array with an out-of-range bit yields an OOB read and wild pointer dereference."},
+    {"anchor": "WARN_ON_ONCE(!event) / WARN_ON_ONCE(!event->attr.precise_ip) (lines 94-98)", "disposition": "dismissed", "reason": "NULL/attribute sanity checks on the event; defensive, no added contract (but do not protect against an OOB events[bit] read that returns a garbage non-NULL pointer)."},
+    {"anchor": "perf_log_lost_samples / x86_pmu_stop / __intel_pmu_pebs_event calls (lines 102-111)", "disposition": "dismissed", "reason": "Downstream delivery of tallied samples; they consume bit/count but do not themselves define the OOB contract, which lives at the loop bound."}
+  ],
+  "findings": [
+    {
+      "title": "Stack out-of-bounds write in counts[]/error[]: PEBS scan width can exceed fixed array length",
+      "anchor": "size = INTEL_PMC_IDX_FIXED + x86_pmu.num_counters_fixed vs short counts/error[INTEL_PMC_IDX_FIXED + MAX_FIXED_PEBS_EVENTS]",
+      "file": "corpus/train/train_0103_cwe755.c",
+      "line": "25 (root); 8-9, 42-43, 81-82",
+      "code": "size = INTEL_PMC_IDX_FIXED + x86_pmu.num_counters_fixed;\n... short counts[INTEL_PMC_IDX_FIXED + MAX_FIXED_PEBS_EVENTS] = {};\n... for_each_set_bit(bit, (unsigned long *)&pebs_status, size)\n\t\t\t\tcounts[bit]++;\n... for_each_set_bit(i, (unsigned long *)&pebs_status, size)\n\t\t\t\terror[i]++;",
+      "bug_class": "Stack out-of-bounds write (fixed buffer indexed by an unbounded runtime count)",
+      "cwe": "CWE-787",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0103_cwe755.c (this function)",
+      "invariant": "The for_each_set_bit scan width and every subscript into counts[]/error[] must be bounded by the array length; i.e. INTEL_PMC_IDX_FIXED + x86_pmu.num_counters_fixed must never exceed INTEL_PMC_IDX_FIXED + MAX_FIXED_PEBS_EVENTS (equivalently num_counters_fixed <= MAX_FIXED_PEBS_EVENTS), and if hardware can exceed that, size must be clamped.",
+      "failure_mode": "On a PMU_FL_PEBS_ALL CPU that enumerates more fixed-function counters than MAX_FIXED_PEBS_EVENTS, size becomes larger than the counts[]/error[] length. The for_each_set_bit loops at lines 42-43 and 81-82 then increment counts[bit]/error[i] at indices beyond the arrays, corrupting adjacent stack memory (the other array, saved registers, or the stack canary) while running in NMI/interrupt context. Impact: kernel stack memory corruption -> crash or potential privilege escalation.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the numeric value of MAX_FIXED_PEBS_EVENTS versus the maximum x86_pmu.num_counters_fixed the driver can set for any supported CPU (e.g. Ice Lake and later), and whether size is clamped (MIN with array length) before the for_each_set_bit loops; check whether the fixed build introduced such a clamp or enlarged MAX_FIXED_PEBS_EVENTS."
+    },
+    {
+      "title": "Out-of-bounds read and wild-pointer dereference of cpuc->events[bit] in the summary loop",
+      "anchor": "for_each_set_bit(bit, (unsigned long *)&mask, size) ... event = cpuc->events[bit]",
+      "file": "corpus/train/train_0103_cwe755.c",
+      "line": "89-93",
+      "code": "for_each_set_bit(bit, (unsigned long *)&mask, size) {\n\t\tif ((counts[bit] == 0) && (error[bit] == 0))\n\t\t\tcontinue;\n\n\t\tevent = cpuc->events[bit];",
+      "bug_class": "Out-of-bounds read leading to wild pointer dereference",
+      "cwe": "CWE-125",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0103_cwe755.c (this function)",
+      "invariant": "bit used to index counts[]/error[]/cpuc->events[] must be within each array's length; mask must not set bits beyond the smallest indexable range, and the scan width must be clamped to that range.",
+      "failure_mode": "mask is built (line 24) with bits up to INTEL_PMC_IDX_FIXED + num_counters_fixed - 1 and the loop scans it with width size, so when num_counters_fixed > MAX_FIXED_PEBS_EVENTS, bit reaches indices past counts[]/error[]. The reads counts[bit]/error[bit] are out of bounds; if the stale stack slot is non-zero, cpuc->events[bit] is read past its valid fixed-counter range and the resulting garbage pointer is dereferenced (event->attr.precise_ip, passed to __intel_pmu_pebs_event). Impact: OOB read and potential arbitrary kernel pointer dereference/crash. The WARN_ON_ONCE(!event) check does not help when the OOB slot holds a non-NULL garbage value.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the declared length of cpuc->events[] (INTEL_PMC_IDX_MAX) relative to INTEL_PMC_IDX_FIXED + num_counters_fixed, and that bit cannot exceed it; verify that clamping size (finding 1) also bounds this loop."
+    },
+    {
+      "title": "Latent: record-buffer bounds/alignment assumed for the [base, top) walk",
+      "anchor": "for (at = base; at < top; at += x86_pmu.pebs_record_size)",
+      "file": "corpus/train/train_0103_cwe755.c",
+      "line": "16-17, 33-34, 37",
+      "code": "base = (struct pebs_record_nhm *)(unsigned long)ds->pebs_buffer_base;\n\ttop = (struct pebs_record_nhm *)(unsigned long)ds->pebs_index;\n... for (at = base; at < top; at += x86_pmu.pebs_record_size) {\n\t\tstruct pebs_record_nhm *p = at;\n... \t\tpebs_status = p->status & cpuc->pebs_enabled;",
+      "bug_class": "Out-of-bounds read on mis-sized/misaligned hardware buffer (defensive)",
+      "cwe": "CWE-125",
+      "severity": "low",
+      "where_it_lives": "implementation (buffer setup; file not provided)",
+      "invariant": "ds->pebs_index must always be within the allocated PEBS buffer and (pebs_index - pebs_buffer_base) must be an exact multiple of x86_pmu.pebs_record_size so that the last *p read at line 37 stays inside the buffer.",
+      "failure_mode": "If a buffer-setup bug or hardware errata leaves ds->pebs_index misaligned or beyond the buffer, the loop reads a partial/overrun record p->status past the allocation. This is not attacker-controlled from userspace in the normal path (DS is kernel/hardware-owned), hence low severity, but it is an unvalidated bound worth a defensive check.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify PEBS buffer allocation size, that pebs_index is bounded to the buffer at DS init/interrupt, and that pebs_record_size divides the buffer window exactly."
+    }
+  ],
+  "audit_checklist": [
+    "Compare MAX_FIXED_PEBS_EVENTS against the maximum x86_pmu.num_counters_fixed any supported CPU can enumerate (Ice Lake+); if the latter can exceed the former, the counts[]/error[] arrays are undersized.",
+    "Ensure size (line 25) is clamped (e.g. min(size, ARRAY_SIZE(counts))) before every for_each_set_bit at lines 42, 81 and 89, or that the arrays are sized to the true maximum.",
+    "Confirm mask (line 24) never sets bits at indices that cannot be validly used to subscript counts[]/error[]/cpuc->events[].",
+    "Verify cpuc->events[] length (INTEL_PMC_IDX_MAX) covers every bit reachable by the line-89 loop so cpuc->events[bit] at line 93 is always in range.",
+    "Check that the pre-v3 path's max_pebs_events bound (lines 60-63) and the PEBS_ALL size bound remain consistent, since counts[bit]++ at line 86 relies on the former.",
+    "Validate that ds->pebs_index stays within the allocated PEBS buffer and is aligned to x86_pmu.pebs_record_size before the [base, top) walk.",
+    "Confirm the fixed upstream commit's approach (enlarged constant vs. runtime clamp) is present in the deployed tree."
+  ]
+}

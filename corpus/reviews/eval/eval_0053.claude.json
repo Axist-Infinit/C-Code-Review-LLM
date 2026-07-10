@@ -1,0 +1,183 @@
+{
+  "subsystem": "FreeRDP parallel-port device redirection channel. parallel_process_irp_create() is the IRP_MJ_CREATE handler for a redirected parallel (LPT) device carried over the RDPDR device-redirection virtual channel. It parses the DR_CREATE_REQ PDU (fixed create-parameter block plus a Unicode PathLength/Path), opens the backing host device, and writes a create response into the IRP output stream.",
+  "provenance": "Identified by FreeRDP idioms: the signature parallel_process_irp_create(PARALLEL_DEVICE*, IRP*), the Stream_* accessor family (Stream_SafeSeek, Stream_GetRemainingLength, Stream_Read_UINT32, Stream_Pointer, Stream_Write_UINT32/UINT8), ConvertFromUnicode(CP_UTF8, ...), the WLog_ERR(TAG, ...) logger, irp->devman->id_sequence, irp->Complete(irp), and the channel status codes ERROR_INVALID_DATA / CHANNEL_RC_NO_MEMORY / STATUS_ACCESS_DENIED. This is channels/parallel/client/parallel_main.c in FreeRDP. The sample banner comment on line 1 (primevul_c_validation_0298_fixed) marks it as a fixed variant.",
+  "trust_boundary": "irp->input is the RDPDR PDU payload delivered from the RDP peer (server/proxy) across the virtual channel; it is fully attacker-controllable. The 32-bit PathLength (line 14) and the trailing path bytes read through ptr (line 15) are hostile and can take any value the wire buffer permits. In contrast parallel->path, parallel->file, parallel->id, irp->devman, and irp->output are host/endpoint-side state, not directly attacker-authored (though attacker-influenced in count/timing).",
+  "what_the_code_does": [
+    {
+      "file": "corpus/eval/eval_0053_cwe415.c",
+      "lines": "2-7",
+      "code": "static UINT parallel_process_irp_create(PARALLEL_DEVICE* parallel, IRP* irp)\n{\n\tchar* path = NULL;\n\tint status;\n\tWCHAR* ptr;\n\tUINT32 PathLength;",
+      "explanation": "Entry point for handling an IRP_MJ_CREATE request against a redirected parallel device. parallel is the endpoint's per-device state (holding the configured device path, an open file descriptor, and an id counter); irp is the I/O request packet whose input stream carries the on-wire create request and whose output stream will carry the response. Four locals are declared: path (a function-local heap pointer for the decoded UTF-8 path, initialised to NULL so an unconditional free at the end is safe), status (holds the ConvertFromUnicode result), ptr (a WCHAR* that will point directly into the untrusted input buffer), and PathLength (an unsigned 32-bit length taken verbatim off the wire)."
+    },
+    {
+      "file": "corpus/eval/eval_0053_cwe415.c",
+      "lines": "8-9",
+      "code": "\tif (!Stream_SafeSeek(irp->input, 28))\n\t\treturn ERROR_INVALID_DATA;",
+      "explanation": "Skips the 28-byte fixed create-parameter block at the front of DR_CREATE_REQ. Stream_SafeSeek advances the read cursor by 28 bytes and returns FALSE if that would run past the end of the buffer, in which case the handler bails out with ERROR_INVALID_DATA. This is a bounds-checked skip: it both consumes the header fields and guarantees at least 28 bytes were present."
+    },
+    {
+      "file": "corpus/eval/eval_0053_cwe415.c",
+      "lines": "10-13",
+      "code": "\t/* DesiredAccess(4) AllocationSize(8), FileAttributes(4) */\n\t/* SharedAccess(4) CreateDisposition(4), CreateOptions(4) */\n\tif (Stream_GetRemainingLength(irp->input) < 4)\n\t\treturn ERROR_INVALID_DATA;",
+      "explanation": "The comments document the 28 skipped bytes: DesiredAccess(4) + AllocationSize(8) + FileAttributes(4) + SharedAccess(4) + CreateDisposition(4) + CreateOptions(4) = 28. The guard then verifies at least 4 bytes remain before the next field is read, so the upcoming 32-bit PathLength read cannot itself over-read. This is the correct \"check length before reading a fixed scalar\" pattern."
+    },
+    {
+      "file": "corpus/eval/eval_0053_cwe415.c",
+      "lines": "14-17",
+      "code": "\tStream_Read_UINT32(irp->input, PathLength);\n\tptr = (WCHAR*)Stream_Pointer(irp->input);\n\tif (!Stream_SafeSeek(irp->input, PathLength))\n\t\treturn ERROR_INVALID_DATA;",
+      "explanation": "Reads the attacker-controlled 32-bit PathLength (byte count of the Unicode path), then captures ptr as the raw address of the current stream position — i.e. a pointer straight into untrusted buffer memory where the path bytes begin. Stream_SafeSeek(irp->input, PathLength) then advances the cursor by PathLength AND validates that PathLength bytes actually exist from ptr onward, returning FALSE (and bailing out) otherwise. Crucially the validation at line 16 happens BEFORE ptr is consumed at line 18, so [ptr, ptr+PathLength) is proven in-bounds before any read."
+    },
+    {
+      "file": "corpus/eval/eval_0053_cwe415.c",
+      "lines": "18",
+      "code": "\tstatus = ConvertFromUnicode(CP_UTF8, 0, ptr, PathLength / 2, &path, 0, NULL, NULL);",
+      "explanation": "Decodes PathLength/2 UTF-16 code units (PathLength is a byte count; each WCHAR is 2 bytes) starting at ptr into a freshly heap-allocated UTF-8 string returned via &path (the cbMultiByte==0 with &path form makes ConvertFromUnicode allocate the destination). status receives the number of converted characters, or 0/negative on failure. Because line 16 bounded PathLength to the remaining buffer, reading PathLength/2 wide chars (= at most PathLength bytes) stays inside the buffer."
+    },
+    {
+      "file": "corpus/eval/eval_0053_cwe415.c",
+      "lines": "20-25",
+      "code": "\tif (status < 1)\n\t\tif (!(path = (char*)calloc(1, 1)))\n\t\t{\n\t\t\tWLog_ERR(TAG, \"calloc failed!\");\n\t\t\treturn CHANNEL_RC_NO_MEMORY;\n\t\t}",
+      "explanation": "If the conversion produced nothing (status < 1, e.g. an empty or invalid path), path is set to a 1-byte zero buffer via calloc(1,1) so downstream code always has a valid, freeable string. If that allocation itself fails, the handler logs and returns CHANNEL_RC_NO_MEMORY. Note the nested-if (no braces on the outer if): calloc only runs when status < 1, and path is checked for NULL immediately after assignment."
+    },
+    {
+      "file": "corpus/eval/eval_0053_cwe415.c",
+      "lines": "27-28",
+      "code": "\tparallel->id = irp->devman->id_sequence++;\n\tparallel->file = open(parallel->path, O_RDWR);",
+      "explanation": "Assigns a new device id from the device manager's monotonically increasing sequence, then opens the backing host device for read/write. Importantly, open() is called on parallel->path — the endpoint-configured device path established at device registration — NOT on the decoded, attacker-supplied path variable. The decoded path is therefore not used to steer the open(), which removes attacker path-injection from this operation."
+    },
+    {
+      "file": "corpus/eval/eval_0053_cwe415.c",
+      "lines": "30-41",
+      "code": "\tif (parallel->file < 0)\n\t{\n\t\tirp->IoStatus = STATUS_ACCESS_DENIED;\n\t\tparallel->id = 0;\n\t}\n\telse\n\t{\n\t\t/* all read and write operations should be non-blocking */\n\t\tif (fcntl(parallel->file, F_SETFL, O_NONBLOCK) == -1)\n\t\t{\n\t\t}\n\t}",
+      "explanation": "Handles the open() result. On failure (fd < 0) it reports STATUS_ACCESS_DENIED and clears the id. On success it sets the descriptor non-blocking via fcntl(F_SETFL, O_NONBLOCK); the empty braces mean an fcntl failure is silently ignored (best-effort). No security-relevant data crosses the boundary here."
+    },
+    {
+      "file": "corpus/eval/eval_0053_cwe415.c",
+      "lines": "43-46",
+      "code": "\tStream_Write_UINT32(irp->output, parallel->id);\n\tStream_Write_UINT8(irp->output, 0);\n\tfree(path);\n\treturn irp->Complete(irp);",
+      "explanation": "Serialises the create response: the 4-byte device id and a trailing 1-byte field (Information / padding = 0) into irp->output. It then frees the decoded path exactly once and hands the IRP back via the completion callback irp->Complete(irp), which dispatches the response. The single free of the function-local path (never stored elsewhere) is the key fix in this variant."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/eval/eval_0053_cwe415.c",
+      "lines": "14-18",
+      "code": "\tStream_Read_UINT32(irp->input, PathLength);\n\tptr = (WCHAR*)Stream_Pointer(irp->input);\n\tif (!Stream_SafeSeek(irp->input, PathLength))\n\t\treturn ERROR_INVALID_DATA;\n\tstatus = ConvertFromUnicode(CP_UTF8, 0, ptr, PathLength / 2, &path, 0, NULL, NULL);",
+      "explanation": "This is the central untrusted-decode surface. PathLength (line 14) is fully attacker-controlled up to 0xFFFFFFFF, and ptr (line 15) points directly into the wire buffer, so ConvertFromUnicode reads PathLength/2 wide chars straight from attacker memory. The ONLY thing preventing an out-of-bounds read (CWE-125) is Stream_SafeSeek(irp->input, PathLength) at line 16, which must advance-and-validate PathLength against the remaining buffer BEFORE ptr is dereferenced at line 18. In this code the ordering is correct and the read is bounded, so the over-read is avoided. The invariant the implementation must keep: never move the SafeSeek after the ConvertFromUnicode, and never trust PathLength without it. (A minor benign detail: odd PathLength truncates via /2, reading at most PathLength bytes, still in-bounds.)"
+    },
+    {
+      "file": "corpus/eval/eval_0053_cwe415.c",
+      "lines": "45",
+      "code": "\tfree(path);",
+      "explanation": "The historical bug class for this exact handler is a double free (CWE-415): earlier variants decoded the path into a long-lived field (e.g. parallel->path) and then freed that same pointer both in the create handler and again at device teardown, or freed a pointer that was also used after free. In THIS version the danger is neutralised: path is a pure function-local (declared line 4, initialised NULL), assigned only via &path at line 18 or calloc at line 21, never aliased into parallel->path or any persistent structure, and freed exactly once here at line 45. Combined with line 28 opening parallel->path rather than the decoded string, there is no second owner to free it later and no attacker-controlled path reaching open(). The invariant to preserve: keep path function-local and single-owner; do not store it into parallel->* without removing this free."
+    },
+    {
+      "file": "corpus/eval/eval_0053_cwe415.c",
+      "lines": "27-28",
+      "code": "\tparallel->id = irp->devman->id_sequence++;\n\tparallel->file = open(parallel->path, O_RDWR);",
+      "explanation": "Two latent implementation hazards live here. (1) File-descriptor leak (CWE-775): open() overwrites parallel->file unconditionally; if a peer sends a second IRP_MJ_CREATE without an intervening IRP_MJ_CLOSE, the previously-open descriptor is lost and leaked, and repeating this exhausts the process fd table (DoS). The handler should reject a create when a descriptor is already open, or close it first. (2) NULL-pointer dereference (CWE-476): open(parallel->path, ...) assumes parallel->path is a valid, non-NULL string; if a create is processed before the device path was initialised (or initialisation failed), open(NULL) is undefined behaviour and glibc will fault. Both depend on device-lifecycle code not shown here."
+    },
+    {
+      "file": "corpus/eval/eval_0053_cwe415.c",
+      "lines": "20-25",
+      "code": "\tif (status < 1)\n\t\tif (!(path = (char*)calloc(1, 1)))\n\t\t{\n\t\t\tWLog_ERR(TAG, \"calloc failed!\");\n\t\t\treturn CHANNEL_RC_NO_MEMORY;\n\t\t}",
+      "explanation": "Potential memory leak (CWE-401), latent and low-risk. If ConvertFromUnicode ever returned status < 1 while having already allocated a buffer into *path, overwriting path with calloc(1,1) at line 21 would leak the earlier allocation. FreeRDP's ConvertFromUnicode does not allocate on failure (it leaves *path untouched, and path was NULL), so in practice there is no leak; this is a contract to confirm rather than a demonstrated bug. The invariant: ConvertFromUnicode must not allocate output when it returns < 1."
+    },
+    {
+      "file": "corpus/eval/eval_0053_cwe415.c",
+      "lines": "43-44",
+      "code": "\tStream_Write_UINT32(irp->output, parallel->id);\n\tStream_Write_UINT8(irp->output, 0);",
+      "explanation": "These write 5 bytes into irp->output with no visible Stream_EnsureRemainingCapacity(irp->output, 5) beforehand. FreeRDP's Stream_Write_* macros do not grow the buffer; they assume the caller guaranteed capacity. If the output IRP stream is not pre-sized for at least 5 bytes, this is an out-of-bounds write (CWE-787). In practice the device manager pre-allocates the output stream, so this is latent, but the capacity guarantee lives in code not shown and should be confirmed."
+    }
+  ],
+  "summary": "This is the remediated IRP_MJ_CREATE handler for FreeRDP's redirected parallel device. The attacker-controlled Unicode path decode is correctly bounded (Stream_SafeSeek validates PathLength before ConvertFromUnicode reads it), and the CWE-415 double free this sample is named for is genuinely fixed: the decoded path is a single-owner function-local freed exactly once and never aliased, while open() uses the endpoint-configured parallel->path rather than any attacker string. Residual risks are all latent, low-severity implementation contracts: an fd leak / NULL-deref around open(parallel->path), a theoretical leak on the conversion-failure fallback, and unchecked output-stream writes.",
+  "reviewed_anchors": [
+    {"anchor": "parallel_process_irp_create(PARALLEL_DEVICE*, IRP*) signature (line 2)", "disposition": "dismissed", "reason": "Entry point; the parameters' trust is analysed via irp->input below, no contract on the signature itself."},
+    {"anchor": "char* path = NULL (line 4)", "disposition": "dismissed", "reason": "Function-local, initialised NULL, single-owner, freed exactly once at line 45; the double-free class is avoided."},
+    {"anchor": "UINT32 PathLength (lines 7,14)", "disposition": "dismissed", "reason": "Attacker-controlled 32-bit length, but bounded against the buffer by Stream_SafeSeek at line 16 before use; no over-read."},
+    {"anchor": "Stream_SafeSeek(irp->input, 28) (line 8)", "disposition": "dismissed", "reason": "Bounds-checked skip of the 28-byte create header; returns FALSE past end, correctly guarded."},
+    {"anchor": "Stream_GetRemainingLength(irp->input) < 4 (line 12)", "disposition": "dismissed", "reason": "Correct length guard before the 4-byte PathLength read."},
+    {"anchor": "Stream_Read_UINT32(irp->input, PathLength) (line 14)", "disposition": "dismissed", "reason": "Guarded by the >=4 check at line 12; reads a scalar, not a buffer."},
+    {"anchor": "ptr = (WCHAR*)Stream_Pointer(irp->input) (line 15)", "disposition": "dismissed", "reason": "Raw pointer into untrusted buffer, but only consumed after the SafeSeek bound at line 16 proves the range."},
+    {"anchor": "Stream_SafeSeek(irp->input, PathLength) (line 16)", "disposition": "finding", "reason": "The load-bearing bound for the untrusted decode; validated here as correctly ordered before the read (over-read avoided)."},
+    {"anchor": "ConvertFromUnicode(CP_UTF8, 0, ptr, PathLength/2, &path, ...) (line 18)", "disposition": "dismissed", "reason": "Reads PathLength/2 wide chars from ptr; bounded by line 16, allocates via &path; no OOB read."},
+    {"anchor": "if (status < 1) { path = calloc(1,1) } (lines 20-25)", "disposition": "finding", "reason": "Fallback allocation; only a theoretical leak if ConvertFromUnicode allocated on failure — contract to confirm."},
+    {"anchor": "parallel->id = irp->devman->id_sequence++ (line 27)", "disposition": "dismissed", "reason": "Id assignment from host-side counter; no untrusted contract."},
+    {"anchor": "parallel->file = open(parallel->path, O_RDWR) (line 28)", "disposition": "finding", "reason": "Fd leak on repeated CREATE and NULL-deref if parallel->path uninitialised; uses server path not attacker path (good)."},
+    {"anchor": "fcntl(parallel->file, F_SETFL, O_NONBLOCK) (line 38)", "disposition": "dismissed", "reason": "Best-effort non-blocking set; failure ignored intentionally, no security impact."},
+    {"anchor": "Stream_Write_UINT32/UINT8(irp->output, ...) (lines 43-44)", "disposition": "finding", "reason": "5-byte output write with no visible Stream_EnsureRemainingCapacity; latent OOB write if output not pre-sized."},
+    {"anchor": "free(path) (line 45)", "disposition": "dismissed", "reason": "Single free of the single-owner local; the CWE-415 double free is fixed."},
+    {"anchor": "return irp->Complete(irp) (line 46)", "disposition": "dismissed", "reason": "Completion callback dispatch; no field is freed underneath an active use here."}
+  ],
+  "findings": [
+    {
+      "title": "File descriptor leak: parallel->file overwritten on repeated CREATE without close",
+      "anchor": "parallel->file = open(parallel->path, O_RDWR);",
+      "file": "corpus/eval/eval_0053_cwe415.c",
+      "line": "28",
+      "code": "\tparallel->file = open(parallel->path, O_RDWR);",
+      "bug_class": "File descriptor / resource leak (missing release before reacquire)",
+      "cwe": "CWE-775",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "Any descriptor already held in parallel->file must be closed (or the CREATE rejected) before open() overwrites the field; the device state machine must not allow two live handles per device.",
+      "failure_mode": "A malicious or buggy peer sends multiple IRP_MJ_CREATE for the same device without an intervening IRP_MJ_CLOSE. Each open() overwrites parallel->file, leaking the previous descriptor. Repeating this exhausts the process file-descriptor table, a denial of service.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether parallel->file is initialised to a sentinel and closed before this open(), and whether the RDPDR state machine forbids create-without-close for an already-open device."
+    },
+    {
+      "title": "Possible NULL-pointer dereference in open(parallel->path)",
+      "anchor": "parallel->file = open(parallel->path, O_RDWR);",
+      "file": "corpus/eval/eval_0053_cwe415.c",
+      "line": "28",
+      "code": "\tparallel->file = open(parallel->path, O_RDWR);",
+      "bug_class": "NULL-pointer dereference",
+      "cwe": "CWE-476",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "parallel->path must be a valid, non-NULL, NUL-terminated device path for the entire lifetime of the PARALLEL_DEVICE before any CREATE is dispatched.",
+      "failure_mode": "If an IRP_MJ_CREATE is processed before the device path was initialised (or initialisation silently failed), open(NULL, O_RDWR) is undefined behaviour and faults in glibc, crashing the channel/session.",
+      "cve_analog": "",
+      "what_to_confirm": "That parallel->path is always set (and never freed/NULLed) at device registration before create handling, i.e. it cannot be NULL at line 28."
+    },
+    {
+      "title": "Output stream written without an ensured-capacity guard",
+      "anchor": "Stream_Write_UINT32(irp->output, parallel->id); Stream_Write_UINT8(irp->output, 0);",
+      "file": "corpus/eval/eval_0053_cwe415.c",
+      "line": "43-44",
+      "code": "\tStream_Write_UINT32(irp->output, parallel->id);\n\tStream_Write_UINT8(irp->output, 0);",
+      "bug_class": "Out-of-bounds write (missing capacity check before serialisation)",
+      "cwe": "CWE-787",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "irp->output must have at least 5 bytes of remaining capacity (or Stream_EnsureRemainingCapacity(irp->output, 5) must be called) before these Stream_Write_* calls, which do not grow the buffer themselves.",
+      "failure_mode": "If the output IRP stream is not pre-sized for the 5-byte create response, the two writes run past the buffer end, corrupting adjacent heap memory. Latent because FreeRDP's device manager normally pre-allocates the output stream.",
+      "cve_analog": "",
+      "what_to_confirm": "Where irp->output is allocated/sized and whether it guarantees >=5 bytes here, or whether a Stream_EnsureRemainingCapacity call is missing."
+    },
+    {
+      "title": "Theoretical leak of decoded path on conversion-failure fallback",
+      "anchor": "if (status < 1) if (!(path = (char*)calloc(1, 1)))",
+      "file": "corpus/eval/eval_0053_cwe415.c",
+      "line": "20-21",
+      "code": "\tif (status < 1)\n\t\tif (!(path = (char*)calloc(1, 1)))",
+      "bug_class": "Memory leak (overwrite of a possibly-allocated pointer)",
+      "cwe": "CWE-401",
+      "severity": "info",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "ConvertFromUnicode must not allocate and return a buffer via &path while also returning status < 1; if it could, path must be freed before being overwritten by calloc.",
+      "failure_mode": "If ConvertFromUnicode ever allocated *path yet returned < 1, line 21 would overwrite path and leak the earlier allocation. In FreeRDP it does not allocate on failure, so this is a contract to confirm rather than a demonstrated leak.",
+      "cve_analog": "",
+      "what_to_confirm": "That ConvertFromUnicode leaves *path unallocated (NULL) whenever it returns a value < 1."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm Stream_SafeSeek(irp->input, PathLength) at line 16 always runs and validates before ptr is dereferenced at line 18 — this is the sole bound on the untrusted path read.",
+    "Confirm the decoded local path is never stored into parallel->path or any persistent structure, so line 45 free(path) remains a single, non-aliased free (double-free regression guard).",
+    "Verify parallel->file is closed (or CREATE rejected) before line 28 re-opens it, to prevent fd leaks on repeated IRP_MJ_CREATE.",
+    "Verify parallel->path is non-NULL and valid at device-create time so open(parallel->path) cannot dereference NULL.",
+    "Verify irp->output has ensured capacity (>=5 bytes) before the Stream_Write_UINT32/UINT8 calls, or add Stream_EnsureRemainingCapacity.",
+    "Confirm ConvertFromUnicode does not allocate *path when returning status < 1, so the calloc fallback cannot leak.",
+    "Confirm open() with the server-configured path (not the attacker-decoded path) is the intended behaviour and no code path later opens the attacker string."
+  ]
+}

@@ -1,0 +1,295 @@
+{
+  "subsystem": "SCP (Secure Copy) client download engine. This is TSCPFileSystem::SCPSink, the routine that drives the receiving side of an SCP `scp -f` download: it reads the remote server's control records (T=time, C=file, D=enter directory, E=exit) and their payloads, creates the corresponding local files/directories, confirms overwrites, and streams file content to disk. It recurses to descend into remote directories.",
+  "provenance": "Identified by the WinSCP-specific types and idioms: TSCPFileSystem, UnicodeString, TCopyParamType, TFileOperationProgressType, TRights/TRights.Octal, TSecureShell (FSecureShell), FTerminal, FMTLOAD/LoadStr resource macros, FILE_OPERATION_LOOP_BEGIN/END, __fastcall and __finally (Embarcadero C++Builder). The SCP protocol control-record letters (T/C/D/E) and the header comment `sample: primevul_train_2165_vuln` confirm this is WinSCP's core/ScpFileSystem.cpp SCPSink download handler.",
+  "trust_boundary": "The remote SCP server is the untrusted party. Every value consumed inside the loop originates from FSecureShell->ReceiveLine() (line 38) or FSecureShell->Receive() (line 295): the control-record type byte, the modification/access timestamps, the octal permission bits, the file size, the file/directory NAME, and the raw file bytes are all attacker-controllable. A malicious or compromised server (or a MITM on a weak host-key trust decision) can send arbitrary values for any of these. The local file paths, target directory, and the recursion depth are therefore driven by hostile input; the filename and the C/D recursion structure are the most dangerous fields because they choose WHERE on the local disk data is written.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/eval/eval_0014_cwe20.cpp",
+      "lines": "2-6",
+      "code": "void __fastcall TSCPFileSystem::SCPSink(const UnicodeString TargetDir,\n  const UnicodeString FileName, const UnicodeString SourceDir,\n  const TCopyParamType * CopyParam, bool & Success,\n  TFileOperationProgressType * OperationProgress, int Params,\n  int Level)",
+      "explanation": "Entry point for the SCP receive (\"sink\") side of a download. TargetDir is the local directory the caller wants files written into; FileName is the current remote path context; SourceDir is the remote directory being descended; CopyParam holds transfer options; Success is an out/in-out flag; OperationProgress carries progress and cancel state; Params holds copy flags; Level is the recursion depth (0 at top). The function is called once per download and re-enters itself for each remote subdirectory, so Level is the only signal of nesting depth."
+    },
+    {
+      "file": "corpus/eval/eval_0014_cwe20.cpp",
+      "lines": "8-20",
+      "code": "struct\n  {\n    int SetTime;\n    TDateTime Modification;\n    TRights RemoteRights;\n    int Attrs;\n    bool Exists;\n  } FileData;\n\n  bool SkipConfirmed = false;\n  bool Initialized = (Level > 0);\n\n  FileData.SetTime = 0;",
+      "explanation": "A local anonymous struct FileData accumulates per-file metadata received from the server across control records: SetTime is a small countdown that says how many upcoming file records a just-received 'T' timestamp applies to; Modification is the remote modification time; RemoteRights holds the octal permission bits the server sent; Attrs is the local file's attribute bitmask; Exists records whether the local target already exists. SkipConfirmed tracks whether the user already declined this file. Initialized is true when we recursed (Level>0), used to decide whether an early error is a fatal init failure. SetTime is zeroed to start."
+    },
+    {
+      "file": "corpus/eval/eval_0014_cwe20.cpp",
+      "lines": "22-33",
+      "code": "FSecureShell->SendNull();\n\n  while (!OperationProgress->Cancel)\n  {\n    // See (switch ... case 'T':)\n    if (FileData.SetTime) FileData.SetTime--;\n\n    // In case of error occurred before control record arrived.\n    // We can finally use full path here, as we get current path in FileName param\n    // (we used to set the file into OperationProgress->FileName, but it collided\n    // with progress outputting, particularly for scripting)\n    UnicodeString FullFileName = FileName;",
+      "explanation": "SendNull() sends the SCP protocol acknowledgement byte (0x00) that tells the remote side to proceed. The main loop runs until the user cancels. Each iteration first decrements SetTime (so a 'T' timestamp only applies to the immediately following file record). FullFileName is initialized to the passed-in FileName so error messages have a path even before a control record is parsed."
+    },
+    {
+      "file": "corpus/eval/eval_0014_cwe20.cpp",
+      "lines": "37-40",
+      "code": "// Receive control record\n      UnicodeString Line = FSecureShell->ReceiveLine();\n\n      if (Line.Length() == 0) FTerminal->FatalError(NULL, LoadStr(SCP_EMPTY_LINE));",
+      "explanation": "Reads one newline-terminated control record from the SSH channel into Line. This is the primary untrusted-input read: everything in Line comes from the server. An empty line is rejected as a fatal protocol error, which also guarantees Line has at least one character before the later Line[1] index."
+    },
+    {
+      "file": "corpus/eval/eval_0014_cwe20.cpp",
+      "lines": "42-72",
+      "code": "if (IsLastLine(Line))\n      {\n        // Remote side finished copying, so remote SCP was closed\n        // and we don't need to terminate it manually, see CopyToLocal()\n        OperationProgress->SetCancel(csRemoteAbort);\n        /* TODO 1 : Show stderror to user? */\n        FSecureShell->ClearStdError();\n        try\n        {\n          // coIgnoreWarnings should allow batch transfer to continue when\n          // download of one the files fails (user denies overwriting\n          // of target local file, no read permissions...)\n          ReadCommandOutput(coExpectNoOutput | coRaiseExcept |\n            coOnlyReturnCode | coIgnoreWarnings);\n          if (!Initialized)\n          {\n            throw Exception(L\"\");\n          }\n        }\n        catch(Exception & E)\n        {\n          if (!Initialized && FTerminal->Active)\n          {\n            FTerminal->TerminalError(&E, LoadStr(SCP_INIT_ERROR));\n          }\n          else\n          {\n            throw;\n          }\n        }\n        return;\n      }",
+      "explanation": "If the received line signals end-of-stream (IsLastLine), the remote SCP process has closed. The code marks the operation as remotely aborted, drains stderr, and reads the command exit code. If we never actually initialized a transfer (no valid control record was ever seen) it converts this into an SCP_INIT_ERROR, otherwise it returns cleanly. This is the normal termination path of the loop."
+    },
+    {
+      "file": "corpus/eval/eval_0014_cwe20.cpp",
+      "lines": "76-80",
+      "code": "Initialized = true;\n\n        // First character distinguish type of control record\n        wchar_t Ctrl = Line[1];\n        Line.Delete(1, 1);",
+      "explanation": "For any non-terminal record, mark the session initialized. The first character (UnicodeString is 1-indexed, so Line[1] is the leading byte) is the control-record type selector. That character is then deleted from Line so the remainder holds the record's arguments. Ctrl fully determines how the rest of the untrusted line is interpreted."
+    },
+    {
+      "file": "corpus/eval/eval_0014_cwe20.cpp",
+      "lines": "82-94",
+      "code": "switch (Ctrl) {\n          case 1:\n            // Error (already logged by ReceiveLine())\n            throw EScpFileSkipped(NULL, FMTLOAD(REMOTE_ERROR, (Line)));\n\n          case 2:\n            // Fatal error, terminate copying\n            FTerminal->TerminalError(Line);\n            return; // Unreachable\n\n          case L'E': // Exit\n            FSecureShell->SendNull();\n            return;",
+      "explanation": "Control byte 0x01 is the SCP soft-error marker: the remainder is a server-supplied message and the file is skipped via EScpFileSkipped. 0x02 is a fatal error, terminating the copy with a server-supplied message. 'E' means the server is leaving the current directory level; the client acks and returns from this recursion level. Note the server-supplied Line text is passed straight into resource-format messages here."
+    },
+    {
+      "file": "corpus/eval/eval_0014_cwe20.cpp",
+      "lines": "96-109",
+      "code": "case L'T':\n            unsigned long MTime, ATime;\n            if (swscanf(Line.c_str(), L\"%ld %*d %ld %*d\",  &MTime, &ATime) == 2)\n            {\n              FileData.Modification = UnixToDateTime(MTime, FTerminal->SessionData->DSTMode);\n              FSecureShell->SendNull();\n              // File time is only valid until next pass\n              FileData.SetTime = 2;\n              continue;\n            }\n              else\n            {\n              SCPError(LoadStr(SCP_ILLEGAL_TIME_FORMAT), False);\n            }",
+      "explanation": "A 'T' record carries the modification and access times (SCP format: `T<mtime> 0 <atime> 0`). swscanf parses two unsigned longs (mtime, atime) skipping the microsecond fields with %*d. On success the modification time is converted to a TDateTime, the record is acked, and SetTime is set to 2 so the timestamp survives the SetTime decrement at the top of the loop and applies to the next file. On a parse failure SCPError raises an illegal-time-format error. Note the format specifier is %ld (signed long) even though the destinations are unsigned long."
+    },
+    {
+      "file": "corpus/eval/eval_0014_cwe20.cpp",
+      "lines": "111-120",
+      "code": "case L'C':\n          case L'D':\n            break; // continue pass switch{}\n\n          default:\n            FTerminal->FatalError(NULL, FMTLOAD(SCP_INVALID_CONTROL_RECORD, (Ctrl, Line)));\n        }\n\n        TFileMasks::TParams MaskParams;\n        MaskParams.Modification = FileData.Modification;",
+      "explanation": "'C' (create file) and 'D' (descend directory) break out of the switch to fall through into the shared file/dir handling below. Any other control byte is a fatal protocol error. After the switch, a TFileMasks::TParams is built carrying the just-parsed modification time, later used for include/exclude mask evaluation."
+    },
+    {
+      "file": "corpus/eval/eval_0014_cwe20.cpp",
+      "lines": "124-139",
+      "code": "try\n        {\n          FileData.RemoteRights.Octal = CutToChar(Line, L' ', True);\n          // do not trim leading spaces of the filename\n          __int64 TSize = StrToInt64(CutToChar(Line, L' ', False).TrimRight());\n          MaskParams.Size = TSize;\n          // Security fix: ensure the file ends up where we asked for it.\n          // (accept only filename, not path)\n          UnicodeString OnlyFileName = UnixExtractFileName(Line);\n          if (Line != OnlyFileName)\n          {\n            FTerminal->LogEvent(FORMAT(L\"Warning: Remote host set a compound pathname '%s'\", (Line)));\n          }\n\n          FullFileName = SourceDir + OnlyFileName;\n          OperationProgress->SetFile(FullFileName);\n          OperationProgress->SetTransferSize(TSize);",
+      "explanation": "This block parses the C/D record body, which has the wire form `<octal-mode> <size> <name>`. CutToChar peels the leading octal permission string into RemoteRights.Octal; the next CutToChar peels the size, converted via StrToInt64 into TSize. The remaining text is the file/directory NAME. The security-fix comment shows the intended defense: UnixExtractFileName strips any directory component so only the basename is used, and FullFileName is built from the trusted SourceDir plus that basename. If the server sent a compound path, the code only LOGS a warning; it does not reject. All three parsed values are attacker-controlled."
+    },
+    {
+      "file": "corpus/eval/eval_0014_cwe20.cpp",
+      "lines": "141-154",
+      "code": "catch (Exception &E)\n        {\n          {\n            TSuspendFileOperationProgress Suspend(OperationProgress);\n            FTerminal->Log->AddException(&E);\n          }\n          SCPError(LoadStr(SCP_ILLEGAL_FILE_DESCRIPTOR), false);\n        }\n\n        // last possibility to cancel transfer before it starts\n        if (OperationProgress->Cancel)\n        {\n          throw ESkipFile(NULL, MainInstructions(LoadStr(USER_TERMINATED)));\n        }",
+      "explanation": "If any of the descriptor parsing (StrToInt64, etc.) throws, it is logged and converted to an SCP illegal-file-descriptor error. After parsing, the code offers a final cancellation point before starting the actual transfer, throwing ESkipFile if the user cancelled."
+    },
+    {
+      "file": "corpus/eval/eval_0014_cwe20.cpp",
+      "lines": "156-173",
+      "code": "bool Dir = (Ctrl == L'D');\n        UnicodeString BaseFileName = FTerminal->GetBaseFileName(FullFileName);\n        if (!CopyParam->AllowTransfer(BaseFileName, osRemote, Dir, MaskParams, IsUnixHiddenFile(BaseFileName)))\n        {\n          FTerminal->LogEvent(FORMAT(L\"File \\\"%s\\\" excluded from transfer\",\n            (FullFileName)));\n          SkipConfirmed = true;\n          SCPError(L\"\", false);\n        }\n\n        if (CopyParam->SkipTransfer(FullFileName, Dir))\n        {\n          SkipConfirmed = true;\n          SCPError(L\"\", false);\n          OperationProgress->AddSkippedFileSize(MaskParams.Size);\n        }\n\n        FTerminal->LogFileDetails(FileName, FileData.Modification, MaskParams.Size);",
+      "explanation": "Dir distinguishes directory vs file records. The file/dir is checked against the copy parameter masks (AllowTransfer) and resume/skip logic (SkipTransfer); if excluded it is marked skip-confirmed and an empty SCPError skips it. Otherwise file details (name, modification, size) are logged."
+    },
+    {
+      "file": "corpus/eval/eval_0014_cwe20.cpp",
+      "lines": "175-184",
+      "code": "UnicodeString DestFileNameOnly =\n          FTerminal->ChangeFileName(\n            CopyParam, OperationProgress->FileName, osRemote,\n            Level == 0);\n        UnicodeString DestFileName =\n          IncludeTrailingBackslash(TargetDir) + DestFileNameOnly;\n\n        FileData.Attrs = FileGetAttrFix(ApiPath(DestFileName));\n        // If getting attrs fails, we suppose, that file/folder doesn't exists\n        FileData.Exists = (FileData.Attrs != -1);",
+      "explanation": "The local destination path is computed: ChangeFileName applies any rename rules to produce DestFileNameOnly, and DestFileName is TargetDir with a trailing backslash prepended to it. FileGetAttrFix probes whether the target already exists (Attrs==-1 means missing). DestFileName is the exact local path that will be created/overwritten, derived from the server-influenced OperationProgress->FileName."
+    },
+    {
+      "file": "corpus/eval/eval_0014_cwe20.cpp",
+      "lines": "185-205",
+      "code": "if (Dir)\n        {\n          if (FileData.Exists && !(FileData.Attrs & faDirectory))\n          {\n            SCPError(FMTLOAD(NOT_DIRECTORY_ERROR, (DestFileName)), false);\n          }\n\n          if (!FileData.Exists)\n          {\n            FILE_OPERATION_LOOP_BEGIN\n            {\n              THROWOSIFFALSE(ForceDirectories(ApiPath(DestFileName)));\n            }\n            FILE_OPERATION_LOOP_END(FMTLOAD(CREATE_DIR_ERROR, (DestFileName)));\n            /* SCP: can we set the timestamp for directories ? */\n          }\n          UnicodeString FullFileName = SourceDir + OperationProgress->FileName;\n          SCPSink(DestFileName, FullFileName, UnixIncludeTrailingBackslash(FullFileName),\n            CopyParam, Success, OperationProgress, Params, Level + 1);\n          continue;\n        }",
+      "explanation": "The directory ('D') branch: if a non-directory already occupies the target, error; otherwise create the directory tree with ForceDirectories. Then the function RECURSES into itself with DestFileName as the new TargetDir and Level+1, to process the directory's contents until the server sends 'E'. Each remote 'D' record thus deepens native call-stack recursion; there is no depth cap on Level."
+    },
+    {
+      "file": "corpus/eval/eval_0014_cwe20.cpp",
+      "lines": "206-255",
+      "code": "else if (Ctrl == L'C')\n        {\n          TDownloadSessionAction Action(FTerminal->ActionLog);\n          Action.FileName(FTerminal->AbsolutePath(FullFileName, true));\n\n          try\n          {\n            HANDLE File = NULL;\n            TStream * FileStream = NULL;\n\n            /* TODO 1 : Turn off read-only attr */\n\n            try\n            {\n              try\n              {\n                if (FileExists(ApiPath(DestFileName)))\n                {\n                  __int64 MTime;\n                  TOverwriteFileParams FileParams;\n                  FileParams.SourceSize = OperationProgress->TransferSize;\n                  FileParams.SourceTimestamp = FileData.Modification;\n                  FTerminal->OpenLocalFile(DestFileName, GENERIC_READ,\n                    NULL, NULL, NULL, &MTime, NULL,\n                    &FileParams.DestSize);\n                  FileParams.DestTimestamp = UnixToDateTime(MTime,\n                    FTerminal->SessionData->DSTMode);\n\n                  unsigned int Answer =\n                    ConfirmOverwrite(OperationProgress->FileName, DestFileNameOnly, osLocal,\n                      &FileParams, CopyParam, Params, OperationProgress);\n\n                  switch (Answer)\n                  {\n                    case qaCancel:\n                      OperationProgress->SetCancel(csCancel); // continue on next case\n                    case qaNo:\n                      SkipConfirmed = true;\n                      EXCEPTION;\n                  }\n                }\n\n                Action.Destination(DestFileName);\n\n                if (!FTerminal->CreateLocalFile(DestFileName, OperationProgress,\n                       &File, FLAGSET(Params, cpNoConfirmation)))\n                {\n                  SkipConfirmed = true;\n                  EXCEPTION;\n                }\n\n                FileStream = new TSafeHandleStream((THandle)File);",
+      "explanation": "The file ('C') branch. It records the action for logging, then if the local target already exists it gathers overwrite parameters and asks the user via ConfirmOverwrite; qaCancel/qaNo mark skip and raise. Otherwise it creates/opens the local file (CreateLocalFile fills File) and wraps the handle in a TSafeHandleStream (new-allocated, released in the __finally below). This is where remote data is about to hit local disk."
+    },
+    {
+      "file": "corpus/eval/eval_0014_cwe20.cpp",
+      "lines": "267-282",
+      "code": "// We succeeded, so we confirm transfer to remote side\n              FSecureShell->SendNull();\n              // From now we need to finish file transfer, if not it's fatal error\n              OperationProgress->SetTransferringFile(true);\n\n              // Suppose same data size to transfer as to write\n              // (not true with ASCII transfer)\n              OperationProgress->SetLocalSize(OperationProgress->TransferSize);\n\n              // Will we use ASCII of BINARY file transfer?\n              OperationProgress->SetAsciiTransfer(\n                CopyParam->UseAsciiTransfer(BaseFileName, osRemote, MaskParams));\n              if (FTerminal->Configuration->ActualLogProtocol >= 0)\n              {\n                FTerminal->LogEvent(UnicodeString((OperationProgress->AsciiTransfer ? L\"Ascii\" : L\"Binary\")) +\n                  L\" transfer mode selected.\");\n              }",
+      "explanation": "Having created the local file, the client acks the server to start sending bytes and marks the transfer as in-progress (from here a failure is fatal, not skippable). LocalSize is seeded from the server-declared TransferSize, and the ASCII/binary mode is decided from copy parameters and logged."
+    },
+    {
+      "file": "corpus/eval/eval_0014_cwe20.cpp",
+      "lines": "286-322",
+      "code": "// Buffer for one block of data\n                TFileBuffer BlockBuf;\n                bool ConvertToken = false;\n\n                do\n                {\n                  BlockBuf.Size = OperationProgress->TransferBlockSize();\n                  BlockBuf.Position = 0;\n\n                  FSecureShell->Receive(reinterpret_cast<unsigned char *>(BlockBuf.Data), BlockBuf.Size);\n                  OperationProgress->AddTransferred(BlockBuf.Size);\n\n                  if (OperationProgress->AsciiTransfer)\n                  {\n                    unsigned int PrevBlockSize = BlockBuf.Size;\n                    BlockBuf.Convert(FTerminal->SessionData->EOLType,\n                      FTerminal->Configuration->LocalEOLType, 0, ConvertToken);\n                    OperationProgress->SetLocalSize(\n                      OperationProgress->LocalSize - PrevBlockSize + BlockBuf.Size);\n                  }\n\n                  // This is crucial, if it fails during file transfer, it's fatal error\n                  FILE_OPERATION_LOOP_BEGIN\n                  {\n                    BlockBuf.WriteToStream(FileStream, BlockBuf.Size);\n                  }\n                  FILE_OPERATION_LOOP_END_EX(FMTLOAD(WRITE_ERROR, (DestFileName)), folNone);\n\n                  OperationProgress->AddLocallyUsed(BlockBuf.Size);\n\n                  if (OperationProgress->Cancel == csCancelTransfer)\n                  {\n                    throw Exception(MainInstructions(LoadStr(USER_TERMINATED)));\n                  }\n                }\n                while (!OperationProgress->IsLocallyDone() || !\n                    OperationProgress->IsTransferDone());",
+      "explanation": "The core receive loop. Each pass sizes a block buffer to TransferBlockSize(), reads that many bytes from the SSH channel into BlockBuf.Data (the reinterpret_cast just retypes the buffer pointer to unsigned char*), optionally applies EOL conversion for ASCII mode, and writes the block to the local file stream. AddTransferred/AddLocallyUsed advance the progress counters, and the loop ends when both the transferred and locally-written amounts reach the expected size (derived from the server-declared TransferSize)."
+    },
+    {
+      "file": "corpus/eval/eval_0014_cwe20.cpp",
+      "lines": "331-374",
+      "code": "OperationProgress->SetTransferringFile(false);\n\n              try\n              {\n                SCPResponse();\n                // If one of following exception occurs, we still need\n                // to send confirmation to other side\n              }\n              catch (EScp &E)\n              {\n                FSecureShell->SendNull();\n                throw;\n              }\n              catch (EScpFileSkipped &E)\n              {\n                FSecureShell->SendNull();\n                throw;\n              }\n\n              FSecureShell->SendNull();\n\n              if (FileData.SetTime && CopyParam->PreserveTime)\n              {\n                FTerminal->UpdateTargetTime(File, FileData.Modification, FTerminal->SessionData->DSTMode);\n              }\n            }\n            __finally\n            {\n              if (File) CloseHandle(File);\n              if (FileStream) delete FileStream;\n            }\n          }\n          catch(Exception & E)\n          {\n            if (SkipConfirmed)\n            {\n              Action.Cancel();\n            }\n            else\n            {\n              FTerminal->RollbackAction(Action, OperationProgress, &E);\n            }\n            throw;\n          }",
+      "explanation": "After the data ends, SCPResponse() reads the server's trailing status; SendNull acks. If SetTime is armed and PreserveTime is set, the local file's timestamp is set from the server-supplied Modification. The __finally block always closes the OS handle and deletes the heap-allocated FileStream (new/delete are correctly paired). The outer catch either cancels or rolls back the download action, then rethrows."
+    },
+    {
+      "file": "corpus/eval/eval_0014_cwe20.cpp",
+      "lines": "376-387",
+      "code": "if (FileData.Attrs == -1) FileData.Attrs = faArchive;\n          int NewAttrs = CopyParam->LocalFileAttrs(FileData.RemoteRights);\n          if ((NewAttrs & FileData.Attrs) != NewAttrs)\n          {\n            FILE_OPERATION_LOOP_BEGIN\n            {\n              THROWOSIFFALSE(FileSetAttr(ApiPath(DestFileName), FileData.Attrs | NewAttrs) == 0);\n            }\n            FILE_OPERATION_LOOP_END(FMTLOAD(CANT_SET_ATTRS, (DestFileName)));\n          }\n\n          FTerminal->LogFileDone(OperationProgress, DestFileName);",
+      "explanation": "After a successful file transfer, local attributes are applied. LocalFileAttrs translates the server-supplied RemoteRights (the octal mode from the 'C' record) into local file attributes; if the target lacks any of those bits they are OR'd on via FileSetAttr. This is where remote permission bits directly influence the local file's attributes. Completion is logged."
+    },
+    {
+      "file": "corpus/eval/eval_0014_cwe20.cpp",
+      "lines": "391-414",
+      "code": "catch (EScpFileSkipped &E)\n    {\n      if (!SkipConfirmed)\n      {\n        TSuspendFileOperationProgress Suspend(OperationProgress);\n        TQueryParams Params(qpAllowContinueOnError);\n        if (FTerminal->QueryUserException(FMTLOAD(COPY_ERROR, (FullFileName)),\n              &E, qaOK | qaAbort, &Params, qtError) == qaAbort)\n        {\n          OperationProgress->SetCancel(csCancel);\n        }\n        FTerminal->Log->AddException(&E);\n      }\n      // this was inside above condition, but then transfer was considered\n      // successful, even when for example user refused to overwrite file\n      Success = false;\n    }\n    catch (ESkipFile &E)\n    {\n      SCPSendError(E.Message, false);\n      Success = false;\n      if (!FTerminal->HandleException(&E)) throw;\n    }",
+      "explanation": "The loop-level exception handlers. EScpFileSkipped (a single-file skip) optionally prompts the user (OK/Abort) and sets Success=false so the batch is not falsely reported successful. ESkipFile sends an error to the remote and asks HandleException whether to continue; if not, it rethrows to abort. Both keep the outer while-loop alive to process the next control record."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/eval/eval_0014_cwe20.cpp",
+      "lines": "131-137",
+      "code": "UnicodeString OnlyFileName = UnixExtractFileName(Line);\n          if (Line != OnlyFileName)\n          {\n            FTerminal->LogEvent(FORMAT(L\"Warning: Remote host set a compound pathname '%s'\", (Line)));\n          }\n\n          FullFileName = SourceDir + OnlyFileName;",
+      "explanation": "The single most important attack surface: the file/directory NAME comes entirely from the server (via ReceiveLine). A hostile SCP server can request that the client write to a name it did not ask for (the classic \"malicious server overwrites arbitrary client files\" SCP flaw, CVE-2018-20684 / the broader CVE-2019-6111 class). The intended defense is UnixExtractFileName, which strips a path down to its basename. The residual risks are: (1) the mismatch is only LOGGED, not rejected, so the code proceeds with whatever UnixExtractFileName returns; (2) UnixExtractFileName uses UNIX separator semantics ('/'), so on Windows a server-sent name containing backslashes or a drive-relative form (e.g. `..\\..\\evil.exe` or `C:evil`) may survive extraction and then be concatenated with SourceDir/TargetDir and used as a real local path in CreateLocalFile/ForceDirectories, escaping the target directory. The invariant the implementation must uphold is that OnlyFileName is a single pathless component under the current platform's rules, and any compound/traversing name must be REJECTED (skip the file), not merely logged."
+    },
+    {
+      "file": "corpus/eval/eval_0014_cwe20.cpp",
+      "lines": "202-203",
+      "code": "SCPSink(DestFileName, FullFileName, UnixIncludeTrailingBackslash(FullFileName),\n            CopyParam, Success, OperationProgress, Params, Level + 1);",
+      "explanation": "Every server-sent 'D' record causes SCPSink to recurse one native call frame deeper, and Level is passed as Level+1 but is never compared against any maximum. A malicious server can stream an unbounded sequence of 'D' records (e.g. thousands of nested directories) without ever sending matching 'E' records, driving deep native recursion until the call stack is exhausted and the process crashes (stack overflow, denial of service). The invariant is that recursion depth must be bounded (reject or abort past a sane Level cap), since the depth is chosen by untrusted input."
+    },
+    {
+      "file": "corpus/eval/eval_0014_cwe20.cpp",
+      "lines": "125-125",
+      "code": "FileData.RemoteRights.Octal = CutToChar(Line, L' ', True);",
+      "explanation": "The permission bits are server-controlled and flow, unfiltered, into the local file's attributes at lines 377-382 (LocalFileAttrs(FileData.RemoteRights) then FileSetAttr). A malicious server can therefore influence the attributes applied to the freshly written local file. On its own this is lower severity than the path issue, but combined with a controlled filename it lets the server shape both WHERE and WITH WHAT ATTRIBUTES a file lands (e.g. clearing read-only, setting archive/hidden). The implementation must sanitize/limit which mode bits it honors and must never let RemoteRights make a file more dangerous than policy allows."
+    },
+    {
+      "file": "corpus/eval/eval_0014_cwe20.cpp",
+      "lines": "98-98",
+      "code": "if (swscanf(Line.c_str(), L\"%ld %*d %ld %*d\",  &MTime, &ATime) == 2)",
+      "explanation": "The 'T' timestamp is parsed from the server string with swscanf using %ld while the destinations MTime/ATime are declared `unsigned long`. The == 2 check ensures two conversions succeeded, but the values themselves are unvalidated and range-unchecked before being handed to UnixToDateTime (line 100). A server can supply out-of-range or negative-looking values; the signed/unsigned format mismatch is technically incorrect and, with a hostile UNIX epoch value, UnixToDateTime could produce a nonsensical or overflowing TDateTime used later for file-time preservation. Low severity (no memory-safety consequence here), but the timestamp should be range-validated before conversion."
+    },
+    {
+      "file": "corpus/eval/eval_0014_cwe20.cpp",
+      "lines": "106-116",
+      "code": "  else\n            {\n              SCPError(LoadStr(SCP_ILLEGAL_TIME_FORMAT), False);\n            }\n\n          case L'C':\n          case L'D':\n            break; // continue pass switch{}",
+      "explanation": "Control-flow fragility: the 'T' case's else branch calls SCPError and then, because there is no break/return after it, execution FALLS THROUGH into `case L'C': case L'D': break;`. This is only safe if SCPError() always throws. If SCPError ever returns for a low-severity error, a malformed 'T' record would silently be reprocessed as a C/D file descriptor, parsing garbage as octal/size/name. The implementation must guarantee SCPError throws on this path (or add an explicit break) so a malformed timestamp cannot bleed into file-descriptor handling."
+    },
+    {
+      "file": "corpus/eval/eval_0014_cwe20.cpp",
+      "lines": "295-295",
+      "code": "FSecureShell->Receive(reinterpret_cast<unsigned char *>(BlockBuf.Data), BlockBuf.Size);",
+      "explanation": "The block buffer is filled from the SSH channel. The size passed is BlockBuf.Size = OperationProgress->TransferBlockSize() (a locally chosen block size), and BlockBuf.Data is the buffer, so the destination bound is the client's own value rather than a server-supplied length — this is not a direct overflow. The reinterpret_cast merely retypes the buffer pointer to unsigned char* and is benign for a byte buffer. The residual thing to confirm is that TFileBuffer allocates Data to at least TransferBlockSize() bytes before this call and that Receive strictly honors the count; if Receive could ever write more than BlockBuf.Size, or Data is smaller than Size, this becomes an out-of-bounds write (CWE-787). As shown, the contract looks internally consistent."
+    }
+  ],
+  "summary": "WinSCP SCP download sink (TSCPFileSystem::SCPSink). The dominant risk is that every field of every control record — most importantly the file/directory NAME — is attacker-controlled by the remote server, making this a textbook improper-input-validation surface. The code carries the CVE-2018-20684-era path-basename fix (UnixExtractFileName) but only WARNS rather than rejects a compound/traversing name and relies on UNIX separator semantics, leaving residual path-traversal exposure (especially on Windows). Secondary issues: unbounded attacker-driven recursion via 'D' records (stack-exhaustion DoS) and server-controlled permission bits/timestamps applied to local files.",
+  "reviewed_anchors": [
+    {"anchor": "SCPSink signature (TargetDir, FileName, SourceDir, CopyParam, Success, OperationProgress, Params, Level)", "disposition": "finding", "reason": "Level is the untrusted-driven recursion depth with no cap; TargetDir/SourceDir combine with server names to form local paths."},
+    {"anchor": "struct FileData { int SetTime; TDateTime Modification; TRights RemoteRights; int Attrs; bool Exists; }", "disposition": "finding", "reason": "RemoteRights carries server-supplied permission bits later applied locally; Modification carries a server timestamp; struct-level anchor retained per method."},
+    {"anchor": "bool SkipConfirmed / bool Initialized (lines 17-18)", "disposition": "dismissed", "reason": "Local control flags; no external input, no memory or path contract."},
+    {"anchor": "UnicodeString Line = FSecureShell->ReceiveLine() (line 38)", "disposition": "finding", "reason": "Primary untrusted-input source; every parsed value derives from it."},
+    {"anchor": "Line.Length() == 0 guard (line 40)", "disposition": "dismissed", "reason": "Correctly rejects empty line and guarantees Line[1] is in-bounds; defensive, not a defect."},
+    {"anchor": "wchar_t Ctrl = Line[1]; Line.Delete(1,1) (lines 79-80)", "disposition": "dismissed", "reason": "Index is safe because empty lines were already rejected; selector is untrusted but every branch is enumerated."},
+    {"anchor": "switch case 1 / case 2 (lines 83-90)", "disposition": "dismissed", "reason": "Error/fatal markers pass server text into resource messages only; no memory/path effect."},
+    {"anchor": "case L'T' swscanf(%ld %*d %ld %*d, &MTime, &ATime) (line 98)", "disposition": "finding", "reason": "Signed/unsigned format mismatch and unvalidated server timestamp range fed to UnixToDateTime."},
+    {"anchor": "FileData.SetTime countdown (lines 27, 103)", "disposition": "dismissed", "reason": "Bounded small counter controlling timestamp applicability; no external memory contract."},
+    {"anchor": "case L'C' / case L'D' fallthrough after 'T' else (lines 106-116)", "disposition": "finding", "reason": "Missing break after SCPError relies on SCPError always throwing to avoid reprocessing a bad 'T' as C/D."},
+    {"anchor": "default: FatalError SCP_INVALID_CONTROL_RECORD (line 116)", "disposition": "dismissed", "reason": "Correctly rejects unknown control bytes."},
+    {"anchor": "FileData.RemoteRights.Octal = CutToChar(Line, L' ', True) (line 125)", "disposition": "finding", "reason": "Server-controlled permission string flows into local FileSetAttr at 377-382."},
+    {"anchor": "__int64 TSize = StrToInt64(CutToChar(...).TrimRight()) (line 127)", "disposition": "dismissed", "reason": "Server-supplied size, but parse errors are caught and value only drives progress/transfer-size accounting; no buffer sized from it here."},
+    {"anchor": "UnixExtractFileName(Line) + `if (Line != OnlyFileName)` warn-only (lines 131-135)", "disposition": "finding", "reason": "Core path-traversal defense; only warns, and UNIX-separator semantics may miss Windows separators."},
+    {"anchor": "FullFileName = SourceDir + OnlyFileName (line 137)", "disposition": "finding", "reason": "Local path is built from server-influenced basename; part of the traversal finding."},
+    {"anchor": "AllowTransfer / SkipTransfer gating (lines 158-171)", "disposition": "dismissed", "reason": "Policy mask checks; do not themselves introduce a memory/path defect."},
+    {"anchor": "DestFileName = IncludeTrailingBackslash(TargetDir) + DestFileNameOnly (lines 179-180)", "disposition": "finding", "reason": "Final local write path derived from server-influenced name; covered by traversal finding."},
+    {"anchor": "SCPSink(...Level + 1) recursion in Dir branch (lines 202-203)", "disposition": "finding", "reason": "Unbounded attacker-driven recursion depth (stack exhaustion / DoS)."},
+    {"anchor": "ConfirmOverwrite / CreateLocalFile (lines 234-251)", "disposition": "dismissed", "reason": "Interactive overwrite guard and file creation; behave correctly given a validated path."},
+    {"anchor": "FileStream = new TSafeHandleStream(...) with __finally delete (lines 257, 360)", "disposition": "dismissed", "reason": "new/delete correctly paired in __finally; handle closed; no leak or mismatched-free."},
+    {"anchor": "FSecureShell->Receive(reinterpret_cast<unsigned char *>(BlockBuf.Data), BlockBuf.Size) (line 295)", "disposition": "finding", "reason": "Latent OOB-write contract: buffer must be >= Size and Receive must honor the count; retype cast itself benign."},
+    {"anchor": "BlockBuf.Convert / LocalSize arithmetic (lines 300-304)", "disposition": "dismissed", "reason": "EOL conversion size bookkeeping; sizes are client-derived, no external bound."},
+    {"anchor": "UpdateTargetTime(File, FileData.Modification, ...) (line 354)", "disposition": "dismissed", "reason": "Applies server timestamp to local file; covered indirectly by the timestamp-validation finding, no separate memory contract."},
+    {"anchor": "NewAttrs = CopyParam->LocalFileAttrs(FileData.RemoteRights); FileSetAttr (lines 377-382)", "disposition": "finding", "reason": "Consumes the server-controlled RemoteRights to set local attributes; part of the permission-bits finding."},
+    {"anchor": "outer catch EScpFileSkipped / ESkipFile (lines 391-413)", "disposition": "dismissed", "reason": "Error handling that keeps the loop alive and sets Success=false; no defect."}
+  ],
+  "findings": [
+    {
+      "title": "Server-controlled filename: path traversal / arbitrary local file write (warn-only, UNIX-separator basename)",
+      "anchor": "UnixExtractFileName(Line) + `if (Line != OnlyFileName)` warn-only; FullFileName = SourceDir + OnlyFileName",
+      "file": "corpus/eval/eval_0014_cwe20.cpp",
+      "line": "131-137",
+      "code": "UnicodeString OnlyFileName = UnixExtractFileName(Line);\n          if (Line != OnlyFileName)\n          {\n            FTerminal->LogEvent(FORMAT(L\"Warning: Remote host set a compound pathname '%s'\", (Line)));\n          }\n\n          FullFileName = SourceDir + OnlyFileName;",
+      "bug_class": "Improper input validation of server-supplied path (directory traversal / arbitrary file overwrite)",
+      "cwe": "CWE-22",
+      "severity": "high",
+      "where_it_lives": "corpus/eval/eval_0014_cwe20.cpp (and UnixExtractFileName in the implementation, file not provided)",
+      "invariant": "The name taken from a C/D control record must be reduced to a single, pathless component under the LOCAL platform's separator rules, and any name that is compound or contains traversal (`..`, absolute, drive-relative, alternate separators) must cause the file to be REJECTED — never merely logged — so a hostile server cannot choose a write location outside TargetDir.",
+      "failure_mode": "A malicious or MITM'd SCP server returns a C/D record whose name field encodes a path (e.g. `../../..\\Users\\victim\\Startup\\evil.exe` on Windows, or absolute/drive-relative forms). UnixExtractFileName strips only up to the last '/', so backslash/drive components survive; the code logs a warning but proceeds, concatenates into FullFileName/DestFileName, and CreateLocalFile/ForceDirectories writes attacker data outside the requested directory — arbitrary file creation/overwrite, potentially code execution.",
+      "cve_analog": "CVE-2018-20684",
+      "what_to_confirm": "Whether UnixExtractFileName strips ALL separators valid on the target OS (backslash and drive-relative on Windows) and whether the compound-pathname case should reject rather than warn; confirm DestFileName cannot escape TargetDir for any Line value."
+    },
+    {
+      "title": "Unbounded attacker-driven recursion on nested 'D' records (stack exhaustion DoS)",
+      "anchor": "SCPSink(DestFileName, FullFileName, ..., Level + 1)",
+      "file": "corpus/eval/eval_0014_cwe20.cpp",
+      "line": "202-203",
+      "code": "SCPSink(DestFileName, FullFileName, UnixIncludeTrailingBackslash(FullFileName),\n            CopyParam, Success, OperationProgress, Params, Level + 1);",
+      "bug_class": "Uncontrolled recursion driven by untrusted input",
+      "cwe": "CWE-674",
+      "severity": "medium",
+      "where_it_lives": "corpus/eval/eval_0014_cwe20.cpp",
+      "invariant": "Recursion depth (Level) must be bounded by a fixed maximum; when the server-driven nesting exceeds it, the transfer must abort rather than recurse, because the depth is chosen entirely by untrusted control records.",
+      "failure_mode": "A hostile server streams an endless run of 'D' (descend) records with no matching 'E' records. Each 'D' invokes SCPSink one native stack frame deeper with Level+1, which is incremented but never checked against any cap. The call stack is exhausted and the client process crashes (denial of service); each frame also holds sizable UnicodeString locals, accelerating exhaustion.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether any caller or SCPSink itself enforces a maximum Level / nesting depth before recursing, and how many bytes each frame consumes."
+    },
+    {
+      "title": "Server-controlled permission bits applied to local file attributes",
+      "anchor": "FileData.RemoteRights.Octal = CutToChar(Line, L' ', True); ... CopyParam->LocalFileAttrs(FileData.RemoteRights); FileSetAttr(...)",
+      "file": "corpus/eval/eval_0014_cwe20.cpp",
+      "line": "125",
+      "code": "FileData.RemoteRights.Octal = CutToChar(Line, L' ', True);",
+      "bug_class": "Improper input validation of server-supplied permission metadata",
+      "cwe": "CWE-20",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0014_cwe20.cpp (LocalFileAttrs mapping in the implementation, file not provided)",
+      "invariant": "The mode/permission bits parsed from the remote must be range-checked and policy-limited before being translated to and applied as local file attributes; the server must not be able to grant a local file more permissive or more dangerous attributes than the user's copy policy allows.",
+      "failure_mode": "The octal mode string in the C record is entirely server-controlled and flows unvalidated into LocalFileAttrs and FileSetAttr at lines 377-382. A malicious server can influence the attributes of the just-written local file (e.g. clearing read-only, toggling archive/hidden), shaping post-write behavior; combined with the filename issue it lets the server control both location and attributes of dropped files.",
+      "cve_analog": "",
+      "what_to_confirm": "How CutToChar validates the octal string and how LocalFileAttrs bounds/maps RemoteRights before FileSetAttr; whether any out-of-range or unexpected bits are rejected."
+    },
+    {
+      "title": "Unvalidated / sign-mismatched server timestamp parse",
+      "anchor": "swscanf(Line.c_str(), L\"%ld %*d %ld %*d\", &MTime, &ATime)",
+      "file": "corpus/eval/eval_0014_cwe20.cpp",
+      "line": "98",
+      "code": "if (swscanf(Line.c_str(), L\"%ld %*d %ld %*d\",  &MTime, &ATime) == 2)",
+      "bug_class": "Improper input validation / signed-unsigned format mismatch",
+      "cwe": "CWE-20",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0014_cwe20.cpp (UnixToDateTime in the implementation, file not provided)",
+      "invariant": "The format specifier must match the destination type and the parsed epoch values must be range-validated before conversion, so a hostile timestamp cannot produce an out-of-range or overflowing TDateTime used for file-time preservation.",
+      "failure_mode": "MTime/ATime are declared `unsigned long` but read with %ld (signed long); the == 2 check confirms two conversions but not their range. A server can supply extreme values that, once passed to UnixToDateTime(MTime, ...) at line 100 and later UpdateTargetTime, yield a nonsensical or overflowing date. Impact is limited to incorrect file timestamps (no memory-safety break in the shown code), hence low severity.",
+      "cve_analog": "",
+      "what_to_confirm": "That UnixToDateTime bounds MTime and that the signed/unsigned mismatch cannot silently truncate or misinterpret large values on this platform's long width."
+    },
+    {
+      "title": "Fall-through from malformed 'T' record into C/D handling if SCPError does not throw",
+      "anchor": "SCPError(LoadStr(SCP_ILLEGAL_TIME_FORMAT), False); (no break) -> case L'C': case L'D': break;",
+      "file": "corpus/eval/eval_0014_cwe20.cpp",
+      "line": "106-116",
+      "code": "  else\n            {\n              SCPError(LoadStr(SCP_ILLEGAL_TIME_FORMAT), False);\n            }\n\n          case L'C':\n          case L'D':\n            break; // continue pass switch{}",
+      "bug_class": "Missing break / control-flow fall-through on error path",
+      "cwe": "CWE-484",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0014_cwe20.cpp (SCPError in the implementation, file not provided)",
+      "invariant": "A malformed 'T' record must not be reprocessed as a C/D file descriptor; the error path must terminate the switch (SCPError must throw, or an explicit break/return must follow) so the leftover Line is not parsed as `<octal> <size> <name>`.",
+      "failure_mode": "If swscanf fails, the else branch calls SCPError and then, lacking a break, falls through into `case L'C'/'D': break;`, dropping into the file-descriptor parsing below with the raw (bad) 'T' line. This is only safe if SCPError always raises; should it ever return for a low-severity error, the client would misparse a timestamp record as a file, corrupting rights/size/name interpretation.",
+      "cve_analog": "",
+      "what_to_confirm": "That SCPError() unconditionally throws on this call so control never actually reaches the C/D case from the 'T' else branch."
+    },
+    {
+      "title": "Latent OOB-write contract on block receive buffer",
+      "anchor": "FSecureShell->Receive(reinterpret_cast<unsigned char *>(BlockBuf.Data), BlockBuf.Size)",
+      "file": "corpus/eval/eval_0014_cwe20.cpp",
+      "line": "295",
+      "code": "FSecureShell->Receive(reinterpret_cast<unsigned char *>(BlockBuf.Data), BlockBuf.Size);",
+      "bug_class": "Potential out-of-bounds write (buffer/size contract)",
+      "cwe": "CWE-787",
+      "severity": "info",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "BlockBuf.Data must be allocated to at least BlockBuf.Size (= TransferBlockSize()) bytes, and Receive must write no more than the count it is given; the reinterpret_cast must not change the effective buffer length.",
+      "failure_mode": "As shown the destination size is the client's own TransferBlockSize(), not a server length, so this is not a direct remote overflow. It becomes an out-of-bounds write only if TFileBuffer fails to size Data to BlockBuf.Size before this call, or if Receive can write past the supplied count — both live in code not shown. Flagged as a contract to verify, not a confirmed bug.",
+      "cve_analog": "",
+      "what_to_confirm": "That TFileBuffer.Size setter (line 292) actually (re)allocates Data to that many bytes and that TSecureShell::Receive strictly bounds its write to the passed length."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm UnixExtractFileName strips every separator valid on the target OS (backslash and drive-relative forms on Windows), and change the compound-pathname case (lines 132-135) from warn-only to reject/skip.",
+    "Verify DestFileName (lines 179-180) can never escape TargetDir for any server-supplied Line, including `..`, absolute, UNC, and mixed-separator names.",
+    "Add and enforce a maximum recursion depth on Level before the SCPSink self-call (lines 202-203) to prevent stack-exhaustion DoS from nested 'D' records.",
+    "Check that LocalFileAttrs (line 377) bounds and policy-limits the server-supplied RemoteRights.Octal before FileSetAttr applies them (lines 382).",
+    "Confirm SCPError() always throws so the 'T'-else fall-through (lines 106-116) cannot reprocess a malformed timestamp record as a C/D file descriptor.",
+    "Validate the 'T' timestamp range and fix the %ld-vs-unsigned-long mismatch (line 98) before UnixToDateTime/UpdateTargetTime consume it.",
+    "Verify TFileBuffer sizes Data to at least BlockBuf.Size and that FSecureShell->Receive never writes beyond the supplied count (line 295).",
+    "Confirm the __finally correctly closes File and deletes FileStream on every exit path, including exceptions thrown mid-transfer (lines 357-361)."
+  ]
+}

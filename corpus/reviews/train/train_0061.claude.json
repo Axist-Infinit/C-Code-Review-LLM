@@ -1,0 +1,189 @@
+{
+  "subsystem": "SSSD (System Security Services Daemon) Kerberos authentication back end. This is the tevent callback krb5_save_ccname_done() from the krb5 auth provider (src/providers/krb5/krb5_auth.c), invoked after the krb5_child has produced a credential cache name. Its job is to finish a PAM authentication request and, when the domain caches credentials, to store the user's password into the sysdb so that OFFLINE (disconnected) authentication can later succeed against the local cache.",
+  "provenance": "Identified by naming and API surface: the function name krb5_save_ccname_done, the tevent_req async plumbing (tevent_req_data, tevent_req_done, tevent_req_error), the struct krb5_auth_state / struct krb5child_req / struct pam_data types, the SSSD option accessor dp_opt_get_bool with KRB5_STORE_PASSWORD_IF_OFFLINE, the SSS_PAM_* / SSS_CMD_RENEW command enums, the DP_ERR_* status codes, sysdb_cache_password(), and talloc memory management are all distinctive to SSSD's krb5 provider. The banner comment '/* sample: primevul_c_train_3270_vuln */' and the file suffix cwe287 indicate an authentication-class defect. This is a full function body, not a header, so the executable logic is reviewed directly.",
+  "trust_boundary": "The struct pam_data *pd (pd->cmd, pd->authtok, pd->authtok_size, pd->newauthtok, pd->newauthtok_size, pd->user) originates from a PAM client that connected to the SSSD PAM responder socket — i.e. an unauthenticated or partially-authenticated local process supplying the credentials a user typed. The authentication token bytes and their declared length are therefore ATTACKER-INFLUENCED: the size field and the token contents are chosen by whoever is trying to log in. The talloc contexts, be_ctx, sysdb handle, and domain configuration are trusted process-internal state. The security-critical crossing is the copy of pd->authtok (length pd->authtok_size) into a heap buffer that is then persisted to the on-disk credential cache.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0061_cwe287.c",
+      "lines": "2-8",
+      "code": "static void krb5_save_ccname_done(struct tevent_req *req)\n{\n    struct krb5_auth_state *state = tevent_req_data(req, struct krb5_auth_state);\n    struct krb5child_req *kr = state->kr;\n    struct pam_data *pd = state->pd;\n    int ret;\n    char *password = NULL;",
+      "explanation": "This is an asynchronous tevent completion callback (returns void, takes the tevent request). It recovers the request's private state via tevent_req_data(), then caches three frequently used pointers: kr (the krb5child request describing the child run), and pd (the pam_data holding the client-supplied PAM command and authentication tokens). ret holds the eventual result code, and password is initialised to NULL — its NULL-ness is later used as the sentinel that decides whether a credential was materialised. pd is the object that carries untrusted, client-supplied fields into this function."
+    },
+    {
+      "file": "corpus/train/train_0061_cwe287.c",
+      "lines": "10-21",
+      "code": "    if (kr->is_offline) {\n        if (dp_opt_get_bool(kr->krb5_ctx->opts,KRB5_STORE_PASSWORD_IF_OFFLINE)) {\n            krb5_pam_handler_cache_auth_step(req);\n            return;\n        }\n\n        DEBUG(4, (\"Backend is marked offline, retry later!\\n\"));\n        state->pam_status = PAM_AUTHINFO_UNAVAIL;\n        state->dp_err = DP_ERR_OFFLINE;\n        ret = EOK;\n        goto done;\n    }",
+      "explanation": "The first branch handles the case where the back end is already offline. If the KRB5_STORE_PASSWORD_IF_OFFLINE option is set, it delegates to krb5_pam_handler_cache_auth_step(req) and returns immediately (that path performs its own offline password verification/caching). Otherwise it records PAM_AUTHINFO_UNAVAIL / DP_ERR_OFFLINE, sets ret = EOK, and jumps to the done label so the caller is told to retry later. Note the chained dereference kr->krb5_ctx->opts, which assumes both kr->krb5_ctx and its opts are non-NULL."
+    },
+    {
+      "file": "corpus/train/train_0061_cwe287.c",
+      "lines": "23-28",
+      "code": "    if (state->be_ctx->domain->cache_credentials == TRUE) {\n\n        /* password caching failures are not fatal errors */\n        state->pam_status = PAM_SUCCESS;\n        state->dp_err = DP_ERR_OK;",
+      "explanation": "When the back end is online, the function checks whether the domain is configured to cache credentials (cache_credentials == TRUE). Only inside this block does credential caching happen. Notably the pam_status is pre-set to PAM_SUCCESS and dp_err to DP_ERR_OK up front, encoding the policy stated in the comment that a caching failure must not turn a successful online authentication into a failure. This dereferences state->be_ctx->domain unconditionally."
+    },
+    {
+      "file": "corpus/train/train_0061_cwe287.c",
+      "lines": "29-38",
+      "code": "        switch(pd->cmd) {\n            case SSS_PAM_AUTHENTICATE:\n            case SSS_CMD_RENEW:\n            case SSS_PAM_CHAUTHTOK_PRELIM:\n                password = talloc_size(state, pd->authtok_size + 1);\n                if (password != NULL) {\n                    memcpy(password, pd->authtok, pd->authtok_size);\n                    password[pd->authtok_size] = '\\0';\n                }\n                break;",
+      "explanation": "The core caching logic. For an ordinary authentication (SSS_PAM_AUTHENTICATE), a ticket renewal (SSS_CMD_RENEW), or the preliminary password-change check (SSS_PAM_CHAUTHTOK_PRELIM), it allocates a talloc buffer of pd->authtok_size + 1 bytes on the state context, copies pd->authtok_size bytes of the client-supplied authentication token into it, and NUL-terminates it to form a C string. Both the size field and the token bytes are attacker-influenced. There is no validation here of the token TYPE (password vs. PIN/OTP/smartcard), of an upper bound on authtok_size, or of whether the size matches the real length of the pd->authtok buffer."
+    },
+    {
+      "file": "corpus/train/train_0061_cwe287.c",
+      "lines": "39-48",
+      "code": "            case SSS_PAM_CHAUTHTOK:\n                password = talloc_size(state, pd->newauthtok_size + 1);\n                if (password != NULL) {\n                    memcpy(password, pd->newauthtok, pd->newauthtok_size);\n                    password[pd->newauthtok_size] = '\\0';\n                }\n                break;\n            default:\n                DEBUG(0, (\"unsupported PAM command [%d].\\n\", pd->cmd));",
+      "explanation": "For a completed password change (SSS_PAM_CHAUTHTOK) the NEW token is what must be cached, so it copies pd->newauthtok (length pd->newauthtok_size) with the same +1 allocation / memcpy / NUL-terminate pattern — and the same absence of size and type validation. The default arm logs an unsupported command and leaves password == NULL, which becomes the not-available signal below."
+    },
+    {
+      "file": "corpus/train/train_0061_cwe287.c",
+      "lines": "50-54",
+      "code": "        if (password == NULL) {\n            DEBUG(0, (\"password not available, offline auth may not work.\\n\"));\n            ret = EOK; /* password caching failures are not fatal errors */\n            goto done;\n        }",
+      "explanation": "If no password buffer was produced — either the allocation failed or the command was in the default arm — the function logs a warning, sets ret = EOK (deliberately not an error), and jumps to done. Crucially, a NON-NULL password of length zero (an empty token) does NOT trip this check: password != NULL as soon as talloc_size(state, 0 + 1) succeeds, so an empty credential proceeds to be cached."
+    },
+    {
+      "file": "corpus/train/train_0061_cwe287.c",
+      "lines": "56-64",
+      "code": "        talloc_set_destructor((TALLOC_CTX *)password, password_destructor);\n\n        ret = sysdb_cache_password(state, state->be_ctx->sysdb,\n                                   state->be_ctx->domain, pd->user,\n                                   password);\n        if (ret) {\n            DEBUG(2, (\"Failed to cache password, offline auth may not work.\"\n                      \" (%d)[%s]!?\\n\", ret, strerror(ret)));\n        }",
+      "explanation": "A talloc destructor (password_destructor) is attached so the plaintext buffer is scrubbed/zeroed when freed — evidence the authors are handling sensitive memory. Then sysdb_cache_password() persists the hashed password for user pd->user into the domain's sysdb so that a future OFFLINE PAM authentication can be verified against this stored value. A caching failure is only logged (DEBUG level 2), consistent with the not-fatal policy; ret is left set but is overwritten immediately below on the success path."
+    },
+    {
+      "file": "corpus/train/train_0061_cwe287.c",
+      "lines": "67-78",
+      "code": "    state->pam_status = PAM_SUCCESS;\n    state->dp_err = DP_ERR_OK;\n    ret = EOK;\n\ndone:\n    if (ret == EOK) {\n        tevent_req_done(req);\n    } else {\n        tevent_req_error(req, ret);\n    }\n\n}",
+      "explanation": "The online success tail unconditionally sets PAM_SUCCESS / DP_ERR_OK / ret = EOK (so even a sysdb_cache_password error above does not alter the PAM outcome), then falls through to done. The done label finishes the tevent request: tevent_req_done() on EOK, otherwise tevent_req_error() with ret, waking the parent request with the result."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0061_cwe287.c",
+      "lines": "29-60",
+      "code": "        switch(pd->cmd) {\n            case SSS_PAM_AUTHENTICATE:\n            case SSS_CMD_RENEW:\n            case SSS_PAM_CHAUTHTOK_PRELIM:\n                password = talloc_size(state, pd->authtok_size + 1);\n                if (password != NULL) {\n                    memcpy(password, pd->authtok, pd->authtok_size);\n                    password[pd->authtok_size] = '\\0';\n                }\n                break;",
+      "explanation": "IMPROPER AUTHENTICATION (the headline defect, CWE-287). The routine caches whatever bytes are in pd->authtok as 'the password' for offline verification, with no check that the token that just succeeded online was actually a reusable password. Two concrete abuses follow. (1) If the online authentication used a non-password factor — smartcard/PKINIT, or a two-factor/OTP flow where authtok holds a one-time value or a PIN — those bytes get stored as the long-term offline password, so the later OFFLINE path (which only knows how to check a password) accepts a credential that the online policy would have rejected: an authentication downgrade / 2FA bypass. (2) If pd->authtok_size is 0 (empty token, common for smartcard/GSSAPI or a deliberately empty submission), talloc_size(state, 1) succeeds, password != NULL, the empty-string sentinel at line 50 is NOT tripped, and an EMPTY password is cached — a subsequent offline login can then succeed with an empty password. The implementation must verify the authtok TYPE (password) and non-empty length, and must refuse to cache when the successful mechanism was not a password, before calling sysdb_cache_password()."
+    },
+    {
+      "file": "corpus/train/train_0061_cwe287.c",
+      "lines": "33-36",
+      "code": "                password = talloc_size(state, pd->authtok_size + 1);\n                if (password != NULL) {\n                    memcpy(password, pd->authtok, pd->authtok_size);\n                    password[pd->authtok_size] = '\\0';",
+      "explanation": "INTEGER OVERFLOW to HEAP OVERFLOW (CWE-190 -> CWE-787). pd->authtok_size is an unsigned size supplied across the PAM socket. The expression pd->authtok_size + 1 wraps to 0 when authtok_size is the maximum value of its type (e.g. SIZE_MAX or, if 32-bit, 0xFFFFFFFF). talloc_size(state, 0) then returns a minimal/zero-length allocation that passes the != NULL check, after which memcpy(password, pd->authtok, pd->authtok_size) attempts to copy an enormous number of bytes into it — a controlled heap buffer overflow — and password[pd->authtok_size] writes far out of bounds. The invariant: reject implausibly large authtok_size (bound it well below the type max) BEFORE performing the +1 and the allocation. In practice the PAM responder caps token length, so exploitability depends on that upstream cap being enforced for every code path that reaches here — which is exactly what to confirm."
+    },
+    {
+      "file": "corpus/train/train_0061_cwe287.c",
+      "lines": "35-36",
+      "code": "                    memcpy(password, pd->authtok, pd->authtok_size);\n                    password[pd->authtok_size] = '\\0';",
+      "explanation": "OUT-OF-BOUNDS READ on the source buffer (CWE-125). The destination is sized from pd->authtok_size, so the copy is self-consistent for the destination, but nothing here re-checks that pd->authtok actually points to at least pd->authtok_size valid bytes. If the length field and the token buffer can be desynchronised — a size larger than the real allocation of pd->authtok — memcpy over-reads adjacent heap memory and that (possibly sensitive) memory is then cached and persisted via sysdb_cache_password(). The invariant: pd->authtok_size must equal the true length of the pd->authtok allocation; this equality must be established where pd is unmarshalled, not assumed here."
+    },
+    {
+      "file": "corpus/train/train_0061_cwe287.c",
+      "lines": "11-23",
+      "code": "        if (dp_opt_get_bool(kr->krb5_ctx->opts,KRB5_STORE_PASSWORD_IF_OFFLINE)) {\n            krb5_pam_handler_cache_auth_step(req);\n            return;\n        }\n\n        DEBUG(4, (\"Backend is marked offline, retry later!\\n\"));\n        state->pam_status = PAM_AUTHINFO_UNAVAIL;\n        state->dp_err = DP_ERR_OFFLINE;\n        ret = EOK;\n        goto done;\n    }\n\n    if (state->be_ctx->domain->cache_credentials == TRUE) {",
+      "explanation": "NULL-POINTER DEREFERENCE (CWE-476, lower severity / latent). The code walks several pointer chains without guarding them: kr->krb5_ctx->opts (line 11) and state->be_ctx->domain->cache_credentials (line 23). If any intermediate (kr->krb5_ctx, state->be_ctx, ->domain) can be NULL on an error/edge path — for example a partially initialised request that still reaches this done callback — the process crashes at the log/option site, a denial of service on the authentication daemon. These are process-internal structures (not directly attacker-controlled), so the risk is a robustness/DoS one; the implementation must guarantee these are populated whenever krb5_save_ccname_done runs."
+    },
+    {
+      "file": "corpus/train/train_0061_cwe287.c",
+      "lines": "56-76",
+      "code": "        talloc_set_destructor((TALLOC_CTX *)password, password_destructor);\n\n        ret = sysdb_cache_password(state, state->be_ctx->sysdb,\n                                   state->be_ctx->domain, pd->user,\n                                   password);\n        if (ret) {\n            DEBUG(2, (\"Failed to cache password, offline auth may not work.\"\n                      \" (%d)[%s]!?\\n\", ret, strerror(ret)));\n        }",
+      "explanation": "SENSITIVE-DATA LIFETIME (CWE-316/CWE-212, informational). The plaintext password is allocated on the long-lived state (request) context; the destructor password_destructor is what scrubs it, but only for the paths where a buffer was created — and the buffer lingers in process memory until the request context is freed. The invariant to confirm: password_destructor actually zeroes the memory (not just frees it), the buffer is freed promptly after caching rather than living for the full request lifetime, and no copy of the token survives elsewhere. Also note pd->user is used as the cache key without any check that it matches the identity that was actually authenticated by the child — confirm upstream that pd->user is authoritative, or a caller could cache a password under an arbitrary username."
+    }
+  ],
+  "summary": "This SSSD krb5 callback persists the client-supplied PAM authentication token as the user's OFFLINE password without validating that the token was actually a (non-empty) password or that the online authentication used a password mechanism — an improper-authentication / authentication-downgrade defect (CWE-287): empty or non-password (smartcard/OTP/PIN) tokens can be cached and later replayed for offline password login. Secondary memory-safety contracts on the attacker-influenced length field pd->authtok_size (the pd->authtok_size + 1 allocation can integer-overflow to a heap overflow; the memcpy trusts the length against the source buffer) and unguarded pointer chains round out the risk. Confirm the token-type/non-empty gating and the upstream length cap in the implementation.",
+  "reviewed_anchors": [
+    {"anchor": "static void krb5_save_ccname_done(struct tevent_req *req) — signature (line 2)", "disposition": "dismissed", "reason": "tevent callback taking a trusted request pointer; the untrusted data enters via the recovered pd, not the parameter."},
+    {"anchor": "struct krb5_auth_state *state / struct krb5child_req *kr / struct pam_data *pd (lines 4-6)", "disposition": "finding", "reason": "pd carries the attacker-influenced authtok/authtok_size/cmd/user fields; anchor for the improper-auth and memory-safety findings."},
+    {"anchor": "kr->is_offline (line 10)", "disposition": "dismissed", "reason": "internal state flag selecting the offline delegation branch; no attacker-controlled length or buffer contract."},
+    {"anchor": "dp_opt_get_bool(kr->krb5_ctx->opts, KRB5_STORE_PASSWORD_IF_OFFLINE) (line 11)", "disposition": "finding", "reason": "chained deref kr->krb5_ctx->opts contributes to the NULL-dereference robustness finding."},
+    {"anchor": "state->be_ctx->domain->cache_credentials (line 23)", "disposition": "finding", "reason": "gate for caching AND an unguarded pointer chain; part of the NULL-deref finding."},
+    {"anchor": "switch(pd->cmd) with cases SSS_PAM_AUTHENTICATE / SSS_CMD_RENEW / SSS_PAM_CHAUTHTOK_PRELIM / SSS_PAM_CHAUTHTOK (lines 29-45)", "disposition": "finding", "reason": "selects which token is cached; no validation of token type — anchor for CWE-287 improper authentication."},
+    {"anchor": "password = talloc_size(state, pd->authtok_size + 1) (line 33)", "disposition": "finding", "reason": "attacker-influenced length + 1 can integer-overflow (CWE-190) yielding an undersized allocation."},
+    {"anchor": "memcpy(password, pd->authtok, pd->authtok_size) (line 35)", "disposition": "finding", "reason": "copies untrusted length from untrusted source buffer; overflow/over-read contract (CWE-787/CWE-125)."},
+    {"anchor": "password[pd->authtok_size] = '\\0' (line 36)", "disposition": "finding", "reason": "out-of-bounds write index if the +1 allocation overflowed; folded into the integer-overflow finding."},
+    {"anchor": "SSS_PAM_CHAUTHTOK: talloc_size(state, pd->newauthtok_size + 1) / memcpy(pd->newauthtok) (lines 40-43)", "disposition": "finding", "reason": "same length/overflow contract as the authtok path on the new-token fields; covered by the same memory-safety findings."},
+    {"anchor": "if (password == NULL) sentinel (line 50)", "disposition": "finding", "reason": "does not catch an empty (size 0) but non-NULL buffer, allowing an empty credential to be cached — part of CWE-287."},
+    {"anchor": "talloc_set_destructor((TALLOC_CTX *)password, password_destructor) (line 56)", "disposition": "finding", "reason": "sensitive-memory scrubbing / lifetime contract; informational finding."},
+    {"anchor": "sysdb_cache_password(state, sysdb, domain, pd->user, password) (lines 58-60)", "disposition": "finding", "reason": "persists the credential under pd->user; sink of the improper-auth and sensitive-data findings; user-key authority to confirm."},
+    {"anchor": "done: tevent_req_done/tevent_req_error(req, ret) (lines 71-76)", "disposition": "dismissed", "reason": "standard tevent completion dispatch; no untrusted-data contract."}
+  ],
+  "findings": [
+    {
+      "title": "Credential cached for offline auth without validating token type or non-emptiness (authentication downgrade / empty-password bypass)",
+      "anchor": "switch(pd->cmd) { ... password = talloc_size(...); memcpy(password, pd->authtok, pd->authtok_size); ... } sysdb_cache_password(..., password)",
+      "file": "corpus/train/train_0061_cwe287.c",
+      "line": "29-60",
+      "code": "        switch(pd->cmd) {\n            case SSS_PAM_AUTHENTICATE:\n            case SSS_CMD_RENEW:\n            case SSS_PAM_CHAUTHTOK_PRELIM:\n                password = talloc_size(state, pd->authtok_size + 1);\n                if (password != NULL) {\n                    memcpy(password, pd->authtok, pd->authtok_size);\n                    password[pd->authtok_size] = '\\0';\n                }\n                break;",
+      "bug_class": "Improper authentication (offline credential cached without verifying the online factor was a reusable password; empty token accepted)",
+      "cwe": "CWE-287",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0061_cwe287.c (and sysdb_cache_password / offline verification in implementation, files not provided)",
+      "invariant": "Cache a credential for offline verification ONLY when the successful online authentication used a password mechanism (pd->authtok is a real, non-empty password of type PASSWORD); refuse to cache for smartcard/PKINIT/OTP/2FA flows and for zero-length tokens so the offline password path cannot accept a credential the online policy rejects.",
+      "failure_mode": "A user who authenticates online with a non-password factor (smartcard/PKINIT) or a two-factor/OTP flow has whatever bytes are in pd->authtok (a PIN, an OTP, or nothing) stored as the long-term offline password; later the offline path — which only checks passwords — accepts it, downgrading/bypassing the stronger policy. Separately, an empty token (pd->authtok_size == 0) yields a non-NULL 1-byte buffer that slips past the password==NULL sentinel at line 50 and caches an EMPTY password, enabling offline login with no password.",
+      "cve_analog": "",
+      "what_to_confirm": "Check whether the code path gates caching on pd->authtok_type == SSS_AUTHTOK_TYPE_PASSWORD and pd->authtok_size > 0, and whether the offline authentication routine would accept the resulting cached value; confirm the fixed version added such a token-type/length guard."
+    },
+    {
+      "title": "Integer overflow in token buffer allocation leads to heap overflow",
+      "anchor": "password = talloc_size(state, pd->authtok_size + 1); memcpy(password, pd->authtok, pd->authtok_size); password[pd->authtok_size] = '\\0';",
+      "file": "corpus/train/train_0061_cwe287.c",
+      "line": "33-36",
+      "code": "                password = talloc_size(state, pd->authtok_size + 1);\n                if (password != NULL) {\n                    memcpy(password, pd->authtok, pd->authtok_size);\n                    password[pd->authtok_size] = '\\0';",
+      "bug_class": "Integer overflow of unsigned length driving an undersized allocation then heap buffer overflow",
+      "cwe": "CWE-190",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0061_cwe287.c (line-length cap in PAM responder, file not provided)",
+      "invariant": "pd->authtok_size must be validated to be within a sane maximum (well below the max of its unsigned type) BEFORE computing pd->authtok_size + 1, so the allocation size cannot wrap to a small value while the memcpy still copies the full length.",
+      "failure_mode": "If pd->authtok_size equals the maximum value of its unsigned type, pd->authtok_size + 1 wraps to 0; talloc_size(state, 0) returns a minimal allocation that passes the != NULL check, and memcpy then copies authtok_size bytes (and password[authtok_size] writes) far past the buffer — a controlled remote/local heap overflow. The same pattern applies to pd->newauthtok_size + 1 on lines 40-43.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the PAM responder enforces a maximum authtok_size on every path that reaches this callback, and that no path lets authtok_size approach the type maximum; a bound check here would make the guarantee local."
+    },
+    {
+      "title": "memcpy trusts client length against the source token buffer (out-of-bounds read)",
+      "anchor": "memcpy(password, pd->authtok, pd->authtok_size)",
+      "file": "corpus/train/train_0061_cwe287.c",
+      "line": "35-36",
+      "code": "                    memcpy(password, pd->authtok, pd->authtok_size);\n                    password[pd->authtok_size] = '\\0';",
+      "bug_class": "Out-of-bounds read from source buffer via unvalidated length (then persisted)",
+      "cwe": "CWE-125",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0061_cwe287.c (pd unmarshalling in PAM responder, file not provided)",
+      "invariant": "pd->authtok_size must exactly equal the number of valid bytes at pd->authtok (the two must be set together when pd is unmarshalled and never desynchronised).",
+      "failure_mode": "If the length field can be larger than the real pd->authtok allocation, memcpy over-reads adjacent heap memory; that potentially sensitive memory is copied into the password buffer and then stored via sysdb_cache_password(), an information-disclosure/corruption vector. Depends on whether the size and buffer can be desynchronised upstream.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify that pd->authtok_size is always derived from the actual received token length and cannot exceed the pd->authtok allocation on any deserialization path."
+    },
+    {
+      "title": "Unguarded pointer chains can NULL-dereference the auth daemon",
+      "anchor": "dp_opt_get_bool(kr->krb5_ctx->opts, ...) and state->be_ctx->domain->cache_credentials",
+      "file": "corpus/train/train_0061_cwe287.c",
+      "line": "11-23",
+      "code": "        if (dp_opt_get_bool(kr->krb5_ctx->opts,KRB5_STORE_PASSWORD_IF_OFFLINE)) {\n...\n    if (state->be_ctx->domain->cache_credentials == TRUE) {",
+      "bug_class": "NULL pointer dereference on multi-level pointer chains",
+      "cwe": "CWE-476",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0061_cwe287.c",
+      "invariant": "kr->krb5_ctx (and its opts), state->be_ctx, and state->be_ctx->domain must be guaranteed non-NULL whenever this done callback executes.",
+      "failure_mode": "On a partially initialised or error request that still reaches krb5_save_ccname_done, any NULL intermediate causes a crash at line 11 or line 23, a denial of service of the authentication provider. These are internal structures, so this is a robustness/DoS rather than a directly attacker-driven memory-safety issue.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm every code path that schedules this callback fully initialises kr->krb5_ctx, state->be_ctx and ->domain, or add NULL guards."
+    },
+    {
+      "title": "Plaintext password held on long-lived context; scrub/lifetime and user-key authority to confirm",
+      "anchor": "talloc_set_destructor((TALLOC_CTX *)password, password_destructor); sysdb_cache_password(..., pd->user, password)",
+      "file": "corpus/train/train_0061_cwe287.c",
+      "line": "56-60",
+      "code": "        talloc_set_destructor((TALLOC_CTX *)password, password_destructor);\n\n        ret = sysdb_cache_password(state, state->be_ctx->sysdb,\n                                   state->be_ctx->domain, pd->user,\n                                   password);",
+      "bug_class": "Sensitive data lifetime / cleartext credential handling; cache keyed on unverified username",
+      "cwe": "CWE-316",
+      "severity": "info",
+      "where_it_lives": "corpus/train/train_0061_cwe287.c (password_destructor and sysdb_cache_password in implementation, files not provided)",
+      "invariant": "password_destructor must zeroize the buffer (not merely free it), the plaintext should be freed promptly rather than living for the whole request context, and pd->user must be the identity actually authenticated by the child so a caller cannot cache a password under an arbitrary account.",
+      "failure_mode": "If password_destructor does not scrub memory, the cleartext password lingers in the process heap (memory disclosure / core-dump exposure). If pd->user is not authoritatively tied to the authenticated identity, a manipulated request could seed the offline cache for a different username.",
+      "cve_analog": "",
+      "what_to_confirm": "Inspect password_destructor for explicit_bzero/memset-then-free semantics, when the buffer is actually freed, and that pd->user matches the child-authenticated principal."
+    }
+  ],
+  "audit_checklist": [
+    "Does the caching path check pd->authtok_type == PASSWORD and pd->authtok_size > 0 before caching, and refuse to cache after smartcard/PKINIT/OTP/2FA authentication (CWE-287)?",
+    "Is pd->authtok_size (and pd->newauthtok_size) bounded to a sane maximum before the +1 allocation, so the size cannot integer-overflow to an undersized talloc buffer (CWE-190/787)?",
+    "Is pd->authtok_size guaranteed to equal the real length of pd->authtok on every deserialization path, preventing memcpy over-read (CWE-125)?",
+    "Can the empty-token case (size 0, non-NULL buffer) reach sysdb_cache_password, and would the offline verifier then accept an empty password?",
+    "Are kr->krb5_ctx/opts, state->be_ctx, and state->be_ctx->domain always non-NULL when this callback runs (CWE-476)?",
+    "Does password_destructor zeroize the plaintext, is the buffer freed promptly, and is pd->user the authoritative authenticated identity used as the cache key?"
+  ]
+}

@@ -1,0 +1,278 @@
+{
+  "subsystem": "ImageMagick raster image coder: the MATLAB (MAT) image reader ReadMATImage(). It parses a MATLAB v5 .mat container (and falls back to a v4 reader), walks a sequence of MATLAB matrix objects, decodes cell/element types into ImageMagick pixels, optionally zlib-decompresses object bodies, and returns an Image list. It is registered as a decoder, so it runs on any file a caller feeds to the MAT coder.",
+  "provenance": "Identified by ImageMagick-specific API names and idioms: ReadMATImage/ReadMATImageV4, Image/ImageInfo/ExceptionInfo/QuantumInfo/BlobInfo types, MagickCoreSignature asserts, ReadBlob/ReadBlobLSBLong/ReadBlobMSBShort/OpenBlob/TellBlob/SeekBlob/EOFBlob blob API, AcquireImage/AcquireQuantumMemory/ImportQuantumPixels/GetAuthenticPixels/SyncAuthenticPixels pixel cache API, ThrowReaderException/LogMagickEvent macros, and the MATHeader struct (MATLAB_HDR) with fields identific/Version/EndianIndicator/DataType/ObjectSize/StructureClass/StructureFlag/DimFlag/SizeX/SizeY. This is coders/mat.c from ImageMagick. The sample banner comment '/* sample: primevul_c_train_2215_vuln */' also marks it as a PrimeVul C training vuln sample.",
+  "trust_boundary": "The entire byte stream read through the blob API is attacker-controlled file content: an untrusted .mat file supplied to ImageMagick (e.g. an uploaded image on a server that uses ImageMagick/GraphicsMagick, or `convert`/`identify` on a hostile file). Every field read via ReadBlob*/ReadBlobXXXLong/ReadBlobXXXShort — Version, EndianIndicator, DataType, ObjectSize, StructureClass/StructureFlag, DimFlag, SizeX, SizeY, Frames, NameFlag, CellType, and the trailing pixel bytes — is hostile and may take any value in its width. The header 'MATLAB' magic (line 56/90) and the ObjectSize<=blobsize check (line 104) are the only real sanity gates before dimensions and element sizes drive memory allocation, seek arithmetic, and pixel imports.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/eval/eval_0016_cwe401.c",
+      "lines": "2-2",
+      "code": "static Image *ReadMATImage(const ImageInfo *image_info,ExceptionInfo *exception)",
+      "explanation": "Entry point of the MAT decoder. It takes the read-time settings (image_info, which carries the filename, the 'ping' flag, endian preference, etc.) and an exception sink, and returns a freshly built Image list (or NULL on failure). Because it is the coder's read hook, image_info->filename ultimately points at an attacker-supplied file whose bytes this function will parse."
+    },
+    {
+      "file": "corpus/eval/eval_0016_cwe401.c",
+      "lines": "4-24",
+      "code": "Image *image, *image2=NULL,\n *rotated_image;\nregister Quantum *q;\n\nunsigned int status;\nMATHeader MATLAB_HDR;\nsize_t size;\nsize_t CellType;\nQuantumInfo *quantum_info;\nImageInfo *clone_info;\nint i;\nssize_t ldblk;\nunsigned char *BImgBuff = NULL;\ndouble MinVal, MaxVal;\nunsigned z, z2;\nunsigned Frames;\nint logging;\nint sample_size;\nMagickOffsetType filepos=0x80;\nBlobInfo *blob;\nsize_t one;",
+      "explanation": "Local state for the parse. MATLAB_HDR is the on-stack copy of the parsed header/object metadata (a MATHeader struct). clone_info is a cloned ImageInfo used per matrix object and as the owner of any temp file produced by zlib decompression; quantum_info describes the pixel quantum layout; BImgBuff is the heap scanline buffer (initialized NULL). ldblk is the per-row byte length used both to size BImgBuff and to bound ReadBlob. filepos starts at 0x80 (128), the fixed MAT data offset after the header. Note clone_info and quantum_info are NOT initialized to NULL here (only image2 and BImgBuff are), which matters for the cleanup paths."
+    },
+    {
+      "file": "corpus/eval/eval_0016_cwe401.c",
+      "lines": "26-29",
+      "code": "unsigned int (*ReadBlobXXXLong)(Image *image);\nunsigned short (*ReadBlobXXXShort)(Image *image);\nvoid (*ReadBlobDoublesXXX)(Image * image, size_t len, double *data);\nvoid (*ReadBlobFloatsXXX)(Image * image, size_t len, float *data);",
+      "explanation": "Function pointers that will be bound to either the little-endian or big-endian blob readers after the file declares its byte order. ReadBlobXXXLong reads a 32-bit value, ReadBlobXXXShort a 16-bit value, and ReadBlobDoublesXXX/ReadBlobFloatsXXX read `len` bytes of floating-point samples into a caller buffer. All subsequent header fields are read through these indirect readers, so the endian indicator fully controls interpretation of every multi-byte field."
+    },
+    {
+      "file": "corpus/eval/eval_0016_cwe401.c",
+      "lines": "32-48",
+      "code": "assert(image_info != (const ImageInfo *) NULL);\nassert(image_info->signature == MagickCoreSignature);\nassert(exception != (ExceptionInfo *) NULL);\nassert(exception->signature == MagickCoreSignature);\nlogging = LogMagickEvent(CoderEvent,GetMagickModule(),\"enter\");\n\n/*\n   Open image file.\n */\nimage = AcquireImage(image_info,exception);\n\nstatus = OpenBlob(image_info, image, ReadBinaryBlobMode, exception);\nif (status == MagickFalse)\n  {\n    image=DestroyImageList(image);\n    return((Image *) NULL);\n  }",
+      "explanation": "Sanity asserts on the caller-owned structs, then acquires a blank Image and opens the file blob for binary reading. If the open fails, the just-acquired image is destroyed and NULL returned — this early path is clean because clone_info/quantum_info/BImgBuff have not been allocated yet. From here on `image` is live and blob reads begin."
+    },
+    {
+      "file": "corpus/eval/eval_0016_cwe401.c",
+      "lines": "54-63",
+      "code": "if (ReadBlob(image,124,(unsigned char *) &MATLAB_HDR.identific) != 124)\n  ThrowReaderException(CorruptImageError,\"ImproperImageHeader\");\nif (strncmp(MATLAB_HDR.identific,\"MATLAB\",6) != 0)\n  {\n    image2=ReadMATImageV4(image_info,image,exception);\n    if (image2  == NULL)\n      goto MATLAB_KO;\n    image=image2;\n    goto END_OF_READING;\n  }",
+      "explanation": "Reads the first 124 bytes of the MAT header into MATLAB_HDR.identific (the descriptive text field). If fewer than 124 bytes are available it throws CorruptImage. It then checks the first 6 bytes for the literal 'MATLAB'; if absent it assumes the older v4 format and defers to ReadMATImageV4, jumping to END_OF_READING on success or MATLAB_KO on failure. This is the primary format gate for the v5 path."
+    },
+    {
+      "file": "corpus/eval/eval_0016_cwe401.c",
+      "lines": "64-91",
+      "code": "MATLAB_HDR.Version = ReadBlobLSBShort(image);\nif(ReadBlob(image,2,(unsigned char *) &MATLAB_HDR.EndianIndicator) != 2)\n  ThrowReaderException(CorruptImageError,\"ImproperImageHeader\");\n\nif (logging)\n  (void) LogMagickEvent(CoderEvent,GetMagickModule(),\"  Endian %c%c\",\n    MATLAB_HDR.EndianIndicator[0],MATLAB_HDR.EndianIndicator[1]);\nif (!strncmp(MATLAB_HDR.EndianIndicator, \"IM\", 2))\n{\n  ReadBlobXXXLong = ReadBlobLSBLong;\n  ReadBlobXXXShort = ReadBlobLSBShort;\n  ReadBlobDoublesXXX = ReadBlobDoublesLSB;\n  ReadBlobFloatsXXX = ReadBlobFloatsLSB;\n  image->endian = LSBEndian;\n}\nelse if (!strncmp(MATLAB_HDR.EndianIndicator, \"MI\", 2))\n{\n  ReadBlobXXXLong = ReadBlobMSBLong;\n  ReadBlobXXXShort = ReadBlobMSBShort;\n  ReadBlobDoublesXXX = ReadBlobDoublesMSB;\n  ReadBlobFloatsXXX = ReadBlobFloatsMSB;\n  image->endian = MSBEndian;\n}\nelse\n  goto MATLAB_KO;    /* unsupported endian */\n\nif (strncmp(MATLAB_HDR.identific, \"MATLAB\", 6))\nMATLAB_KO: ThrowReaderException(CorruptImageError,\"ImproperImageHeader\");",
+      "explanation": "Reads the 2-byte version and the 2-byte endian indicator ('IM' = little-endian, 'MI' = big-endian) and binds all four indirect blob readers accordingly; any other indicator jumps to the MATLAB_KO error label. Line 90-91 re-checks the 'MATLAB' magic and, together with MATLAB_KO, defines the shared error exit that simply calls ThrowReaderException. Note MATLAB_KO is reached from many later points via `goto`, so the cleanup behavior of ThrowReaderException here governs the leak profile of the whole function."
+    },
+    {
+      "file": "corpus/eval/eval_0016_cwe401.c",
+      "lines": "93-106",
+      "code": "filepos = TellBlob(image);\nwhile(!EOFBlob(image)) /* object parser loop */\n{\n  Frames = 1;\n  (void) SeekBlob(image,filepos,SEEK_SET);\n  /* printf(\"pos=%X\\n\",TellBlob(image)); */\n\n  MATLAB_HDR.DataType = ReadBlobXXXLong(image);\n  if(EOFBlob(image)) break;\n  MATLAB_HDR.ObjectSize = ReadBlobXXXLong(image);\n  if(EOFBlob(image)) break;\n  if(MATLAB_HDR.ObjectSize+filepos > GetBlobSize(image))\n    goto MATLAB_KO;\n  filepos += MATLAB_HDR.ObjectSize + 4 + 4;",
+      "explanation": "The object parser loop. Each iteration seeks to filepos, reads a 32-bit DataType tag and a 32-bit ObjectSize (the byte length of this object body), then bounds-checks that the object ends within the file (ObjectSize+filepos <= blob size) before advancing filepos past this object (ObjectSize + 8 bytes of tag/size). DataType and ObjectSize are fully attacker-controlled 32-bit values; ObjectSize later serves as the ceiling for pixel-data size validation at line 258."
+    },
+    {
+      "file": "corpus/eval/eval_0016_cwe401.c",
+      "lines": "108-119",
+      "code": "clone_info=CloneImageInfo(image_info);\nimage2 = image;\n#if defined(MAGICKCORE_ZLIB_DELEGATE)\nif(MATLAB_HDR.DataType == miCOMPRESSED)\n{\n  image2 = decompress_block(image,&MATLAB_HDR.ObjectSize,clone_info,exception);\n  if(image2==NULL) continue;\n  MATLAB_HDR.DataType = ReadBlobXXXLong(image2); /* replace compressed object type. */\n}\n#endif\n\nif(MATLAB_HDR.DataType!=miMATRIX) continue;  /* skip another objects. */",
+      "explanation": "Allocates a per-object clone_info via CloneImageInfo (heap ImageInfo) and defaults image2 to the real image. If the object is zlib-compressed (miCOMPRESSED), decompress_block inflates the body into a temporary Image/backing file owned through clone_info and image2 now points at that temp image; the real DataType is re-read from the decompressed stream. If the object is not a matrix (miMATRIX) the loop `continue`s. Crucially, clone_info is re-assigned by CloneImageInfo on EVERY loop iteration and the `continue` paths here do not free it, so its lifetime management is fragile."
+    },
+    {
+      "file": "corpus/eval/eval_0016_cwe401.c",
+      "lines": "121-134",
+      "code": "MATLAB_HDR.unknown1 = ReadBlobXXXLong(image2);\nMATLAB_HDR.unknown2 = ReadBlobXXXLong(image2);\n\nMATLAB_HDR.unknown5 = ReadBlobXXXLong(image2);\nMATLAB_HDR.StructureClass = MATLAB_HDR.unknown5 & 0xFF;\nMATLAB_HDR.StructureFlag = (MATLAB_HDR.unknown5>>8) & 0xFF;\n\nMATLAB_HDR.unknown3 = ReadBlobXXXLong(image2);\nif(image!=image2)\n  MATLAB_HDR.unknown4 = ReadBlobXXXLong(image2);  /* ??? don't understand why ?? */\nMATLAB_HDR.unknown4 = ReadBlobXXXLong(image2);\nMATLAB_HDR.DimFlag = ReadBlobXXXLong(image2);\nMATLAB_HDR.SizeX = ReadBlobXXXLong(image2);\nMATLAB_HDR.SizeY = ReadBlobXXXLong(image2);",
+      "explanation": "Reads the array-flags block. unknown5 packs StructureClass (low byte: the MATLAB class such as mxUINT8_CLASS) and StructureFlag (next byte: bit flags including FLAG_COMPLEX and FLAG_LOGICAL). Then it reads the dimensions block: DimFlag (dimension count marker), SizeX and SizeY, the matrix column and row counts. SizeX and SizeY are attacker-controlled 32-bit values and become image->columns/rows and the multipliers for ldblk and the scanline loop bound. There is an extra ReadBlobXXXLong when image!=image2 (decompressed case)."
+    },
+    {
+      "file": "corpus/eval/eval_0016_cwe401.c",
+      "lines": "137-152",
+      "code": "switch(MATLAB_HDR.DimFlag)\n{\n  case  8: z2=z=1; break;      /* 2D matrix*/\n  case 12: z2=z = ReadBlobXXXLong(image2);  /* 3D matrix RGB*/\n       (void) ReadBlobXXXLong(image2);\n     if(z!=3) ThrowReaderException(CoderError, \"MultidimensionalMatricesAreNotSupported\");\n     break;\n  case 16: z2=z = ReadBlobXXXLong(image2);  /* 4D matrix animation */\n     if(z!=3 && z!=1)\n        ThrowReaderException(CoderError, \"MultidimensionalMatricesAreNotSupported\");\n     Frames = ReadBlobXXXLong(image2);\n     if (Frames == 0)\n       ThrowReaderException(CorruptImageError,\"ImproperImageHeader\");\n     break;\n  default: ThrowReaderException(CoderError, \"MultidimensionalMatricesAreNotSupported\");\n}",
+      "explanation": "Interprets the dimension flag: 8 = 2D (z=1 plane), 12 = 3D RGB (z read from file, must be 3), 16 = 4D animation (z in {1,3}, plus a Frames count that must be non-zero). z/z2 select the number of channel planes and drive the outer `do…while(z--)` scanline loop; Frames drives the NEXT_FRAME re-entry. The several ThrowReaderException calls here are error exits that occur AFTER clone_info was allocated at line 108 (and possibly after image2/decompress temp exists)."
+    },
+    {
+      "file": "corpus/eval/eval_0016_cwe401.c",
+      "lines": "154-170",
+      "code": "MATLAB_HDR.Flag1 = ReadBlobXXXShort(image2);\nMATLAB_HDR.NameFlag = ReadBlobXXXShort(image2);\n\nif (logging) (void)LogMagickEvent(CoderEvent,GetMagickModule(),\n      \"MATLAB_HDR.StructureClass %d\",MATLAB_HDR.StructureClass);\nif (MATLAB_HDR.StructureClass != mxCHAR_CLASS &&\n    MATLAB_HDR.StructureClass != mxSINGLE_CLASS &&    /* float + complex float */\n    MATLAB_HDR.StructureClass != mxDOUBLE_CLASS &&    /* double + complex double */\n    MATLAB_HDR.StructureClass != mxINT8_CLASS &&\n    MATLAB_HDR.StructureClass != mxUINT8_CLASS &&    /* uint8 + uint8 3D */\n    MATLAB_HDR.StructureClass != mxINT16_CLASS &&\n    MATLAB_HDR.StructureClass != mxUINT16_CLASS &&    /* uint16 + uint16 3D */\n    MATLAB_HDR.StructureClass != mxINT32_CLASS &&\n    MATLAB_HDR.StructureClass != mxUINT32_CLASS &&    /* uint32 + uint32 3D */\n    MATLAB_HDR.StructureClass != mxINT64_CLASS &&\n    MATLAB_HDR.StructureClass != mxUINT64_CLASS)    /* uint64 + uint64 3D */\n  ThrowReaderException(CoderError,\"UnsupportedCellTypeInTheMatrix\");",
+      "explanation": "Reads Flag1 and NameFlag (16-bit) and validates the StructureClass against a whitelist of MATLAB numeric/char classes; an unrecognized class throws. Again this ThrowReaderException fires with clone_info live (and possibly the decompress temp image2 live), so it is one of the many error exits whose cleanup completeness determines whether memory/temp files leak."
+    },
+    {
+      "file": "corpus/eval/eval_0016_cwe401.c",
+      "lines": "172-194",
+      "code": "switch (MATLAB_HDR.NameFlag)\n{\n  case 0:\n    size = ReadBlobXXXLong(image2);  /* Object name string size */\n    size = 4 * (ssize_t) ((size + 3 + 1) / 4);\n    (void) SeekBlob(image2, size, SEEK_CUR);\n    break;\n  case 1:\n  case 2:\n  case 3:\n  case 4:\n    (void) ReadBlob(image2, 4, (unsigned char *) &size); /* Object name string */\n    break;\n  default:\n    goto MATLAB_KO;\n}\n\nCellType = ReadBlobXXXLong(image2);    /* Additional object type */\nif (logging)\n  (void) LogMagickEvent(CoderEvent,GetMagickModule(),\n    \"MATLAB_HDR.CellType: %.20g\",(double) CellType);\n\n(void) ReadBlob(image2, 4, (unsigned char *) &size);     /* data size */",
+      "explanation": "Decodes the object-name field. NameFlag==0 reads a 32-bit name length, rounds it up to a 4-byte boundary, and seeks past the name; NameFlag 1..4 reads 4 raw bytes; anything else jumps to MATLAB_KO. Then it reads the element CellType tag and a 4-byte data-size word. CellType (attacker-controlled) selects the pixel element size in the next switch. Note the case 1..4 branch reads only 4 bytes into the size_t `size` (an 8-byte object), leaving the upper half indeterminate."
+    },
+    {
+      "file": "corpus/eval/eval_0016_cwe401.c",
+      "lines": "199-251",
+      "code": "switch (CellType)\n{\n  case miINT8:\n  case miUINT8:\n    sample_size = 8;\n    if(MATLAB_HDR.StructureFlag & FLAG_LOGICAL)\n      image->depth = 1;\n    else\n      image->depth = 8;         /* Byte type cell */\n    ldblk = (ssize_t) MATLAB_HDR.SizeX;\n    break;\n  case miINT16:\n  case miUINT16:\n    sample_size = 16;\n    image->depth = 16;        /* Word type cell */\n    ldblk = (ssize_t) (2 * MATLAB_HDR.SizeX);\n    break;\n  case miINT32:\n  case miUINT32:\n    sample_size = 32;\n    image->depth = 32;        /* Dword type cell */\n    ldblk = (ssize_t) (4 * MATLAB_HDR.SizeX);\n    break;\n  case miINT64:\n  case miUINT64:\n    sample_size = 64;\n    image->depth = 64;        /* Qword type cell */\n    ldblk = (ssize_t) (8 * MATLAB_HDR.SizeX);\n    break;\n  case miSINGLE:\n    sample_size = 32;\n    image->depth = 32;        /* double type cell */\n    (void) SetImageOption(clone_info,\"quantum:format\",\"floating-point\");\n    if (MATLAB_HDR.StructureFlag & FLAG_COMPLEX)\n{              /* complex float type cell */\n}\n    ldblk = (ssize_t) (4 * MATLAB_HDR.SizeX);\n    break;\n  case miDOUBLE:\n    sample_size = 64;\n    image->depth = 64;        /* double type cell */\n    (void) SetImageOption(clone_info,\"quantum:format\",\"floating-point\");\nDisableMSCWarning(4127)\n    if (sizeof(double) != 8)\nRestoreMSCWarning\n      ThrowReaderException(CoderError, \"IncompatibleSizeOfDouble\");\n    if (MATLAB_HDR.StructureFlag & FLAG_COMPLEX)\n{                         /* complex double type cell */\n}\n    ldblk = (ssize_t) (8 * MATLAB_HDR.SizeX);\n    break;\n  default:\n    ThrowReaderException(CoderError, \"UnsupportedCellTypeInTheMatrix\");\n}",
+      "explanation": "Maps the CellType to image->depth and, critically, to ldblk — the per-row byte count = (element bytes) * SizeX. For 8-bit types ldblk = SizeX; 16-bit = 2*SizeX; 32-bit = 4*SizeX; 64-bit/double = 8*SizeX. The multiplication (e.g. `2 * MATLAB_HDR.SizeX`) is performed in the width of MATLAB_HDR.SizeX BEFORE the widening cast to ssize_t, so for large SizeX it can wrap. ldblk then sizes the heap scanline buffer and bounds the per-row ReadBlob. The default case throws (another clone_info-live error exit)."
+    },
+    {
+      "file": "corpus/eval/eval_0016_cwe401.c",
+      "lines": "252-259",
+      "code": "image->columns = MATLAB_HDR.SizeX;\nimage->rows = MATLAB_HDR.SizeY;\none=1;\nimage->colors = one << image->depth;\nif (image->columns == 0 || image->rows == 0)\n  goto MATLAB_KO;\nif((unsigned long)ldblk*MATLAB_HDR.SizeY > MATLAB_HDR.ObjectSize)\n  goto MATLAB_KO;",
+      "explanation": "Commits the geometry: columns=SizeX, rows=SizeY, and colors = 1<<depth. Depth can be up to 64 (miUINT64), so `one << image->depth` is a shift by >= the width of size_t and is undefined behavior / meaningless. It rejects zero dimensions, then performs the ONLY size guard on the pixel data: ldblk*SizeY must not exceed ObjectSize (which itself was bounded by the blob size at line 104). Because ldblk was already computed from a possibly-wrapped multiplication, this guard validates the wrapped value, not the true byte count."
+    },
+    {
+      "file": "corpus/eval/eval_0016_cwe401.c",
+      "lines": "273-291",
+      "code": "if (image_info->ping)\n{\n  size_t temp = image->columns;\n  image->columns = image->rows;\n  image->rows = temp;\n  goto done_reading; /* !!!!!! BAD  !!!! */\n}\nstatus=SetImageExtent(image,image->columns,image->rows,exception);\nif (status == MagickFalse)\n  return(DestroyImageList(image));\nquantum_info=AcquireQuantumInfo(clone_info,image);\nif (quantum_info == (QuantumInfo *) NULL)\n  ThrowReaderException(ResourceLimitError,\"MemoryAllocationFailed\");\n\n/* ----- Load raster data ----- */\nBImgBuff = (unsigned char *) AcquireQuantumMemory((size_t) (ldblk),sizeof(double));    /* Ldblk was set in the check phase */\nif (BImgBuff == NULL)\n  ThrowReaderException(ResourceLimitError,\"MemoryAllocationFailed\");\n(void) ResetMagickMemory(BImgBuff,0,ldblk*sizeof(double));",
+      "explanation": "For a 'ping' (metadata-only) request it swaps rows/columns and jumps straight to done_reading. Otherwise it allocates the pixel cache via SetImageExtent; on failure it does a bare `return(DestroyImageList(image))` (line 282). It then acquires quantum_info and allocates the scanline buffer BImgBuff of ldblk*sizeof(double) bytes (8x over-allocation vs the ldblk bytes actually read per row). Both the SetImageExtent return and the two ThrowReaderException calls here exit while clone_info (and, for the BImgBuff throw, quantum_info) are live but are NOT released by those exits."
+    },
+    {
+      "file": "corpus/eval/eval_0016_cwe401.c",
+      "lines": "293-349",
+      "code": "MinVal = 0;\nMaxVal = 0;\nif (CellType==miDOUBLE || CellType==miSINGLE)        /* Find Min and Max Values for floats */\n{\n  CalcMinMax(image2, image_info->endian,  MATLAB_HDR.SizeX, MATLAB_HDR.SizeY, CellType, ldblk, BImgBuff, &quantum_info->minimum, &quantum_info->maximum);\n}\n\n/* Main loop for reading all scanlines */\nif(z==1) z=0; /* read grey scanlines */\n/* else read color scanlines */\ndo\n{\n  for (i = 0; i < (ssize_t) MATLAB_HDR.SizeY; i++)\n  {\n    q=GetAuthenticPixels(image,0,MATLAB_HDR.SizeY-i-1,image->columns,1,exception);\n    if (q == (Quantum *) NULL)\n{\n  if (logging) (void)LogMagickEvent(CoderEvent,GetMagickModule(),\n            \"  MAT set image pixels returns unexpected NULL on a row %u.\", (unsigned)(MATLAB_HDR.SizeY-i-1));\n  goto done_reading;    /* Skip image rotation, when cannot set image pixels    */\n}\n    if(ReadBlob(image2,ldblk,(unsigned char *)BImgBuff) != (ssize_t) ldblk)\n{\n  if (logging) (void)LogMagickEvent(CoderEvent,GetMagickModule(),\n           \"  MAT cannot read scanrow %u from a file.\", (unsigned)(MATLAB_HDR.SizeY-i-1));\n  goto ExitLoop;\n}\n    if((CellType==miINT8 || CellType==miUINT8) && (MATLAB_HDR.StructureFlag & FLAG_LOGICAL))\n    {\n      FixLogical((unsigned char *)BImgBuff,ldblk);\n      if(ImportQuantumPixels(image,(CacheView *) NULL,quantum_info,z2qtype[z],BImgBuff,exception) <= 0)\n{\nImportQuantumPixelsFailed:\n  if (logging) (void)LogMagickEvent(CoderEvent,GetMagickModule(),\n          \"  MAT failed to ImportQuantumPixels for a row %u\", (unsigned)(MATLAB_HDR.SizeY-i-1));\n  break;\n}\n    }\n    else\n    {\n      if(ImportQuantumPixels(image,(CacheView *) NULL,quantum_info,z2qtype[z],BImgBuff,exception) <= 0)\n  goto ImportQuantumPixelsFailed;\n\n\n      if (z<=1 &&       /* fix only during a last pass z==0 || z==1 */\n      (CellType==miINT8 || CellType==miINT16 || CellType==miINT32 || CellType==miINT64))\n  FixSignedValues(image,q,MATLAB_HDR.SizeX);\n    }\n\n    if (!SyncAuthenticPixels(image,exception))\n{\n  if (logging) (void)LogMagickEvent(CoderEvent,GetMagickModule(),\n        \"  MAT failed to sync image pixels for a row %u\", (unsigned)(MATLAB_HDR.SizeY-i-1));\n  goto ExitLoop;\n}\n  }\n} while(z-- >= 2);",
+      "explanation": "The raster read. For float/double types it first calls CalcMinMax (which itself reads through the blob). Then for each channel plane (do…while over z) and each of SizeY rows it acquires the destination pixel row, reads ldblk bytes from the blob into BImgBuff, optionally fixes logical/signed encodings, and imports the row into the pixel cache via ImportQuantumPixels using the quantum type z2qtype[z]. ImportQuantumPixels consumes image->columns (=SizeX) pixels of the given depth from BImgBuff; the safety of this read depends entirely on ldblk (buffer size) being consistent with SizeX*depth. The error jumps here (done_reading/ExitLoop/break) exit the read but continue into the shared cleanup rather than leaking."
+    },
+    {
+      "file": "corpus/eval/eval_0016_cwe401.c",
+      "lines": "353-405",
+      "code": "if (MATLAB_HDR.StructureFlag & FLAG_COMPLEX)\n{        /* Find Min and Max Values for complex parts of floats */\n  CellType = ReadBlobXXXLong(image2);    /* Additional object type */\n  i = ReadBlobXXXLong(image2);           /* size of a complex part - toss away*/\n\n  if (CellType==miDOUBLE || CellType==miSINGLE)\n  {\n    CalcMinMax(image2,  image_info->endian, MATLAB_HDR.SizeX, MATLAB_HDR.SizeY, CellType, ldblk, BImgBuff, &MinVal, &MaxVal);\n  }\n\n  if (CellType==miDOUBLE)\n    for (i = 0; i < (ssize_t) MATLAB_HDR.SizeY; i++)\n{\n      ReadBlobDoublesXXX(image2, ldblk, (double *)BImgBuff);\n      InsertComplexDoubleRow(image, (double *)BImgBuff, i, MinVal, MaxVal,\n        exception);\n}\n\n  if (CellType==miSINGLE)\n    for (i = 0; i < (ssize_t) MATLAB_HDR.SizeY; i++)\n{\n      ReadBlobFloatsXXX(image2, ldblk, (float *)BImgBuff);\n      InsertComplexFloatRow(image,(float *)BImgBuff,i,MinVal,MaxVal,\n        exception);\n}\n}\n\n  /* Image is gray when no complex flag is set and 2D Matrix AGAIN!!! */\nif ((MATLAB_HDR.DimFlag == 8) &&\n    ((MATLAB_HDR.StructureFlag & FLAG_COMPLEX) == 0))\n  image->type=GrayscaleType;\nif (image->depth == 1)\n  image->type=BilevelType;\n\nif(image2==image)\n    image2 = NULL;    /* Remove shadow copy to an image before rotation. */\n\n  /*  Rotate image. */\nrotated_image = RotateImage(image, 90.0, exception);",
+      "explanation": "If the matrix is complex, a second CellType/size tag is read and the imaginary planes are read row-by-row via ReadBlobDoublesXXX/ReadBlobFloatsXXX into BImgBuff and merged. The same ldblk sizing assumptions apply. Then it finalizes the image type (grayscale/bilevel), clears the image2 shadow pointer if it aliases image, and rotates the decoded matrix 90 degrees (MAT stores column-major, so the reader rotates to display orientation)."
+    },
+    {
+      "file": "corpus/eval/eval_0016_cwe401.c",
+      "lines": "407-455",
+      "code": "done_reading:\n\n  if(image2!=NULL)\n    if(image2!=image)\n    {\n      DeleteImageFromList(&image2);\nif(clone_info)\n{\n        if(clone_info->file)\n  {\n          fclose(clone_info->file);\n          clone_info->file = NULL;\n          (void) remove_utf8(clone_info->filename);\n  }\n      }\n    }\n\n    /* Allocate next image structure. */\n  AcquireNextImage(image_info,image,exception);\n  if (image->next == (Image *) NULL) break;\n  image=SyncNextImageInList(image);\n  image->columns=image->rows=0;\n  image->colors=0;\n\n    /* row scan buffer is no longer needed */\n  RelinquishMagickMemory(BImgBuff);\n  BImgBuff = NULL;\n\n  if(--Frames>0)\n  {\n    z = z2;\n    if(image2==NULL) image2 = image;\n    goto NEXT_FRAME;\n  }\n  if ((image2!=NULL) && (image2!=image))   /* Does shadow temporary decompressed image exist? */\n    {\n/*  CloseBlob(image2); */\n      DeleteImageFromList(&image2);\n      if(clone_info)\n      {\n        if(clone_info->file)\n        {\n          fclose(clone_info->file);\n          clone_info->file = NULL;\n          (void) remove_utf8(clone_info->filename);\n        }\n      }\n      }\n}",
+      "explanation": "The per-object cleanup/tail. done_reading disposes the decompress shadow image2 and its temp file (via clone_info->file/remove_utf8), appends a fresh Image for the next object, frees BImgBuff, and either loops back to NEXT_FRAME for multi-frame animations (decrementing Frames) or disposes the shadow image again before the outer while loops for the next object. Note BImgBuff is freed only on this normal tail; the abnormal ThrowReaderException exits earlier never reach here. clone_info is NOT destroyed here — only its temp file is closed — so a new CloneImageInfo next iteration overwrites the pointer."
+    },
+    {
+      "file": "corpus/eval/eval_0016_cwe401.c",
+      "lines": "457-508",
+      "code": "RelinquishMagickMemory(BImgBuff);\nif (quantum_info != (QuantumInfo *) NULL)\n  quantum_info=DestroyQuantumInfo(quantum_info);\nEND_OF_READING:\nif (clone_info)\n  clone_info=DestroyImageInfo(clone_info);\nCloseBlob(image);\n\n\n{\n  Image *p;\n  ssize_t scene=0;\n\n  /*\n    Rewind list, removing any empty images while rewinding.\n  */\n  p=image;\n  image=NULL;\n  while (p != (Image *) NULL)\n    {\n      Image *tmp=p;\n      if ((p->rows == 0) || (p->columns == 0)) {\n        p=p->previous;\n        DeleteImageFromList(&tmp);\n      } else {\n        image=p;\n        p=p->previous;\n      }\n    }\n\n  /*\n    Fix scene numbers\n  */\n  for (p=image; p != (Image *) NULL; p=p->next)\n    p->scene=scene++;\n}\n\nif(clone_info != NULL)  /* cleanup garbage file from compression */\n{\n  if(clone_info->file)\n  {\n    fclose(clone_info->file);\n    clone_info->file = NULL;\n    (void) remove_utf8(clone_info->filename);\n  }\n  DestroyImageInfo(clone_info);\n  clone_info = NULL;\n}\nif (logging) (void)LogMagickEvent(CoderEvent,GetMagickModule(),\"return\");\nif(image==NULL)\n  ThrowReaderException(CorruptImageError,\"ImproperImageHeader\");\nreturn (image);",
+      "explanation": "The function tail after the object loop: frees the final BImgBuff, destroys quantum_info, destroys clone_info (at line 461-462), closes the blob, rewinds/prunes empty images, renumbers scenes, and then AGAIN attempts to destroy clone_info at line 494-503. Since clone_info was already set to a destroyed pointer via `clone_info=DestroyImageInfo(clone_info)` (which returns NULL) at 462, the second block is guarded by `clone_info != NULL` and normally does nothing — but this double cleanup structure is exactly what makes the many early ThrowReaderException exits (which bypass all of this) leak. Finally it returns the image list, or throws if empty."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/eval/eval_0016_cwe401.c",
+      "lines": "280-282",
+      "code": "status=SetImageExtent(image,image->columns,image->rows,exception);\nif (status == MagickFalse)\n  return(DestroyImageList(image));",
+      "explanation": "This is the cleanest memory leak (CWE-401). SetImageExtent readily fails on an attacker-chosen huge columns/rows (SizeX/SizeY), which is the common case for a malformed/oversized .mat. The failure path does a bare `return(DestroyImageList(image))` that frees only `image`. clone_info — heap-allocated at line 108 via CloneImageInfo on this iteration — is never destroyed, so it leaks on every failing file. It also skips CloseBlob. The invariant the implementation must uphold: every exit reachable after clone_info is allocated must run DestroyImageInfo(clone_info) (and free BImgBuff/quantum_info if allocated) before returning. Because SizeX/SizeY are attacker-controlled and this is reached per object, an attacker can force repeated leaks -> resource exhaustion / DoS on a long-lived server."
+    },
+    {
+      "file": "corpus/eval/eval_0016_cwe401.c",
+      "lines": "285-290",
+      "code": "if (quantum_info == (QuantumInfo *) NULL)\n  ThrowReaderException(ResourceLimitError,\"MemoryAllocationFailed\");\n\n/* ----- Load raster data ----- */\nBImgBuff = (unsigned char *) AcquireQuantumMemory((size_t) (ldblk),sizeof(double));    /* Ldblk was set in the check phase */\nif (BImgBuff == NULL)\n  ThrowReaderException(ResourceLimitError,\"MemoryAllocationFailed\");",
+      "explanation": "ThrowReaderException expands to a block that closes the blob and `return(DestroyImageList(image))` — it frees ONLY image. At line 285 (quantum_info==NULL) clone_info leaks. At line 290 (BImgBuff==NULL, e.g. an attacker sets a huge ldblk so AcquireQuantumMemory fails) BOTH clone_info AND the just-acquired quantum_info leak (quantum_info is never destroyed by the macro). The same defect applies to every ThrowReaderException reached after line 108: the StructureClass check (line 170), the CellType default (line 249), the DimFlag switch throws (lines 142/146/149/151), and every `goto MATLAB_KO` (line 91) taken after clone_info exists (lines 105, 186, 257, 259). Each leaks the live clone_info (and quantum_info/BImgBuff where already allocated). Invariant: the error macro used inside this loop must release the per-object heap objects, or the loop must use a single goto-based cleanup epilogue."
+    },
+    {
+      "file": "corpus/eval/eval_0016_cwe401.c",
+      "lines": "108-119",
+      "code": "clone_info=CloneImageInfo(image_info);\nimage2 = image;\n#if defined(MAGICKCORE_ZLIB_DELEGATE)\nif(MATLAB_HDR.DataType == miCOMPRESSED)\n{\n  image2 = decompress_block(image,&MATLAB_HDR.ObjectSize,clone_info,exception);\n  if(image2==NULL) continue;\n  MATLAB_HDR.DataType = ReadBlobXXXLong(image2); /* replace compressed object type. */\n}\n#endif\n\nif(MATLAB_HDR.DataType!=miMATRIX) continue;  /* skip another objects. */",
+      "explanation": "clone_info is re-assigned by CloneImageInfo on EVERY loop iteration, but the loop body never destroys the previous clone_info before overwriting it. The two `continue` statements here (image2==NULL at line 114, DataType!=miMATRIX at line 119) go back to the top of the while loop, which immediately re-runs line 108 and overwrites clone_info — leaking the prior allocation (CWE-401). A crafted file with many non-matrix objects (each hitting `continue` at 119) leaks one ImageInfo per object. When decompress_block succeeds it also creates a temp-file-backed image2/clone_info->file; the `if(MATLAB_HDR.DataType!=miMATRIX) continue;` at 119 then abandons that temp image2 and its backing file without the DeleteImageFromList/fclose/remove_utf8 cleanup used elsewhere, leaking both memory and a temp file. Invariant: clone_info and any decompress temp must be released before re-cloning or continuing."
+    },
+    {
+      "file": "corpus/eval/eval_0016_cwe401.c",
+      "lines": "206-224",
+      "code": "ldblk = (ssize_t) MATLAB_HDR.SizeX;\n...\n    ldblk = (ssize_t) (2 * MATLAB_HDR.SizeX);\n...\n    ldblk = (ssize_t) (4 * MATLAB_HDR.SizeX);\n...\n    ldblk = (ssize_t) (8 * MATLAB_HDR.SizeX);",
+      "explanation": "ldblk = elementbytes * SizeX is computed in the (32-bit) width of MATLAB_HDR.SizeX BEFORE the cast to ssize_t (CWE-190). With SizeX = 0x80000000 and a 16-bit cell, `2 * SizeX` wraps to 0; with a 64-bit cell, `8 * SizeX` wraps as well. A wrapped-small ldblk sizes BImgBuff = AcquireQuantumMemory(ldblk, sizeof(double)) tiny (line 288) and passes the guard at line 258 (ldblk*SizeY <= ObjectSize), yet image->columns = SizeX (line 252) stays huge. ImportQuantumPixels (lines 323/333) and CalcMinMax (line 297) then read image->columns (=SizeX) pixels' worth of bytes from the tiny BImgBuff -> heap out-of-bounds read (CWE-125), and the pixel-cache import can propagate corrupted/over-read data. Invariant: the element-size*SizeX product must be computed in a 64-bit type and validated against both the buffer size and image->columns*bytes-per-pixel before allocation and import."
+    },
+    {
+      "file": "corpus/eval/eval_0016_cwe401.c",
+      "lines": "255-255",
+      "code": "image->colors = one << image->depth;",
+      "explanation": "image->depth is set from the attacker-chosen CellType and can be 64 (miUINT64/miINT64/miDOUBLE). `one` is a size_t (=1); shifting a 64-bit size_t left by 64 is undefined behavior (CWE-190/CWE-682) and on typical targets yields 1 or 0 rather than the intended value. Even for depth 32, `1 << 32` overflows and image->colors becomes 0/1 or a nonsensical value that downstream colormap logic may use to size allocations. Invariant: colors must be computed as `(size_t)1 << MagickMin(depth, bits-1)` or clamped, and depth must be validated to a supported range before use as a shift count."
+    },
+    {
+      "file": "corpus/eval/eval_0016_cwe401.c",
+      "lines": "104-106",
+      "code": "if(MATLAB_HDR.ObjectSize+filepos > GetBlobSize(image))\n  goto MATLAB_KO;\nfilepos += MATLAB_HDR.ObjectSize + 4 + 4;",
+      "explanation": "The object-bounds check adds attacker-controlled ObjectSize to filepos. ObjectSize is a 32-bit field but filepos is a 64-bit MagickOffsetType, so the sum is computed in 64-bit and cannot easily wrap here — however, the check only bounds ObjectSize against the on-disk blob size, it does NOT bound it against the amount of data the pixel loop will actually consume, and ObjectSize is later the sole ceiling for the ldblk*SizeY guard (line 258). If GetBlobSize is imprecise (e.g. a streamed/piped blob) the check can be bypassed. Line 106 then advances filepos by ObjectSize+8; a zero ObjectSize with a non-EOF blob makes the outer while loop re-read the same 8 bytes and can spin. Invariant: ObjectSize must be a positive, minimum-sized value and the advance must guarantee forward progress to avoid an infinite parse loop (DoS)."
+    },
+    {
+      "file": "corpus/eval/eval_0016_cwe401.c",
+      "lines": "179-184",
+      "code": "case 1:\n  case 2:\n  case 3:\n  case 4:\n    (void) ReadBlob(image2, 4, (unsigned char *) &size); /* Object name string */\n    break;",
+      "explanation": "This reads only 4 bytes into `size`, which is a size_t (8 bytes on LP64). The upper 4 bytes of `size` are left with whatever the previous use put there (here it is overwritten again at line 194, so the value is not consumed for allocation, limiting impact) — but the pattern of reading a 4-byte wire field straight into a wider host variable is a latent uninitialized/partial-write hazard (CWE-457/CWE-704) if a future edit uses `size` before the line-194 reload. Additionally the return value of ReadBlob is discarded, so a truncated file is not detected here. Invariant: read fixed-width fields into fixed-width types (uint32_t) and check the byte count returned."
+    }
+  ],
+  "summary": "This is ImageMagick's MAT (MATLAB v5) image decoder ReadMATImage(), parsing a fully untrusted file. Its dominant, certain defect is a set of memory leaks (CWE-401): clone_info (and, later, quantum_info/BImgBuff) allocated inside the per-object loop are not released on the numerous ThrowReaderException / `return(DestroyImageList(image))` / `goto MATLAB_KO` / `continue` error exits, and clone_info is re-cloned every iteration without freeing the previous one — attacker-controlled dimensions (SizeX/SizeY) and element sizes make these paths trivially reachable, yielding memory/temp-file exhaustion DoS. A second, higher-impact latent bug is an integer overflow in ldblk = elementbytes*SizeX (CWE-190) that can under-size the scanline buffer while image->columns stays huge, producing heap out-of-bounds reads during ImportQuantumPixels/CalcMinMax; minor issues include the 1<<depth shift UB and a potential zero-ObjectSize parse loop.",
+  "reviewed_anchors": [
+    {"anchor": "ReadMATImage() signature (line 2)", "disposition": "dismissed", "reason": "Standard coder read hook; contract carried by the untrusted blob it parses, covered by the field anchors below."},
+    {"anchor": "clone_info local + CloneImageInfo (lines 13, 108)", "disposition": "finding", "reason": "Per-object heap ImageInfo re-cloned each loop and not freed on error/continue/re-clone paths -> CWE-401 leak."},
+    {"anchor": "quantum_info local + AcquireQuantumInfo (lines 12, 283)", "disposition": "finding", "reason": "Allocated then not released on the BImgBuff-NULL throw path (line 290) -> CWE-401 leak."},
+    {"anchor": "BImgBuff scanline buffer + AcquireQuantumMemory (lines 16, 288)", "disposition": "finding", "reason": "Sized from ldblk which can integer-overflow; also part of the leak set and the OOB-read primitive."},
+    {"anchor": "ldblk computation (lines 206, 212, 218, 224, 233, 246)", "disposition": "finding", "reason": "elementbytes*SizeX computed in 32-bit before widening -> CWE-190 undersized alloc / OOB read."},
+    {"anchor": "image->colors = one << image->depth (line 255)", "disposition": "finding", "reason": "depth up to 64 makes the shift undefined behavior -> CWE-190/682."},
+    {"anchor": "ObjectSize bounds check and filepos advance (lines 104-106)", "disposition": "finding", "reason": "Only bounds ObjectSize to blob size; zero/small ObjectSize risks non-progress loop; sole ceiling for pixel-size guard."},
+    {"anchor": "NameFlag switch 4-byte ReadBlob into size_t (lines 172-184)", "disposition": "finding", "reason": "Partial write of a wider host variable and unchecked ReadBlob return -> latent CWE-457/704."},
+    {"anchor": "MATLAB_HDR.identific + strncmp \"MATLAB\" (lines 54, 56, 90)", "disposition": "dismissed", "reason": "Bounded 6/124-byte compare into a fixed field read with an exact-length ReadBlob check; acts as the format gate, no overflow."},
+    {"anchor": "MATLAB_HDR.EndianIndicator[2] (lines 65, 71, 79)", "disposition": "dismissed", "reason": "Read with an exact 2-byte count and compared with strncmp(...,2); selects reader function pointers, no overflow or unhandled value (else -> MATLAB_KO)."},
+    {"anchor": "MATLAB_HDR.Version (line 64)", "disposition": "dismissed", "reason": "16-bit value read but not used for sizing/branching; no security contract."},
+    {"anchor": "MATLAB_HDR.DataType (lines 100, 111, 115, 119)", "disposition": "dismissed", "reason": "Tag compared against miCOMPRESSED/miMATRIX; non-matching values cause continue; no memory contract itself (but its continue path feeds the clone_info leak finding)."},
+    {"anchor": "MATLAB_HDR.ObjectSize (lines 102, 104, 106, 113, 258)", "disposition": "finding", "reason": "Attacker-controlled size used as the sole ceiling for the ldblk*SizeY pixel guard and for loop advance; covered by the bounds/advance finding."},
+    {"anchor": "StructureClass / StructureFlag (lines 125-126, 159-170, 202, 230, 243, 354)", "disposition": "dismissed", "reason": "Whitelisted (line 170) and used as bit flags; the class check itself is safe, though its throw path participates in the leak finding."},
+    {"anchor": "MATLAB_HDR.DimFlag (lines 132, 137, 261, 382)", "disposition": "dismissed", "reason": "Switched with a default that throws; z/z2/Frames derived here are covered by the ldblk/leak findings; DimFlag alone carries no separate overflow."},
+    {"anchor": "MATLAB_HDR.SizeX (columns) (lines 133, 206-246, 252)", "disposition": "finding", "reason": "Attacker-controlled column count drives ldblk multiplication and image->columns; central to the integer-overflow/OOB finding."},
+    {"anchor": "MATLAB_HDR.SizeY (rows) (lines 134, 253, 258, 305)", "disposition": "dismissed", "reason": "Row count/loop bound; validated only against ObjectSize via ldblk*SizeY; its risk is folded into the ldblk overflow finding, not a distinct bug."},
+    {"anchor": "Frames (lines 19, 96, 147-149, 435-439)", "disposition": "dismissed", "reason": "Non-zero-checked (line 148) frame counter driving NEXT_FRAME re-entry; no direct memory contract beyond re-running the guarded loop."},
+    {"anchor": "CellType / sample_size (lines 11, 189, 197-251)", "disposition": "dismissed", "reason": "Selects element size with a throwing default; the resulting depth/ldblk risks are captured by the shift and ldblk findings."},
+    {"anchor": "z2qtype[z] indexing (lines 323, 333)", "disposition": "dismissed", "reason": "z constrained to {0,1,3} by the DimFlag switch and decremented in the do/while; no evidence of an out-of-range index into z2qtype in the shown code."},
+    {"anchor": "ThrowReaderException / MATLAB_KO error macro exits (lines 55, 66, 88, 91, 142-151, 170, 186, 242, 249, 257, 259, 282, 285, 290)", "disposition": "finding", "reason": "The macro/return frees only image and skips clone_info/quantum_info/BImgBuff -> the core CWE-401 leak set."},
+    {"anchor": "decompress_block temp image2 + clone_info->file (lines 113, 411-421, 441-453)", "disposition": "finding", "reason": "Temp-file-backed shadow image; abandoned without cleanup on the DataType!=miMATRIX continue and on early throws -> memory/temp-file leak; covered by the clone_info/continue finding."},
+    {"anchor": "image_info->ping shortcut (lines 273-279)", "disposition": "dismissed", "reason": "Swaps rows/columns and jumps to done_reading before any pixel allocation; the marked '!!! BAD !!!' concerns dimension semantics, not memory safety."}
+  ],
+  "findings": [
+    {
+      "title": "Memory leak of clone_info/quantum_info/BImgBuff on error exits inside the object loop",
+      "anchor": "ThrowReaderException / return(DestroyImageList(image)) exits after clone_info is allocated",
+      "file": "corpus/eval/eval_0016_cwe401.c",
+      "line": "282, 285, 290 (and 91, 170, 249, 142-151)",
+      "code": "status=SetImageExtent(image,image->columns,image->rows,exception);\nif (status == MagickFalse)\n  return(DestroyImageList(image));\nquantum_info=AcquireQuantumInfo(clone_info,image);\nif (quantum_info == (QuantumInfo *) NULL)\n  ThrowReaderException(ResourceLimitError,\"MemoryAllocationFailed\");\n\n/* ----- Load raster data ----- */\nBImgBuff = (unsigned char *) AcquireQuantumMemory((size_t) (ldblk),sizeof(double));    /* Ldblk was set in the check phase */\nif (BImgBuff == NULL)\n  ThrowReaderException(ResourceLimitError,\"MemoryAllocationFailed\");",
+      "bug_class": "Missing release of memory after effective lifetime (resource leak on error path)",
+      "cwe": "CWE-401",
+      "severity": "high",
+      "where_it_lives": "corpus/eval/eval_0016_cwe401.c (ReadMATImage) and the ThrowReaderException macro in implementation (file not provided)",
+      "invariant": "Every function exit reachable after clone_info (line 108), quantum_info (line 283), or BImgBuff (line 288) is allocated MUST destroy those objects (DestroyImageInfo/DestroyQuantumInfo/RelinquishMagickMemory) before returning; the loop needs a single goto-based cleanup epilogue rather than bare return/throw.",
+      "failure_mode": "A malformed .mat with attacker-chosen huge SizeX/SizeY makes SetImageExtent fail -> line 282 returns and leaks clone_info; a huge ldblk makes AcquireQuantumMemory fail -> line 290 throws and leaks clone_info AND quantum_info; unsupported StructureClass/CellType/DimFlag throw (lines 170/249/142-151) and every goto MATLAB_KO (line 91) leaks clone_info. Repeatedly feeding such files to a long-running process (image service, thumbnailer) exhausts memory -> denial of service.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the ThrowReaderException macro used by this coder frees only `image` (via DestroyImageList) and does not release clone_info/quantum_info/BImgBuff, and that line 282's bare return has no preceding free of clone_info; verify the upstream fix added a MATLAB_KO/cleanup epilogue that destroys clone_info/quantum_info/BImgBuff."
+    },
+    {
+      "title": "Per-iteration clone_info re-clone and abandoned decompress temp leak on continue",
+      "anchor": "clone_info=CloneImageInfo(image_info); ... continue;",
+      "file": "corpus/eval/eval_0016_cwe401.c",
+      "line": "108-119",
+      "code": "clone_info=CloneImageInfo(image_info);\nimage2 = image;\n#if defined(MAGICKCORE_ZLIB_DELEGATE)\nif(MATLAB_HDR.DataType == miCOMPRESSED)\n{\n  image2 = decompress_block(image,&MATLAB_HDR.ObjectSize,clone_info,exception);\n  if(image2==NULL) continue;\n  MATLAB_HDR.DataType = ReadBlobXXXLong(image2); /* replace compressed object type. */\n}\n#endif\n\nif(MATLAB_HDR.DataType!=miMATRIX) continue;  /* skip another objects. */",
+      "bug_class": "Missing release of memory (leak across loop iterations)",
+      "cwe": "CWE-401",
+      "severity": "medium",
+      "where_it_lives": "corpus/eval/eval_0016_cwe401.c (ReadMATImage object loop)",
+      "invariant": "Before re-cloning clone_info at the top of each iteration, or before any `continue`, the previous clone_info must be destroyed and any decompress temp image2/clone_info->file must be deleted/closed/removed.",
+      "failure_mode": "A file containing many objects where the first bytes are non-matrix (DataType!=miMATRIX, line 119) or where decompress_block returns non-matrix data makes each iteration allocate a fresh clone_info via CloneImageInfo (line 108) and then `continue` without freeing the previous one -> one ImageInfo leaked per object. When miCOMPRESSED produced a temp-file-backed image2 and DataType!=miMATRIX at line 119, that image2 and its clone_info->file are abandoned without DeleteImageFromList/fclose/remove_utf8, leaking both heap memory and an on-disk temp file. Many objects -> unbounded leak / temp-file exhaustion.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm CloneImageInfo returns a heap object that the continue paths (lines 114, 119) do not release, and that decompress_block leaves clone_info->file / image2 requiring explicit cleanup that the miMATRIX continue skips."
+    },
+    {
+      "title": "Integer overflow in ldblk (elementbytes*SizeX) undersizes scanline buffer -> heap OOB read",
+      "anchor": "ldblk = (ssize_t) (N * MATLAB_HDR.SizeX)",
+      "file": "corpus/eval/eval_0016_cwe401.c",
+      "line": "212, 218, 224, 233, 246 (with 258, 288, 297, 314)",
+      "code": "ldblk = (ssize_t) (2 * MATLAB_HDR.SizeX);",
+      "bug_class": "Integer overflow leading to undersized allocation and out-of-bounds read",
+      "cwe": "CWE-190",
+      "severity": "high",
+      "where_it_lives": "corpus/eval/eval_0016_cwe401.c (ReadMATImage) with downstream ImportQuantumPixels/CalcMinMax in implementation (file not provided)",
+      "invariant": "The per-row byte length must be computed in a 64-bit unsigned type (elementbytes*(uint64)SizeX) and validated so that BImgBuff (ldblk*sizeof(double)) is >= image->columns * bytes-per-pixel for the chosen depth, and ldblk >= what ImportQuantumPixels/CalcMinMax will read; SizeX itself must be bounded.",
+      "failure_mode": "For 16/32/64-bit cell types the multiplication `N * MATLAB_HDR.SizeX` is evaluated in SizeX's 32-bit width before the ssize_t cast, so a large SizeX (e.g. 0x80000000 with N=2) wraps ldblk to a tiny value. The guard at line 258 (ldblk*SizeY <= ObjectSize) sees the wrapped value and passes; AcquireQuantumMemory(ldblk, 8) at line 288 allocates a tiny buffer; but image->columns = SizeX (line 252) stays huge, so ImportQuantumPixels (lines 323/333) and CalcMinMax (line 297) read SizeX-worth of pixels from the tiny BImgBuff -> heap out-of-bounds read (CWE-125) and corrupted pixel output, potentially an info leak.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the type/width of MATLAB_HDR.SizeX and that `N * SizeX` is evaluated before the widening cast; confirm ImportQuantumPixels reads image->columns*(depth/8) bytes from BImgBuff regardless of ldblk, and that no separate clamp of SizeX exists upstream."
+    },
+    {
+      "title": "Undefined shift when computing image->colors from attacker depth",
+      "anchor": "image->colors = one << image->depth;",
+      "file": "corpus/eval/eval_0016_cwe401.c",
+      "line": "254-255",
+      "code": "one=1;\nimage->colors = one << image->depth;",
+      "bug_class": "Undefined behavior / integer overflow via oversized shift count",
+      "cwe": "CWE-190",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0016_cwe401.c (ReadMATImage)",
+      "invariant": "The shift count must be strictly less than the bit width of `one` (size_t); depth must be clamped (e.g. MagickMin(depth, 8*sizeof(size_t)-1)) before use as a shift amount.",
+      "failure_mode": "image->depth is derived from the attacker-chosen CellType and reaches 64 for miUINT64/miINT64/miDOUBLE (line 224/246). `one << 64` (and even `1 << 32` on 32-bit size_t) shifts by >= the operand width, which is undefined behavior and typically yields 1 or 0. image->colors then holds a nonsensical value that any subsequent colormap sizing/iteration may trust, risking further miscomputation. Impact is limited here because colors is not directly used to size an allocation in the shown code, hence low severity.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm image->depth can be 64 for the 64-bit/double cell types and that no clamp precedes line 255; check whether image->colors is later used to allocate or index a colormap."
+    },
+    {
+      "title": "Object-size bounds check does not guarantee forward progress / precise bound",
+      "anchor": "if(MATLAB_HDR.ObjectSize+filepos > GetBlobSize(image)) ... filepos += MATLAB_HDR.ObjectSize + 4 + 4;",
+      "file": "corpus/eval/eval_0016_cwe401.c",
+      "line": "104-106",
+      "code": "if(MATLAB_HDR.ObjectSize+filepos > GetBlobSize(image))\n  goto MATLAB_KO;\nfilepos += MATLAB_HDR.ObjectSize + 4 + 4;",
+      "bug_class": "Insufficient input validation on a length field (loop-progress / bound precision)",
+      "cwe": "CWE-20",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0016_cwe401.c (ReadMATImage object loop)",
+      "invariant": "ObjectSize must be validated as a positive, minimum-sized object and the per-iteration filepos advance must be strictly positive so the while(!EOFBlob) loop always makes forward progress; the bound should reflect the bytes actually consumed, not just GetBlobSize.",
+      "failure_mode": "ObjectSize is a 32-bit attacker value used as the sole ceiling for the pixel-size guard at line 258; it is only checked against GetBlobSize. On a streamed/imprecise blob GetBlobSize may be unreliable, weakening the check. Separately, an object where processing does not consume the full ObjectSize (or a crafted layout) combined with the fixed filepos advance can cause repeated re-parsing of overlapping regions; a zero/tiny ObjectSize yields minimal advance and risks a slow/looping parse (CPU DoS).",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm GetBlobSize is exact for the input types this coder accepts, that ObjectSize has a lower-bound check, and that filepos strictly increases each iteration."
+    }
+  ],
+  "audit_checklist": [
+    "Trace every ThrowReaderException and `return(DestroyImageList(image))` reachable after line 108 and confirm clone_info, quantum_info, and BImgBuff are freed on each (the core CWE-401).",
+    "Confirm clone_info allocated at line 108 is destroyed (or reused safely) before the next loop iteration re-clones it, and before both `continue` statements (lines 114, 119).",
+    "Verify decompress_block temp images and clone_info->file are deleted/closed/removed on the DataType!=miMATRIX continue and on early throws.",
+    "Check the integer width of MATLAB_HDR.SizeX and whether `N * SizeX` (lines 212-246) overflows before the ssize_t cast; verify BImgBuff size vs image->columns*(depth/8) consumed by ImportQuantumPixels/CalcMinMax.",
+    "Confirm image->depth is bounded before `image->colors = one << image->depth` (line 255) to avoid an oversized shift.",
+    "Confirm the ldblk*SizeY <= ObjectSize guard (line 258) operates on the true 64-bit byte count, not a wrapped ldblk.",
+    "Verify ObjectSize has a lower bound and that filepos strictly advances each iteration to prevent a re-parse/infinite loop.",
+    "Confirm 4-byte ReadBlob into the size_t `size` (line 183) is not consumed while partially initialized and that ReadBlob return values are checked."
+  ]
+}

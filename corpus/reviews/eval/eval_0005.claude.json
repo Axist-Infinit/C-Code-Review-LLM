@@ -1,0 +1,204 @@
+{
+  "subsystem": "TensorFlow op kernel: the Compute() method of a Sparse-tensor bincount/count kernel (the SparseCountSparseOutput family). It counts occurrences of integer values, optionally weighted, per batch row of a sparse tensor supplied as the standard COO triple (indices, values, dense_shape) plus an optional weights tensor, and emits the counts as a sparse output.",
+  "provenance": "Identified from the TensorFlow op-kernel idioms: the OpKernelContext* signature, context->input(N) tensor fetches, OP_REQUIRES / OP_REQUIRES_OK error macros, errors::InvalidArgument, TensorShapeUtils::IsMatrix/IsVector, Tensor::matrix<int64_t>()/vec<int64_t>()/flat<T>(), and member fields maxlength_/minlength_/binary_output_ with a BatchedMap<W>, GetOutputSize() and OutputSparse<W>() helper. The banner names the file corpus/eval/eval_0005_cwe190.cpp and the top comment tags it 'sample: primevul_train_2059_fixed'. The (indices, values, shape, weights) input contract with a per-batch map is the SparseCount / SparseCountSparseOutput kernel in tensorflow/core/kernels/count_ops.cc.",
+  "trust_boundary": "Every one of the four input tensors is attacker-controllable: in TensorFlow a caller of the op (a saved model, a tf.function graph, a serialized GraphDef, or a remote-served inference request) fully controls the dtype, shape, and element values of indices, values, shape (the dense shape), and weights. The kernel's shape/rank guards (OP_REQUIRES IsMatrix/IsVector and the dimension-agreement checks) constrain layout but NOT the numeric magnitude of individual int64 elements. Hostile fields are therefore: the int64 elements of the dense-shape vector (shape_vector, especially shape_vector(0) = number of batches), the int64 elements of the indices matrix (indices_values, especially column 0 = the batch index), the element count of values (num_values), and the T-typed values themselves (used as map keys and to size the output). These flow into narrowing int conversions and into unchecked container indexing.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/eval/eval_0005_cwe190.cpp",
+      "lines": "2-7",
+      "code": "  void Compute(OpKernelContext* context) override {\n    const Tensor& indices = context->input(0);\n    const Tensor& values = context->input(1);\n    const Tensor& shape = context->input(2);\n    const Tensor& weights = context->input(3);\n    bool use_weights = weights.NumElements() > 0;",
+      "explanation": "This is the entry point of a TensorFlow op kernel, overriding OpKernel::Compute. It pulls the four positional inputs off the OpKernelContext: input 0 is 'indices' (a COO index matrix, one row per non-zero value, one column per sparse dimension), input 1 is 'values' (the vector of non-zero values), input 2 is 'shape' (the dense shape vector of the sparse tensor), and input 3 is 'weights' (an optional per-value weight vector). use_weights is a boolean derived from whether the weights tensor has any elements at all; when true the kernel accumulates weights instead of raw occurrence counts. All four Tensor references alias attacker-supplied graph inputs and are the raw material the rest of the method parses."
+    },
+    {
+      "file": "corpus/eval/eval_0005_cwe190.cpp",
+      "lines": "9-18",
+      "code": "    OP_REQUIRES(context, TensorShapeUtils::IsMatrix(indices.shape()),\n                errors::InvalidArgument(\n                    \"Input indices must be a 2-dimensional tensor. Got: \",\n                    indices.shape().DebugString()));\n    OP_REQUIRES(context, TensorShapeUtils::IsVector(values.shape()),\n                errors::InvalidArgument(\"Input values must be a vector. Got: \",\n                                        values.shape().DebugString()));\n    OP_REQUIRES(context, TensorShapeUtils::IsVector(shape.shape()),\n                errors::InvalidArgument(\"Input shape must be a vector. Got: \",\n                                        shape.shape().DebugString()));",
+      "explanation": "Three shape-well-formedness gates. OP_REQUIRES(context, cond, status) is a TensorFlow macro that, if cond is false, sets the context status to the given error and RETURNS from Compute immediately. Here they require indices to be rank-2 (a matrix), and values and shape to be rank-1 (vectors). These checks establish the geometric contract for the COO representation but only constrain rank, not the numeric values or the magnitude of any dimension. They do not bound how large indices.dim_size(0) (number of entries) or the elements of the shape vector may be."
+    },
+    {
+      "file": "corpus/eval/eval_0005_cwe190.cpp",
+      "lines": "19-33",
+      "code": "    OP_REQUIRES(context,\n                values.shape().dim_size(0) == indices.shape().dim_size(0),\n                errors::InvalidArgument(\n                    \"Number of values must match first dimension of indices.\",\n                    \"Got \", values.shape().dim_size(0),\n                    \" values, indices shape: \", indices.shape().DebugString()));\n    OP_REQUIRES(\n        context, shape.shape().dim_size(0) == indices.shape().dim_size(1),\n        errors::InvalidArgument(\n            \"Number of dimensions must match second dimension of indices.\",\n            \"Got \", shape.shape().dim_size(0),\n            \" dimensions, indices shape: \", indices.shape().DebugString()));\n    OP_REQUIRES(context, shape.NumElements() > 0,\n                errors::InvalidArgument(\n                    \"The shape argument requires at least one element.\"));",
+      "explanation": "Cross-consistency gates for the COO triple. The first requires that the number of values equals the number of index rows (values.dim_size(0) == indices.dim_size(0)). The second requires that the length of the dense-shape vector equals the number of index columns (shape.dim_size(0) == indices.dim_size(1)), i.e. the declared rank matches the index width. The third requires the shape vector be non-empty. These enforce internal structural agreement of the sparse tensor but, again, place NO ceiling on any concrete dimension value, on the entry count, or on the elements stored inside indices or shape."
+    },
+    {
+      "file": "corpus/eval/eval_0005_cwe190.cpp",
+      "lines": "36-39",
+      "code": "    const auto indices_values = indices.matrix<int64_t>();\n    const auto shape_vector = shape.vec<int64_t>();\n    int num_values = values.NumElements();  // same as first dim of indices\n    int rank = indices.shape().dim_size(1);",
+      "explanation": "The kernel obtains typed views: indices_values is an Eigen matrix view of int64 index coordinates, and shape_vector is an int64 vector view of the dense shape. It then computes two loop bounds. num_values is assigned from values.NumElements(), whose true return type is int64 (tensorflow::int64 / int64_t) — it is silently narrowed to a 32-bit int. rank is assigned from indices.shape().dim_size(1), also an int64 dimension, likewise narrowed to int. num_values is the count of non-zero entries and rank is the number of sparse dimensions; both drive the following nested loops and later container indexing."
+    },
+    {
+      "file": "corpus/eval/eval_0005_cwe190.cpp",
+      "lines": "40-50",
+      "code": "    for (int i = 0; i < num_values; ++i) {\n      for (int j = 0; j < rank; ++j) {\n        OP_REQUIRES(\n            context,\n            indices_values(i, j) >= 0 && indices_values(i, j) < shape_vector(j),\n            errors::InvalidArgument(\n                \"Invalid index value at \", i, \": dimension \", j, \" has value \",\n                indices_values(i, j), \" which is not in [0, \", shape_vector(j),\n                \") (as given by dense shape \", shape.DebugString()));\n      }\n    }",
+      "explanation": "A double loop that validates every coordinate of every entry: for row i and column j, it requires that indices_values(i, j) is non-negative AND strictly less than the corresponding dense-shape extent shape_vector(j). This is the bounds check that keeps individual index coordinates within their declared dimension. Note that both loop counters are int and are compared against the narrowed num_values and rank, and the comparison itself is done in int64 (the values are read as int64). This loop is O(num_values * rank) and is the main per-index sanitizer; its correctness depends on num_values and rank not having been corrupted by the narrowing at lines 38-39."
+    },
+    {
+      "file": "corpus/eval/eval_0005_cwe190.cpp",
+      "lines": "52-59",
+      "code": "    if (use_weights) {\n      OP_REQUIRES(\n          context, weights.shape() == values.shape(),\n          errors::InvalidArgument(\n              \"Weights and values must have the same shape. Weight shape: \",\n              weights.shape().DebugString(),\n              \"; values shape: \", values.shape().DebugString()));\n    }",
+      "explanation": "When weights were supplied (use_weights true), the kernel requires that the weights tensor has exactly the same shape as the values tensor, so that weight_values(idx) is a valid companion for every values_values(idx). This guarantees the weighted accumulation path later cannot index weights out of range. When no weights were supplied this block is skipped entirely."
+    },
+    {
+      "file": "corpus/eval/eval_0005_cwe190.cpp",
+      "lines": "61-66",
+      "code": "    bool is_1d = shape.NumElements() == 1;\n    int num_batches = is_1d ? 1 : shape_vector(0);\n    OP_REQUIRES(\n        context, 0 < num_batches && num_batches < kMaxBatches,\n        errors::InvalidArgument(\"Cannot allocate \", num_batches,\n                                \" batches, is the dense shape too wide?\"));",
+      "explanation": "is_1d is true when the dense shape has a single element, i.e. the sparse tensor is a 1-D bincount rather than a batched (2-D) one. num_batches is 1 for the 1-D case, otherwise it is taken from shape_vector(0) — the first (batch) dimension of the dense shape, an int64 element narrowed to int. The kernel then requires 0 < num_batches < kMaxBatches to bound the per-batch allocation. This is the primary defense that limits how many batch buckets are allocated. Critically, the bound is applied AFTER the int64->int narrowing, so it sees the truncated value, not the original attacker-supplied magnitude."
+    },
+    {
+      "file": "corpus/eval/eval_0005_cwe190.cpp",
+      "lines": "68-73",
+      "code": "    const auto values_values = values.flat<T>();\n    const auto weight_values = weights.flat<W>();\n\n    auto per_batch_counts = BatchedMap<W>(num_batches);\n\n    T max_value = 0;",
+      "explanation": "values_values is a flat typed view of the values tensor (element type T, the count/index type) and weight_values a flat view of the weights (type W, the accumulator type). per_batch_counts is a BatchedMap<W> sized to num_batches — conceptually a container of num_batches maps, one per batch row, each mapping an observed value to its accumulated count/weight. Because it is sized by num_batches, indexing it with a batch id outside [0, num_batches) is out of bounds. max_value tracks the largest value seen, used later to size the output; it starts at 0."
+    },
+    {
+      "file": "corpus/eval/eval_0005_cwe190.cpp",
+      "lines": "75-84",
+      "code": "    for (int idx = 0; idx < num_values; ++idx) {\n      int batch = is_1d ? 0 : indices_values(idx, 0);\n      if (batch >= num_batches) {\n        OP_REQUIRES(context, batch < num_batches,\n                    errors::InvalidArgument(\n                        \"Indices value along the first dimension must be \",\n                        \"lower than the first index of the shape.\", \"Got \",\n                        batch, \" as batch and \", num_batches,\n                        \" as the first dimension of the shape.\"));\n      }",
+      "explanation": "The main accumulation loop iterates over all num_values entries. For each entry it derives batch: 0 in the 1-D case, otherwise the entry's first index column indices_values(idx, 0) — an int64 coordinate narrowed to int. It then attempts a guard: if batch >= num_batches, it invokes OP_REQUIRES(context, batch < num_batches, ...), which is guaranteed to fail inside that branch (batch < num_batches is the negation of the branch condition) and therefore return with an InvalidArgument error. This is the runtime check meant to keep batch within the allocated per_batch_counts range. Its logic only rejects batch values that are too LARGE (>= num_batches); it does nothing for negative batch values."
+    },
+    {
+      "file": "corpus/eval/eval_0005_cwe190.cpp",
+      "lines": "85-98",
+      "code": "      const auto& value = values_values(idx);\n      if (value >= 0 && (maxlength_ <= 0 || value < maxlength_)) {\n        if (binary_output_) {\n          per_batch_counts[batch][value] = 1;\n        } else if (use_weights) {\n          per_batch_counts[batch][value] += weight_values(idx);\n        } else {\n          per_batch_counts[batch][value]++;\n        }\n        if (value > max_value) {\n          max_value = value;\n        }\n      }\n    }",
+      "explanation": "For each entry the kernel reads value = values_values(idx) and filters it: it must be non-negative, and either maxlength_ is unset (<= 0) or value < maxlength_. When accepted, it updates per_batch_counts[batch][value]: set to 1 for binary_output_, add weight_values(idx) when weighted, otherwise increment. It also tracks the running max_value. The value is used as a map KEY, so a very large value inflates memory but does not itself index a fixed array; the dangerous index here is batch, which selects the outer per_batch_counts container element. The safety of every write on lines 88/90/92 depends entirely on batch being within [0, num_batches), which the guard above only half-enforces."
+    },
+    {
+      "file": "corpus/eval/eval_0005_cwe190.cpp",
+      "lines": "100-103",
+      "code": "    int num_output_values = GetOutputSize(max_value, maxlength_, minlength_);\n    OP_REQUIRES_OK(context, OutputSparse<W>(per_batch_counts, num_output_values,\n                                            is_1d, context));\n  }",
+      "explanation": "After accumulation, num_output_values is computed by GetOutputSize from the largest observed value plus the maxlength_/minlength_ member bounds; this determines the width (dense length) of the counts axis in the emitted sparse output. OutputSparse<W> then materializes per_batch_counts into the op's outputs, and OP_REQUIRES_OK propagates any error it returns. num_output_values is derived from attacker-influenced max_value (bounded above by maxlength_ only when maxlength_ > 0), so when maxlength_ <= 0 the output width is driven directly by the largest value present in the input."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/eval/eval_0005_cwe190.cpp",
+      "lines": "76-84",
+      "code": "      int batch = is_1d ? 0 : indices_values(idx, 0);\n      if (batch >= num_batches) {\n        OP_REQUIRES(context, batch < num_batches,\n                    errors::InvalidArgument(\n                        \"Indices value along the first dimension must be \",\n                        \"lower than the first index of the shape.\", \"Got \",\n                        batch, \" as batch and \", num_batches,\n                        \" as the first dimension of the shape.\"));\n      }",
+      "explanation": "The batch guard is one-sided: it only rejects batch >= num_batches and never checks for a NEGATIVE batch. batch is an int narrowed from the int64 coordinate indices_values(idx, 0). Although the earlier validation loop (lines 40-50) checks indices_values(i, j) >= 0 in int64, the value that reaches this line is the 32-bit-truncated batch: an int64 coordinate whose low 32 bits form a negative pattern (e.g. 0x80000000 = 2147483648, or 0xFFFFFFFF00000001) narrows to a negative int here. Because indices_values(idx, 0) is read twice in different widths (int64 in the validator, int here), the two checks disagree. A negative batch sails past 'batch >= num_batches' (a negative is not >= a positive) and is then used to index per_batch_counts[batch] on lines 88/90/92, which is an out-of-bounds container access before/around the allocated storage — an out-of-bounds write. The implementation must validate batch against BOTH bounds (0 <= batch < num_batches) using the same width the index is stored in, before any per_batch_counts[batch] access. This is the SparseCountSparseOutput integer-overflow / OOB defect (CVE-2022-21740)."
+    },
+    {
+      "file": "corpus/eval/eval_0005_cwe190.cpp",
+      "lines": "61-66",
+      "code": "    bool is_1d = shape.NumElements() == 1;\n    int num_batches = is_1d ? 1 : shape_vector(0);\n    OP_REQUIRES(\n        context, 0 < num_batches && num_batches < kMaxBatches,\n        errors::InvalidArgument(\"Cannot allocate \", num_batches,\n                                \" batches, is the dense shape too wide?\"));",
+      "explanation": "num_batches is derived by narrowing shape_vector(0), an attacker-controlled int64, to int, and the kMaxBatches bound is checked only AFTER the narrowing. A hostile dense shape whose first extent exceeds INT_MAX truncates: e.g. shape_vector(0) = 2^32 + 5 narrows to 5, or 2^31 narrows to a negative that the '0 < num_batches' half rejects — but many large int64 values (any whose low 32 bits land in (0, kMaxBatches)) pass the guard while the true declared batch count is astronomically larger. The validation loop at line 44 then checks batch indices against shape_vector(j) in FULL int64, so index coordinates up to the huge declared extent are accepted, yet per_batch_counts was allocated with only the truncated num_batches buckets. The result is that batch (line 76) can legitimately (per the int64 view) exceed the small allocated num_batches — combined with the truncation at line 76 this yields out-of-range indexing. The implementation must reject dense-shape extents that do not fit the index type it will use, and must derive num_batches and the bounds check in a single consistent (int64) width."
+    },
+    {
+      "file": "corpus/eval/eval_0005_cwe190.cpp",
+      "lines": "38-39",
+      "code": "    int num_values = values.NumElements();  // same as first dim of indices\n    int rank = indices.shape().dim_size(1);",
+      "explanation": "num_values (from values.NumElements(), an int64) and rank (from dim_size(1), an int64) are narrowed to 32-bit int. For a values tensor with more than INT_MAX elements, num_values overflows to a smaller or negative int; a negative num_values makes the loops on lines 40 and 75 execute zero times (silently skipping validation/accumulation), and a truncated-positive num_values makes them process the wrong number of entries relative to the true tensor size, so later code that assumes num_values == the real entry count (e.g. any per-entry output sizing) is inconsistent. The comparisons 'idx < num_values' mix an int loop counter with a possibly-negative int bound. The implementation must keep entry counts and rank in int64 (or explicitly reject tensors whose element count exceeds INT_MAX) so that loop bounds cannot be corrupted by narrowing (CWE-197 truncation feeding CWE-190/CWE-125 downstream)."
+    },
+    {
+      "file": "corpus/eval/eval_0005_cwe190.cpp",
+      "lines": "86-100",
+      "code": "      if (value >= 0 && (maxlength_ <= 0 || value < maxlength_)) {\n        if (binary_output_) {\n          per_batch_counts[batch][value] = 1;\n        } else if (use_weights) {\n          per_batch_counts[batch][value] += weight_values(idx);\n        } else {\n          per_batch_counts[batch][value]++;\n        }\n        if (value > max_value) {\n          max_value = value;\n        }\n      }\n    }\n\n    int num_output_values = GetOutputSize(max_value, maxlength_, minlength_);",
+      "explanation": "When maxlength_ <= 0 there is no upper bound on value: any non-negative value present in the input is accepted, inserted as a map key on lines 88/90/92, and can raise max_value up to the maximum of type T. GetOutputSize(max_value, ...) at line 100 then derives num_output_values from that unbounded max_value, sizing the dense output axis. An attacker can supply a single value near the type maximum (e.g. INT64_MAX) to force an enormous num_output_values and a correspondingly huge output allocation in OutputSparse, causing memory exhaustion / denial of service, and num_output_values is itself an int that can overflow when GetOutputSize adds/derives from a near-max value (CWE-190 leading to CWE-770). The implementation must cap the effective output width and compute it in a width that cannot overflow."
+    },
+    {
+      "file": "corpus/eval/eval_0005_cwe190.cpp",
+      "lines": "77-84",
+      "code": "      if (batch >= num_batches) {\n        OP_REQUIRES(context, batch < num_batches,\n                    errors::InvalidArgument(\n                        \"Indices value along the first dimension must be \",\n                        \"lower than the first index of the shape.\", \"Got \",\n                        batch, \" as batch and \", num_batches,\n                        \" as the first dimension of the shape.\"));\n      }",
+      "explanation": "Even for the too-large case the guard is written in a convoluted way that is easy to regress: the OP_REQUIRES condition (batch < num_batches) is unconditionally false whenever the enclosing 'if (batch >= num_batches)' is entered, so the macro's only purpose is to emit the error and return. If a future edit removes the OP_REQUIRES-returns-on-failure behavior, adds a non-returning log, or someone 'simplifies' the redundant-looking inner condition, the out-of-range batch would fall through to per_batch_counts[batch]. The robust form is a single positive check 'OP_REQUIRES(context, 0 <= batch && batch < num_batches, ...)' placed before any use of batch; the current double-negative phrasing is fragile and, as noted above, omits the lower bound entirely."
+    }
+  ],
+  "summary": "Attacker-controlled sparse-tensor inputs flow through several int64->int narrowing conversions (num_batches from the dense shape, batch from the index matrix, num_values/rank) before being used to size and index the per-batch counts container. The batch bounds check on lines 76-84 only rejects batch >= num_batches and never a negative batch, so a truncated/negative batch index reaches per_batch_counts[batch] out of bounds — a heap out-of-bounds write matching the SparseCountSparseOutput integer-overflow vulnerability (CVE-2022-21740). Secondary risks are unbounded output sizing from max_value when maxlength_ <= 0 (DoS) and loop-bound corruption from the num_values/rank truncation.",
+  "reviewed_anchors": [
+    {"anchor": "void Compute(OpKernelContext* context) override (line 2)", "disposition": "dismissed", "reason": "Standard OpKernel entry-point signature; the context is the trusted framework handle, risk is in how it is used below."},
+    {"anchor": "context->input(0..3): indices, values, shape, weights (lines 3-6)", "disposition": "finding", "reason": "All four are fully attacker-controlled tensors; their magnitudes drive the narrowing and indexing findings."},
+    {"anchor": "use_weights = weights.NumElements() > 0 (line 7)", "disposition": "dismissed", "reason": "Boolean feature flag; weights shape is separately validated at lines 52-59, no direct hazard."},
+    {"anchor": "OP_REQUIRES IsMatrix/IsVector shape gates (lines 9-18)", "disposition": "dismissed", "reason": "Constrain rank only; correct as far as they go but do not bound magnitudes — captured by downstream findings."},
+    {"anchor": "COO consistency gates: values dim==indices dim0, shape dim0==indices dim1, shape non-empty (lines 19-33)", "disposition": "dismissed", "reason": "Enforce structural agreement; place no ceiling on dimension values, so real risk is downstream, not here."},
+    {"anchor": "indices_values = indices.matrix<int64_t>() (line 36)", "disposition": "finding", "reason": "int64 coordinate matrix; column 0 (batch) is later narrowed to int, the core defect."},
+    {"anchor": "shape_vector = shape.vec<int64_t>() (line 37)", "disposition": "finding", "reason": "int64 dense-shape vector; shape_vector(0) narrows to int num_batches with the bound applied post-truncation."},
+    {"anchor": "int num_values = values.NumElements() (line 38)", "disposition": "finding", "reason": "int64->int narrowing of the entry count corrupts loop bounds when > INT_MAX."},
+    {"anchor": "int rank = indices.shape().dim_size(1) (line 39)", "disposition": "finding", "reason": "int64->int narrowing of rank; feeds the inner validation loop bound."},
+    {"anchor": "index validation loop, indices_values(i,j) in [0, shape_vector(j)) (lines 40-50)", "disposition": "dismissed", "reason": "Correct per-coordinate bound in int64, but it reads the index in a different width than the later batch use, which is the finding, not this loop itself."},
+    {"anchor": "weights.shape() == values.shape() gate (lines 52-59)", "disposition": "dismissed", "reason": "Correctly guarantees weight_values(idx) is in range on the weighted path; no hazard."},
+    {"anchor": "int num_batches = is_1d ? 1 : shape_vector(0) (line 62)", "disposition": "finding", "reason": "int64->int narrowing of the batch count; bound checked after truncation."},
+    {"anchor": "OP_REQUIRES 0 < num_batches && num_batches < kMaxBatches (lines 63-66)", "disposition": "finding", "reason": "Bound applied to the already-truncated value; large int64 shapes that truncate into (0,kMaxBatches) slip through."},
+    {"anchor": "kMaxBatches (line 64)", "disposition": "dismissed", "reason": "Named allocation ceiling constant; sound in principle but ineffective because it gates the post-narrowing value (covered by the num_batches finding)."},
+    {"anchor": "values_values = values.flat<T>() (line 68)", "disposition": "dismissed", "reason": "Flat view indexed only by idx < num_values; in-range given the same tensor supplies num_values."},
+    {"anchor": "weight_values = weights.flat<W>() (line 69)", "disposition": "dismissed", "reason": "Indexed by idx; the weights==values shape gate makes it in-range on the only path that reads it."},
+    {"anchor": "per_batch_counts = BatchedMap<W>(num_batches) (line 71)", "disposition": "finding", "reason": "Container sized by num_batches; indexed by an unvalidated (negative-capable, truncated) batch — the OOB target."},
+    {"anchor": "T max_value = 0 (line 73)", "disposition": "finding", "reason": "Grows with attacker value up to type max when maxlength_<=0; drives output sizing."},
+    {"anchor": "int batch = is_1d ? 0 : indices_values(idx, 0) (line 76)", "disposition": "finding", "reason": "int64->int narrowing of the batch coordinate producing a negative/truncated index."},
+    {"anchor": "batch >= num_batches guard + OP_REQUIRES (lines 77-84)", "disposition": "finding", "reason": "One-sided guard: rejects too-large batch only, never negative; fragile double-negative phrasing."},
+    {"anchor": "value >= 0 && (maxlength_ <= 0 || value < maxlength_) (line 86)", "disposition": "finding", "reason": "When maxlength_<=0 no upper bound on value; unbounded map keys and max_value growth."},
+    {"anchor": "per_batch_counts[batch][value] writes (lines 88, 90, 92)", "disposition": "finding", "reason": "The sink where an out-of-range batch becomes an out-of-bounds write."},
+    {"anchor": "int num_output_values = GetOutputSize(max_value, maxlength_, minlength_) (line 100)", "disposition": "finding", "reason": "Output width derived from unbounded max_value in an int; overflow / huge allocation."},
+    {"anchor": "OutputSparse<W>(per_batch_counts, num_output_values, is_1d, context) (lines 101-102)", "disposition": "dismissed", "reason": "Emission helper (not shown); its input num_output_values is the finding, not this call."},
+    {"anchor": "member fields maxlength_, minlength_, binary_output_", "disposition": "dismissed", "reason": "Op attributes; maxlength_<=0 disabling the upper value bound is captured in the value/output findings."}
+  ],
+  "findings": [
+    {
+      "title": "Negative/truncated batch index bypasses one-sided bounds check -> out-of-bounds write",
+      "anchor": "int batch = is_1d ? 0 : indices_values(idx, 0); if (batch >= num_batches) { ... }  then per_batch_counts[batch][value]",
+      "file": "corpus/eval/eval_0005_cwe190.cpp",
+      "line": "76-92",
+      "code": "      int batch = is_1d ? 0 : indices_values(idx, 0);\n      if (batch >= num_batches) {\n        OP_REQUIRES(context, batch < num_batches,\n                    errors::InvalidArgument(\n                        \"Indices value along the first dimension must be \",\n                        \"lower than the first index of the shape.\", \"Got \",\n                        batch, \" as batch and \", num_batches,\n                        \" as the first dimension of the shape.\"));\n      }\n      const auto& value = values_values(idx);\n      if (value >= 0 && (maxlength_ <= 0 || value < maxlength_)) {\n        if (binary_output_) {\n          per_batch_counts[batch][value] = 1;\n        } else if (use_weights) {\n          per_batch_counts[batch][value] += weight_values(idx);\n        } else {\n          per_batch_counts[batch][value]++;\n        }",
+      "bug_class": "Integer truncation feeding out-of-bounds container write (missing lower-bound check)",
+      "cwe": "CWE-787",
+      "severity": "critical",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "Before any per_batch_counts[batch] access, batch must satisfy 0 <= batch < num_batches, evaluated in the same width the index is stored (int64), so no coordinate whose low bits form a negative or out-of-range int can index the container.",
+      "failure_mode": "The batch coordinate is read as int64 in the validator (line 44, checked >= 0 and < shape_vector(0)) but re-read and narrowed to int here (line 76). An int64 first-column index whose low 32 bits are negative (e.g. 0x0000000080000000 = 2147483648, or any value with bit 31 set) becomes a negative int batch. The guard on line 77 only tests batch >= num_batches, so a negative batch passes, and per_batch_counts[batch] on lines 88/90/92 writes before the allocated storage — a heap out-of-bounds write giving memory corruption / potential RCE, or a crash. Triggered purely by crafting the indices tensor of a SparseCount op call.",
+      "cve_analog": "CVE-2022-21740",
+      "what_to_confirm": "Confirm per_batch_counts is a vector-like container indexed by operator[] with no internal bounds check, that indices_values(idx,0) is int64 narrowed to int at line 76, and that no lower-bound (0 <= batch) check exists on any path to lines 88/90/92."
+    },
+    {
+      "title": "int64->int narrowing of dense-shape batch count with bound applied after truncation",
+      "anchor": "int num_batches = is_1d ? 1 : shape_vector(0); OP_REQUIRES(context, 0 < num_batches && num_batches < kMaxBatches, ...)",
+      "file": "corpus/eval/eval_0005_cwe190.cpp",
+      "line": "62-66",
+      "code": "    int num_batches = is_1d ? 1 : shape_vector(0);\n    OP_REQUIRES(\n        context, 0 < num_batches && num_batches < kMaxBatches,\n        errors::InvalidArgument(\"Cannot allocate \", num_batches,\n                                \" batches, is the dense shape too wide?\"));",
+      "bug_class": "Integer truncation / overflow (narrowing before validation)",
+      "cwe": "CWE-190",
+      "severity": "high",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "num_batches must be derived and range-checked in int64; the kMaxBatches bound and the per-index bound must both see the true (untruncated) dense-shape extent, so allocation size and accepted batch indices agree.",
+      "failure_mode": "shape_vector(0) is an attacker-controlled int64 narrowed to int at line 62. A dense shape with first extent > INT_MAX truncates: values whose low 32 bits land in (0, kMaxBatches) pass the guard while the true declared batch count is far larger. Meanwhile the index validator (line 44) accepts batch coordinates up to the full int64 extent, so legitimate-per-int64 batch ids exceed the small num_batches actually allocated for per_batch_counts, producing out-of-range indexing at lines 88/90/92. The bound check at lines 63-66 cannot catch this because it runs on the already-truncated value.",
+      "cve_analog": "CVE-2022-21740",
+      "what_to_confirm": "Confirm shape_vector(0) is int64 and is narrowed to int at line 62, and that no check rejects dense-shape extents exceeding INT_MAX / num_batches' representable range before allocation."
+    },
+    {
+      "title": "Unbounded output size from attacker max_value when maxlength_ <= 0 (allocation/overflow)",
+      "anchor": "if (value >= 0 && (maxlength_ <= 0 || value < maxlength_)) { ... if (value > max_value) max_value = value; }  then GetOutputSize(max_value, ...)",
+      "file": "corpus/eval/eval_0005_cwe190.cpp",
+      "line": "86-100",
+      "code": "      if (value >= 0 && (maxlength_ <= 0 || value < maxlength_)) {\n        if (binary_output_) {\n          per_batch_counts[batch][value] = 1;\n        } else if (use_weights) {\n          per_batch_counts[batch][value] += weight_values(idx);\n        } else {\n          per_batch_counts[batch][value]++;\n        }\n        if (value > max_value) {\n          max_value = value;\n        }\n      }\n    }\n\n    int num_output_values = GetOutputSize(max_value, maxlength_, minlength_);",
+      "bug_class": "Uncontrolled resource allocation via unbounded value + int overflow of output size",
+      "cwe": "CWE-770",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "The effective counting width must be capped regardless of maxlength_, and num_output_values must be computed in a width that cannot overflow, so a single large input value cannot dictate an unbounded output allocation.",
+      "failure_mode": "When maxlength_ <= 0 the value filter on line 86 imposes no upper bound, so any non-negative value (up to the max of type T, e.g. INT64_MAX) is accepted, inserted as a map key, and raised into max_value. GetOutputSize(max_value, ...) at line 100 then sizes the dense output axis from that value, and the assignment to int num_output_values can itself overflow. An attacker supplies one huge value to force an enormous output allocation in OutputSparse (memory exhaustion / DoS) or an overflowed/negative num_output_values.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm GetOutputSize returns int64 and how it uses maxlength_/minlength_ when maxlength_ <= 0, and whether OutputSparse bounds num_output_values before allocating; check for overflow in the int num_output_values assignment at line 100."
+    },
+    {
+      "title": "int64->int narrowing of entry count and rank corrupts loop bounds",
+      "anchor": "int num_values = values.NumElements(); int rank = indices.shape().dim_size(1);",
+      "file": "corpus/eval/eval_0005_cwe190.cpp",
+      "line": "38-39",
+      "code": "    int num_values = values.NumElements();  // same as first dim of indices\n    int rank = indices.shape().dim_size(1);",
+      "bug_class": "Integer truncation of size feeding loop bounds",
+      "cwe": "CWE-197",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "Entry counts and rank derived from int64 tensor metadata must be kept in int64 (or the tensor rejected if it exceeds INT_MAX), so loop bounds cannot be truncated to a wrong or negative value.",
+      "failure_mode": "values.NumElements() and dim_size(1) are int64 and are narrowed to int. For a tensor with more than INT_MAX elements, num_values wraps to a small or negative int: the validation loop (line 40) and accumulation loop (line 75) then skip entries or run zero iterations, defeating per-index validation and making num_values inconsistent with the true tensor size assumed elsewhere. In practice bounded by memory (a >2^31-element tensor is large), so severity is lower, but the narrowing is unguarded.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm NumElements()/dim_size return int64 and are narrowed at lines 38-39, and whether any upstream limit prevents values tensors with more than INT_MAX elements."
+    }
+  ],
+  "audit_checklist": [
+    "Verify per_batch_counts (BatchedMap<W>) is indexed by operator[] with no bounds check and add a 0 <= batch < num_batches guard (both bounds) before every access at lines 88/90/92.",
+    "Confirm indices_values(idx,0) is int64 and is truncated to int at line 76; keep batch in int64 and reject negative or >= num_batches values with the SAME width used at line 44.",
+    "Derive num_batches from shape_vector(0) in int64 and apply the kMaxBatches / positivity check before truncation, so large dense shapes cannot alias into the valid range.",
+    "Keep num_values and rank (lines 38-39) in int64 or reject tensors whose element count exceeds INT_MAX.",
+    "Bound the effective output width: cap max_value / num_output_values (line 100) even when maxlength_ <= 0 and compute the size in an overflow-safe width before OutputSparse allocates.",
+    "Rewrite the fragile double-negative guard at lines 77-84 as a single positive OP_REQUIRES(0 <= batch && batch < num_batches) placed before any use of batch.",
+    "Confirm GetOutputSize and OutputSparse handle attacker-maximal max_value without integer overflow or unbounded allocation."
+  ]
+}

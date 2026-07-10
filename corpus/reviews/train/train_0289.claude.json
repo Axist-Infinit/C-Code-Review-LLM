@@ -1,0 +1,246 @@
+{
+  "subsystem": "Poppler PDF parser. Parser::makeStream() constructs a Stream object for a PDF indirect stream: it reads the /Length entry from the stream dictionary, positions the lexer over the raw stream body, verifies the trailing 'endstream' keyword, then builds a BaseStream sub-stream over the [pos, pos+length] byte range and optionally wraps it in a decryption/filter chain. It processes fully untrusted PDF file bytes.",
+  "provenance": "Identified from Poppler-specific types and APIs: Goffset/Guchar/GBool/gTrue, Object with dictLookup()/dictSet()/isInt()/getInt64(), Lexer (skipToNextLine, getStream, setPos, lookCharLastValueCached, LOOK_VALUE_NOT_CACHED), BaseStream::makeSubStream, DecryptStream, CryptAlgorithm, XRef::getStreamEnd, and error(errSyntaxError, ...). The qualified name Parser::makeStream and the signature match Poppler's Parser.cc. The banner comment '/* sample: primevul_train_3210_fixed */' marks this as the PATCHED variant of a PrimeVul sample, and the file name (cwe190) points at integer overflow as the intended bug class.",
+  "trust_boundary": "The whole PDF document is attacker-controlled. The stream dictionary 'dict' and its /Length value (lines 19-23), the raw stream body walked by the lexer, and the xref stream-end table consulted at lines 31-32 all originate in the file. Therefore 'length', 'pos', and 'endPos' are hostile 64-bit signed offsets. 'fileKey'/'encAlgorithm'/'keyLength' come from the document's security handler (also file-influenced). 'recursion' is the nesting-depth counter threaded from the object parser. A malicious PDF fully controls the arithmetic operands used to size and position the sub-stream.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0289_cwe190.cpp",
+      "lines": "2-5",
+      "code": "Stream *Parser::makeStream(Object &&dict, Guchar *fileKey,\n\t\t\t   CryptAlgorithm encAlgorithm, int keyLength,\n\t\t\t   int objNum, int objGen, int recursion,\n                           GBool strict) {",
+      "explanation": "This is the entry point that turns a parsed PDF stream dictionary into a Stream. 'Object &&dict' is an rvalue reference to the stream dictionary, taken by move because the function will hand ownership to the sub-stream. 'Guchar *fileKey' is the document decryption key (nullptr when the file is unencrypted). 'CryptAlgorithm encAlgorithm' and 'int keyLength' describe the cipher. 'objNum'/'objGen' identify the indirect object for decryption and error context. 'recursion' is the nesting-depth counter used to bound recursive dictionary/stream resolution. 'GBool strict' toggles whether malformed input aborts (return nullptr) or is tolerated. Every scalar here except fileKey is ultimately derived from untrusted file content."
+    },
+    {
+      "file": "corpus/train/train_0289_cwe190.cpp",
+      "lines": "6-9",
+      "code": "  BaseStream *baseStr;\n  Stream *str;\n  Goffset length;\n  Goffset pos, endPos;",
+      "explanation": "Local declarations. 'baseStr' will hold the underlying byte source. 'str' is the working Stream pointer that is progressively wrapped (decrypt, filters). 'length' is the stream body length in bytes, and 'pos'/'endPos' are byte offsets into the file. Goffset is Poppler's 64-bit signed file-offset type, so all three can hold negative values and are the operands of the size arithmetic that this function must keep sane. None are initialized here; correctness depends on the branches below assigning them before use."
+    },
+    {
+      "file": "corpus/train/train_0289_cwe190.cpp",
+      "lines": "11-16",
+      "code": "  // get stream start position\n  lexer->skipToNextLine();\n  if (!(str = lexer->getStream())) {\n    return nullptr;\n  }\n  pos = str->getPos();",
+      "explanation": "After the 'stream' keyword, the body begins on the next line, so skipToNextLine() advances the lexer past the end-of-line marker. lexer->getStream() returns the current stream object; if it is null (truncated input) the function bails out. pos = str->getPos() records the byte offset of the first byte of the stream body. This 'pos' is the anchor for all later position arithmetic and is derived from the file's byte layout."
+    },
+    {
+      "file": "corpus/train/train_0289_cwe190.cpp",
+      "lines": "18-28",
+      "code": "  // get length\n  Object obj = dict.dictLookup(\"Length\", recursion);\n  if (obj.isInt()) {\n    length = obj.getInt();\n  } else if (obj.isInt64()) {\n    length = obj.getInt64();\n  } else {\n    error(errSyntaxError, getPos(), \"Bad 'Length' attribute in stream\");\n    if (strict) return nullptr;\n    length = 0;\n  }",
+      "explanation": "The stream's declared byte length is read from the /Length dictionary entry, resolving indirect references with the recursion budget. If it is a 32-bit int, length = obj.getInt(); if a 64-bit int, length = obj.getInt64(); otherwise a syntax error is logged and, in non-strict mode, length defaults to 0. Crucially, /Length is fully attacker-controlled and this block performs NO range validation: it does not reject negative values (getInt() returns a signed int; a PDF may declare '/Length -5'), nor cap the value against the remaining file size. Whatever the file says becomes the sub-stream size later."
+    },
+    {
+      "file": "corpus/train/train_0289_cwe190.cpp",
+      "lines": "30-33",
+      "code": "  // check for length in damaged file\n  if (xref && xref->getStreamEnd(pos, &endPos)) {\n    length = endPos - pos;\n  }",
+      "explanation": "For files whose /Length is unreliable, Poppler keeps a side table (built while scanning the xref) mapping a stream start position to its recorded end offset. If getStreamEnd(pos, &endPos) succeeds, the length is recomputed as endPos - pos, overriding the dictionary value. Both endPos and pos come from file structures; the subtraction assumes endPos >= pos, which is not enforced here."
+    },
+    {
+      "file": "corpus/train/train_0289_cwe190.cpp",
+      "lines": "35-40",
+      "code": "  // in badly damaged PDF files, we can run off the end of the input\n  // stream immediately after the \"stream\" token\n  if (!lexer->getStream()) {\n    return nullptr;\n  }\n  baseStr = lexer->getStream()->getBaseStream();",
+      "explanation": "A second null-check on the lexer's current stream guards against truncation right after the 'stream' token. getBaseStream() then retrieves the raw, unfiltered byte source that will back the sub-stream. baseStr is the object whose makeSubStream() is called at line 76 with the attacker-influenced pos/length."
+    },
+    {
+      "file": "corpus/train/train_0289_cwe190.cpp",
+      "lines": "42-47",
+      "code": "  // skip over stream data\n  if (Lexer::LOOK_VALUE_NOT_CACHED != lexer->lookCharLastValueCached) {\n      // take into account the fact that we've cached one value\n      pos = pos - 1;\n      lexer->lookCharLastValueCached = Lexer::LOOK_VALUE_NOT_CACHED;\n  }",
+      "explanation": "The lexer may have peeked (look-ahead) one byte and cached it. If a value was cached (lookCharLastValueCached != LOOK_VALUE_NOT_CACHED), the recorded start position is one byte too high, so it is corrected with pos = pos - 1 and the cache flag reset. This adjusts the base offset just before the size arithmetic; it silently decrements pos without a lower-bound check."
+    },
+    {
+      "file": "corpus/train/train_0289_cwe190.cpp",
+      "lines": "48-51",
+      "code": "  if (unlikely(pos > LONG_LONG_MAX - length)) {\n      return nullptr;\n  }\n  lexer->setPos(pos + length);",
+      "explanation": "This is the security fix that names this sample. Before seeking to the end of the stream body (setPos(pos + length)), it checks that pos + length would not overflow a signed 64-bit value by rearranging the test to pos > LONG_LONG_MAX - length. If it would overflow, it aborts. This defends the positive-overflow case (large pos and large length wrapping to a small/negative offset), which is the classic CWE-190 primitive. The rearrangement is only correct when length >= 0, however (see risks)."
+    },
+    {
+      "file": "corpus/train/train_0289_cwe190.cpp",
+      "lines": "53-73",
+      "code": "  // refill token buffers and check for 'endstream'\n  shift();  // kill '>>'\n  shift(\"endstream\", objNum);  // kill 'stream'\n  if (buf1.isCmd(\"endstream\")) {\n    shift();\n  } else {\n    error(errSyntaxError, getPos(), \"Missing 'endstream' or incorrect stream length\");\n    if (strict) return nullptr;\n    if (xref && lexer->getStream()) {\n      // shift until we find the proper endstream or we change to another object or reach eof\n      length = lexer->getPos() - pos;\n      if (buf1.isCmd(\"endstream\")) {\n        dict.dictSet(\"Length\", Object(length));\n      }\n    } else {\n      // When building the xref we can't use it so use this\n      // kludge for broken PDF files: just add 5k to the length, and\n      // hope its enough\n      length += 5000;\n    }\n  }",
+      "explanation": "After seeking, the parser refills its token buffers and expects the 'endstream' keyword. shift() consumes '>>', shift(\"endstream\", objNum) consumes 'stream'. If the next token is 'endstream', all is well. Otherwise the declared length was wrong: in strict mode it aborts; otherwise, if an xref exists, it recovers the true length as lexer->getPos() - pos (again assuming getPos() >= pos) and writes it back into the dictionary. If no xref is available it applies a heuristic kludge, length += 5000, hoping to cover the real body. Both recovery paths re-derive 'length' AFTER the overflow guard at line 48, so the value ultimately handed to makeSubStream is not the one that was overflow-checked."
+    },
+    {
+      "file": "corpus/train/train_0289_cwe190.cpp",
+      "lines": "75-76",
+      "code": "  // make base stream\n  str = baseStr->makeSubStream(pos, gTrue, length, std::move(dict));",
+      "explanation": "The sub-stream is constructed over the raw source from offset 'pos' spanning 'length' bytes, with 'gTrue' meaning the length is limited/known, and the dictionary is moved in to become the sub-stream's dict. This is the sink: pos and length, both attacker-influenced, define the window of bytes the rest of Poppler will read. std::move(dict) leaves 'dict' in a valid-but-unspecified moved-from state for the remainder of the function."
+    },
+    {
+      "file": "corpus/train/train_0289_cwe190.cpp",
+      "lines": "78-82",
+      "code": "  // handle decryption\n  if (fileKey) {\n    str = new DecryptStream(str, fileKey, encAlgorithm, keyLength,\n\t\t\t    objNum, objGen);\n  }",
+      "explanation": "If the document is encrypted (fileKey != nullptr), the raw sub-stream is wrapped in a heap-allocated DecryptStream carrying the key, algorithm, key length, and object identity. The new-ed pointer replaces 'str'; ownership of the wrapper chain is expected to be managed by the returned Stream / its destructor chain."
+    },
+    {
+      "file": "corpus/train/train_0289_cwe190.cpp",
+      "lines": "84-87",
+      "code": "  // get filters\n  str = str->addFilters(str->getDict(), recursion);\n\n  return str;",
+      "explanation": "Finally the stream's /Filter chain (FlateDecode, etc.) is applied by addFilters, which reads the dictionary via str->getDict() (NOT the moved-from 'dict' local) and threads the same 'recursion' budget so nested filter/stream references are depth-limited. The fully wrapped Stream is returned. Note that getDict() is taken from 'str', so the local 'dict' moved at line 76 is not read again."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0289_cwe190.cpp",
+      "lines": "48-50",
+      "code": "  if (unlikely(pos > LONG_LONG_MAX - length)) {\n      return nullptr;\n  }",
+      "explanation": "The overflow guard is only sound when length >= 0. /Length is read with getInt() at line 21, which yields a signed int, and no code rejects a negative value; a PDF can declare '/Length -1'. With length negative, the sub-expression LONG_LONG_MAX - length computes LONG_LONG_MAX plus a positive magnitude, which is itself a signed-integer overflow and therefore undefined behavior (a compiler may fold the comparison in either direction). The guard is meant to bound pos + length, but it never establishes the lower bound length >= 0, so it does not actually validate that the [pos, pos+length] window is well-formed. Invariant: reject length < 0 (and pos < 0) BEFORE forming LONG_LONG_MAX - length or pos + length."
+    },
+    {
+      "file": "corpus/train/train_0289_cwe190.cpp",
+      "lines": "19-27",
+      "code": "  Object obj = dict.dictLookup(\"Length\", recursion);\n  if (obj.isInt()) {\n    length = obj.getInt();\n  } else if (obj.isInt64()) {\n    length = obj.getInt64();\n  } else {\n    error(errSyntaxError, getPos(), \"Bad 'Length' attribute in stream\");\n    if (strict) return nullptr;\n    length = 0;",
+      "explanation": "The declared /Length is trusted with no range or sign validation. An attacker controls whether it is int or int64 and its exact value, up to LONG_LONG_MAX. Even after the pos+length overflow guard, a large-but-non-overflowing length that exceeds the actual bytes remaining in the file yields a sub-stream that reads past the real data. The safety of that read depends entirely on BaseStream::makeSubStream clamping to the underlying file size; the parser itself supplies no such bound. Invariant: length must be clamped to the bytes actually available at 'pos' before it defines the sub-stream window."
+    },
+    {
+      "file": "corpus/train/train_0289_cwe190.cpp",
+      "lines": "31-32",
+      "code": "  if (xref && xref->getStreamEnd(pos, &endPos)) {\n    length = endPos - pos;\n  }",
+      "explanation": "When the xref side table supplies a stream end, length is recomputed as endPos - pos with no check that endPos >= pos. Both offsets are derived from file structures an attacker can corrupt so that the recorded endPos precedes pos, producing a negative 'length'. That negative value then feeds the flawed guard at line 48 (triggering the UB above) and, if it survives, a negative size at makeSubStream. Invariant: verify endPos >= pos before the subtraction (CWE-191 underflow on signed offsets)."
+    },
+    {
+      "file": "corpus/train/train_0289_cwe190.cpp",
+      "lines": "76",
+      "code": "  str = baseStr->makeSubStream(pos, gTrue, length, std::move(dict));",
+      "explanation": "This is the sink where pos and length become the byte window. Because length can be re-derived after the guard by the endstream-recovery paths (lines 63 and 71) and is never re-validated, and because pos was decremented at line 45 possibly below 0, the sub-stream can be asked to cover a negative-length or out-of-range range. If makeSubStream or downstream filter code treats length as an unsigned count or as a large positive extent, this is an out-of-bounds read primitive (CWE-125). Invariant: makeSubStream must independently clamp start/length to the base stream's real extent; the caller must not assume it does."
+    },
+    {
+      "file": "corpus/train/train_0289_cwe190.cpp",
+      "lines": "68-71",
+      "code": "      // When building the xref we can't use it so use this\n      // kludge for broken PDF files: just add 5k to the length, and\n      // hope its enough\n      length += 5000;",
+      "explanation": "The recovery kludge blindly extends length by 5000 bytes when 'endstream' is missing and no xref is available. This value was already used to seek (line 51) and is not re-run through the overflow guard, so length += 5000 can push a length that was near LONG_LONG_MAX into signed overflow, and more practically it deliberately makes the sub-stream span 5 KB beyond the declared body, which is an over-read of whatever follows in the file. Invariant: any post-guard mutation of length must be re-bounded against the file size and re-checked for overflow."
+    },
+    {
+      "file": "corpus/train/train_0289_cwe190.cpp",
+      "lines": "45",
+      "code": "      pos = pos - 1;",
+      "explanation": "When a look-ahead value was cached, the start offset is decremented unconditionally. If pos is 0 (a stream body at the very start of the input, or a corrupted lexer state), pos - 1 underflows to -1, which then flows into pos + length at line 51 and into makeSubStream at line 76 as a negative start offset. Invariant: guard pos > 0 (or clamp) before decrementing so the sub-stream start cannot go negative."
+    },
+    {
+      "file": "corpus/train/train_0289_cwe190.cpp",
+      "lines": "85",
+      "code": "  str = str->addFilters(str->getDict(), recursion);",
+      "explanation": "The /Length lookup (line 19) and addFilters (here) thread the 'recursion' counter, which is the ONLY defense against a PDF whose stream dictionaries reference each other (indirect /Length, chained filters, or object streams) to force unbounded recursion. If any resolver on this path fails to increment/bound 'recursion', a crafted document drives stack exhaustion (CWE-674 uncontrolled recursion / DoS). Invariant: every recursive resolution reachable from here must enforce a hard depth cap and abort past it."
+    }
+  ],
+  "summary": "This is the hardened variant of Poppler's Parser::makeStream: the central CWE-190 overflow of pos + length is now guarded at line 48. The residual risk is that the guard and the surrounding size arithmetic only cover the positive-overflow case: /Length is never validated to be non-negative or within the file, so a negative length (from /Length or from endPos - pos) makes the guard's own subtraction undefined and can drive a negative/oversized window into makeSubStream. Net risk is medium and latent, concentrated in the missing lower-bound validation on 'length' and 'pos'.",
+  "reviewed_anchors": [
+    {"anchor": "Parser::makeStream(Object &&dict, Guchar *fileKey, CryptAlgorithm, int keyLength, int objNum, int objGen, int recursion, GBool strict) (lines 2-5)", "disposition": "finding", "reason": "Entry point taking the untrusted stream dictionary and producing a byte window; attack surface for the whole parse."},
+    {"anchor": "Object &&dict parameter / std::move(dict) at line 76", "disposition": "dismissed", "reason": "Moved-from 'dict' is not read afterward (line 85 reads str->getDict(), not dict), so no use-after-move (CWE-672)."},
+    {"anchor": "Guchar *fileKey parameter (line 2)", "disposition": "dismissed", "reason": "Null-checked at line 79 before use; a pointer, not a sized buffer here."},
+    {"anchor": "CryptAlgorithm encAlgorithm / int keyLength (line 3)", "disposition": "dismissed", "reason": "Passed opaquely to DecryptStream; no arithmetic or buffer contract visible in this function."},
+    {"anchor": "int recursion parameter (lines 4, 19, 85)", "disposition": "finding", "reason": "Depth budget threaded into dictLookup and addFilters; the only guard against uncontrolled recursion (CWE-674)."},
+    {"anchor": "GBool strict parameter (line 5)", "disposition": "dismissed", "reason": "Selects abort-vs-tolerate on malformed input; no memory-safety contract of its own."},
+    {"anchor": "Goffset length (line 8)", "disposition": "finding", "reason": "Attacker-controlled 64-bit signed size with no sign/range validation; primary operand of the size arithmetic."},
+    {"anchor": "Goffset pos, endPos (line 9)", "disposition": "finding", "reason": "File-derived offsets used in pos+length and endPos-pos; can be negative or wrap."},
+    {"anchor": "dict.dictLookup(\"Length\", recursion) + isInt/getInt/getInt64 (lines 19-23)", "disposition": "finding", "reason": "Reads untrusted /Length with no lower-bound or file-size check."},
+    {"anchor": "length = endPos - pos (line 32)", "disposition": "finding", "reason": "Signed subtraction with no endPos >= pos check; underflow to negative length (CWE-191)."},
+    {"anchor": "pos = pos - 1 (line 45)", "disposition": "finding", "reason": "Unconditional decrement can underflow start offset below 0 when pos == 0."},
+    {"anchor": "if (unlikely(pos > LONG_LONG_MAX - length)) (lines 48-50)", "disposition": "finding", "reason": "Overflow guard is only valid for length >= 0; LONG_LONG_MAX - length is itself UB for negative length (CWE-190/191)."},
+    {"anchor": "lexer->setPos(pos + length) (line 51)", "disposition": "dismissed", "reason": "Covered by the guard finding; the addition is exactly what lines 48-50 attempt to bound."},
+    {"anchor": "length = lexer->getPos() - pos (line 63)", "disposition": "dismissed", "reason": "Recovery re-derivation assuming getPos() >= pos; folded into the post-guard length-mutation finding (line 71 anchor)."},
+    {"anchor": "length += 5000 (line 71)", "disposition": "finding", "reason": "Post-guard length mutation, not re-bounded or re-overflow-checked; deliberate over-read window (CWE-125/CWE-20)."},
+    {"anchor": "baseStr->makeSubStream(pos, gTrue, length, std::move(dict)) (line 76)", "disposition": "finding", "reason": "Sink: pos/length define the byte window; safety depends on downstream clamping the caller does not perform."},
+    {"anchor": "new DecryptStream(str, fileKey, encAlgorithm, keyLength, objNum, objGen) (lines 80-81)", "disposition": "dismissed", "reason": "Raw new wrapping the stream; ownership handled by the Stream destructor chain and out of scope here (no size arithmetic)."},
+    {"anchor": "str->addFilters(str->getDict(), recursion) (line 85)", "disposition": "finding", "reason": "Recursion-bounded filter application; folded into the uncontrolled-recursion finding."},
+    {"anchor": "LONG_LONG_MAX (line 48)", "disposition": "dismissed", "reason": "The overflow ceiling constant; its role is analyzed in the guard finding."}
+  ],
+  "findings": [
+    {
+      "title": "Overflow guard omits length>=0 lower bound; negative /Length makes the guard's own subtraction undefined",
+      "anchor": "if (unlikely(pos > LONG_LONG_MAX - length)) { return nullptr; }",
+      "file": "corpus/train/train_0289_cwe190.cpp",
+      "line": "48-50",
+      "code": "  if (unlikely(pos > LONG_LONG_MAX - length)) {\n      return nullptr;\n  }",
+      "bug_class": "Signed integer overflow / missing lower-bound validation in overflow guard",
+      "cwe": "CWE-190",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0289_cwe190.cpp",
+      "invariant": "Establish length >= 0 (and pos >= 0) BEFORE evaluating LONG_LONG_MAX - length or pos + length; the ceiling-subtraction form is only valid for non-negative length.",
+      "failure_mode": "A PDF sets /Length to a negative value (getInt() at line 21 yields a signed int and nothing rejects it), or endPos-pos at line 32 underflows negative. Then LONG_LONG_MAX - length adds a positive magnitude to LONG_LONG_MAX, which is signed-integer overflow (undefined behavior) and does not validate the intended pos+length bound, so a malformed [pos, pos+length] window can slip through to makeSubStream.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether any caller or earlier parser stage rejects negative /Length before makeStream, and whether the guard should instead be 'if (length < 0 || pos < 0 || pos > LONG_LONG_MAX - length)'."
+    },
+    {
+      "title": "Attacker-controlled /Length used without range/file-size validation",
+      "anchor": "Object obj = dict.dictLookup(\"Length\", recursion); ... length = obj.getInt();",
+      "file": "corpus/train/train_0289_cwe190.cpp",
+      "line": "19-27",
+      "code": "  Object obj = dict.dictLookup(\"Length\", recursion);\n  if (obj.isInt()) {\n    length = obj.getInt();\n  } else if (obj.isInt64()) {\n    length = obj.getInt64();\n  } else {\n    error(errSyntaxError, getPos(), \"Bad 'Length' attribute in stream\");\n    if (strict) return nullptr;\n    length = 0;",
+      "bug_class": "Missing input validation on length field",
+      "cwe": "CWE-20",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0289_cwe190.cpp",
+      "invariant": "The declared stream length must be non-negative and clamped to the bytes actually available from 'pos' to end-of-file before it can define the sub-stream extent.",
+      "failure_mode": "An attacker declares a /Length that is large but does not overflow pos+length (e.g. spanning far beyond the real body). The overflow guard passes, and makeSubStream is asked to cover bytes that do not exist; if the base stream or a downstream filter treats the extent as valid, this is an out-of-bounds read of file/heap memory. Safety here depends entirely on makeSubStream clamping, which the caller does not verify.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether BaseStream::makeSubStream clamps 'length' to the underlying source size, or whether callers/filters read the full declared length."
+    },
+    {
+      "title": "length = endPos - pos underflows when xref end precedes stream start",
+      "anchor": "length = endPos - pos;",
+      "file": "corpus/train/train_0289_cwe190.cpp",
+      "line": "31-32",
+      "code": "  if (xref && xref->getStreamEnd(pos, &endPos)) {\n    length = endPos - pos;\n  }",
+      "bug_class": "Signed integer underflow on offset subtraction",
+      "cwe": "CWE-191",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0289_cwe190.cpp",
+      "invariant": "endPos must be verified >= pos before computing length = endPos - pos.",
+      "failure_mode": "The xref stream-end table is built from file content; a crafted document can record an endPos smaller than the stream's start 'pos'. The subtraction then yields a negative length, which overrides the dictionary value and flows into the flawed guard at line 48 and the makeSubStream sink, producing a negative/ill-formed byte window.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether XRef::getStreamEnd can return endPos < pos and whether any caller validates the ordering."
+    },
+    {
+      "title": "Post-guard length mutations (recovery + '+5000' kludge) bypass the overflow/size check",
+      "anchor": "length += 5000;",
+      "file": "corpus/train/train_0289_cwe190.cpp",
+      "line": "63-71",
+      "code": "      length = lexer->getPos() - pos;\n      if (buf1.isCmd(\"endstream\")) {\n        dict.dictSet(\"Length\", Object(length));\n      }\n    } else {\n      // When building the xref we can't use it so use this\n      // kludge for broken PDF files: just add 5k to the length, and\n      // hope its enough\n      length += 5000;",
+      "bug_class": "Unvalidated size after guard / deliberate over-read",
+      "cwe": "CWE-125",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0289_cwe190.cpp",
+      "invariant": "Any re-derivation or increment of 'length' after the overflow guard must be re-bounded against the file size and re-checked for overflow before makeSubStream uses it.",
+      "failure_mode": "When 'endstream' is missing, length is recomputed as getPos()-pos (assuming getPos()>=pos) or blindly incremented by 5000. Because this happens after the line-48 guard, a length near LONG_LONG_MAX can overflow, and the +5000 kludge intentionally makes the sub-stream extend past the real body, reading trailing file/heap bytes.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether the final 'length' passed to makeSubStream at line 76 is re-validated after these recovery branches."
+    },
+    {
+      "title": "Recursion budget is the only guard against nested-stream stack exhaustion",
+      "anchor": "str = str->addFilters(str->getDict(), recursion);",
+      "file": "corpus/train/train_0289_cwe190.cpp",
+      "line": "85",
+      "code": "  str = str->addFilters(str->getDict(), recursion);",
+      "bug_class": "Uncontrolled recursion / resource exhaustion",
+      "cwe": "CWE-674",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "dictLookup and addFilters must strictly increment and cap 'recursion', aborting once a hard depth limit is exceeded.",
+      "failure_mode": "A PDF whose stream dictionaries reference each other (indirect /Length, chained /Filter, object streams) can drive deep or unbounded recursion through dictLookup (line 19) and addFilters (line 85). If any resolver on the path does not enforce the depth cap, a small crafted file exhausts the stack and crashes the process (DoS).",
+      "cve_analog": "",
+      "what_to_confirm": "That every recursive resolver reachable from dictLookup/addFilters bounds 'recursion' against a fixed maximum."
+    },
+    {
+      "title": "pos = pos - 1 can underflow start offset below zero",
+      "anchor": "pos = pos - 1;",
+      "file": "corpus/train/train_0289_cwe190.cpp",
+      "line": "43-45",
+      "code": "  if (Lexer::LOOK_VALUE_NOT_CACHED != lexer->lookCharLastValueCached) {\n      // take into account the fact that we've cached one value\n      pos = pos - 1;",
+      "bug_class": "Integer underflow on offset",
+      "cwe": "CWE-191",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0289_cwe190.cpp",
+      "invariant": "pos must be > 0 before decrementing so the sub-stream start offset cannot become negative.",
+      "failure_mode": "If a look-ahead value was cached while pos == 0 (stream body at the very start of input, or corrupted lexer state), pos becomes -1 and feeds pos + length (line 51) and makeSubStream (line 76) as a negative start, potentially seeking before the buffer.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether pos can be 0 at line 45 in practice and whether makeSubStream rejects negative start offsets."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm whether /Length (getInt/getInt64 at lines 21-23) can be negative and whether it is validated >= 0 before line 48; the ceiling guard is only correct for non-negative length.",
+    "Add/verify a lower-bound test 'length < 0 || pos < 0' alongside 'pos > LONG_LONG_MAX - length' at line 48.",
+    "Verify endPos >= pos before 'length = endPos - pos' (line 32); check XRef::getStreamEnd cannot return an end before the start.",
+    "Confirm BaseStream::makeSubStream clamps 'pos' and 'length' (line 76) to the underlying source size so an oversized declared length cannot cause an out-of-bounds read.",
+    "Ensure the recovery paths (lines 63 and 71, including 'length += 5000') re-bound and re-overflow-check 'length' before it reaches makeSubStream.",
+    "Check that pos == 0 cannot reach 'pos = pos - 1' (line 45), or that a negative start offset is rejected downstream.",
+    "Confirm dictLookup and addFilters strictly enforce the 'recursion' depth cap to prevent stack exhaustion from nested streams/filters."
+  ]
+}

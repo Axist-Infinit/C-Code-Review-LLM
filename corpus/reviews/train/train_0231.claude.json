@@ -1,0 +1,231 @@
+{
+  "subsystem": "collectd network plugin — receive-side parser for the HMAC-SHA-256 signature part of a collectd binary network packet. parse_part_sign_sha256() consumes the leading 'signature' TLV of a UDP datagram, extracts the sender's username and the transmitted HMAC, recomputes the HMAC over the remaining packet using the user's shared secret, and (on match) recursively parses the rest of the datagram as authenticated (PP_SIGNED) content.",
+  "provenance": "Identified by the collectd-specific idioms and symbol names: sockent_t, part_signature_sha256_t, part.head.type/part.head.length, PART_SIGNATURE_SHA256_SIZE, the BUFFER_READ macro, c_complain_t/C_COMPLAIN_INIT_STATIC, ERROR()/WARNING()/sfree(), fbh_get() (a filter/host DB lookup), parse_packet(), and the libgcrypt HMAC API (gcry_md_open/gcry_md_setkey/gcry_md_write/gcry_md_read with GCRY_MD_SHA256 | GCRY_MD_FLAG_HMAC). The banner tag 'primevul_c_train_3140_fixed' and the function name parse_part_sign_sha256 match src/network.c in collectd. This is the receive path of collectd's authenticated network protocol.",
+  "trust_boundary": "The buffer (*ret_buffer / *ret_buffer_len) is a raw UDP datagram received on the network plugin's listen socket. Every byte is attacker-controlled and unauthenticated at entry — the signature part exists precisely to authenticate the rest, so its own header (pss.head.type, pss.head.length), the transmitted 32-byte hash, and the trailing username bytes are all hostile input. pss_head_length (a 16-bit, byte-swapped length field, max 65535) and username_len (derived from it) are the primary hostile scalars. se->data.server.userdb is trusted local configuration. The shared secret returned by fbh_get() is trusted local configuration keyed by the untrusted username.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0231_cwe835.c",
+      "lines": "2-4",
+      "code": "static int parse_part_sign_sha256(sockent_t *se, /* {{{ */\n                                  void **ret_buffer, size_t *ret_buffer_len,\n                                  int flags) {",
+      "explanation": "The entry point for parsing one HMAC-SHA-256 signature part. se carries per-socket state including the user database (se->data.server.userdb). ret_buffer/ret_buffer_len are in/out pointers to the current parse cursor into the received datagram: the function reads from them and, on success, advances them past the bytes it consumed so the caller (parse_packet) can continue with the remainder. flags carries parse mode bits and is OR'd with PP_SIGNED before re-parsing the authenticated remainder. The function returns 0 on success or a negative errno/-1 on error."
+    },
+    {
+      "file": "corpus/train/train_0231_cwe835.c",
+      "lines": "5-20",
+      "code": "static c_complain_t complain_no_users = C_COMPLAIN_INIT_STATIC;\n\n  char *buffer;\n  size_t buffer_len;\n  size_t buffer_offset;\n\n  size_t username_len;\n  char *secret;\n\n  part_signature_sha256_t pss;\n  uint16_t pss_head_length;\n  char hash[sizeof(pss.hash)];\n\n  gcry_md_hd_t hd;\n  gcry_error_t err;\n  unsigned char *hash_ptr;",
+      "explanation": "Local declarations. complain_no_users is a static rate-limiter used to throttle the 'no user DB configured' log. buffer/buffer_len/buffer_offset are the working copy of the cursor and a byte offset that BUFFER_READ advances. username_len is the size_t length of the attacker-supplied username. pss is a stack copy of the on-wire signature struct (part_signature_sha256_t) with sub-fields head.type, head.length, a fixed-size hash[] array, and a username pointer; pss_head_length holds the host-order copy of head.length. hash[sizeof(pss.hash)] is a fixed 32-byte stack buffer sized to mirror the wire hash field — it receives the locally recomputed digest. hd/err/hash_ptr are the libgcrypt HMAC handle, error code, and digest pointer."
+    },
+    {
+      "file": "corpus/train/train_0231_cwe835.c",
+      "lines": "22-24",
+      "code": "buffer = *ret_buffer;\n  buffer_len = *ret_buffer_len;\n  buffer_offset = 0;",
+      "explanation": "Snapshot the caller's cursor into locals. buffer_len is the number of bytes remaining in the datagram from this point on; the code trusts that buffer actually points to at least buffer_len readable bytes (this is the caller's contract). buffer_offset starts at 0 and is bumped by each BUFFER_READ; it is later asserted to equal pss_head_length, i.e. the size of this whole part."
+    },
+    {
+      "file": "corpus/train/train_0231_cwe835.c",
+      "lines": "26-28",
+      "code": "/* Check if the buffer has enough data for this structure. */\n  if (buffer_len <= PART_SIGNATURE_SHA256_SIZE)\n    return (-ENOMEM);",
+      "explanation": "The first gate: reject the part unless there are strictly more than PART_SIGNATURE_SHA256_SIZE bytes remaining. PART_SIGNATURE_SHA256_SIZE is the fixed size of the header-plus-hash prefix (2-byte type + 2-byte length + 32-byte hash = 36 bytes). Using '<=' (not '<') guarantees buffer_len > PART_SIGNATURE_SHA256_SIZE, which is what makes the later subtraction buffer_len - PART_SIGNATURE_SHA256_SIZE at line 98 non-negative. This '<=' is part of the CVE-2016-6254 hardening."
+    },
+    {
+      "file": "corpus/train/train_0231_cwe835.c",
+      "lines": "30-33",
+      "code": "/* Read type and length header */\n  BUFFER_READ(&pss.head.type, sizeof(pss.head.type));\n  BUFFER_READ(&pss.head.length, sizeof(pss.head.length));\n  pss_head_length = ntohs(pss.head.length);",
+      "explanation": "BUFFER_READ (a collectd macro not shown here) copies sizeof(...) bytes from buffer+buffer_offset into the destination and advances buffer_offset by that many bytes. It reads the 2-byte part type and 2-byte part length from the wire into pss.head, then ntohs() converts the big-endian length to host order in pss_head_length. Because the field is a uint16_t, pss_head_length can be anything from 0 to 65535 under attacker control. This length is the self-declared total size of the signature part."
+    },
+    {
+      "file": "corpus/train/train_0231_cwe835.c",
+      "lines": "35-40",
+      "code": "/* Check if the `pss_head_length' is within bounds. */\n  if ((pss_head_length <= PART_SIGNATURE_SHA256_SIZE) ||\n      (pss_head_length > buffer_len)) {\n    ERROR(\"network plugin: HMAC-SHA-256 with invalid length received.\");\n    return (-1);\n  }",
+      "explanation": "The core sanity gate on the attacker-declared length. It requires PART_SIGNATURE_SHA256_SIZE < pss_head_length <= buffer_len. The lower bound (pss_head_length <= PART_SIGNATURE_SHA256_SIZE rejected) is essential: it guarantees username_len = pss_head_length - PART_SIGNATURE_SHA256_SIZE at line 58 is at least 1 and cannot wrap around in unsigned arithmetic. The upper bound (pss_head_length > buffer_len rejected) guarantees the whole declared part fits inside the received datagram, so the subsequent BUFFER_READ of the username stays in bounds. Both halves of this check are the CVE-2016-6254 fix."
+    },
+    {
+      "file": "corpus/train/train_0231_cwe835.c",
+      "lines": "42-52",
+      "code": "if (se->data.server.userdb == NULL) {\n    c_complain(\n        LOG_NOTICE, &complain_no_users,\n        \"network plugin: Received signed network packet but can't verify it \"\n        \"because no user DB has been configured. Will accept it.\");\n\n    *ret_buffer = buffer + pss_head_length;\n    *ret_buffer_len -= pss_head_length;\n\n    return (0);",
+      "explanation": "Degraded-trust path: if no user database is configured, the plugin cannot verify the signature. Instead of dropping the packet it logs a rate-limited notice and ACCEPTS it — it simply skips the signature part by advancing the cursor by pss_head_length and shrinking the remaining length, returning success. The caller then continues parsing the rest of the datagram WITHOUT the PP_SIGNED flag, i.e. as ordinary unauthenticated data. Note that pss_head_length > PART_SIGNATURE_SHA256_SIZE > 0 (guaranteed by lines 27 and 36) so the cursor always makes forward progress here."
+    },
+    {
+      "file": "corpus/train/train_0231_cwe835.c",
+      "lines": "54-55",
+      "code": "/* Copy the hash. */\n  BUFFER_READ(pss.hash, sizeof(pss.hash));",
+      "explanation": "Reads the 32-byte transmitted HMAC from the wire into the fixed pss.hash array, advancing buffer_offset to PART_SIGNATURE_SHA256_SIZE (type+length+hash consumed). sizeof(pss.hash) is a compile-time constant so this copy is bounded by the destination size; its in-bounds-ness on the source side rests entirely on the line 27/36-37 length gates."
+    },
+    {
+      "file": "corpus/train/train_0231_cwe835.c",
+      "lines": "57-65",
+      "code": "/* Calculate username length (without null byte) and allocate memory */\n  username_len = pss_head_length - PART_SIGNATURE_SHA256_SIZE;\n  pss.username = malloc(username_len + 1);\n  if (pss.username == NULL)\n    return (-ENOMEM);\n\n  /* Read the username */\n  BUFFER_READ(pss.username, username_len);\n  pss.username[username_len] = 0;",
+      "explanation": "The trailing bytes of the part after the fixed prefix are the username. username_len = pss_head_length - PART_SIGNATURE_SHA256_SIZE; because line 36 already rejected pss_head_length <= PART_SIGNATURE_SHA256_SIZE, this subtraction is safe (>= 1) and, since pss_head_length is a uint16_t, username_len is at most ~65499 so username_len + 1 cannot overflow size_t. malloc is checked for NULL (good). BUFFER_READ then copies username_len bytes into the heap buffer, and pss.username[username_len] = 0 NUL-terminates it. The username read is in bounds because buffer_offset (= PART_SIGNATURE_SHA256_SIZE) + username_len = pss_head_length <= buffer_len (line 37)."
+    },
+    {
+      "file": "corpus/train/train_0231_cwe835.c",
+      "lines": "67-75",
+      "code": "assert(buffer_offset == pss_head_length);\n\n  /* Query the password */\n  secret = fbh_get(se->data.server.userdb, pss.username);\n  if (secret == NULL) {\n    ERROR(\"network plugin: Unknown user: %s\", pss.username);\n    sfree(pss.username);\n    return (-ENOENT);\n  }",
+      "explanation": "The assert documents the invariant that exactly pss_head_length bytes were consumed (type+length+hash+username). Note assert() is compiled out under NDEBUG, so it is documentation, not a runtime guard. fbh_get looks up the shared secret for the untrusted username in the trusted user DB. On unknown user it logs the (NUL-terminated) username and frees the heap buffer before returning -ENOENT. Logging the attacker-controlled username via a %s format argument is safe here (it is a data argument, not the format string), though it does echo attacker data into logs."
+    },
+    {
+      "file": "corpus/train/train_0231_cwe835.c",
+      "lines": "77-95",
+      "code": "/* Create a hash device and check the HMAC */\n  hd = NULL;\n  err = gcry_md_open(&hd, GCRY_MD_SHA256, GCRY_MD_FLAG_HMAC);\n  if (err != 0) {\n    ERROR(\"network plugin: Creating HMAC-SHA-256 object failed: %s\",\n          gcry_strerror(err));\n    sfree(secret);\n    sfree(pss.username);\n    return (-1);\n  }\n\n  err = gcry_md_setkey(hd, secret, strlen(secret));\n  if (err != 0) {\n    ERROR(\"network plugin: gcry_md_setkey failed: %s\", gcry_strerror(err));\n    gcry_md_close(hd);\n    sfree(secret);\n    sfree(pss.username);\n    return (-1);\n  }",
+      "explanation": "Sets up a libgcrypt HMAC-SHA-256 context and keys it with the trusted secret (keyed by strlen(secret), so an embedded NUL in the stored secret would truncate the key — but secret is local config, not attacker data). Both gcry calls are error-checked and every error path frees secret and pss.username and closes the md handle where already opened, so no leaks on these branches."
+    },
+    {
+      "file": "corpus/train/train_0231_cwe835.c",
+      "lines": "97-107",
+      "code": "gcry_md_write(hd, buffer + PART_SIGNATURE_SHA256_SIZE,\n                buffer_len - PART_SIGNATURE_SHA256_SIZE);\n  hash_ptr = gcry_md_read(hd, GCRY_MD_SHA256);\n  if (hash_ptr == NULL) {\n    ERROR(\"network plugin: gcry_md_read failed.\");\n    gcry_md_close(hd);\n    sfree(secret);\n    sfree(pss.username);\n    return (-1);\n  }\n  memcpy(hash, hash_ptr, sizeof(hash));",
+      "explanation": "Computes the HMAC over the datagram region starting just past this signature part's fixed prefix, i.e. bytes [PART_SIGNATURE_SHA256_SIZE, buffer_len). The length buffer_len - PART_SIGNATURE_SHA256_SIZE is safe from unsigned underflow because line 27 guaranteed buffer_len > PART_SIGNATURE_SHA256_SIZE. Importantly the signature authenticates everything after the prefix (including the username bytes and the rest of the packet), not just this part. gcry_md_read returns a pointer to the 32-byte digest (NULL-checked), which is copied into the fixed 32-byte hash buffer via a size-bounded memcpy."
+    },
+    {
+      "file": "corpus/train/train_0231_cwe835.c",
+      "lines": "109-120",
+      "code": "/* Clean up */\n  gcry_md_close(hd);\n  hd = NULL;\n\n  if (memcmp(pss.hash, hash, sizeof(pss.hash)) != 0) {\n    WARNING(\"network plugin: Verifying HMAC-SHA-256 signature failed: \"\n            \"Hash mismatch. Username: %s\",\n            pss.username);\n  } else {\n    parse_packet(se, buffer + buffer_offset, buffer_len - buffer_offset,\n                 flags | PP_SIGNED, pss.username);\n  }",
+      "explanation": "Closes the HMAC handle, then compares the transmitted hash (pss.hash) against the locally computed hash with memcmp. On mismatch it logs a warning and drops the authenticated interpretation. On match it recursively invokes parse_packet on the remainder of the datagram (buffer + buffer_offset, where buffer_offset == pss_head_length), tagging it PP_SIGNED and attaching the verified username. buffer_len - buffer_offset is non-negative because buffer_offset == pss_head_length <= buffer_len (line 37). This re-parse of the trailing bytes is the mechanism by which signed content is processed."
+    },
+    {
+      "file": "corpus/train/train_0231_cwe835.c",
+      "lines": "122-129",
+      "code": "sfree(secret);\n  sfree(pss.username);\n\n  *ret_buffer = buffer + buffer_len;\n  *ret_buffer_len = 0;\n\n  return (0);\n} /* }}} int parse_part_sign_sha256 */",
+      "explanation": "Frees the secret and username, then consumes the ENTIRE remaining datagram by advancing the caller's cursor to buffer + buffer_len and zeroing *ret_buffer_len. This is deliberate: because line 118 already recursively parsed everything after the signature part, the caller's outer loop must not re-process those bytes — setting *ret_buffer_len = 0 acts as a once-guard so the remainder is parsed exactly once. Returns 0 (success) even on hash mismatch (the packet is simply not treated as signed)."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0231_cwe835.c",
+      "lines": "31-64",
+      "code": "BUFFER_READ(&pss.head.type, sizeof(pss.head.type));\n  BUFFER_READ(&pss.head.length, sizeof(pss.head.length));\n...\n  BUFFER_READ(pss.hash, sizeof(pss.hash));\n...\n  BUFFER_READ(pss.username, username_len);",
+      "explanation": "BUFFER_READ is the central untrusted-read surface and its definition is not shown. In collectd it is a bare memcpy from buffer+buffer_offset that advances buffer_offset with NO internal bounds check against buffer_len — every read's safety is delegated to the caller's length gates. Here the header reads at lines 31-32 and the 32-byte hash read at line 55 execute BEFORE any check that buffer_len is large enough for them; they are covered only by the coarse line-27 test (buffer_len > PART_SIGNATURE_SHA256_SIZE), which is exactly PART_SIGNATURE_SHA256_SIZE bytes' worth. The username read at line 64 is bounded solely by the line 36-37 gate (buffer_offset + username_len == pss_head_length <= buffer_len). The invariant the implementation MUST uphold is that PART_SIGNATURE_SHA256_SIZE equals exactly sizeof(type)+sizeof(length)+sizeof(hash) and that buffer really holds buffer_len bytes; if PART_SIGNATURE_SHA256_SIZE is mis-defined or a future edit relaxes the gates, BUFFER_READ becomes an out-of-bounds read (CWE-125) into pss/pss.username."
+    },
+    {
+      "file": "corpus/train/train_0231_cwe835.c",
+      "lines": "36-58",
+      "code": "if ((pss_head_length <= PART_SIGNATURE_SHA256_SIZE) ||\n      (pss_head_length > buffer_len)) {\n...\n  username_len = pss_head_length - PART_SIGNATURE_SHA256_SIZE;",
+      "explanation": "This is the historical heap-overflow primitive (CVE-2016-6254). pss_head_length is an attacker-controlled uint16_t and username_len is computed as pss_head_length - PART_SIGNATURE_SHA256_SIZE in unsigned size_t arithmetic. If the guard 'pss_head_length <= PART_SIGNATURE_SHA256_SIZE' at line 36 were absent or weakened (e.g. '<' vs '<=', or dropped entirely as in the pre-patch code), a length smaller than PART_SIGNATURE_SHA256_SIZE would make the subtraction wrap to a value near SIZE_MAX. That would drive a gigantic malloc(username_len + 1) (username_len + 1 could even wrap to 0, yielding a tiny allocation) and a BUFFER_READ(pss.username, username_len) copying an enormous count out of the datagram — a remote heap buffer overflow / OOB read. In THIS revision the lower-bound check is present and correct, so the primitive is mitigated; the finding documents the contract that must never regress."
+    },
+    {
+      "file": "corpus/train/train_0231_cwe835.c",
+      "lines": "113-119",
+      "code": "if (memcmp(pss.hash, hash, sizeof(pss.hash)) != 0) {\n...\n  } else {\n    parse_packet(se, buffer + buffer_offset, buffer_len - buffer_offset,\n                 flags | PP_SIGNED, pss.username);",
+      "explanation": "The HMAC tag is verified with memcmp, which is not a constant-time comparison: it returns as soon as the first differing byte is found. An attacker who can measure the verification time could, in principle, forge a valid HMAC byte-by-byte (a classic MAC-comparison timing side channel, CWE-208). The impact is bounded because a successful forgery still requires knowing the shared secret to make earlier bytes match, and network jitter on UDP makes the channel very noisy, so severity is low — but MAC comparisons should use a constant-time compare (e.g. gcry_mac_verify or a volatile XOR-accumulate) as a matter of hygiene. The invariant: authentication-tag comparison must be time-independent of how many leading bytes match."
+    },
+    {
+      "file": "corpus/train/train_0231_cwe835.c",
+      "lines": "118-126",
+      "code": "parse_packet(se, buffer + buffer_offset, buffer_len - buffer_offset,\n                 flags | PP_SIGNED, pss.username);\n...\n  *ret_buffer = buffer + buffer_len;\n  *ret_buffer_len = 0;",
+      "explanation": "parse_part_sign_sha256 recursively re-enters parse_packet on the trailing bytes, and parse_packet in turn dispatches back into parse_part_sign_sha256 whenever it meets another signature part. A malicious datagram can chain many signature parts (each consuming at least PART_SIGNATURE_SHA256_SIZE + 1 bytes), so for a maximum ~64 KB UDP payload the nesting depth can reach on the order of a thousand frames — uncontrolled recursion that can exhaust the thread stack and crash the daemon (DoS, CWE-674). Each level does make strict forward progress (pss_head_length > PART_SIGNATURE_SHA256_SIZE), so it terminates rather than looping forever, and the *ret_buffer_len = 0 write is a correct once-guard preventing the outer loop from re-parsing the same bytes; the residual risk is stack depth, which the implementation should cap with an explicit recursion/nesting limit."
+    },
+    {
+      "file": "corpus/train/train_0231_cwe835.c",
+      "lines": "42-51",
+      "code": "if (se->data.server.userdb == NULL) {\n    c_complain(\n        LOG_NOTICE, &complain_no_users,\n        \"network plugin: Received signed network packet but can't verify it \"\n        \"because no user DB has been configured. Will accept it.\");\n\n    *ret_buffer = buffer + pss_head_length;\n    *ret_buffer_len -= pss_head_length;\n\n    return (0);",
+      "explanation": "When no user DB is configured the code fails OPEN: it accepts the packet without verifying the HMAC and continues parsing the remainder as (unsigned) data. An operator who enables the SecurityLevel 'Sign' expecting signed-only ingestion but forgets to configure an AuthFile gets no protection at all — spoofed metrics are ingested. This is an intentional, documented behavior (CWE-287, authentication decision that defaults to accept), not a memory-safety bug, but it is a security-posture footgun worth confirming against the plugin's SecurityLevel handling: 'Sign' should arguably drop, not accept, when it cannot verify."
+    }
+  ],
+  "summary": "This is the hardened (post-CVE-2016-6254) revision of collectd's parse_part_sign_sha256. The classic remote heap-overflow primitive — the unsigned underflow of username_len = pss_head_length - PART_SIGNATURE_SHA256_SIZE — is correctly gated by the two-sided length check at lines 36-37 and the '<=' minimum-size check at line 27, and all allocation/free/error paths are clean. Residual issues are lower-severity and largely latent: the shown reads depend entirely on the unshown BUFFER_READ macro doing no bounds checking, the HMAC tag is compared with non-constant-time memcmp, verification fails open when no user DB is configured, and the recursive parse_packet re-entry has no explicit nesting cap.",
+  "reviewed_anchors": [
+    {"anchor": "parse_part_sign_sha256(sockent_t *se, void **ret_buffer, size_t *ret_buffer_len, int flags) — signature (lines 2-4)", "disposition": "finding", "reason": "In/out cursor over an untrusted UDP datagram; the whole attack surface enters through *ret_buffer/*ret_buffer_len."},
+    {"anchor": "complain_no_users (static c_complain_t, line 5)", "disposition": "dismissed", "reason": "Rate-limiter state for logging only; no attacker-controlled data flows through it."},
+    {"anchor": "buffer / buffer_len / buffer_offset (lines 7-9, 22-24)", "disposition": "finding", "reason": "buffer_len is the trusted-length contract and buffer_offset is the running index BUFFER_READ advances; safety of all reads depends on their relationship."},
+    {"anchor": "username_len (size_t, line 11) and its computation (line 58)", "disposition": "finding", "reason": "Unsigned subtraction of an attacker length from a fixed size macro — the CVE-2016-6254 underflow primitive; guarded here but contract-critical."},
+    {"anchor": "secret (char *, line 12; fbh_get line 70)", "disposition": "dismissed", "reason": "Trusted local shared secret looked up from config; keyed by untrusted username but not itself attacker data. Freed on all paths."},
+    {"anchor": "part_signature_sha256_t pss (line 14) with head.type, head.length, hash[], username", "disposition": "finding", "reason": "Stack copy of the on-wire struct; head.length and the trailing username are hostile; struct-level anchor carrying the parse contract."},
+    {"anchor": "uint16_t pss_head_length (line 15; ntohs line 33)", "disposition": "finding", "reason": "Attacker-controlled 16-bit length field (0..65535) that drives the buffer subtraction and username size; the primary hostile scalar."},
+    {"anchor": "char hash[sizeof(pss.hash)] (line 16) and memcpy(hash, hash_ptr, sizeof(hash)) (line 107)", "disposition": "dismissed", "reason": "Fixed 32-byte buffer written by a size-bounded memcpy of the 32-byte SHA-256 digest; no length mismatch possible."},
+    {"anchor": "PART_SIGNATURE_SHA256_SIZE (macro; lines 27, 36, 58, 97-98)", "disposition": "finding", "reason": "Size constant that all bounds checks and the underflow subtraction hinge on; must equal sizeof(type)+sizeof(length)+sizeof(hash)."},
+    {"anchor": "BUFFER_READ macro (lines 31, 32, 55, 64)", "disposition": "finding", "reason": "Central untrusted-read primitive; definition not shown and does no internal bounds check, so every read relies on the surrounding length gates."},
+    {"anchor": "Length gate: pss_head_length <= PART_SIGNATURE_SHA256_SIZE || pss_head_length > buffer_len (lines 36-37)", "disposition": "finding", "reason": "The single guard that prevents both the underflow and the OOB username read; the crux of the fix."},
+    {"anchor": "no-userdb accept path (lines 42-52)", "disposition": "finding", "reason": "Fails open: accepts unverifiable signed packets, an authentication-posture decision."},
+    {"anchor": "malloc(username_len + 1) (line 59) + NULL check (lines 60-61)", "disposition": "dismissed", "reason": "username_len is a bounded uint16-derived value so +1 cannot overflow, and the NULL return is checked."},
+    {"anchor": "pss.username[username_len] = 0 (line 65)", "disposition": "dismissed", "reason": "Writes the terminator at the exact byte allocated for it (malloc reserved username_len + 1); in bounds by construction."},
+    {"anchor": "assert(buffer_offset == pss_head_length) (line 67)", "disposition": "dismissed", "reason": "Documentation/debug invariant only; compiled out under NDEBUG so it enforces nothing at runtime but is not itself a defect."},
+    {"anchor": "gcry_md_open / gcry_md_setkey / gcry_md_write / gcry_md_read (lines 79, 88, 97, 99)", "disposition": "dismissed", "reason": "All error/NULL returns checked and resources freed on every path; write region length is underflow-safe via the line 27 guard."},
+    {"anchor": "memcmp(pss.hash, hash, sizeof(pss.hash)) (line 113)", "disposition": "finding", "reason": "Non-constant-time comparison of an authentication tag — a timing side channel."},
+    {"anchor": "parse_packet(se, buffer + buffer_offset, buffer_len - buffer_offset, flags | PP_SIGNED, pss.username) (line 118)", "disposition": "finding", "reason": "Recursive re-parse of the remainder; no explicit nesting cap, so deeply chained signature parts can exhaust the stack."},
+    {"anchor": "*ret_buffer = buffer + buffer_len; *ret_buffer_len = 0 (lines 125-126)", "disposition": "dismissed", "reason": "Correct once-guard: consumes exactly the remainder already handled by the line 118 recursion, preventing double processing."}
+  ],
+  "findings": [
+    {
+      "title": "BUFFER_READ performs untrusted reads with no internal bounds check; header and hash are read before a size check covering them",
+      "anchor": "BUFFER_READ(&pss.head.type, ...) / BUFFER_READ(pss.hash, ...) / BUFFER_READ(pss.username, username_len)",
+      "file": "corpus/train/train_0231_cwe835.c",
+      "line": "31-32, 55, 64",
+      "code": "BUFFER_READ(&pss.head.type, sizeof(pss.head.type));\n  BUFFER_READ(&pss.head.length, sizeof(pss.head.length));\n...\n  BUFFER_READ(pss.hash, sizeof(pss.hash));\n...\n  BUFFER_READ(pss.username, username_len);",
+      "bug_class": "Out-of-bounds read from unbounded copy macro (contract delegated to caller)",
+      "cwe": "CWE-125",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided) — BUFFER_READ macro definition and PART_SIGNATURE_SHA256_SIZE in collectd src/network.c",
+      "invariant": "BUFFER_READ(dst, n) must only ever be reached when buffer_offset + n <= buffer_len, and PART_SIGNATURE_SHA256_SIZE must equal sizeof(head.type)+sizeof(head.length)+sizeof(hash) so the line 27/36-37 gates actually cover the header+hash reads.",
+      "failure_mode": "BUFFER_READ is a bare memcpy that advances buffer_offset without validating against buffer_len; the type/length (lines 31-32) and 32-byte hash (line 55) are read under only the coarse line-27 check. If PART_SIGNATURE_SHA256_SIZE is mis-sized, or a future edit relaxes the gates, these reads walk past the datagram, disclosing adjacent heap/stack memory (and feeding it into the HMAC and username).",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the BUFFER_READ definition does no bounds checking and that PART_SIGNATURE_SHA256_SIZE == 2 + 2 + 32; verify no read occurs before a check that buffer_len covers it."
+    },
+    {
+      "title": "username_len unsigned-underflow heap-overflow primitive (CVE-2016-6254) — mitigated here by the lower-bound length check",
+      "anchor": "username_len = pss_head_length - PART_SIGNATURE_SHA256_SIZE;",
+      "file": "corpus/train/train_0231_cwe835.c",
+      "line": "58",
+      "code": "username_len = pss_head_length - PART_SIGNATURE_SHA256_SIZE;",
+      "bug_class": "Integer underflow driving oversized allocation/copy (heap buffer overflow)",
+      "cwe": "CWE-191",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0231_cwe835.c",
+      "invariant": "pss_head_length must be verified strictly greater than PART_SIGNATURE_SHA256_SIZE BEFORE the subtraction, so username_len is always >= 1 and never wraps.",
+      "failure_mode": "If the guard at line 36 (pss_head_length <= PART_SIGNATURE_SHA256_SIZE) is removed or weakened, an attacker sends a signature part whose declared length is below PART_SIGNATURE_SHA256_SIZE; the size_t subtraction wraps to ~SIZE_MAX, malloc(username_len + 1) may wrap to a tiny allocation, and BUFFER_READ(pss.username, username_len) copies a huge count — a remote heap overflow / massive OOB read. In this revision the check is present and correct, so the primitive is currently closed; the finding pins the contract.",
+      "cve_analog": "CVE-2016-6254",
+      "what_to_confirm": "Confirm the line 36 test uses '<=' (not '<') and executes before line 58, and that no other caller reaches this subtraction without it."
+    },
+    {
+      "title": "Uncontrolled recursion via parse_packet re-entry on chained signature parts",
+      "anchor": "parse_packet(se, buffer + buffer_offset, buffer_len - buffer_offset, flags | PP_SIGNED, pss.username)",
+      "file": "corpus/train/train_0231_cwe835.c",
+      "line": "118-119",
+      "code": "parse_packet(se, buffer + buffer_offset, buffer_len - buffer_offset,\n                 flags | PP_SIGNED, pss.username);",
+      "bug_class": "Uncontrolled recursion / stack exhaustion (DoS)",
+      "cwe": "CWE-674",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided) — parse_packet in collectd src/network.c",
+      "invariant": "The mutual recursion parse_packet -> parse_part_sign_sha256 -> parse_packet must be bounded by an explicit maximum nesting depth so a single datagram cannot drive arbitrarily deep recursion.",
+      "failure_mode": "A crafted UDP packet packs many nested signature parts; each recursion consumes at least PART_SIGNATURE_SHA256_SIZE+1 bytes, so a ~64 KB payload can nest on the order of a thousand frames deep. Each frame adds a stack frame (plus libgcrypt context), which can overflow the thread stack and crash the daemon. Progress is monotone so it is not an infinite loop, but there is no depth cap.",
+      "cve_analog": "",
+      "what_to_confirm": "Check parse_packet for a recursion/nesting-depth limit and confirm signature and encrypt (AES-256) parts cannot mutually recurse without bound."
+    },
+    {
+      "title": "Non-constant-time HMAC tag comparison (timing side channel)",
+      "anchor": "memcmp(pss.hash, hash, sizeof(pss.hash))",
+      "file": "corpus/train/train_0231_cwe835.c",
+      "line": "113",
+      "code": "if (memcmp(pss.hash, hash, sizeof(pss.hash)) != 0) {",
+      "bug_class": "Observable timing discrepancy in authentication-tag comparison",
+      "cwe": "CWE-208",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0231_cwe835.c",
+      "invariant": "Comparison of a received MAC against the computed MAC must be constant-time (independent of the number of matching leading bytes).",
+      "failure_mode": "memcmp short-circuits at the first differing byte, so verification time correlates with the length of the matching prefix. In principle a remote attacker measuring response timing could reconstruct a valid tag byte-by-byte; in practice UDP jitter and the need to also match the keyed HMAC make this very hard, so impact is low. Best practice is gcry_mac_verify or a volatile constant-time compare.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm whether collectd intends constant-time verification here; if so replace memcmp with a constant-time comparison."
+    },
+    {
+      "title": "Verification fails open when no user database is configured",
+      "anchor": "if (se->data.server.userdb == NULL) { ... \"Will accept it.\" ... return (0); }",
+      "file": "corpus/train/train_0231_cwe835.c",
+      "line": "42-52",
+      "code": "if (se->data.server.userdb == NULL) {\n    c_complain(\n        LOG_NOTICE, &complain_no_users,\n        \"network plugin: Received signed network packet but can't verify it \"\n        \"because no user DB has been configured. Will accept it.\");\n\n    *ret_buffer = buffer + pss_head_length;\n    *ret_buffer_len -= pss_head_length;\n\n    return (0);",
+      "bug_class": "Authentication bypass by insecure default (fail-open)",
+      "cwe": "CWE-287",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0231_cwe835.c (policy also depends on SecurityLevel handling in parse_packet, file not provided)",
+      "invariant": "When a packet asserts a signature but the receiver cannot verify it, the configured SecurityLevel should decide drop-vs-accept; a 'Sign'-required listener must not silently accept unverifiable data.",
+      "failure_mode": "With SecurityLevel Sign enabled but no AuthFile/user DB loaded, any spoofed packet bearing a well-formed (but unverifiable) signature part is accepted and its remainder ingested as unsigned data, defeating the operator's intent to authenticate senders. This is documented behavior, so it is a hardening/posture issue rather than a memory-safety bug.",
+      "cve_analog": "",
+      "what_to_confirm": "Check how SecurityLevel interacts with a NULL userdb — whether 'Sign' should reject rather than accept, and whether operators are warned loudly enough at startup."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm the BUFFER_READ macro does NO internal bounds check and that PART_SIGNATURE_SHA256_SIZE == sizeof(type)+sizeof(length)+sizeof(hash) (2+2+32=36), so the header and hash reads at lines 31-32/55 are actually covered by the line 27 gate.",
+    "Verify the line 36-37 length gate uses '<=' on the lower bound and '>' on the upper bound and always runs before username_len is computed (line 58) and before the username BUFFER_READ (line 64) — this is the CVE-2016-6254 fix and must not regress.",
+    "Check parse_packet for an explicit recursion/nesting-depth cap so chained signature/encrypt parts cannot exhaust the stack (CWE-674).",
+    "Decide whether the HMAC comparison at line 113 must be constant-time; if so replace memcmp with gcry_mac_verify or a volatile compare.",
+    "Review the no-userdb fail-open path (lines 42-52) against SecurityLevel policy: a 'Sign'-required listener with no AuthFile should arguably drop rather than accept.",
+    "Confirm that on every return path secret and pss.username are freed exactly once and that parse_packet at line 118 does not retain pss.username beyond the call (it is sfree'd at line 123).",
+    "Verify the caller guarantees buffer points to at least buffer_len readable bytes, since the HMAC over [PART_SIGNATURE_SHA256_SIZE, buffer_len) at lines 97-98 trusts that length."
+  ]
+}

@@ -1,0 +1,191 @@
+Files under review: corpus/train/train_0020_cwe401.c
+
+<<<BEGIN_UNTRUSTED_CODE>>>
+/* ===== FILE: corpus/train/train_0020_cwe401.c ===== */
+   1| /* sample: primevul_c_train_2992_vuln */
+   2| static struct rds_connection *__rds_conn_create(struct net *net,
+   3| 						const struct in6_addr *laddr,
+   4| 						const struct in6_addr *faddr,
+   5| 						struct rds_transport *trans,
+   6| 						gfp_t gfp, u8 tos,
+   7| 						int is_outgoing,
+   8| 						int dev_if)
+   9| {
+  10| 	struct rds_connection *conn, *parent = NULL;
+  11| 	struct hlist_head *head = rds_conn_bucket(laddr, faddr);
+  12| 	struct rds_transport *loop_trans;
+  13| 	unsigned long flags;
+  14| 	int ret, i;
+  15| 	int npaths = (trans->t_mp_capable ? RDS_MPATH_WORKERS : 1);
+  16| 
+  17| 	rcu_read_lock();
+  18| 	conn = rds_conn_lookup(net, head, laddr, faddr, trans, tos, dev_if);
+  19| 	if (conn &&
+  20| 	    conn->c_loopback &&
+  21| 	    conn->c_trans != &rds_loop_transport &&
+  22| 	    ipv6_addr_equal(laddr, faddr) &&
+  23| 	    !is_outgoing) {
+  24| 		/* This is a looped back IB connection, and we're
+  25| 		 * called by the code handling the incoming connect.
+  26| 		 * We need a second connection object into which we
+  27| 		 * can stick the other QP. */
+  28| 		parent = conn;
+  29| 		conn = parent->c_passive;
+  30| 	}
+  31| 	rcu_read_unlock();
+  32| 	if (conn)
+  33| 		goto out;
+  34| 
+  35| 	conn = kmem_cache_zalloc(rds_conn_slab, gfp);
+  36| 	if (!conn) {
+  37| 		conn = ERR_PTR(-ENOMEM);
+  38| 		goto out;
+  39| 	}
+  40| 	conn->c_path = kcalloc(npaths, sizeof(struct rds_conn_path), gfp);
+  41| 	if (!conn->c_path) {
+  42| 		kmem_cache_free(rds_conn_slab, conn);
+  43| 		conn = ERR_PTR(-ENOMEM);
+  44| 		goto out;
+  45| 	}
+  46| 
+  47| 	INIT_HLIST_NODE(&conn->c_hash_node);
+  48| 	conn->c_laddr = *laddr;
+  49| 	conn->c_isv6 = !ipv6_addr_v4mapped(laddr);
+  50| 	conn->c_faddr = *faddr;
+  51| 	conn->c_dev_if = dev_if;
+  52| 	conn->c_tos = tos;
+  53| 
+  54| #if IS_ENABLED(CONFIG_IPV6)
+  55| 	/* If the local address is link local, set c_bound_if to be the
+  56| 	 * index used for this connection.  Otherwise, set it to 0 as
+  57| 	 * the socket is not bound to an interface.  c_bound_if is used
+  58| 	 * to look up a socket when a packet is received
+  59| 	 */
+  60| 	if (ipv6_addr_type(laddr) & IPV6_ADDR_LINKLOCAL)
+  61| 		conn->c_bound_if = dev_if;
+  62| 	else
+  63| #endif
+  64| 		conn->c_bound_if = 0;
+  65| 
+  66| 	rds_conn_net_set(conn, net);
+  67| 
+  68| 	ret = rds_cong_get_maps(conn);
+  69| 	if (ret) {
+  70| 		kfree(conn->c_path);
+  71| 		kmem_cache_free(rds_conn_slab, conn);
+  72| 		conn = ERR_PTR(ret);
+  73| 		goto out;
+  74| 	}
+  75| 
+  76| 	/*
+  77| 	 * This is where a connection becomes loopback.  If *any* RDS sockets
+  78| 	 * can bind to the destination address then we'd rather the messages
+  79| 	 * flow through loopback rather than either transport.
+  80| 	 */
+  81| 	loop_trans = rds_trans_get_preferred(net, faddr, conn->c_dev_if);
+  82| 	if (loop_trans) {
+  83| 		rds_trans_put(loop_trans);
+  84| 		conn->c_loopback = 1;
+  85| 		if (trans->t_prefer_loopback) {
+  86| 			if (likely(is_outgoing)) {
+  87| 				/* "outgoing" connection to local address.
+  88| 				 * Protocol says it wants the connection
+  89| 				 * handled by the loopback transport.
+  90| 				 * This is what TCP does.
+  91| 				 */
+  92| 				trans = &rds_loop_transport;
+  93| 			} else {
+  94| 				/* No transport currently in use
+  95| 				 * should end up here, but if it
+  96| 				 * does, reset/destroy the connection.
+  97| 				 */
+  98| 				kmem_cache_free(rds_conn_slab, conn);
+  99| 				conn = ERR_PTR(-EOPNOTSUPP);
+ 100| 				goto out;
+ 101| 			}
+ 102| 		}
+ 103| 	}
+ 104| 
+ 105| 	conn->c_trans = trans;
+ 106| 
+ 107| 	init_waitqueue_head(&conn->c_hs_waitq);
+ 108| 	for (i = 0; i < npaths; i++) {
+ 109| 		__rds_conn_path_init(conn, &conn->c_path[i],
+ 110| 				     is_outgoing);
+ 111| 		conn->c_path[i].cp_index = i;
+ 112| 	}
+ 113| 	rcu_read_lock();
+ 114| 	if (rds_destroy_pending(conn))
+ 115| 		ret = -ENETDOWN;
+ 116| 	else
+ 117| 		ret = trans->conn_alloc(conn, GFP_ATOMIC);
+ 118| 	if (ret) {
+ 119| 		rcu_read_unlock();
+ 120| 		kfree(conn->c_path);
+ 121| 		kmem_cache_free(rds_conn_slab, conn);
+ 122| 		conn = ERR_PTR(ret);
+ 123| 		goto out;
+ 124| 	}
+ 125| 
+ 126| 	rdsdebug("allocated conn %p for %pI6c -> %pI6c over %s %s\n",
+ 127| 		 conn, laddr, faddr,
+ 128| 		 strnlen(trans->t_name, sizeof(trans->t_name)) ?
+ 129| 		 trans->t_name : "[unknown]", is_outgoing ? "(outgoing)" : "");
+ 130| 
+ 131| 	/*
+ 132| 	 * Since we ran without holding the conn lock, someone could
+ 133| 	 * have created the same conn (either normal or passive) in the
+ 134| 	 * interim. We check while holding the lock. If we won, we complete
+ 135| 	 * init and return our conn. If we lost, we rollback and return the
+ 136| 	 * other one.
+ 137| 	 */
+ 138| 	spin_lock_irqsave(&rds_conn_lock, flags);
+ 139| 	if (parent) {
+ 140| 		/* Creating passive conn */
+ 141| 		if (parent->c_passive) {
+ 142| 			trans->conn_free(conn->c_path[0].cp_transport_data);
+ 143| 			kfree(conn->c_path);
+ 144| 			kmem_cache_free(rds_conn_slab, conn);
+ 145| 			conn = parent->c_passive;
+ 146| 		} else {
+ 147| 			parent->c_passive = conn;
+ 148| 			rds_cong_add_conn(conn);
+ 149| 			rds_conn_count++;
+ 150| 		}
+ 151| 	} else {
+ 152| 		/* Creating normal conn */
+ 153| 		struct rds_connection *found;
+ 154| 
+ 155| 		found = rds_conn_lookup(net, head, laddr, faddr, trans,
+ 156| 					tos, dev_if);
+ 157| 		if (found) {
+ 158| 			struct rds_conn_path *cp;
+ 159| 			int i;
+ 160| 
+ 161| 			for (i = 0; i < npaths; i++) {
+ 162| 				cp = &conn->c_path[i];
+ 163| 				/* The ->conn_alloc invocation may have
+ 164| 				 * allocated resource for all paths, so all
+ 165| 				 * of them may have to be freed here.
+ 166| 				 */
+ 167| 				if (cp->cp_transport_data)
+ 168| 					trans->conn_free(cp->cp_transport_data);
+ 169| 			}
+ 170| 			kfree(conn->c_path);
+ 171| 			kmem_cache_free(rds_conn_slab, conn);
+ 172| 			conn = found;
+ 173| 		} else {
+ 174| 			conn->c_my_gen_num = rds_gen_num;
+ 175| 			conn->c_peer_gen_num = 0;
+ 176| 			hlist_add_head_rcu(&conn->c_hash_node, head);
+ 177| 			rds_cong_add_conn(conn);
+ 178| 			rds_conn_count++;
+ 179| 		}
+ 180| 	}
+ 181| 	spin_unlock_irqrestore(&rds_conn_lock, flags);
+ 182| 	rcu_read_unlock();
+ 183| 
+ 184| out:
+ 185| 	return conn;
+ 186| }
+<<<END_UNTRUSTED_CODE>>>

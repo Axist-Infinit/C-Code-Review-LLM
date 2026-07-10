@@ -1,0 +1,212 @@
+{
+  "subsystem": "Ceph RADOS Gateway (RGW) S3 object-store frontend. This is RGWGetObj_ObjStore_S3::send_response_data, the method that builds and emits the HTTP response (status line, headers, and body) for an S3 GetObject request. It translates internal RGW object attributes (attrs) and request-supplied response-override query parameters into outgoing HTTP headers and then streams the object body.",
+  "provenance": "Identified from the fully-qualified method name RGWGetObj_ObjStore_S3::send_response_data (RGW = RADOS Gateway, the Ceph S3/Swift frontend), the Ceph bufferlist type, RGW_ATTR_* / RGW_SYS_PARAM_PREFIX macros, ldpp_dout logging, req_state* s, and helpers dump_header/dump_errno/end_header/get_s3_expiration_header. The banner 'sample: primevul_test_0388_fixed' and filename train_0211_cwe79.cpp indicate a PrimeVul-derived sample of the CWE-79/header-injection family, and the presence of the str_has_cntrl(val) guard shows this is the POST-fix (patched) revision.",
+  "trust_boundary": "This runs inside an authenticated (or anonymous) S3 GetObject request handler. Attacker-controllable inputs that cross the boundary into this function: (1) the response-override query parameters (response-content-type, response-content-disposition, etc.) read via s->info.args.get(p->param) at line 109 — these are fully client-controlled URL query values; (2) the object's stored attributes 'attrs' (user custom metadata x-amz-meta-*, ETag, tags, retention, legal-hold), which were written by a possibly-different client at PUT time and are replayed here into response headers; (3) the object data bufferlist bl plus the off_t offset/length bl_ofs/bl_len passed by the caller. Everything emitted through dump_header/end_header lands verbatim in the HTTP response, so any CR/LF or control byte reaching a header value is a response-splitting / header-injection primitive.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0211_cwe79.cpp",
+      "lines": "2-9",
+      "code": "int RGWGetObj_ObjStore_S3::send_response_data(bufferlist& bl, off_t bl_ofs,\n\t\t\t\t\t      off_t bl_len)\n{\n  const char *content_type = NULL;\n  string content_type_str;\n  map<string, string> response_attrs;\n  map<string, string>::iterator riter;\n  bufferlist metadata_bl;",
+      "explanation": "The entry point for emitting a GetObject HTTP response. bl is the object-data buffer to send, and bl_ofs / bl_len are signed off_t offset and length describing which slice of bl to write as the body. Local state is set up: content_type is a raw const char* that will eventually be handed to end_header; content_type_str is the std::string that actually OWNS the bytes content_type will point into (this ownership relationship is security-relevant later). response_attrs is the accumulator map of header-name -> header-value that gets flushed at the 'done:' label. metadata_bl holds optional JSON-encoded metadata for system requests. Note content_type is initialised to NULL and only set later, which the tail (line 206) depends on."
+    },
+    {
+      "file": "corpus/train/train_0211_cwe79.cpp",
+      "lines": "11-14",
+      "code": "string expires = get_s3_expiration_header(s, lastmod);\n\n  if (sent_header)\n    goto send_data;",
+      "explanation": "expires is computed for the x-amz-expiration header. The sent_header member flag implements a re-entrancy / streaming pattern: send_response_data may be called repeatedly to stream successive body chunks. On the first call sent_header is false and the whole header block runs; on subsequent calls it is true and control jumps straight to the send_data: label (line 217), skipping all header emission and going directly to writing more body bytes. This is why all the header logic is gated behind that single flag."
+    },
+    {
+      "file": "corpus/train/train_0211_cwe79.cpp",
+      "lines": "16-26",
+      "code": "if (custom_http_ret) {\n    set_req_state_err(s, 0);\n    dump_errno(s, custom_http_ret);\n  } else {\n    set_req_state_err(s, (partial_content && !op_ret) ? STATUS_PARTIAL_CONTENT\n                  : op_ret);\n    dump_errno(s);\n  }\n\n  if (op_ret)\n    goto done;",
+      "explanation": "Emits the HTTP status. If a custom_http_ret override is set it is used directly; otherwise the status is derived from op_ret, promoting a successful ranged read to 206 Partial Content. If op_ret is non-zero (an error occurred producing the object) the code jumps to the 'done:' label, skipping all the success-path attribute/header population and just flushing whatever headers exist plus the error status."
+    },
+    {
+      "file": "corpus/train/train_0211_cwe79.cpp",
+      "lines": "28-29",
+      "code": "if (range_str)\n    dump_range(s, start, end, s->obj_size);",
+      "explanation": "If the client sent a Range request, emit the Content-Range header from the resolved start/end and the total object size s->obj_size. This reflects client-influenced range values back but through a structured formatter rather than raw string concatenation."
+    },
+    {
+      "file": "corpus/train/train_0211_cwe79.cpp",
+      "lines": "31-56",
+      "code": "if (s->system_request &&\n      s->info.args.exists(RGW_SYS_PARAM_PREFIX \"prepend-metadata\")) {\n\n    dump_header(s, \"Rgwx-Object-Size\", (long long)total_len);\n\n    if (rgwx_stat) {\n      /*\n       * in this case, we're not returning the object's content, only the prepended\n       * extra metadata\n       */\n      total_len = 0;\n    }\n\n    /* JSON encode object metadata */\n    JSONFormatter jf;\n    jf.open_object_section(\"obj_metadata\");\n    encode_json(\"attrs\", attrs, &jf);\n    utime_t ut(lastmod);\n    encode_json(\"mtime\", ut, &jf);\n    jf.close_section();\n    stringstream ss;\n    jf.flush(ss);\n    metadata_bl.append(ss.str());\n    dump_header(s, \"Rgwx-Embedded-Metadata-Len\", metadata_bl.length());\n    total_len += metadata_bl.length();\n  }",
+      "explanation": "A privileged multi-site replication path, only entered for internal system_request calls carrying the prepend-metadata sys parameter. It JSON-encodes the object attrs and mtime into metadata_bl, emits Rgwx-* headers with the sizes, and grows total_len so Content-Length accounts for the prepended metadata blob. rgwx_stat suppresses the body entirely (metadata-only). This branch trusts the system_request gate: RGW_SYS_PARAM_PREFIX params are only honoured for internally-authenticated system users, so it is not part of the anonymous attack surface."
+    },
+    {
+      "file": "corpus/train/train_0211_cwe79.cpp",
+      "lines": "58-76",
+      "code": "if (s->system_request && !real_clock::is_zero(lastmod)) {\n    /* we end up dumping mtime in two different methods, a bit redundant */\n    dump_epoch_header(s, \"Rgwx-Mtime\", lastmod);\n    uint64_t pg_ver = 0;\n    int r = decode_attr_bl_single_value(attrs, RGW_ATTR_PG_VER, &pg_ver, (uint64_t)0);\n    if (r < 0) {\n      ldpp_dout(this, 0) << \"ERROR: failed to decode pg ver attr, ignoring\" << dendl;\n    }\n    dump_header(s, \"Rgwx-Obj-PG-Ver\", pg_ver);\n\n    uint32_t source_zone_short_id = 0;\n    r = decode_attr_bl_single_value(attrs, RGW_ATTR_SOURCE_ZONE, &source_zone_short_id, (uint32_t)0);\n    if (r < 0) {\n      ldpp_dout(this, 0) << \"ERROR: failed to decode pg ver attr, ignoring\" << dendl;\n    }\n    if (source_zone_short_id != 0) {\n      dump_header(s, \"Rgwx-Source-Zone-Short-Id\", source_zone_short_id);\n    }\n  }",
+      "explanation": "Also system-request only. It decodes the placement-group version and source-zone short id out of the object attrs via decode_attr_bl_single_value, which parses a serialized bufferlist attribute into fixed-width integers. Decode failures are logged and ignored (defaults 0 are used), so a corrupt attr does not abort the response. These decoded integers are then emitted as Rgwx-* replication headers. Because they are integers and this is gated on system_request, the header-value injection surface here is negligible."
+    },
+    {
+      "file": "corpus/train/train_0211_cwe79.cpp",
+      "lines": "78-91",
+      "code": "for (auto &it : crypt_http_responses)\n    dump_header(s, it.first, it.second);\n\n  dump_content_length(s, total_len);\n  dump_last_modified(s, lastmod);\n  dump_header_if_nonempty(s, \"x-amz-version-id\", version_id);\n  dump_header_if_nonempty(s, \"x-amz-expiration\", expires);\n\n  if (attrs.find(RGW_ATTR_APPEND_PART_NUM) != attrs.end()) {\n    dump_header(s, \"x-rgw-object-type\", \"Appendable\");\n    dump_header(s, \"x-rgw-next-append-position\", s->obj_size);\n  } else {\n    dump_header(s, \"x-rgw-object-type\", \"Normal\");\n  }",
+      "explanation": "Emits server-side-encryption response headers accumulated in crypt_http_responses, then the standard Content-Length, Last-Modified, x-amz-version-id and x-amz-expiration headers, and finally an x-rgw-object-type header indicating whether the object is Appendable. These values are server-derived (SSE negotiation, version id, computed expiration) rather than raw request strings."
+    },
+    {
+      "file": "corpus/train/train_0211_cwe79.cpp",
+      "lines": "93-105",
+      "code": "if (! op_ret) {\n    if (! lo_etag.empty()) {\n      /* Handle etag of Swift API's large objects (DLO/SLO). It's entirerly\n       * legit to perform GET on them through S3 API. In such situation,\n       * a client should receive the composited content with corresponding\n       * etag value. */\n      dump_etag(s, lo_etag);\n    } else {\n      auto iter = attrs.find(RGW_ATTR_ETAG);\n      if (iter != attrs.end()) {\n        dump_etag(s, iter->second.to_str());\n      }\n    }",
+      "explanation": "Only on success (op_ret == 0). Emits the ETag header, preferring a large-object (Swift DLO/SLO) composite etag lo_etag if present, otherwise the stored RGW_ATTR_ETAG attribute converted to a string. This opens the big success-only block (lines 93-195) that also populates response_attrs and the content type from user-controlled inputs."
+    },
+    {
+      "file": "corpus/train/train_0211_cwe79.cpp",
+      "lines": "107-136",
+      "code": "for (struct response_attr_param *p = resp_attr_params; p->param; p++) {\n      bool exists;\n      string val = s->info.args.get(p->param, &exists);\n      if (exists) {\n\t/* reject unauthenticated response header manipulation, see\n\t * https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html */\n\tif (s->auth.identity->is_anonymous()) {\n\t  return -ERR_INVALID_REQUEST;\n\t}\n        /* HTTP specification says no control characters should be present in\n         * header values: https://tools.ietf.org/html/rfc7230#section-3.2\n         *      field-vchar    = VCHAR / obs-text\n         *\n         * Failure to validate this permits a CRLF injection in HTTP headers,\n         * whereas S3 GetObject only permits specific headers.\n         */\n        if(str_has_cntrl(val)) {\n          /* TODO: return a more distinct error in future;\n           * stating what the problem is */\n          return -ERR_INVALID_REQUEST;\n        }\n\n\tif (strcmp(p->param, \"response-content-type\") != 0) {\n\t  response_attrs[p->http_attr] = val;\n\t} else {\n\t  content_type_str = val;\n\t  content_type = content_type_str.c_str();\n\t}\n      }\n    }",
+      "explanation": "This is the core client-controlled header path and the locus of the fix. resp_attr_params is a NULL-terminated table mapping S3 response-override query params (response-content-type, response-content-disposition, response-content-encoding, response-content-language, response-expires, response-cache-control) to their HTTP attribute names (p->http_attr). For each, the client-supplied query value is fetched with s->info.args.get(p->param). Two guards run BEFORE the value is accepted: (1) line 113 rejects the request with -ERR_INVALID_REQUEST if the caller is anonymous, so unauthenticated users cannot override response headers at all; (2) line 123 rejects the value if str_has_cntrl(val) finds any control character (CR, LF, NUL, etc.), which is precisely the guard that prevents CRLF response-splitting. Only after passing both is the value stored: response-content-type is captured into content_type_str and content_type points at its buffer; every other param is stored into response_attrs[p->http_attr]."
+    },
+    {
+      "file": "corpus/train/train_0211_cwe79.cpp",
+      "lines": "138-166",
+      "code": "for (auto iter = attrs.begin(); iter != attrs.end(); ++iter) {\n      const char *name = iter->first.c_str();\n      map<string, string>::iterator aiter = rgw_to_http_attrs.find(name);\n      if (aiter != rgw_to_http_attrs.end()) {\n        if (response_attrs.count(aiter->second) == 0) {\n          /* Was not already overridden by a response param. */\n\n          size_t len = iter->second.length();\n          string s(iter->second.c_str(), len);\n          while (len && !s[len - 1]) {\n            --len;\n            s.resize(len);\n          }\n          response_attrs[aiter->second] = s;\n        }\n      } else if (iter->first.compare(RGW_ATTR_CONTENT_TYPE) == 0) {\n        /* Special handling for content_type. */\n        if (!content_type) {\n          content_type_str = rgw_bl_str(iter->second);\n          content_type = content_type_str.c_str();\n        }\n      } else if (strcmp(name, RGW_ATTR_SLO_UINDICATOR) == 0) {\n        // this attr has an extra length prefix from encode() in prior versions\n        dump_header(s, \"X-Object-Meta-Static-Large-Object\", \"True\");\n      } else if (strncmp(name, RGW_ATTR_META_PREFIX,\n\t\t\t sizeof(RGW_ATTR_META_PREFIX)-1) == 0) {\n        /* User custom metadata. */\n        name += sizeof(RGW_ATTR_PREFIX) - 1;\n        dump_header(s, name, iter->second);\n      }",
+      "explanation": "Iterates every stored object attribute and maps it to a response header. For attrs that have a canonical HTTP mapping (rgw_to_http_attrs, e.g. Content-Disposition/Content-Encoding), the value is copied into a local std::string (note it deliberately SHADOWS the outer req_state* s with a local `string s`) and trailing NUL bytes are trimmed off via the while loop, then stored into response_attrs unless a response-* override already set that header. If the attr is the content-type attr and no content_type was chosen yet, it becomes the content type (rgw_bl_str decodes the bufferlist to a string, and content_type again points into content_type_str). RGW_ATTR_SLO_UINDICATOR emits a fixed Static-Large-Object marker. Crucially, attrs whose name starts with RGW_ATTR_META_PREFIX are USER CUSTOM METADATA (x-amz-meta-*): the code advances name past the internal RGW_ATTR_PREFIX and emits dump_header(s, name, iter->second) with BOTH the metadata key (name) and value (iter->second) taken directly from stored, previously-client-supplied bytes."
+    },
+    {
+      "file": "corpus/train/train_0211_cwe79.cpp",
+      "lines": "167-195",
+      "code": "} else if (iter->first.compare(RGW_ATTR_TAGS) == 0) {\n        RGWObjTags obj_tags;\n        try{\n          auto it = iter->second.cbegin();\n          obj_tags.decode(it);\n        } catch (buffer::error &err) {\n          ldpp_dout(this,0) << \"Error caught buffer::error couldn't decode TagSet \" << dendl;\n        }\n        dump_header(s, RGW_AMZ_TAG_COUNT, obj_tags.count());\n      } else if (iter->first.compare(RGW_ATTR_OBJECT_RETENTION) == 0 && get_retention){\n        RGWObjectRetention retention;\n        try {\n          decode(retention, iter->second);\n          dump_header(s, \"x-amz-object-lock-mode\", retention.get_mode());\n          dump_time_header(s, \"x-amz-object-lock-retain-until-date\", retention.get_retain_until_date());\n        } catch (buffer::error& err) {\n          ldpp_dout(this, 0) << \"ERROR: failed to decode RGWObjectRetention\" << dendl;\n        }\n      } else if (iter->first.compare(RGW_ATTR_OBJECT_LEGAL_HOLD) == 0 && get_legal_hold) {\n        RGWObjectLegalHold legal_hold;\n        try {\n          decode(legal_hold, iter->second);\n          dump_header(s, \"x-amz-object-lock-legal-hold\",legal_hold.get_status());\n        } catch (buffer::error& err) {\n          ldpp_dout(this, 0) << \"ERROR: failed to decode RGWObjectLegalHold\" << dendl;\n        }\n      }\n    }\n  }",
+      "explanation": "The remaining attr branches decode structured metadata blobs from the object's stored bufferlists. RGW_ATTR_TAGS is deserialized into RGWObjTags and only the tag COUNT is emitted (numeric). RGW_ATTR_OBJECT_RETENTION and RGW_ATTR_OBJECT_LEGAL_HOLD are decoded (gated on get_retention/get_legal_hold) and their mode/date/status emitted as x-amz-object-lock-* headers. Each decode is wrapped in try/catch(buffer::error) so a malformed serialized attribute is logged and skipped rather than crashing the handler — the decoders are trusted to throw rather than corrupt memory on bad input."
+    },
+    {
+      "file": "corpus/train/train_0211_cwe79.cpp",
+      "lines": "197-215",
+      "code": "done:\n  for (riter = response_attrs.begin(); riter != response_attrs.end();\n       ++riter) {\n    dump_header(s, riter->first, riter->second);\n  }\n\n  if (op_ret == -ERR_NOT_MODIFIED) {\n      end_header(s, this);\n  } else {\n      if (!content_type)\n          content_type = \"binary/octet-stream\";\n\n      end_header(s, this, content_type);\n  }\n\n  if (metadata_bl.length()) {\n    dump_body(s, metadata_bl);\n  }\n  sent_header = true;",
+      "explanation": "The 'done:' label flushes every accumulated response_attrs entry as an HTTP header. For a 304 Not Modified it ends the headers with no content type; otherwise it defaults content_type to binary/octet-stream if nothing set it and finishes the header block with end_header. Note end_header(s, this, content_type) consumes the raw content_type pointer here — its validity depends on content_type_str still being alive and unmodified (it is, being a function-local that was last assigned inside this same call). Any prepended system metadata_bl is written as the body, and sent_header is set so subsequent streaming calls skip straight to the body."
+    },
+    {
+      "file": "corpus/train/train_0211_cwe79.cpp",
+      "lines": "217-225",
+      "code": "send_data:\n  if (get_data && !op_ret) {\n    int r = dump_body(s, bl.c_str() + bl_ofs, bl_len);\n    if (r < 0)\n      return r;\n  }\n\n  return 0;\n}",
+      "explanation": "The body-streaming tail, reached either by falling through or by the sent_header goto. If the request actually wants data (get_data) and there was no error, it writes bl_len bytes starting at bl.c_str() + bl_ofs. bl.c_str() flattens the bufferlist and returns a pointer to a contiguous copy; the code then offsets it by bl_ofs and hands bl_len bytes to dump_body. The correctness of this write depends entirely on 0 <= bl_ofs and bl_ofs + bl_len <= bl.length() holding, which this function does not check — it trusts the caller."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0211_cwe79.cpp",
+      "lines": "162-166",
+      "code": "} else if (strncmp(name, RGW_ATTR_META_PREFIX,\n\t\t\t sizeof(RGW_ATTR_META_PREFIX)-1) == 0) {\n        /* User custom metadata. */\n        name += sizeof(RGW_ATTR_PREFIX) - 1;\n        dump_header(s, name, iter->second);",
+      "explanation": "This is the residual header-injection surface AFTER the fix. The response-override params (lines 107-136) are now sanitized by str_has_cntrl, but user custom metadata (x-amz-meta-*) is emitted here straight from the stored attr with NO equivalent control-character check: both the header name (name, derived from iter->first) and the value (iter->second) are echoed into dump_header verbatim. These bytes were supplied by whoever PUT the object (x-amz-meta-* headers or metadata copy). If RGW's PUT-side metadata validation ever fails to strip CR/LF/NUL from a metadata key or value (or a metadata value is set through a path that bypasses that validation, e.g. bucket replication, Swift POST, or internal copy), a GET on the object reflects those bytes into the response headers, yielding HTTP response splitting / header injection (and, if the split body is rendered, reflected XSS). The invariant the implementation MUST uphold is that every metadata key and value stored in attrs is already free of control characters at write time; this reader trusts that and adds no defense in depth, which is why it is a latent finding rather than a proven overflow here."
+    },
+    {
+      "file": "corpus/train/train_0211_cwe79.cpp",
+      "lines": "123-127",
+      "code": "if(str_has_cntrl(val)) {\n          /* TODO: return a more distinct error in future;\n           * stating what the problem is */\n          return -ERR_INVALID_REQUEST;\n        }",
+      "explanation": "This guard is the actual fix for the response-override CRLF injection (the reason this sample exists). Its correctness hinges entirely on str_has_cntrl detecting EVERY byte that a downstream HTTP writer treats as a line break or field terminator. If str_has_cntrl only tests iscntrl() over the default C locale it will catch CR (0x0D), LF (0x0A) and NUL, which is sufficient for classic splitting; but if the header serializer also honours other separators or if the function's notion of 'control' is narrower than the writer's, a value could slip through. The guard also only covers the response-* param path (lines 107-136) — it is NOT applied to attr-derived headers — so it must not be assumed to protect the metadata path at lines 162-166. Confirm str_has_cntrl rejects 0x00-0x1F and 0x7F, and that it is applied to every attacker-influenced header value, not just these six params."
+    },
+    {
+      "file": "corpus/train/train_0211_cwe79.cpp",
+      "lines": "219-219",
+      "code": "int r = dump_body(s, bl.c_str() + bl_ofs, bl_len);",
+      "explanation": "bl_ofs and bl_len are signed off_t parameters supplied by the caller and are used unchecked as a pointer offset and byte count into the flattened buffer bl.c_str(). If bl_ofs is negative, bl.c_str() + bl_ofs points BEFORE the buffer; if bl_ofs exceeds bl.length(), or bl_ofs + bl_len runs past the end, dump_body reads (and transmits) out-of-bounds heap memory, disclosing adjacent process memory to the S3 client (CWE-125). This function performs no 0 <= bl_ofs and bl_ofs + bl_len <= bl.length() check, so its safety is a contract on the calling read pipeline. The invariant is that callers must pass an offset/length pair fully contained within bl; confirm the RGWGetObj read path clamps bl_ofs/bl_len against the actual bufferlist length before invoking send_response_data."
+    },
+    {
+      "file": "corpus/train/train_0211_cwe79.cpp",
+      "lines": "132-133",
+      "code": "content_type_str = val;\n\t  content_type = content_type_str.c_str();",
+      "explanation": "content_type is a raw const char* cached from content_type_str.c_str() here (and again at line 157). Such a pointer is only valid while content_type_str stays alive and UNMODIFIED. In the shown code it is safe: content_type_str is a function-local that outlives every use of content_type, and the line-155 guard 'if (!content_type)' prevents the later branch from reassigning content_type_str once a content type is chosen, so the buffer is never reallocated out from under the pointer before end_header consumes it at line 209. This is called out so the student learns the pattern: it would become a use-after-free (CWE-416) if any future edit reassigned or resized content_type_str after caching its .c_str(), or cached .c_str() from a temporary. The invariant to preserve is that content_type_str must not be modified between caching content_type and the end_header call."
+    },
+    {
+      "file": "corpus/train/train_0211_cwe79.cpp",
+      "lines": "145-151",
+      "code": "size_t len = iter->second.length();\n          string s(iter->second.c_str(), len);\n          while (len && !s[len - 1]) {\n            --len;\n            s.resize(len);\n          }\n          response_attrs[aiter->second] = s;",
+      "explanation": "The local 'string s' SHADOWS the enclosing req_state* s, which is an easy source of future maintenance bugs (a later edit inside this block that meant to touch the request state would silently operate on the local string). The trailing-NUL trim loop itself is bounded: the 'len &&' test guards s[len - 1] so it cannot underflow at len == 0, and resize only shrinks. The value is constructed from iter->second.c_str() with an explicit length so embedded NULs are preserved until trimmed. No memory-safety defect here, but note that this stored value is later dumped as a header at the done: label without a control-character check, feeding the same latent injection concern as the metadata path."
+    },
+    {
+      "file": "corpus/train/train_0211_cwe79.cpp",
+      "lines": "169-192",
+      "code": "try{\n          auto it = iter->second.cbegin();\n          obj_tags.decode(it);\n        } catch (buffer::error &err) {\n          ldpp_dout(this,0) << \"Error caught buffer::error couldn't decode TagSet \" << dendl;\n        }",
+      "explanation": "obj_tags.decode / decode(retention,...) / decode(legal_hold,...) parse serialized bufferlists that originate from stored object metadata, i.e. previously attacker-influenced bytes. The handler relies entirely on those decoders being memory-safe and throwing buffer::error on truncated or malformed input rather than over-reading. The try/catch only protects against thrown exceptions; a decoder bug that reads out of bounds without throwing (CWE-125) or that mis-sizes an allocation is not contained here. The invariant is that the Ceph decode() implementations bounds-check every length prefix against remaining buffer; this is a latent dependency, not a defect visible in this file."
+    }
+  ],
+  "summary": "This is the post-fix Ceph RGW S3 GetObject response builder. Its primary security contract is preventing HTTP header injection: the client-controlled response-override query params are now properly gated by an anonymous-user rejection (line 113) and a str_has_cntrl control-character check (line 123), which closes the CRLF response-splitting hole (analogous to CVE-2021-3524). The notable residual risk is that stored user metadata (x-amz-meta-*, line 162-166) and other attr-derived headers are echoed into response headers WITHOUT that same control-character check, so header-injection safety depends on PUT-time metadata validation; secondary latent concerns are the unchecked signed bl_ofs/bl_len slice at line 219 (potential OOB read) and the standard .c_str() lifetime discipline around content_type.",
+  "reviewed_anchors": [
+    {"anchor": "send_response_data(bufferlist& bl, off_t bl_ofs, off_t bl_len) signature", "disposition": "finding", "reason": "off_t bl_ofs/bl_len are used unchecked as pointer offset/length into bl at line 219 -> potential OOB read"},
+    {"anchor": "const char *content_type / string content_type_str (lines 5-6)", "disposition": "finding", "reason": "raw pointer cached from .c_str(); lifetime/UAF pattern, safe as written but contract must be preserved"},
+    {"anchor": "goto send_data / goto done control flow (lines 13-14, 25-26, 197, 217)", "disposition": "dismissed", "reason": "forward gotos over already-initialized locals; standard streaming/error control flow, no memory-safety issue"},
+    {"anchor": "system_request prepend-metadata / mtime block (lines 31-76)", "disposition": "dismissed", "reason": "gated on s->system_request (internal privileged callers), emits numeric/JSON server data, not anonymous surface"},
+    {"anchor": "resp_attr_params loop + s->info.args.get(p->param) (lines 107-136)", "disposition": "finding", "reason": "client-controlled query values become response headers; central injection surface"},
+    {"anchor": "s->auth.identity->is_anonymous() guard (line 113)", "disposition": "dismissed", "reason": "correct authorization gate blocking anonymous response-header override; defensive, not a defect"},
+    {"anchor": "str_has_cntrl(val) guard (line 123)", "disposition": "finding", "reason": "the CRLF-injection fix; correctness depends on it covering all control bytes and it only covers the param path"},
+    {"anchor": "response_attrs[p->http_attr] = val (line 130)", "disposition": "dismissed", "reason": "value already passed str_has_cntrl; stored for flush at done: label, covered by the guard"},
+    {"anchor": "content_type = content_type_str.c_str() (lines 133, 157)", "disposition": "finding", "reason": ".c_str() lifetime discipline; safe here but the pattern is the dangling-pointer bug class"},
+    {"anchor": "attrs iteration + rgw_to_http_attrs mapping (lines 138-151)", "disposition": "dismissed", "reason": "NUL-trim loop is bounded (len && guard); local 'string s' shadowing is a style hazard only"},
+    {"anchor": "RGW_ATTR_META_PREFIX user custom metadata dump_header(name, iter->second) (lines 162-166)", "disposition": "finding", "reason": "stored user metadata echoed into headers with no control-char check -> latent header injection"},
+    {"anchor": "name += sizeof(RGW_ATTR_PREFIX) - 1 (line 165)", "disposition": "dismissed", "reason": "name matched the longer RGW_ATTR_META_PREFIX before advancing by the shorter RGW_ATTR_PREFIX length, so it stays within the string"},
+    {"anchor": "RGW_ATTR_TAGS / RETENTION / LEGAL_HOLD decode (lines 168-192)", "disposition": "finding", "reason": "decode of untrusted serialized metadata; safety delegated to decoders, latent OOB-read dependency"},
+    {"anchor": "dump_body(s, bl.c_str() + bl_ofs, bl_len) (line 219)", "disposition": "finding", "reason": "unchecked signed offset/length slice into flattened buffer"},
+    {"anchor": "end_header(s, this, content_type) (line 209)", "disposition": "dismissed", "reason": "consumes content_type default binary/octet-stream if null; pointer validity covered by the content_type finding"}
+  ],
+  "findings": [
+    {
+      "title": "User custom metadata echoed into HTTP response headers without control-character sanitization",
+      "anchor": "dump_header(s, name, iter->second) for RGW_ATTR_META_PREFIX attrs",
+      "file": "corpus/train/train_0211_cwe79.cpp",
+      "line": "162-166",
+      "code": "} else if (strncmp(name, RGW_ATTR_META_PREFIX,\n\t\t\t sizeof(RGW_ATTR_META_PREFIX)-1) == 0) {\n        /* User custom metadata. */\n        name += sizeof(RGW_ATTR_PREFIX) - 1;\n        dump_header(s, name, iter->second);",
+      "bug_class": "HTTP response splitting / header injection (CRLF)",
+      "cwe": "CWE-113",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "Every stored object-metadata key and value emitted as a response header must be free of CR/LF/NUL and other control characters; either the write path must guarantee it or this reader must re-validate with str_has_cntrl before dump_header, matching the response-param path.",
+      "failure_mode": "The response-override param path was hardened with str_has_cntrl (line 123), but this custom-metadata path emits both name and iter->second verbatim. If any x-amz-meta-* key/value containing CR/LF reaches attrs (via a PUT/copy/replication/Swift path whose validation is weaker or absent), a subsequent GET reflects it into the HTTP header stream, enabling response splitting and, if the injected body is rendered, reflected XSS — the CWE-79 the sample is named for.",
+      "cve_analog": "CVE-2021-3524",
+      "what_to_confirm": "Verify RGW rejects/strips control characters in x-amz-meta-* keys AND values at every write path, and consider adding a str_has_cntrl check here for defense in depth."
+    },
+    {
+      "title": "Unchecked signed offset/length slice into flattened object buffer",
+      "anchor": "dump_body(s, bl.c_str() + bl_ofs, bl_len)",
+      "file": "corpus/train/train_0211_cwe79.cpp",
+      "line": "219",
+      "code": "int r = dump_body(s, bl.c_str() + bl_ofs, bl_len);",
+      "bug_class": "Out-of-bounds read (unvalidated offset/length)",
+      "cwe": "CWE-125",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "Callers must guarantee 0 <= bl_ofs and bl_ofs + bl_len <= bl.length(); send_response_data itself performs no bounds check before offsetting bl.c_str().",
+      "failure_mode": "bl_ofs/bl_len are signed off_t. A negative bl_ofs points before the buffer and a too-large bl_ofs/bl_len reads past its end; dump_body would then transmit out-of-bounds heap bytes to the client (information disclosure) or crash. Whether this is reachable depends entirely on the read pipeline that computes these offsets.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the RGWGetObj read/iterate path clamps bl_ofs and bl_len to the actual bufferlist length (and never passes negative values) before calling send_response_data."
+    },
+    {
+      "title": "Cached .c_str() pointer for content_type relies on string lifetime/immutability",
+      "anchor": "content_type = content_type_str.c_str()",
+      "file": "corpus/train/train_0211_cwe79.cpp",
+      "line": "133",
+      "code": "content_type_str = val;\n\t  content_type = content_type_str.c_str();",
+      "bug_class": "Use-after-free / dangling pointer (latent)",
+      "cwe": "CWE-416",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0211_cwe79.cpp",
+      "invariant": "content_type_str must remain alive and unmodified between caching content_type = content_type_str.c_str() (lines 133/157) and its consumption in end_header (line 209).",
+      "failure_mode": "As written this is SAFE: content_type_str is a function-local outliving all uses, and the 'if (!content_type)' guard at line 155 prevents the second branch from reassigning content_type_str after the pointer is cached, so no reallocation invalidates it. It becomes a use-after-free only if a future edit reassigns/resizes content_type_str after caching its .c_str(), or caches .c_str() of a temporary; flagged as the bug pattern to preserve.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm no code path modifies content_type_str after content_type has been set and before end_header consumes it."
+    },
+    {
+      "title": "Decode of untrusted serialized metadata (tags/retention/legal-hold) trusts decoder bounds checking",
+      "anchor": "obj_tags.decode(it) / decode(retention, ...) / decode(legal_hold, ...)",
+      "file": "corpus/train/train_0211_cwe79.cpp",
+      "line": "168-192",
+      "code": "auto it = iter->second.cbegin();\n          obj_tags.decode(it);",
+      "bug_class": "Improper validation of serialized input (latent OOB read)",
+      "cwe": "CWE-20",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "The Ceph decode() routines for RGWObjTags/RGWObjectRetention/RGWObjectLegalHold must bounds-check each length prefix against the remaining bufferlist and throw buffer::error rather than over-read on malformed input.",
+      "failure_mode": "iter->second holds serialized bytes derived from stored (client-influenced) metadata. The try/catch only handles thrown buffer::error; a decoder that reads out of bounds without throwing would not be contained, potentially leaking memory. No defect is visible in this file — it is a dependency on the decoders being safe.",
+      "cve_analog": "",
+      "what_to_confirm": "Review the RGWObjTags / RGWObjectRetention / RGWObjectLegalHold decode() implementations for length-prefix bounds checks against remaining buffer."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm str_has_cntrl rejects the full 0x00-0x1F and 0x7F range (especially CR 0x0D, LF 0x0A, NUL) so no response-override value can split headers.",
+    "Verify x-amz-meta-* metadata keys AND values are stripped/rejected for control characters at every write path (PUT, copy, multipart, Swift POST, multisite replication) — the GET path at lines 162-166 does not re-validate.",
+    "Confirm the RGWGetObj read pipeline clamps bl_ofs and bl_len to 0 <= bl_ofs && bl_ofs + bl_len <= bl.length() before send_response_data uses them at line 219.",
+    "Ensure no code path reassigns or resizes content_type_str after content_type = content_type_str.c_str() is cached and before end_header consumes it (line 209).",
+    "Review RGWObjTags/RGWObjectRetention/RGWObjectLegalHold decode() for bounds-checked length prefixes so malformed stored metadata cannot cause an out-of-bounds read.",
+    "Confirm the anonymous-user rejection at line 113 cannot be bypassed (e.g. presigned/anonymous-with-token edge cases) for response-* override params.",
+    "Check that the local 'string s' shadowing req_state* s at line 146 is not relied upon elsewhere and cannot mask an intended use of the request state."
+  ]
+}

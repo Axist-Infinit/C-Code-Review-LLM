@@ -1,0 +1,182 @@
+{
+  "subsystem": "TensorFlow SaveV2 op kernel — the Compute() method of the C++ OpKernel that serializes a set of runtime tensors into a checkpoint bundle on disk. It reads three fixed operand tensors (prefix, tensor_names, shape_and_slices) plus a variadic list of tensors to be written, and streams each one through a checkpoint::BundleWriter, optionally as a named slice of a larger virtual tensor.",
+  "provenance": "Identified from TensorFlow-specific types and idioms present in the code: OpKernelContext* context, context->input(n), Tensor/TensorShape/TensorSlice, tensor.flat<tstring>()/scalar<tstring>(), the checkpoint::ParseShapeAndSlice / BundleWriter API (tensorflow/core/util/tensor_bundle), the OP_REQUIRES / OP_REQUIRES_OK / VLOG macros, DT_FLOAT, and Env::Default(). The banner comment /* sample: primevul_train_2287_fixed */ and the file name train_0239_cwe369.cpp indicate this is a PrimeVul-derived sample already at its post-fix (hardened) revision, tagged to CWE-369 (divide by zero).",
+  "trust_boundary": "This kernel runs inside a TensorFlow session. The three operand tensors — prefix (a scalar filename string), tensor_names (a vector of strings), and shape_and_slices (a vector of slice-spec strings) — and the variadic payload tensors are all graph inputs. In model-serving / multi-tenant / untrusted-graph deployments (e.g. serving a user-supplied SavedModel or accepting tf.raw_ops.SaveV2 calls) every one of these is attacker-controllable: the element counts, the string contents (parsed by ParseShapeAndSlice), the tensor dtypes and shapes, and the number of variadic inputs. The security of this function therefore rests entirely on the (out-of-view) ValidateInputs() gate having already enforced the count/shape relationships between these operands before the loop dereferences them by index.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0239_cwe369.cpp",
+      "lines": "2-8",
+      "code": "  void Compute(OpKernelContext* context) override {\n    const Tensor& prefix = context->input(0);\n    const Tensor& tensor_names = context->input(1);\n    const Tensor& shape_and_slices = context->input(2);\n    ValidateInputs(true /* is save op */, context, prefix, tensor_names,\n                   shape_and_slices);\n    if (!context->status().ok()) return;",
+      "explanation": "This is the OpKernel entry point, invoked once per SaveV2 op execution. It binds the three fixed operands by reference from the kernel's input list: input(0) is the checkpoint path prefix, input(1) is the vector of tensor names, and input(2) is the vector of shape-and-slice specification strings. It then calls a helper ValidateInputs() (declared elsewhere) with is_save_op=true to enforce the structural preconditions on those operands — expected dtypes, that prefix is a scalar, that tensor_names and shape_and_slices are 1-D vectors of equal length, etc. Because ValidateInputs reports errors through context->SetStatus rather than by throwing, the code immediately checks context->status().ok() and returns early on failure. This guard is the primary trust boundary: everything below assumes validation succeeded."
+    },
+    {
+      "file": "corpus/train/train_0239_cwe369.cpp",
+      "lines": "10-14",
+      "code": "    const int kFixedInputs = 3;  // Prefix, tensor names, shape_and_slices.\n    const int num_tensors = static_cast<int>(tensor_names.NumElements());\n    const string& prefix_string = prefix.scalar<tstring>()();\n    const auto& tensor_names_flat = tensor_names.flat<tstring>();\n    const auto& shape_and_slices_flat = shape_and_slices.flat<tstring>();",
+      "explanation": "kFixedInputs records that the first three operands are fixed, so the i-th payload tensor lives at input(i + 3). num_tensors is the number of tensors to save, taken from tensor_names.NumElements() (an int64) and narrowed to int via static_cast. prefix_string extracts the single scalar string filename by calling scalar<tstring>() (which asserts the tensor is rank-0) and then invoking the returned accessor. tensor_names_flat and shape_and_slices_flat obtain flat<tstring>() views so the loop can index individual string elements by ordinal. These two flat views are expected to have num_tensors elements each; the code relies on ValidateInputs having guaranteed tensor_names and shape_and_slices are the same length."
+    },
+    {
+      "file": "corpus/train/train_0239_cwe369.cpp",
+      "lines": "16-18",
+      "code": "    BundleWriter writer(Env::Default(), prefix_string);\n    OP_REQUIRES_OK(context, writer.status());\n    VLOG(1) << \"BundleWriter, prefix_string: \" << prefix_string;",
+      "explanation": "Constructs a checkpoint::BundleWriter bound to the default filesystem environment and the destination prefix path. Because construction can fail (bad path, permissions, filesystem error), the code immediately propagates any construction error via OP_REQUIRES_OK(context, writer.status()), which sets the op status and returns from Compute on failure. VLOG(1) logs the prefix at verbosity 1 for debugging. The writer accumulates tensor entries and flushes them on Finish()."
+    },
+    {
+      "file": "corpus/train/train_0239_cwe369.cpp",
+      "lines": "20-23",
+      "code": "    for (int i = 0; i < num_tensors; ++i) {\n      const string& tensor_name = tensor_names_flat(i);\n      const Tensor& tensor = context->input(i + kFixedInputs);\n      VLOG(2) << \"Starting save of \" << tensor_name;",
+      "explanation": "The main loop iterates over every tensor to be saved. For each index i it reads the i-th name from tensor_names_flat, and — critically — fetches the i-th payload tensor from the variadic operand list at position i + kFixedInputs (i.e. input(i+3)). This couples num_tensors (derived from tensor_names' element count) to the number of actual operand tensors supplied to the kernel: the op must have been called with exactly num_tensors + 3 inputs, an invariant ValidateInputs / the op registration must guarantee. VLOG(2) traces the start of each save."
+    },
+    {
+      "file": "corpus/train/train_0239_cwe369.cpp",
+      "lines": "25-38",
+      "code": "      if (!shape_and_slices_flat(i).empty()) {\n        const string& shape_spec = shape_and_slices_flat(i);\n        TensorShape shape;\n        TensorSlice slice(tensor.dims());\n        TensorShape slice_shape;\n\n        OP_REQUIRES_OK(context, checkpoint::ParseShapeAndSlice(\n                                    shape_spec, &shape, &slice, &slice_shape));\n        OP_REQUIRES(context, slice_shape.IsSameSize(tensor.shape()),\n                    errors::InvalidArgument(\"Slice in shape_and_slice \"\n                                            \"specification does not match the \"\n                                            \"shape of the tensor to  save: \",\n                                            shape_spec, \", tensor: \",\n                                            tensor.shape().DebugString()));",
+      "explanation": "For each tensor the code inspects the corresponding shape_and_slices string (indexed by the same i). If it is non-empty, this tensor is only a slice of a larger virtual tensor, so the spec is parsed: ParseShapeAndSlice decodes the attacker-supplied string into the full shape, the slice descriptor, and the resulting slice_shape, with any parse error propagated via OP_REQUIRES_OK. slice is seeded with tensor.dims() so the slice rank matches the tensor rank. The subsequent OP_REQUIRES enforces a semantic invariant: the parsed slice_shape must have the same size as the actual tensor being written; otherwise it raises InvalidArgument. This is a validation gate that consumes the untrusted spec string but rejects mismatches before the write."
+    },
+    {
+      "file": "corpus/train/train_0239_cwe369.cpp",
+      "lines": "40-44",
+      "code": "        OP_REQUIRES_OK(context,\n                       writer.AddSlice(tensor_name, shape, slice, tensor));\n      } else {\n        OP_REQUIRES_OK(context, writer.Add(tensor_name, tensor));\n      }",
+      "explanation": "Having decided whether the entry is a full tensor or a slice, the code writes it. If a slice spec was present it calls writer.AddSlice(name, full_shape, slice, tensor) to record this tensor as a named slice of a larger checkpoint entry; otherwise it calls writer.Add(name, tensor) to store the whole tensor. Both paths propagate writer errors via OP_REQUIRES_OK, aborting the op on any I/O or serialization failure."
+    },
+    {
+      "file": "corpus/train/train_0239_cwe369.cpp",
+      "lines": "46-61",
+      "code": "      if (VLOG_IS_ON(5)) {\n        if (tensor.dtype() == DT_FLOAT) {\n          const float* t_data = tensor.flat<float>().data();\n          float min = std::numeric_limits<float>::infinity();\n          float max = -std::numeric_limits<float>::infinity();\n          double avg = 0.0;\n          for (int i = 0; i < tensor.NumElements(); ++i) {\n            if (t_data[i] < min) min = t_data[i];\n            if (t_data[i] > max) max = t_data[i];\n            avg += t_data[i];\n          }\n          VLOG(5) << \" min \" << min << \" max \" << max << \" avg \"\n                  << avg / tensor.NumElements() << \" total elts \"\n                  << tensor.NumElements();\n        }\n      }",
+      "explanation": "A verbosity-5-only diagnostic block. When VLOG level 5 is enabled and the tensor is DT_FLOAT, it takes a raw float* view of the tensor data and walks all NumElements() elements, tracking min, max and a running sum avg. Note this inner loop reuses the identifier i, shadowing the outer loop counter inside this scope (harmless because the block is self-contained). It then logs min, max, the arithmetic mean avg / tensor.NumElements(), and the element count. This code path is entirely for debugging and does not affect what is written to disk; it is compiled in but gated behind VLOG_IS_ON(5), which is off in normal builds/runs."
+    },
+    {
+      "file": "corpus/train/train_0239_cwe369.cpp",
+      "lines": "63-67",
+      "code": "      VLOG(2) << \"Done save of \" << tensor_name;\n    }\n    OP_REQUIRES_OK(context, writer.Finish());\n    VLOG(1) << \"Done BundleWriter, prefix_string: \" << prefix_string;\n  }",
+      "explanation": "Closes out each iteration with a trace log, then after the loop calls writer.Finish() to flush the bundle metadata and data files to disk, propagating any error via OP_REQUIRES_OK. A final VLOG(1) records completion. At this point the checkpoint bundle at prefix_string is fully written."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0239_cwe369.cpp",
+      "lines": "25-26",
+      "code": "      if (!shape_and_slices_flat(i).empty()) {\n        const string& shape_spec = shape_and_slices_flat(i);",
+      "explanation": "shape_and_slices_flat is indexed with i, where i ranges over [0, num_tensors) and num_tensors is derived from tensor_names.NumElements() — a DIFFERENT operand. If an attacker calls the op with tensor_names longer than shape_and_slices (e.g. tensor_names has 5 elements but shape_and_slices has 1), the flat accessor shape_and_slices_flat(i) reads past the end of shape_and_slices' backing buffer: an out-of-bounds read (CWE-125) that can crash the process or leak adjacent heap memory into the parse path. The only thing preventing this is ValidateInputs() at line 6 enforcing that tensor_names and shape_and_slices are equal-length vectors. That guard is not visible here, so this is a latent contract: the invariant shape_and_slices.NumElements() == tensor_names.NumElements() MUST hold. This equal-length check is exactly the kind of thing the 'fixed' revision is expected to have added."
+    },
+    {
+      "file": "corpus/train/train_0239_cwe369.cpp",
+      "lines": "22",
+      "code": "      const Tensor& tensor = context->input(i + kFixedInputs);",
+      "explanation": "The payload tensor is fetched at operand index i + kFixedInputs = i + 3. This assumes the kernel was invoked with at least num_tensors + 3 operands. num_tensors comes from tensor_names' element count, which is independent of how many variadic tensors were actually wired in. If tensor_names claims N entries but fewer than N payload tensors were supplied, context->input(i+3) indexes past the operand list. In TensorFlow input() bounds-checks with a CHECK, so the practical impact is a DCHECK/CHECK abort (denial of service, CWE-20 missing input validation) rather than silent OOB — but it is still an attacker-triggerable crash unless ValidateInputs / the op's registered input arity guarantees the operand count equals num_tensors + 3. Confirm that the number of variadic inputs is validated against tensor_names.NumElements() before this loop."
+    },
+    {
+      "file": "corpus/train/train_0239_cwe369.cpp",
+      "lines": "57-59",
+      "code": "          VLOG(5) << \" min \" << min << \" max \" << max << \" avg \"\n                  << avg / tensor.NumElements() << \" total elts \"\n                  << tensor.NumElements();",
+      "explanation": "This is the CWE-369 anchor the sample is tagged to. The mean is computed as avg / tensor.NumElements(); if the DT_FLOAT tensor has zero elements, this divides by zero. Because avg is a double and NumElements() (int64) is promoted to double, the operation is IEEE-754 floating-point division: 0.0/0.0 yields NaN and x/0.0 yields +/-Inf rather than a hardware SIGFPE, so it does not crash — it merely logs a NaN/Inf 'avg'. Impact is therefore benign (garbled diagnostic output only) and, crucially, the whole block is gated behind VLOG_IS_ON(5), which is disabled in normal operation. Had the divisor instead been an integer division of integer operands, an empty tensor would trap. The invariant to keep it safe is simply that this division stays floating-point (it does) and remains behind the VLOG gate. This is the residual, low-severity divide-by-zero contract."
+    },
+    {
+      "file": "corpus/train/train_0239_cwe369.cpp",
+      "lines": "12",
+      "code": "    const string& prefix_string = prefix.scalar<tstring>()();",
+      "explanation": "scalar<tstring>() asserts (via an internal CHECK/DCHECK) that prefix is a rank-0 tensor and of dtype tstring. If an attacker supplies a prefix that is not a scalar string (wrong rank or dtype), this dereference aborts the process (CHECK failure, denial of service) rather than returning an error status. The safe behavior depends on ValidateInputs() at line 6 having already verified prefix.dims()==0 and its dtype. Because that check is out of view, treat 'prefix is validated to be a scalar tstring before this line' as a latent invariant to confirm."
+    },
+    {
+      "file": "corpus/train/train_0239_cwe369.cpp",
+      "lines": "11",
+      "code": "    const int num_tensors = static_cast<int>(tensor_names.NumElements());",
+      "explanation": "NumElements() returns int64 but is narrowed to a 32-bit int. If tensor_names somehow carried more than INT_MAX elements the count would truncate/overflow to a negative or wrapped value, which would then drive the loop bound and the input(i+3) indexing incorrectly (CWE-197 numeric truncation feeding CWE-125). In practice a names vector with >2^31 elements is not constructible within normal memory limits, so this is a low-probability hardening note rather than a live bug; still, the implementation should ensure the operand count that ValidateInputs checks uses the un-narrowed int64 value."
+    }
+  ],
+  "summary": "This is the post-fix SaveV2 Compute() kernel; it is comparatively well-guarded — inputs pass through ValidateInputs() and an early status check, and every writer/parse call is wrapped in OP_REQUIRES(_OK). The CWE-369 divide-by-zero the sample is named for (avg / tensor.NumElements() at lines 57-59) is real but low severity: it is floating-point division that yields NaN rather than a trap, and it sits behind a VLOG(5) debug gate. The sharper residual risks are latent memory-safety contracts — indexing shape_and_slices and the variadic input list by tensor_names' element count — whose safety rests entirely on the unseen ValidateInputs() enforcing equal lengths and operand arity.",
+  "reviewed_anchors": [
+    {"anchor": "void Compute(OpKernelContext* context) override", "disposition": "dismissed", "reason": "OpKernel entry point; carries no contract of its own beyond dispatching to the logic below."},
+    {"anchor": "context->input(0) -> prefix", "disposition": "finding", "reason": "Assumed to be a scalar tstring by prefix.scalar<tstring>() at line 12; latent scalar/dtype contract."},
+    {"anchor": "context->input(1) -> tensor_names", "disposition": "finding", "reason": "Its element count (num_tensors) drives both shape_and_slices indexing and variadic input indexing; source of the equal-length invariants."},
+    {"anchor": "context->input(2) -> shape_and_slices", "disposition": "finding", "reason": "Indexed by tensor_names' count at line 25-26; OOB read if shorter than tensor_names."},
+    {"anchor": "ValidateInputs(true, context, prefix, tensor_names, shape_and_slices)", "disposition": "dismissed", "reason": "Out-of-view validation gate; its correctness is the precondition the findings ask to confirm, not itself quotable code."},
+    {"anchor": "if (!context->status().ok()) return;", "disposition": "dismissed", "reason": "Correct early-out on validation failure; a mitigation, not a defect."},
+    {"anchor": "const int kFixedInputs = 3", "disposition": "dismissed", "reason": "Named constant matching the op's three fixed operands; correct."},
+    {"anchor": "num_tensors = static_cast<int>(tensor_names.NumElements())", "disposition": "finding", "reason": "int64->int narrowing feeding loop bound and input indexing (CWE-197); low-probability hardening note."},
+    {"anchor": "prefix.scalar<tstring>()()", "disposition": "finding", "reason": "Rank-0/dtype assertion aborts if prefix is not a scalar tstring; latent CHECK-failure DoS."},
+    {"anchor": "tensor_names.flat<tstring>()", "disposition": "dismissed", "reason": "Flat view indexed within [0,num_tensors) which equals its own element count; consistent by construction."},
+    {"anchor": "shape_and_slices.flat<tstring>()", "disposition": "finding", "reason": "Flat view indexed by tensor_names' count, not its own; OOB read on length mismatch (CWE-125)."},
+    {"anchor": "BundleWriter writer(Env::Default(), prefix_string); OP_REQUIRES_OK(context, writer.status())", "disposition": "dismissed", "reason": "Construction error is checked and propagated correctly."},
+    {"anchor": "for (int i = 0; i < num_tensors; ++i)", "disposition": "dismissed", "reason": "Loop bound itself is fine; the risk is in the indexing done inside it (covered by other anchors)."},
+    {"anchor": "context->input(i + kFixedInputs)", "disposition": "finding", "reason": "Assumes >= num_tensors+3 operands; crash/OOB if fewer variadic inputs were supplied."},
+    {"anchor": "shape_and_slices_flat(i) / shape_spec", "disposition": "finding", "reason": "Same OOB-read concern as the shape_and_slices flat view; grouped into that finding."},
+    {"anchor": "checkpoint::ParseShapeAndSlice(shape_spec, &shape, &slice, &slice_shape)", "disposition": "dismissed", "reason": "Parses the untrusted spec string but its status is checked via OP_REQUIRES_OK; any parse error aborts cleanly."},
+    {"anchor": "OP_REQUIRES(context, slice_shape.IsSameSize(tensor.shape()), ...)", "disposition": "dismissed", "reason": "Explicit semantic validation of the parsed slice against the tensor shape; a mitigation."},
+    {"anchor": "writer.AddSlice / writer.Add", "disposition": "dismissed", "reason": "Both call sites are error-checked with OP_REQUIRES_OK; serialization safety lives in BundleWriter (not shown)."},
+    {"anchor": "VLOG_IS_ON(5) DT_FLOAT diagnostic block", "disposition": "dismissed", "reason": "Debug-only; t_data[i] walk is bounded by tensor.NumElements() over the same tensor, so the read is in-bounds."},
+    {"anchor": "for (int i = 0; i < tensor.NumElements(); ++i) (inner)", "disposition": "dismissed", "reason": "Shadows the outer i but only within the self-contained VLOG block; benign, no security effect."},
+    {"anchor": "avg / tensor.NumElements()", "disposition": "finding", "reason": "CWE-369 anchor: division by zero when the float tensor is empty, but floating-point (NaN) and behind VLOG(5); low severity."},
+    {"anchor": "writer.Finish()", "disposition": "dismissed", "reason": "Error-checked flush; correct."}
+  ],
+  "findings": [
+    {
+      "title": "shape_and_slices indexed by tensor_names' element count (OOB read on length mismatch)",
+      "anchor": "shape_and_slices_flat(i)",
+      "file": "corpus/train/train_0239_cwe369.cpp",
+      "line": "25-26",
+      "code": "      if (!shape_and_slices_flat(i).empty()) {\n        const string& shape_spec = shape_and_slices_flat(i);",
+      "bug_class": "Out-of-bounds read (index derived from a different operand's count)",
+      "cwe": "CWE-125",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided) — ValidateInputs()",
+      "invariant": "shape_and_slices.NumElements() must equal tensor_names.NumElements() (both must be validated 1-D vectors of the same length) before the loop indexes shape_and_slices_flat(i).",
+      "failure_mode": "An attacker invoking SaveV2 with tensor_names longer than shape_and_slices makes i exceed shape_and_slices' element count, so shape_and_slices_flat(i) reads past its backing buffer — a heap OOB read that can crash the process or feed adjacent memory into ParseShapeAndSlice. Exploitable in any deployment that runs untrusted graphs / tf.raw_ops.SaveV2.",
+      "cve_analog": "",
+      "what_to_confirm": "That ValidateInputs (called at line 6) rejects the op unless shape_and_slices and tensor_names are equal-length vectors; confirm there is no path where shape_and_slices is shorter."
+    },
+    {
+      "title": "Variadic payload input indexed by tensor_names count without operand-arity check",
+      "anchor": "context->input(i + kFixedInputs)",
+      "file": "corpus/train/train_0239_cwe369.cpp",
+      "line": "22",
+      "code": "      const Tensor& tensor = context->input(i + kFixedInputs);",
+      "bug_class": "Missing input-count validation (index derived from operand data)",
+      "cwe": "CWE-20",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided) — ValidateInputs() / op registration",
+      "invariant": "The kernel must be invoked with exactly num_tensors + kFixedInputs operands, i.e. the number of variadic tensor inputs must equal tensor_names.NumElements().",
+      "failure_mode": "If tensor_names declares N entries but fewer than N payload tensors are wired in, input(i+3) indexes past the operand list. TensorFlow's input() bounds-checks with a CHECK, so the realistic impact is a process abort (denial of service); the invariant is nonetheless attacker-influenced via tensor_names' length.",
+      "cve_analog": "",
+      "what_to_confirm": "That the op's registered input arity, or ValidateInputs, ties the number of variadic tensor inputs to tensor_names.NumElements() so context->input(i+3) is always in range."
+    },
+    {
+      "title": "Divide-by-zero computing mean of an empty float tensor (debug log)",
+      "anchor": "avg / tensor.NumElements()",
+      "file": "corpus/train/train_0239_cwe369.cpp",
+      "line": "57-59",
+      "code": "          VLOG(5) << \" min \" << min << \" max \" << max << \" avg \"\n                  << avg / tensor.NumElements() << \" total elts \"\n                  << tensor.NumElements();",
+      "bug_class": "Divide by zero (floating-point, yields NaN/Inf)",
+      "cwe": "CWE-369",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0239_cwe369.cpp",
+      "invariant": "The average should only be computed when tensor.NumElements() > 0; and the division must stay floating-point (double / int64) so an empty tensor produces NaN rather than a SIGFPE trap.",
+      "failure_mode": "A DT_FLOAT tensor with zero elements makes tensor.NumElements() == 0; avg / 0 is evaluated. Because avg is a double the result is IEEE NaN/Inf, not a hardware trap, so the only effect is a garbled 'avg' value in a VLOG(5) line — and only when verbosity 5 is enabled. Benign in normal operation; would be a real crash if the operands were integers.",
+      "cve_analog": "",
+      "what_to_confirm": "That NumElements()==0 cannot reach an integer division here and that no other divisor in the op is an integer division of untrusted counts; optionally guard the average with a NumElements()>0 check."
+    },
+    {
+      "title": "prefix assumed to be a scalar tstring",
+      "anchor": "prefix.scalar<tstring>()()",
+      "file": "corpus/train/train_0239_cwe369.cpp",
+      "line": "12",
+      "code": "    const string& prefix_string = prefix.scalar<tstring>()();",
+      "bug_class": "Missing rank/dtype validation before scalar access (CHECK-failure DoS)",
+      "cwe": "CWE-20",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided) — ValidateInputs()",
+      "invariant": "prefix must be validated to be a rank-0 tensor of dtype tstring before scalar<tstring>() is called.",
+      "failure_mode": "If prefix is not a scalar tstring, scalar<tstring>() fails an internal CHECK/DCHECK and aborts the process (denial of service) instead of returning an InvalidArgument status. Attacker controls prefix's rank and dtype in an untrusted-graph setting.",
+      "cve_analog": "",
+      "what_to_confirm": "That ValidateInputs enforces prefix.dims()==0 and dtype==DT_STRING before line 12 executes."
+    }
+  ],
+  "audit_checklist": [
+    "Read ValidateInputs(): confirm it enforces tensor_names and shape_and_slices are 1-D vectors of EQUAL length, and prefix is a rank-0 tstring — these gate the OOB-read and CHECK-failure findings.",
+    "Confirm the SaveV2 op registration / ValidateInputs ties the number of variadic inputs to tensor_names.NumElements() so context->input(i + kFixedInputs) is always in range.",
+    "Verify avg / tensor.NumElements() at line 58 stays floating-point (double numerator) so an empty tensor cannot trap; consider guarding with NumElements() > 0.",
+    "Check that ParseShapeAndSlice safely rejects malformed/oversized attacker-supplied shape_spec strings and that its status is always honored (it is, via OP_REQUIRES_OK).",
+    "Confirm the int64->int narrowing of NumElements() at line 11 cannot produce a negative/wrapped num_tensors that corrupts the loop bound or input indexing.",
+    "Confirm BundleWriter.AddSlice/Add/Finish handle attacker-chosen tensor_name, shape, and slice values without overflow in the underlying tensor_bundle serialization."
+  ]
+}

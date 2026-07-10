@@ -1,0 +1,185 @@
+{
+  "subsystem": "Eternal Terminal (et) — PipeSocketHandler::listen, the server-side setup of a UNIX-domain (AF_UNIX) stream listening socket used for local inter-process control between the et client, etserver, and etterminal. It binds a filesystem socket at a caller-supplied pipe path, sets its permissions, and records the resulting listen fd in a shared map.",
+  "provenance": "Identified by the fully-qualified class/method name PipeSocketHandler::listen, the SocketEndpoint type with an endpoint.name() accessor, the pipeServerSockets member map, the initServerSocket(fd) helper, the globalMutex recursive lock, and the FATAL_FAIL(...) error macro — all of these are the naming conventions of the EternalTerminal project (github.com/MisterTea/EternalTerminal). The sample banner 'primevul_test_0272_fixed' and filename train_0287_cwe362.cpp indicate a PrimeVul-sourced snippet whose intended weakness class is CWE-362 (race condition). Reviewed blind on the merits regardless of that label.",
+  "trust_boundary": "Two boundaries. (1) The pipe path string returned by endpoint.name() (line 5) is copied into a fixed 108-byte sockaddr_un.sun_path; its length and content drive strncpy, unlink, bind, and chmod — if any path component or the whole path is attacker- or config-influenced it becomes the hostile input. (2) The far more important boundary is the local filesystem and other local users: once ::bind creates the socket file (line 19) and ::listen marks it accepting (line 20), the on-disk node is reachable by any local process subject to its filesystem permissions BEFORE ::chmod (line 22) tightens them. Local users on the same host are the untrusted principals; the socket mediates control of a terminal session, so unauthorized access is a privilege/authentication concern.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0287_cwe362.cpp",
+      "lines": "2",
+      "code": "set<int> PipeSocketHandler::listen(const SocketEndpoint& endpoint) {",
+      "explanation": "Definition of PipeSocketHandler::listen. It takes a SocketEndpoint by const reference (the abstract description of where to listen — for a pipe handler this carries a filesystem path) and returns a set<int> of the file descriptors now listening for that endpoint. Returning a set anticipates that a single endpoint could map to multiple fds, though this path creates exactly one. This is server-side setup code, invoked once per endpoint when a component starts accepting local connections."
+    },
+    {
+      "file": "corpus/train/train_0287_cwe362.cpp",
+      "lines": "3",
+      "code": "  lock_guard<std::recursive_mutex> guard(globalMutex);",
+      "explanation": "Acquires globalMutex, a std::recursive_mutex, for the whole function body via RAII lock_guard. The recursive type implies this method may be reached while the same thread already holds the lock (e.g. nested handler calls). Its scope is the in-memory bookkeeping (the pipeServerSockets map read at line 6 and written at line 25); crucially it does NOT serialize anything about the filesystem node created below, so it gives no protection against other processes racing on the socket file."
+    },
+    {
+      "file": "corpus/train/train_0287_cwe362.cpp",
+      "lines": "5-8",
+      "code": "  string pipePath = endpoint.name();\n  if (pipeServerSockets.find(pipePath) != pipeServerSockets.end()) {\n    throw runtime_error(\"Tried to listen twice on the same path\");\n  }",
+      "explanation": "Reads the endpoint's name into a std::string pipePath — this is the filesystem path of the UNIX socket. It then guards against double-listening: if pipeServerSockets already has an entry keyed by that exact path string, it throws runtime_error rather than binding again. Note the guard is keyed on the string, not on the actual sun_path bytes that will later be used, and it does not bound the length of pipePath — an important gap for the strncpy that follows."
+    },
+    {
+      "file": "corpus/train/train_0287_cwe362.cpp",
+      "lines": "10-14",
+      "code": "  sockaddr_un local;\n\n  int fd = socket(AF_UNIX, SOCK_STREAM, 0);\n  FATAL_FAIL(fd);\n  initServerSocket(fd);",
+      "explanation": "Declares a stack sockaddr_un named local WITHOUT initialization (no {} or memset), then creates an AF_UNIX SOCK_STREAM socket. FATAL_FAIL(fd) is the project's macro that aborts/logs if fd is negative (the socket() call failed). initServerSocket(fd) applies common server-socket options (e.g. SO_REUSEADDR / non-blocking / close-on-exec) to the new descriptor. Because local is uninitialized here, every meaningful byte of it must be written explicitly before it is passed to bind — the code relies on strncpy at line 16 fully populating sun_path."
+    },
+    {
+      "file": "corpus/train/train_0287_cwe362.cpp",
+      "lines": "15-17",
+      "code": "  local.sun_family = AF_UNIX; /* local is declared before socket() ^ */\n  strncpy(local.sun_path, pipePath.c_str(), sizeof(local.sun_path));\n  unlink(local.sun_path);",
+      "explanation": "Sets the address family to AF_UNIX, then copies the pipe path into the fixed-size sun_path array with strncpy bounded by sizeof(local.sun_path) (108 bytes on Linux, ~104 on some BSDs). strncpy has two well-known behaviors that matter here: it pads the destination with NUL bytes when the source is shorter than the bound (so a short path fully initializes sun_path, masking the uninitialized declaration), but it does NOT write a terminating NUL when the source length is >= the bound (it truncates and leaves the buffer unterminated). unlink(local.sun_path) then removes any pre-existing socket file at that path so the subsequent bind can recreate it; unlink treats sun_path as a C string and reads until a NUL."
+    },
+    {
+      "file": "corpus/train/train_0287_cwe362.cpp",
+      "lines": "19-23",
+      "code": "  FATAL_FAIL(::bind(fd, (struct sockaddr*)&local, sizeof(sockaddr_un)));\n  ::listen(fd, 5);\n#ifndef WIN32\n  FATAL_FAIL(::chmod(local.sun_path, S_IRUSR | S_IWUSR | S_IXUSR));\n#endif",
+      "explanation": "Binds fd to the local address, creating the filesystem socket node; FATAL_FAIL aborts on error. Note bind is told the address length is the full sizeof(sockaddr_un) rather than the actual path length, which is legal but means the whole struct (including any non-path trailing bytes) is passed to the kernel. ::listen(fd, 5) then marks the socket as accepting connections with a backlog of 5 — from this instant the node is live and connectable. Only AFTER that, and only on non-Windows builds, ::chmod restricts the node to owner read/write/execute (0700). The permissions the node actually had between bind and this chmod are whatever the process umask produced, not 0700."
+    },
+    {
+      "file": "corpus/train/train_0287_cwe362.cpp",
+      "lines": "25-27",
+      "code": "  pipeServerSockets[pipePath] = set<int>({fd});\n  return pipeServerSockets[pipePath];\n}",
+      "explanation": "Records the new listening fd in the pipeServerSockets map under the original pipePath string (a set containing just fd), then returns a copy of that set to the caller. This registration is what the duplicate-listen guard at line 6 keys on. The map is keyed by the full pipePath string even though the socket was actually bound to the possibly-truncated sun_path, so the bookkeeping key and the real kernel address can diverge if truncation occurred."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0287_cwe362.cpp",
+      "lines": "19-22",
+      "code": "  FATAL_FAIL(::bind(fd, (struct sockaddr*)&local, sizeof(sockaddr_un)));\n  ::listen(fd, 5);\n#ifndef WIN32\n  FATAL_FAIL(::chmod(local.sun_path, S_IRUSR | S_IWUSR | S_IXUSR));",
+      "explanation": "Time-of-check/time-of-use permission race (CWE-362 / CWE-279). ::bind creates the on-disk socket node with permissions derived from the process umask (commonly 0755 or 0775 for the AF_UNIX node), and ::listen immediately makes it accept connections. The restriction to owner-only (0700) does not happen until ::chmod one and two lines later. Between line 19/20 and line 22 there is a real window in which any local user whose access the umask permits can connect() to the control socket and be serviced by the listening endpoint, or can otherwise interact with a node that was meant to be private. Because this socket carries terminal-session control for et, unauthorized local access is a privilege/authentication bypass, not just information exposure. The safe pattern is to eliminate the window entirely — set a tight umask (e.g. fchmod is not available for an AF_UNIX node so use umask(0177) around bind, or create in a 0700 parent directory) so the node is never world/group reachable, rather than binding-then-chmod. The globalMutex held here does nothing against other processes."
+    },
+    {
+      "file": "corpus/train/train_0287_cwe362.cpp",
+      "lines": "16",
+      "code": "  strncpy(local.sun_path, pipePath.c_str(), sizeof(local.sun_path));",
+      "explanation": "Missing NUL termination (CWE-170 leading to CWE-125 out-of-bounds read). When pipePath.length() >= sizeof(local.sun_path) (>= 108 bytes on Linux), strncpy copies exactly that many bytes and writes NO terminating NUL. sun_path is then consumed as a C string by unlink(local.sun_path) at line 17 and chmod(local.sun_path, ...) at line 22, and the sockaddr is handed to bind. Those callers scan for a NUL that is not there and read past the end of sun_path into whatever adjacent stack bytes follow the struct, until a stray zero is found — an out-of-bounds read whose consumed value is an unpredictable, uncontrolled path. Impact ranges from unlink/chmod/bind operating on a garbage path (failure, or acting on an unintended file) to reading uninitialized stack. The invariant: reject or reserve room so pipePath.length() < sizeof(sun_path) and force sun_path[sizeof-1] = '\\0' before any string use. Exploitability depends on whether the endpoint path can reach 108+ bytes, which is plausible for deep /tmp or per-user paths."
+    },
+    {
+      "file": "corpus/train/train_0287_cwe362.cpp",
+      "lines": "16",
+      "code": "  strncpy(local.sun_path, pipePath.c_str(), sizeof(local.sun_path));",
+      "explanation": "Silent path truncation (CWE-20 / CWE-704 improper handling of oversized input). Even ignoring the NUL issue, when pipePath is longer than sun_path the socket is bound to a truncated prefix of the intended path. The bookkeeping map at line 25 is keyed by the full untruncated pipePath, so the duplicate-listen guard at line 6 can be defeated (two distinct long paths sharing a 107-byte prefix collide on the same kernel node while looking distinct in the map), and the process may bind to a shorter, more predictable, and possibly attacker-createable path than intended. There is no length check on pipePath before the copy. The implementation should validate that the endpoint path fits and fail loudly otherwise, instead of silently binding somewhere else."
+    },
+    {
+      "file": "corpus/train/train_0287_cwe362.cpp",
+      "lines": "17",
+      "code": "  unlink(local.sun_path);",
+      "explanation": "Unlink-then-bind on a path resolved through possibly attacker-writable directories (CWE-367 TOCTOU / symlink concerns). If any directory component of sun_path is writable by another local user, an attacker can influence what unlink removes and what bind subsequently creates by swapping directory entries between the unlink at line 17 and the bind at line 19, or can pre-plant a node. Combined with the permission window at lines 19-22 this widens the local attack surface. The implementation must ensure the socket lives in a directory owned by and writable only by the running user (e.g. a per-user 0700 runtime dir) so path resolution cannot be redirected."
+    },
+    {
+      "file": "corpus/train/train_0287_cwe362.cpp",
+      "lines": "10",
+      "code": "  sockaddr_un local;",
+      "explanation": "Uninitialized stack address struct. local is declared without zeroing and only sun_family and sun_path are written explicitly. In the common case this is benign because strncpy NUL-pads sun_path for short paths and sun_family is set, but bind is passed sizeof(sockaddr_un) (line 19), so on platforms/layouts where sockaddr_un has trailing padding beyond sun_path, uninitialized stack bytes are handed to the kernel. It also becomes materially unsafe precisely in the oversized-path case (no NUL, no padding). Zero-initializing local (memset or `sockaddr_un local{};`) before use is the cheap invariant that removes this whole class."
+    }
+  ],
+  "summary": "Server-side UNIX-domain listen setup for Eternal Terminal. The central weakness is a race/permission window: ::bind + ::listen (lines 19-20) publish an accepting control socket with umask-default permissions before ::chmod (line 22) restricts it to 0700, letting a local attacker connect during the gap (CWE-362/CWE-279). Secondary memory-safety issues: strncpy at line 16 does not NUL-terminate an oversized path, so unlink/chmod/bind read past sun_path (CWE-170/CWE-125) and silently truncate the bind target (CWE-20). Uninitialized sockaddr_un and unlink/bind path-resolution TOCTOU compound the local risk.",
+  "reviewed_anchors": [
+    {"anchor": "PipeSocketHandler::listen(const SocketEndpoint& endpoint) -> set<int> (line 2)", "disposition": "dismissed", "reason": "Function signature; return-by-value set<int> and const-ref param carry no direct memory contract. Risks live in the body."},
+    {"anchor": "lock_guard<std::recursive_mutex> guard(globalMutex) (line 3)", "disposition": "dismissed", "reason": "Protects only the in-memory pipeServerSockets map, not the filesystem node; correct for its scope, but its scope excludes the real race."},
+    {"anchor": "string pipePath = endpoint.name() (line 5)", "disposition": "finding", "reason": "Untrusted/config path with no length bound; drives the strncpy truncation and null-termination findings."},
+    {"anchor": "pipeServerSockets.find(pipePath) duplicate-listen guard (lines 6-8)", "disposition": "finding", "reason": "Keyed on full string while bind uses possibly-truncated sun_path; guard can be bypassed via path collision — part of the truncation finding."},
+    {"anchor": "sockaddr_un local; (line 10)", "disposition": "finding", "reason": "Uninitialized stack struct passed to bind with full sizeof; trailing/padding and oversized-path bytes may be uninitialized."},
+    {"anchor": "int fd = socket(AF_UNIX, SOCK_STREAM, 0) (line 12)", "disposition": "dismissed", "reason": "Standard socket creation; return checked by FATAL_FAIL."},
+    {"anchor": "FATAL_FAIL(fd) (line 13)", "disposition": "dismissed", "reason": "Error-handling macro on an int fd; no dereference of a possibly-NULL handle shown."},
+    {"anchor": "initServerSocket(fd) (line 14)", "disposition": "dismissed", "reason": "Helper not shown; applies socket options. No contract visible to review here."},
+    {"anchor": "local.sun_family = AF_UNIX (line 15)", "disposition": "dismissed", "reason": "Scalar family assignment; correct and required."},
+    {"anchor": "strncpy(local.sun_path, pipePath.c_str(), sizeof(local.sun_path)) (line 16)", "disposition": "finding", "reason": "Fixed 108-byte buffer fed a length-unbounded source; strncpy neither guarantees NUL termination nor rejects truncation."},
+    {"anchor": "unlink(local.sun_path) (line 17)", "disposition": "finding", "reason": "Consumes sun_path as a C string (OOB read if unterminated) and resolves a path possibly through attacker-writable dirs (TOCTOU)."},
+    {"anchor": "::bind(fd, (struct sockaddr*)&local, sizeof(sockaddr_un)) (line 19)", "disposition": "finding", "reason": "Creates the on-disk node with umask permissions and passes full sizeof of a partially-initialized struct; start of the permission race window."},
+    {"anchor": "::listen(fd, 5) (line 20)", "disposition": "finding", "reason": "Makes the node accept connections while it still has umask permissions (before chmod) — the exploitable half of the race."},
+    {"anchor": "::chmod(local.sun_path, S_IRUSR | S_IWUSR | S_IXUSR) (line 22)", "disposition": "finding", "reason": "Restricts permissions to 0700 only AFTER bind+listen; too late to close the window, and operates by path (chmod OOB read if sun_path unterminated)."},
+    {"anchor": "#ifndef WIN32 guard around chmod (lines 21-23)", "disposition": "dismissed", "reason": "Platform guard; on Windows the chmod is skipped entirely, but AF_UNIX permissioning differs there — noted, not a distinct memory finding."},
+    {"anchor": "pipeServerSockets[pipePath] = set<int>({fd}) and return (lines 25-26)", "disposition": "dismissed", "reason": "Bookkeeping write/return under the mutex; the key-vs-sun_path divergence is captured by the truncation finding."}
+  ],
+  "findings": [
+    {
+      "title": "Permission race: control socket accepts connections before chmod tightens it",
+      "anchor": "::bind(...); ::listen(fd, 5); ... ::chmod(local.sun_path, S_IRUSR | S_IWUSR | S_IXUSR)",
+      "file": "corpus/train/train_0287_cwe362.cpp",
+      "line": "19-22",
+      "code": "  FATAL_FAIL(::bind(fd, (struct sockaddr*)&local, sizeof(sockaddr_un)));\n  ::listen(fd, 5);\n#ifndef WIN32\n  FATAL_FAIL(::chmod(local.sun_path, S_IRUSR | S_IWUSR | S_IXUSR));\n#endif",
+      "bug_class": "Race condition / insecure default permissions on newly created UNIX socket (bind creates with umask, chmod tightens too late)",
+      "cwe": "CWE-362",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0287_cwe362.cpp (shown) plus surrounding PipeSocketHandler implementation (file not fully provided)",
+      "invariant": "The socket node must NEVER be reachable by other local users at any instant: create it already restricted (tight umask around bind, or inside a 0700 per-user directory) so there is no window between becoming connectable and being locked to the owner.",
+      "failure_mode": "bind() creates the filesystem socket with umask-default permissions and listen() immediately makes it accept; until chmod runs (next statement, and skipped entirely on WIN32) a local attacker permitted by the umask can connect() to the et control socket and be serviced, or interfere with the node — a local privilege/authentication bypass. The globalMutex does not serialize other processes.",
+      "cve_analog": "CVE-2022-24949",
+      "what_to_confirm": "Confirm the process umask at listen time and the parent directory permissions; verify whether any connection accepted between listen() and chmod() is authenticated later or acted on immediately, and whether WIN32 builds ever leave the node unrestricted."
+    },
+    {
+      "title": "strncpy leaves sun_path unterminated on oversized path -> OOB read in unlink/chmod/bind",
+      "anchor": "strncpy(local.sun_path, pipePath.c_str(), sizeof(local.sun_path))",
+      "file": "corpus/train/train_0287_cwe362.cpp",
+      "line": "16",
+      "code": "  strncpy(local.sun_path, pipePath.c_str(), sizeof(local.sun_path));",
+      "bug_class": "Missing NUL termination leading to out-of-bounds read of adjacent stack",
+      "cwe": "CWE-170",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0287_cwe362.cpp",
+      "invariant": "After copying, sun_path must be NUL-terminated within its bounds: ensure pipePath.length() < sizeof(sun_path) (reject otherwise) and explicitly set local.sun_path[sizeof(local.sun_path)-1] = '\\0'.",
+      "failure_mode": "If endpoint.name() returns >= 108 bytes, strncpy writes no terminator; the subsequent unlink(local.sun_path) (line 17) and chmod(local.sun_path, ...) (line 22) scan past sun_path into adjacent stack until a stray NUL, reading out of bounds and operating on an unpredictable path (unintended unlink/chmod target, bind failure, or leak of stack contents into the resolved path).",
+      "cve_analog": "",
+      "what_to_confirm": "Whether any code path lets endpoint.name() reach or exceed sizeof(sockaddr_un.sun_path) (108 on Linux), and whether callers of listen validate path length beforehand."
+    },
+    {
+      "title": "Silent path truncation binds to unintended path and defeats duplicate-listen guard",
+      "anchor": "strncpy(...) truncation vs pipeServerSockets key",
+      "file": "corpus/train/train_0287_cwe362.cpp",
+      "line": "16",
+      "code": "  strncpy(local.sun_path, pipePath.c_str(), sizeof(local.sun_path));",
+      "bug_class": "Improper handling of oversized input (silent truncation of security-relevant path)",
+      "cwe": "CWE-20",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0287_cwe362.cpp",
+      "invariant": "An endpoint path that does not fit in sun_path must be rejected, not truncated; the kernel address bound must equal the path used as the map key so the duplicate-listen guard (line 6) reflects reality.",
+      "failure_mode": "When pipePath exceeds sun_path, bind uses only the truncated prefix while pipeServerSockets (line 25) is keyed by the full string. Two distinct long paths sharing the first 107 bytes collide on one kernel node yet appear distinct in the map, bypassing the 'listen twice' check (lines 6-8), and the process may bind to a shorter, more predictable path than intended.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether endpoint paths can share long prefixes and whether the map key vs sun_path divergence is reachable in practice; add an explicit length check before strncpy."
+    },
+    {
+      "title": "unlink/bind resolve socket path through possibly attacker-writable directories (TOCTOU)",
+      "anchor": "unlink(local.sun_path)",
+      "file": "corpus/train/train_0287_cwe362.cpp",
+      "line": "17",
+      "code": "  unlink(local.sun_path);",
+      "bug_class": "Time-of-check/time-of-use on filesystem path (unlink-then-bind, symlink/dir swap)",
+      "cwe": "CWE-367",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0287_cwe362.cpp (shown) plus deployment directory choice (not provided)",
+      "invariant": "Every directory component of sun_path must be owned by and writable only by the running user so path resolution cannot be redirected between unlink and bind.",
+      "failure_mode": "If a directory component of sun_path is writable by another user, an attacker can swap entries between the unlink (line 17) and the bind (line 19) to redirect what is removed/created, or pre-plant a node; combined with the permission window this broadens local attack surface.",
+      "cve_analog": "",
+      "what_to_confirm": "The actual directory the pipe path lives in and its permissions/ownership; whether a per-user 0700 runtime directory is enforced."
+    },
+    {
+      "title": "Uninitialized sockaddr_un passed to bind with full sizeof",
+      "anchor": "sockaddr_un local;",
+      "file": "corpus/train/train_0287_cwe362.cpp",
+      "line": "10",
+      "code": "  sockaddr_un local;",
+      "bug_class": "Use of uninitialized stack memory in a kernel-facing struct",
+      "cwe": "CWE-457",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0287_cwe362.cpp",
+      "invariant": "local must be fully zero-initialized (memset or `sockaddr_un local{};`) before any field is set or it is passed to bind, since bind receives sizeof(sockaddr_un).",
+      "failure_mode": "Only sun_family and sun_path are written; bind is given the whole sizeof(sockaddr_un) (line 19). On layouts with trailing padding beyond sun_path, or in the oversized-path case where strncpy neither terminates nor pads, uninitialized stack bytes are handed to the kernel as part of the address.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether sockaddr_un has bytes beyond sun_path on target platforms and whether any path reaches bind without full initialization of local."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm the umask in effect when bind() runs and the permissions of the socket node in the window between listen() (line 20) and chmod() (line 22); replace bind-then-chmod with create-already-restricted (tight umask or 0700 parent dir).",
+    "Verify WIN32 builds do not leave the AF_UNIX node world/group accessible given the #ifndef WIN32 guard skips chmod entirely.",
+    "Check every producer of endpoint.name() for a length bound < sizeof(sockaddr_un.sun_path) (108 on Linux); add rejection and explicit NUL termination after strncpy (line 16).",
+    "Confirm the pipeServerSockets duplicate-listen guard cannot be bypassed by two long paths sharing a truncated prefix (map keyed by full string vs truncated sun_path).",
+    "Ensure the directory holding the socket path is owned by and writable only by the running user to close the unlink/bind TOCTOU.",
+    "Zero-initialize sockaddr_un local before use since bind is passed the full sizeof(sockaddr_un)."
+  ]
+}

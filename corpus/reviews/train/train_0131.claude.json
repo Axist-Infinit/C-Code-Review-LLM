@@ -1,0 +1,198 @@
+{
+  "subsystem": "Exiv2 image-metadata library, PNG backend. This is Exiv2::PngImage::readMetadata() from pngimage.cpp — the top-level PNG parser that walks the file's chunk stream (IHDR/tEXt/zTXt/iTXt/iCCP/IEND) to extract embedded metadata (dimensions, text records, and the embedded ICC color profile). It consumes raw, file-supplied bytes.",
+  "provenance": "Identified by namespace and API surface: the Exiv2:: namespace, PngImage::readMetadata, Exiv2::getULong(..., Exiv2::bigEndian), DataBuf, IoCloser, Error(kerDataSourceOpenFailed/kerNotAnImage/kerFailedToReadImageData), isPngType, PngChunk::decodeIHDRChunk/decodeTXTChunk, and Internal::PngImageHeader are all Exiv2 identifiers. The banner names corpus/train/train_0131_cwe190.cpp and the sample tag is 'primevul_train_2949_vuln'. This is the classic Exiv2 PNG reader.",
+  "trust_boundary": "The entire chunk stream is attacker-controlled: an untrusted PNG file (downloaded, uploaded, e-mailed, thumbnailed) is opened via io_ and every field parsed here comes off the wire. Hostile inputs are: the 32-bit big-endian chunk-data-length in the 8-byte chunk header (line 24), the 4-byte chunk type (line 30), and the raw chunk payload bytes in chunkData (lines 40-68). The iCCP chunk payload — profile name, null terminator, compression flag, and the compressed profile blob — is fully attacker-shaped, including its length.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0131_cwe190.cpp",
+      "lines": "2-14",
+      "code": "void PngImage::readMetadata()\n    {\n#ifdef DEBUG\n        std::cerr << \"Exiv2::PngImage::readMetadata: Reading PNG file \" << io_->path() << std::endl;\n#endif\n        if (io_->open() != 0) {\n            throw Error(kerDataSourceOpenFailed, io_->path(), strError());\n        }\n        IoCloser closer(*io_);\n        if (!isPngType(*io_, true)) {\n            throw Error(kerNotAnImage, \"PNG\");\n        }\n        clearMetadata();",
+      "explanation": "readMetadata() is the entry point that parses an entire PNG file for metadata. It first opens the backing I/O object io_ (a BasicIo abstraction over a file/memory buffer); on failure it throws kerDataSourceOpenFailed. IoCloser closer(*io_) is an RAII guard that closes io_ when the function returns or throws. isPngType(*io_, true) is the format validation gate: it checks the 8-byte PNG magic signature and (with advance=true) consumes it, throwing kerNotAnImage if the file is not a PNG. clearMetadata() resets any previously accumulated metadata state on this Image object. Everything after this point operates on attacker-controlled bytes."
+    },
+    {
+      "file": "corpus/train/train_0131_cwe190.cpp",
+      "lines": "16-17",
+      "code": "const long imgSize = (long)io_->size();\n        DataBuf cheaderBuf(8);  // Chunk header: 4 bytes (data size) + 4 bytes (chunk type).",
+      "explanation": "imgSize captures the total file size as a signed long (cast from io_->size()). It is later used to bound each chunk length against the bytes remaining in the file. cheaderBuf is an 8-byte DataBuf that will hold one chunk header: PNG chunks are framed as [4-byte big-endian data length][4-byte type][data][4-byte CRC]. This 8 covers just the length+type prefix. DataBuf owns a heap buffer pData_ of size size_ (here 8)."
+    },
+    {
+      "file": "corpus/train/train_0131_cwe190.cpp",
+      "lines": "19-28",
+      "code": "while (!io_->eof()) {\n            std::memset(cheaderBuf.pData_, 0x0, cheaderBuf.size_);\n            readChunk(cheaderBuf, *io_);  // Read chunk header.\n\n            // Decode chunk data length.\n            uint32_t chunkLength = Exiv2::getULong(cheaderBuf.pData_, Exiv2::bigEndian);\n            long pos = io_->tell();\n            if (pos == -1 || chunkLength > uint32_t(0x7FFFFFFF) || static_cast<long>(chunkLength) > imgSize - pos) {\n                throw Exiv2::Error(kerFailedToReadImageData);\n            }",
+      "explanation": "The main loop iterates until EOF. Each pass zeroes cheaderBuf, then readChunk() fills it with the next 8-byte chunk header. getULong(cheaderBuf.pData_, bigEndian) decodes the first 4 bytes as an unsigned 32-bit big-endian chunk data length into chunkLength — this is the primary attacker-controlled size field. pos = io_->tell() is the current read offset (just past the header). The guard on line 26 is the length sanity check: it rejects the chunk if the offset is invalid (pos == -1), if chunkLength exceeds 0x7FFFFFFF (so the later cast to signed long stays non-negative), or if chunkLength would run past the end of the file (static_cast<long>(chunkLength) > imgSize - pos). This bounds chunkLength to [0, min(0x7FFFFFFF, remaining-bytes)] — importantly it does NOT impose any minimum, so chunkLength can legitimately be 0 or a very small value."
+    },
+    {
+      "file": "corpus/train/train_0131_cwe190.cpp",
+      "lines": "30-39",
+      "code": "std::string chunkType(reinterpret_cast<char*>(cheaderBuf.pData_) + 4, 4);\n#ifdef DEBUG\n            std::cout << \"Exiv2::PngImage::readMetadata: chunk type: \" << chunkType << \" length: \" << chunkLength\n                      << std::endl;\n#endif\n\n            /// \\todo analyse remaining chunks of the standard\n            // Perform a chunk triage for item that we need.\n            if (chunkType == \"IEND\" || chunkType == \"IHDR\" || chunkType == \"tEXt\" || chunkType == \"zTXt\" ||\n                chunkType == \"iTXt\" || chunkType == \"iCCP\") {",
+      "explanation": "chunkType is built from bytes 4..7 of the 8-byte header (the 4-character chunk type), read in-bounds. The code then triages: only the interesting chunk types (IEND, IHDR, tEXt, zTXt, iTXt, iCCP) enter the body that actually reads and decodes chunk data; all other chunk types are skipped (their data is seeked over later). This is a whitelist dispatch on the attacker-supplied 4-byte tag."
+    },
+    {
+      "file": "corpus/train/train_0131_cwe190.cpp",
+      "lines": "40-50",
+      "code": "DataBuf chunkData(chunkLength);\n                readChunk(chunkData, *io_);  // Extract chunk data.\n\n                if (chunkType == \"IEND\") {\n                    return;  // Last chunk found: we stop parsing.\n                } else if (chunkType == \"IHDR\" && chunkData.size_ >= 8) {\n                    Internal::PngImageHeader header;\n                    PngChunk::decodeIHDRChunk(chunkData, header);\n                    pixelWidth_ = header.width;\n                    pixelHeight_ = header.height;\n                    /// \\todo handle rest of data",
+      "explanation": "For a whitelisted chunk, chunkData is heap-allocated with exactly chunkLength bytes and readChunk() fills it from the file. Note chunkLength may be 0, producing a zero/empty buffer. IEND immediately returns (end of image). IHDR is decoded only if chunkData.size_ >= 8 — this is an explicit minimum-length guard before decodeIHDRChunk reads the header fields (width/height at fixed offsets). decodeIHDRChunk parses attacker bytes into an Internal::PngImageHeader; pixelWidth_/pixelHeight_ are then set from header.width/height. Note the contrast: IHDR checks a minimum size, but iCCP below does not."
+    },
+    {
+      "file": "corpus/train/train_0131_cwe190.cpp",
+      "lines": "51-56",
+      "code": "} else if (chunkType == \"tEXt\") {\n                    PngChunk::decodeTXTChunk(this, chunkData, PngChunk::tEXt_Chunk);\n                } else if (chunkType == \"zTXt\") {\n                    PngChunk::decodeTXTChunk(this, chunkData, PngChunk::zTXt_Chunk);\n                } else if (chunkType == \"iTXt\") {\n                    PngChunk::decodeTXTChunk(this, chunkData, PngChunk::iTXt_Chunk);",
+      "explanation": "The three text chunk types (tEXt uncompressed, zTXt zlib-compressed, iTXt international) are all forwarded to PngChunk::decodeTXTChunk with a discriminator enum. decodeTXTChunk (implementation not shown here) is responsible for splitting the keyword/value on the embedded NUL separator and, for zTXt/iTXt, zlib-inflating the compressed portion. All of chunkData is attacker-controlled, so the safety of these paths depends entirely on that function's internal bounds checking — a latent surface not visible in this file."
+    },
+    {
+      "file": "corpus/train/train_0131_cwe190.cpp",
+      "lines": "57-65",
+      "code": "} else if (chunkType == \"iCCP\") {\n                    // The ICC profile name can vary from 1-79 characters.\n                    uint32_t iccOffset = 0;\n                    while (iccOffset < 80 && iccOffset < chunkLength) {\n                        if (chunkData.pData_[iccOffset++] == 0x00) {\n                            break;\n                        }\n                    }\n                    profileName_ = std::string(reinterpret_cast<char*>(chunkData.pData_), iccOffset - 1);",
+      "explanation": "The iCCP (embedded ICC color profile) chunk is decoded inline. Its wire layout is: a 1-79 byte profile name, a NUL terminator, a 1-byte compression method, then the zlib-compressed profile. The while loop scans for the NUL terminator, advancing iccOffset up to at most min(80, chunkLength) bytes; the array read chunkData.pData_[iccOffset++] stays in-bounds because iccOffset < chunkLength gates it. After the loop iccOffset points just past the NUL (or at the 80/chunkLength cap). profileName_ is then constructed from the first (iccOffset - 1) bytes, intending to drop the NUL. Crucially, unlike the IHDR branch there is NO minimum-length guard on chunkData before this parsing — chunkLength can be 0, 1, or any small value."
+    },
+    {
+      "file": "corpus/train/train_0131_cwe190.cpp",
+      "lines": "66-74",
+      "code": "++iccOffset;  // +1 = 'compressed' flag\n\n                    zlibToDataBuf(chunkData.pData_ + iccOffset, chunkLength - iccOffset, iccProfile_);\n#ifdef DEBUG\n                    std::cout << \"Exiv2::PngImage::readMetadata: profile name: \" << profileName_ << std::endl;\n                    std::cout << \"Exiv2::PngImage::readMetadata: iccProfile.size_ (uncompressed) : \"\n                              << iccProfile_.size_ << std::endl;\n#endif\n                }",
+      "explanation": "After reading the name, iccOffset is advanced by one more byte to skip the 1-byte compression-method flag. The remaining bytes — starting at chunkData.pData_ + iccOffset with length chunkLength - iccOffset — are treated as the zlib-compressed ICC profile and inflated by zlibToDataBuf into iccProfile_. The length argument chunkLength - iccOffset is unsigned 32-bit subtraction: it is only correct if iccOffset <= chunkLength, an invariant that the preceding code does NOT establish. This is the core hazard of the function."
+    },
+    {
+      "file": "corpus/train/train_0131_cwe190.cpp",
+      "lines": "76-89",
+      "code": "// Set chunkLength to 0 in case we have read a supported chunk type. Otherwise, we need to seek the\n                // file to the next chunk position.\n                chunkLength = 0;\n            }\n\n            // Move to the next chunk: chunk data size + 4 CRC bytes.\n#ifdef DEBUG\n            std::cout << \"Exiv2::PngImage::readMetadata: Seek to offset: \" << chunkLength + 4 << std::endl;\n#endif\n            io_->seek(chunkLength + 4, BasicIo::cur);\n            if (io_->error() || io_->eof()) {\n                throw Error(kerFailedToReadImageData);\n            }",
+      "explanation": "If a whitelisted chunk was fully consumed via readChunk (the branch bodies above already advanced the file position past the data), chunkLength is reset to 0 so the subsequent seek only skips the 4-byte CRC. For non-whitelisted chunk types the whitelist body was skipped entirely, so io_ is still positioned right after the header and the seek of chunkLength + 4 skips both the unread data and the CRC to reach the next chunk header. The loop then repeats until EOF, an io_ error, or IEND. chunkLength was bounded <= 0x7FFFFFFF by line 26, so chunkLength + 4 does not overflow uint32_t here."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0131_cwe190.cpp",
+      "lines": "68",
+      "code": "zlibToDataBuf(chunkData.pData_ + iccOffset, chunkLength - iccOffset, iccProfile_);",
+      "explanation": "This is the primary vulnerability. chunkLength and iccOffset are both uint32_t and the subtraction chunkLength - iccOffset is unsigned. There is no guarantee iccOffset <= chunkLength. Concretely, a tiny iCCP chunk triggers it: if chunkLength == 1 and that single byte is non-zero, the while loop exits with iccOffset == 1; then ++iccOffset makes iccOffset == 2. Now chunkLength - iccOffset == 1u - 2u == 0xFFFFFFFF, and the base pointer chunkData.pData_ + 2 already points one byte past the end of the 1-byte allocation. zlibToDataBuf is handed a pointer just past a tiny heap buffer together with a ~4 GB length and will inflate from far out-of-bounds memory. Because the NUL scan can stop at the '80' cap or at chunkLength before a compression flag ever exists, iccOffset routinely exceeds chunkLength for short chunks. Impact: massive heap out-of-bounds read (info leak / crash / DoS), remotely triggerable by any PNG file. The implementation must reject the chunk unless chunkLength is large enough to contain name + NUL + compression byte, i.e. guarantee iccOffset <= chunkLength (equivalently check chunkLength before subtracting). CWE-191 unsigned underflow feeding a CWE-125 over-read; this matches CVE-2018-4868 (heap over-read in Exiv2::PngImage::readMetadata)."
+    },
+    {
+      "file": "corpus/train/train_0131_cwe190.cpp",
+      "lines": "65",
+      "code": "profileName_ = std::string(reinterpret_cast<char*>(chunkData.pData_), iccOffset - 1);",
+      "explanation": "A second unsigned underflow. If the iCCP chunk has length 0 (allowed — line 26 imposes no minimum and DataBuf chunkData(0) is empty), the while loop condition iccOffset < chunkLength is 0 < 0 == false, so the loop never runs and iccOffset stays 0. Then iccOffset - 1 evaluates as 0u - 1u == 0xFFFFFFFF, which is passed as the length to the std::string(const char*, size_type) constructor. std::string attempts to copy ~4 GB starting at chunkData.pData_, producing a wild heap over-read (or a std::length_error / std::bad_alloc DoS depending on the platform's max_size). The same underflow occurs whenever the very first byte is a NUL only if... no — with a leading NUL, iccOffset becomes 1 first, so the specific len==0 case is the trigger. The invariant: iccOffset must be >= 1 before computing iccOffset - 1, which requires a minimum-length check on the chunk. CWE-191 underflow -> CWE-125 over-read."
+    },
+    {
+      "file": "corpus/train/train_0131_cwe190.cpp",
+      "lines": "58-60",
+      "code": "// The ICC profile name can vary from 1-79 characters.\n                    uint32_t iccOffset = 0;\n                    while (iccOffset < 80 && iccOffset < chunkLength) {",
+      "explanation": "Root cause / missing validation gate. Unlike the IHDR branch, which guards with `chunkData.size_ >= 8` before decoding, the iCCP branch performs no minimum-length check on chunkData/chunkLength before parsing name, NUL, compression flag, and compressed body. The whole iCCP layout requires at least name(>=1) + NUL(1) + compression(1) bytes, yet a chunk of length 0, 1, or 2 is accepted and drives the two underflows above. Additionally the loop can terminate at the 80-byte cap without ever having seen a NUL (a name >= 80 bytes with no terminator), in which case iccOffset==80 while the true payload may be shorter, again inverting the iccOffset<=chunkLength relationship when chunkLength is between the name length and 80. The implementation must validate that a NUL was actually found AND that chunkLength >= iccOffset + 1 (room for the compression byte and body) before line 65/68. CWE-20 missing input validation underpinning the CWE-191 underflows."
+    },
+    {
+      "file": "corpus/train/train_0131_cwe190.cpp",
+      "lines": "52-56",
+      "code": "PngChunk::decodeTXTChunk(this, chunkData, PngChunk::tEXt_Chunk);\n                } else if (chunkType == \"zTXt\") {\n                    PngChunk::decodeTXTChunk(this, chunkData, PngChunk::zTXt_Chunk);\n                } else if (chunkType == \"iTXt\") {\n                    PngChunk::decodeTXTChunk(this, chunkData, PngChunk::iTXt_Chunk);",
+      "explanation": "Latent downstream surface: the tEXt/zTXt/iTXt paths hand a fully attacker-controlled chunkData (which may be empty) to PngChunk::decodeTXTChunk, which must locate keyword/value NUL separators and zlib-inflate compressed text. Historically these Exiv2 text-chunk decoders have had their own out-of-bounds and decompression-bomb issues. The safety of these branches cannot be judged from this file; the implementation of decodeTXTChunk must bound every internal length against chunkData.size_ and must not trust an in-band decompressed size. Marked latent (file not provided)."
+    },
+    {
+      "file": "corpus/train/train_0131_cwe190.cpp",
+      "lines": "45-47",
+      "code": "} else if (chunkType == \"IHDR\" && chunkData.size_ >= 8) {\n                    Internal::PngImageHeader header;\n                    PngChunk::decodeIHDRChunk(chunkData, header);",
+      "explanation": "Lower-severity/latent: the IHDR branch does guard chunkData.size_ >= 8 before decodeIHDRChunk, which is good, but the resulting header.width/height are copied straight into pixelWidth_/pixelHeight_ with no range validation. Downstream consumers that multiply width*height (e.g. to size a pixel buffer) can integer-overflow on attacker-chosen dimensions. This is out of scope of the bytes shown (decodeIHDRChunk not provided) but is the classic PNG dimension-overflow contract to confirm in callers. CWE-190 in consumers of pixelWidth_/pixelHeight_."
+    }
+  ],
+  "summary": "This is Exiv2's PNG chunk parser operating entirely on untrusted file bytes. The iCCP branch (lines 57-68) lacks the minimum-length guard that the IHDR branch has, so two unsigned 32-bit underflows are reachable from a malformed PNG: iccOffset - 1 in the std::string name (line 65, when chunkLength==0) and chunkLength - iccOffset as the length passed to zlibToDataBuf (line 68, whenever iccOffset > chunkLength). Both produce large heap out-of-bounds reads — a remotely triggerable info-leak/DoS matching CVE-2018-4868. The chunk-length guard on line 26 caps the maximum but enforces no minimum, and the text-chunk decoders are an additional latent surface.",
+  "reviewed_anchors": [
+    {"anchor": "void PngImage::readMetadata() (line 2)", "disposition": "dismissed", "reason": "Zero-argument entry point; no attacker-controlled parameter, carries no direct contract."},
+    {"anchor": "isPngType(*io_, true) magic-signature gate (line 11)", "disposition": "dismissed", "reason": "Format validation gate is present and checks the PNG magic before parsing; acts correctly as the first sanity check."},
+    {"anchor": "const long imgSize = (long)io_->size() (line 16)", "disposition": "dismissed", "reason": "Sign-narrowing cast of size to long, but only used as an upper bound against chunkLength; on realistic files no truncation risk and it makes the guard conservative."},
+    {"anchor": "DataBuf cheaderBuf(8) fixed 8-byte header buffer (line 17)", "disposition": "dismissed", "reason": "Fixed size matches the 4+4 header; memset-zeroed each pass (line 20) and only bytes 0-7 are read, so in-bounds."},
+    {"anchor": "readChunk(cheaderBuf, *io_) (line 21)", "disposition": "dismissed", "reason": "Fills the fixed 8-byte buffer from I/O; implementation not shown, but destination size is fixed and known — latent only."},
+    {"anchor": "uint32_t chunkLength = getULong(cheaderBuf.pData_, bigEndian) (line 24)", "disposition": "finding", "reason": "Primary attacker-controlled 32-bit length field driving allocation and the underflowing subtractions in the iCCP branch."},
+    {"anchor": "length guard: pos==-1 || chunkLength>0x7FFFFFFF || (long)chunkLength > imgSize-pos (line 26)", "disposition": "dismissed", "reason": "Correctly caps chunkLength to remaining file bytes and to 0x7FFFFFFF; the residual issue is that it imposes NO minimum, which is captured in the iCCP findings rather than here."},
+    {"anchor": "std::string chunkType(pData_+4, 4) (line 30)", "disposition": "dismissed", "reason": "Reads 4 bytes at offset 4 of an 8-byte buffer — in-bounds; used only for a whitelist string compare."},
+    {"anchor": "chunk-type whitelist compare (lines 38-39)", "disposition": "dismissed", "reason": "Pure string equality dispatch; no memory access, correctly restricts which chunks are decoded."},
+    {"anchor": "DataBuf chunkData(chunkLength) (line 40)", "disposition": "dismissed", "reason": "Allocation is bounded by the line-26 guard; the danger is not the allocation but later access past it (see iCCP findings). Zero-length allocation is the enabling precondition, credited to the findings."},
+    {"anchor": "IHDR guard chunkData.size_ >= 8 + decodeIHDRChunk (lines 45-47)", "disposition": "finding", "reason": "Minimum-length guard is present (good), but width/height flow unvalidated into pixelWidth_/pixelHeight_ — latent CWE-190 in consumers; recorded as a low finding."},
+    {"anchor": "PngChunk::decodeTXTChunk(this, chunkData, ...) (lines 52,54,56)", "disposition": "finding", "reason": "Attacker-controlled (possibly empty) chunkData passed to an unseen decoder that must NUL-split and zlib-inflate; latent out-of-bounds/decompression surface."},
+    {"anchor": "iCCP name scan: while (iccOffset < 80 && iccOffset < chunkLength) (lines 60-64)", "disposition": "finding", "reason": "The array read is in-bounds, but the loop can exit with iccOffset > chunkLength precondition never established and no NUL-found check — root of the underflows; missing-validation finding."},
+    {"anchor": "profileName_ = std::string(pData_, iccOffset - 1) (line 65)", "disposition": "finding", "reason": "Unsigned underflow iccOffset-1 when chunkLength==0 yields a ~4GB std::string length — heap over-read/DoS."},
+    {"anchor": "zlibToDataBuf(pData_ + iccOffset, chunkLength - iccOffset, iccProfile_) (line 68)", "disposition": "finding", "reason": "Primary bug: unsigned underflow chunkLength - iccOffset with an out-of-bounds base pointer feeds a ~4GB length into zlib inflate — CVE-2018-4868."},
+    {"anchor": "chunkLength = 0 then io_->seek(chunkLength + 4, cur) (lines 78,85)", "disposition": "dismissed", "reason": "chunkLength bounded <=0x7FFFFFFF so +4 does not overflow; seek advances past data+CRC; error/eof checked immediately after."}
+  ],
+  "findings": [
+    {
+      "title": "Unsigned underflow of chunkLength - iccOffset feeds ~4GB length + OOB pointer into zlibToDataBuf (iCCP heap over-read)",
+      "anchor": "zlibToDataBuf(chunkData.pData_ + iccOffset, chunkLength - iccOffset, iccProfile_)",
+      "file": "corpus/train/train_0131_cwe190.cpp",
+      "line": "68",
+      "code": "zlibToDataBuf(chunkData.pData_ + iccOffset, chunkLength - iccOffset, iccProfile_);",
+      "bug_class": "Integer underflow (unsigned) driving heap out-of-bounds read",
+      "cwe": "CWE-191",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0131_cwe190.cpp (and zlibToDataBuf implementation, file not provided)",
+      "invariant": "iccOffset must be <= chunkLength before computing chunkLength - iccOffset; the code must verify the iCCP chunk actually contains name + NUL + compression byte (i.e. reject when chunkLength < iccOffset+1) before calling zlibToDataBuf, so the length argument is a true count of remaining in-buffer bytes.",
+      "failure_mode": "For a short iCCP chunk (e.g. chunkLength==1 with a non-zero byte), the NUL scan leaves iccOffset==1, then ++iccOffset makes it 2; chunkLength - iccOffset computes 1u-2u == 0xFFFFFFFF while chunkData.pData_ + 2 already points past the 1-byte allocation. zlibToDataBuf then inflates from ~4 GB of memory starting past a tiny heap buffer, causing a massive out-of-bounds read: information disclosure, crash, or denial of service, triggerable by any malformed PNG.",
+      "cve_analog": "CVE-2018-4868",
+      "what_to_confirm": "Confirm zlibToDataBuf(size_t/long len) does not itself clamp len, and that no guard between line 60 and line 68 ensures iccOffset <= chunkLength; add a check that a NUL was found and chunkLength >= iccOffset before the call."
+    },
+    {
+      "title": "Unsigned underflow iccOffset - 1 yields ~4GB std::string length on zero-length iCCP chunk",
+      "anchor": "profileName_ = std::string(reinterpret_cast<char*>(chunkData.pData_), iccOffset - 1)",
+      "file": "corpus/train/train_0131_cwe190.cpp",
+      "line": "65",
+      "code": "profileName_ = std::string(reinterpret_cast<char*>(chunkData.pData_), iccOffset - 1);",
+      "bug_class": "Integer underflow (unsigned) driving heap over-read / allocation DoS",
+      "cwe": "CWE-191",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0131_cwe190.cpp",
+      "invariant": "iccOffset must be >= 1 (a NUL terminator must actually have been consumed) before evaluating iccOffset - 1; a zero-length or NUL-less iCCP chunk must be rejected first.",
+      "failure_mode": "When chunkLength==0 the while loop never executes (0 < 0 is false) so iccOffset remains 0; iccOffset - 1 wraps to 0xFFFFFFFF and is passed as the length to std::string(const char*, size_type). std::string then reads ~4 GB from chunkData.pData_ (heap over-read) or throws std::length_error/std::bad_alloc, giving an attacker a reliable crash/DoS from a single crafted empty iCCP chunk.",
+      "cve_analog": "CVE-2018-4868",
+      "what_to_confirm": "Confirm no minimum-size guard precedes line 65 and that DataBuf(0) leaves pData_ non-writable; add a check that the loop found a NUL and iccOffset >= 1 before constructing profileName_."
+    },
+    {
+      "title": "iCCP branch has no minimum-length / NUL-found validation (root cause of both underflows)",
+      "anchor": "while (iccOffset < 80 && iccOffset < chunkLength)",
+      "file": "corpus/train/train_0131_cwe190.cpp",
+      "line": "58-64",
+      "code": "// The ICC profile name can vary from 1-79 characters.\n                    uint32_t iccOffset = 0;\n                    while (iccOffset < 80 && iccOffset < chunkLength) {\n                        if (chunkData.pData_[iccOffset++] == 0x00) {\n                            break;\n                        }\n                    }",
+      "bug_class": "Missing input validation (no length/terminator check before structured parse)",
+      "cwe": "CWE-20",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0131_cwe190.cpp",
+      "invariant": "Before splitting the iCCP payload into name/flag/compressed-body, the code must verify (a) chunkLength is large enough to hold at least name(>=1)+NUL+compression(1) bytes and (b) a NUL terminator was actually located within the loop (iccOffset did not stop only because of the 80/chunkLength cap).",
+      "failure_mode": "Because the loop can terminate at the 80-byte cap or at chunkLength without ever having found a NUL, and because chunkLength has no enforced minimum, iccOffset can end up equal to or greater than chunkLength. Every downstream computation (iccOffset-1 at line 65, chunkLength-iccOffset at line 68) then underflows. In contrast the IHDR branch at line 45 guards `chunkData.size_ >= 8`; the same discipline is absent here, which is the shared root cause.",
+      "cve_analog": "CVE-2018-4868",
+      "what_to_confirm": "Verify the fix adds both a NUL-found flag and a `chunkLength >= iccOffset + 1` (or equivalent) check before using iccOffset, mirroring the IHDR size guard."
+    },
+    {
+      "title": "iTXt/zTXt/tEXt payloads (possibly empty) forwarded to unbounded text decoder",
+      "anchor": "PngChunk::decodeTXTChunk(this, chunkData, PngChunk::zTXt_Chunk)",
+      "file": "corpus/train/train_0131_cwe190.cpp",
+      "line": "52-56",
+      "code": "PngChunk::decodeTXTChunk(this, chunkData, PngChunk::tEXt_Chunk);\n                } else if (chunkType == \"zTXt\") {\n                    PngChunk::decodeTXTChunk(this, chunkData, PngChunk::zTXt_Chunk);\n                } else if (chunkType == \"iTXt\") {\n                    PngChunk::decodeTXTChunk(this, chunkData, PngChunk::iTXt_Chunk);",
+      "bug_class": "Latent out-of-bounds / decompression-bomb in delegated decoder",
+      "cwe": "CWE-125",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "decodeTXTChunk must bound every keyword/value NUL search and every zlib-inflate against chunkData.size_ and must cap the decompressed output size; it must tolerate an empty chunkData (chunkLength==0).",
+      "failure_mode": "chunkData here can be empty or malformed; if decodeTXTChunk assumes a NUL separator exists or trusts an in-band size, it can over-read or allocate unboundedly from a crafted text chunk. Not verifiable from this file, hence latent.",
+      "cve_analog": "",
+      "what_to_confirm": "Review PngChunk::decodeTXTChunk for bounds checks on the keyword/value split and a cap on zlib output size."
+    },
+    {
+      "title": "IHDR width/height copied to pixelWidth_/pixelHeight_ without range validation",
+      "anchor": "pixelWidth_ = header.width; pixelHeight_ = header.height;",
+      "file": "corpus/train/train_0131_cwe190.cpp",
+      "line": "45-49",
+      "code": "} else if (chunkType == \"IHDR\" && chunkData.size_ >= 8) {\n                    Internal::PngImageHeader header;\n                    PngChunk::decodeIHDRChunk(chunkData, header);\n                    pixelWidth_ = header.width;\n                    pixelHeight_ = header.height;",
+      "bug_class": "Unvalidated dimensions enabling downstream integer overflow",
+      "cwe": "CWE-190",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0131_cwe190.cpp (and consumers of pixelWidth_/pixelHeight_)",
+      "invariant": "Attacker-supplied width/height must be range-checked before any consumer multiplies them to size a buffer; the size guard here (>= 8) protects the read but not the values.",
+      "failure_mode": "A PNG can declare arbitrary width/height; a consumer computing width*height*bpp can integer-overflow and under-allocate, leading to a later overflow. The bug lives in consumers, not this line, so severity is low/latent.",
+      "cve_analog": "",
+      "what_to_confirm": "Trace all uses of pixelWidth_/pixelHeight_ for multiplications lacking overflow checks."
+    }
+  ],
+  "audit_checklist": [
+    "iCCP: add a guard that a NUL terminator was actually found AND chunkLength >= iccOffset + 1 before line 65 and line 68, so neither iccOffset-1 nor chunkLength-iccOffset can underflow.",
+    "Confirm the line-26 length guard imposes a MINIMUM (or that each branch does) — currently only a maximum (<=0x7FFFFFFF and <=remaining) is enforced, permitting chunkLength==0.",
+    "Verify zlibToDataBuf clamps or validates its length argument and cannot be handed 0xFFFFFFFF; ensure it also caps decompressed output size against a zip-bomb.",
+    "Check DataBuf(chunkLength) behavior for chunkLength==0 (empty/NULL pData_) and that no branch dereferences an empty buffer.",
+    "Audit PngChunk::decodeTXTChunk for keyword/value NUL-split bounds and inflate-size caps on possibly-empty chunkData.",
+    "Range-check header.width/header.height from decodeIHDRChunk before any consumer multiplies pixelWidth_*pixelHeight_.",
+    "Confirm the seek(chunkLength + 4) advance cannot desynchronize the parser for chunkLength near the file-size bound and that eof/error is rechecked each iteration."
+  ]
+}

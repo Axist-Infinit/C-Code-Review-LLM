@@ -1,0 +1,190 @@
+{
+  "subsystem": "Linux kernel crypto user-space configuration API (CRYPTO_USER / NETLINK_CRYPTO). This is the netlink message handler crypto_reportstat(), which answers a userspace request to report the runtime statistics of a named crypto algorithm. It runs inside the kernel, parses an attacker-supplied netlink message, looks up the matching crypto_alg, builds a reply skb, and unicasts it back to the requesting socket.",
+  "provenance": "Identified by kernel-internal API surface and naming: the function operates on struct sk_buff, struct nlmsghdr, struct nlattr (Linux netlink), reads struct crypto_user_alg via nlmsg_data(), uses struct crypto_alg, crypto_alg_match(), crypto_mod_put(), crypto_dump_info, and net->crypto_nlsk. These are the exact symbols of Linux crypto/crypto_user_stat.c / crypto_user_base.c. The header comment '/* sample: primevul_c_train_3206_fixed */' and file name train_0249_cwe284.c indicate a PrimeVul-derived sample labeled with CWE-284 (improper access control), presented as the post-fix revision.",
+  "trust_boundary": "The trust boundary is the netlink socket. A local userspace process sends a CRYPTO_MSG_GETSTAT message over NETLINK_CRYPTO. in_skb is the received socket buffer and in_nlh is the netlink header; p = nlmsg_data(in_nlh) points directly into that attacker-controlled payload. Every byte of struct crypto_user_alg (cru_name[64], cru_driver_name[64], cru_module_name[64], cru_type, cru_mask, cru_refcnt, cru_flags) is therefore hostile and may be arbitrary, non-NUL-terminated, or the message may be shorter than the struct. NETLINK_CB(in_skb).portid identifies the sender for the reply.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0249_cwe284.c",
+      "lines": "2-4",
+      "code": "int crypto_reportstat(struct sk_buff *in_skb, struct nlmsghdr *in_nlh,\n\t\t      struct nlattr **attrs)\n{",
+      "explanation": "Entry point for the CRYPTO_MSG_GETSTAT netlink operation. It is invoked by the NETLINK_CRYPTO dispatch table (crypto_user's rcv_msg path) after the generic netlink layer has received a datagram from userspace. in_skb is the received socket buffer (carries the sender's identity and the raw message), in_nlh is the netlink message header pointing at the payload, and attrs is the parsed netlink attribute array. The function returns a negative errno on failure or the result of the unicast on success. Because this handler is reached from a socket, all three arguments ultimately derive from untrusted userspace input."
+    },
+    {
+      "file": "corpus/train/train_0249_cwe284.c",
+      "lines": "5-10",
+      "code": "\tstruct net *net = sock_net(in_skb->sk);\n\tstruct crypto_user_alg *p = nlmsg_data(in_nlh);\n\tstruct crypto_alg *alg;\n\tstruct sk_buff *skb;\n\tstruct crypto_dump_info info;\n\tint err;",
+      "explanation": "Local state. net = sock_net(in_skb->sk) resolves the network namespace of the requesting socket, later used to pick the crypto netlink socket for the reply. p = nlmsg_data(in_nlh) is the critical one: it casts the netlink payload to a struct crypto_user_alg without any length check here, so p->cru_name / p->cru_driver_name are pointers into raw attacker bytes. alg will hold the looked-up algorithm, skb the reply buffer, info a crypto_dump_info control block passed to the report builder, and err the running error code. None of skb/info/err is initialized at declaration, so control flow must set them before use."
+    },
+    {
+      "file": "corpus/train/train_0249_cwe284.c",
+      "lines": "12-13",
+      "code": "\tif (!null_terminated(p->cru_name) || !null_terminated(p->cru_driver_name))\n\t\treturn -EINVAL;",
+      "explanation": "The hardening guard that distinguishes this 'fixed' revision. cru_name and cru_driver_name are fixed 64-byte (CRYPTO_MAX_ALG_NAME) char arrays inside the untrusted payload. null_terminated() scans each array for a NUL byte within its declared bounds; if either lacks a terminator the request is rejected with -EINVAL. This is required because crypto_alg_match() will treat these fields as C strings (strcmp-style comparison), which would run off the end of the buffer if no NUL is present. The check bounds the subsequent string reads to the 64-byte arrays."
+    },
+    {
+      "file": "corpus/train/train_0249_cwe284.c",
+      "lines": "15-17",
+      "code": "\talg = crypto_alg_match(p, 0);\n\tif (!alg)\n\t\treturn -ENOENT;",
+      "explanation": "crypto_alg_match(p, 0) walks the registered crypto algorithm list and returns the algorithm whose cra_name or cra_driver_name matches the userspace-supplied cru_name/cru_driver_name (the second argument 0 is the 'exact' flag). On a match it increments the algorithm's module/refcount so the object cannot be torn down while in use; a NULL return means no such algorithm, handled by returning -ENOENT. From this point the code owns a reference that must be released on every exit path."
+    },
+    {
+      "file": "corpus/train/train_0249_cwe284.c",
+      "lines": "19-22",
+      "code": "\terr = -ENOMEM;\n\tskb = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_ATOMIC);\n\tif (!skb)\n\t\tgoto drop_alg;",
+      "explanation": "Allocates the reply socket buffer sized to NLMSG_DEFAULT_SIZE using GFP_ATOMIC (non-sleeping allocation). err is preset to -ENOMEM so that if allocation fails the goto drop_alg path returns the right error. Critically, on the failure branch skb is NULL when control reaches the shared cleanup label, which the later kfree_skb must tolerate."
+    },
+    {
+      "file": "corpus/train/train_0249_cwe284.c",
+      "lines": "24-27",
+      "code": "\tinfo.in_skb = in_skb;\n\tinfo.out_skb = skb;\n\tinfo.nlmsg_seq = in_nlh->nlmsg_seq;\n\tinfo.nlmsg_flags = 0;",
+      "explanation": "Populates the crypto_dump_info control block passed to the report builder. in_skb carries the requester context (for portid/credentials), out_skb is the freshly allocated reply buffer the builder will fill via nla_put, nlmsg_seq copies the request sequence number so the reply correlates with the request, and nlmsg_flags is zeroed (single, non-multipart reply). Every field of info is explicitly assigned here, so info is fully initialized before use."
+    },
+    {
+      "file": "corpus/train/train_0249_cwe284.c",
+      "lines": "29",
+      "code": "\terr = crypto_reportstat_alg(alg, &info);",
+      "explanation": "Delegates the actual reply construction to crypto_reportstat_alg(), which reads the algorithm's statistics counters (cra_type-specific crypto_stat fields) and serializes them into info.out_skb as netlink attributes, then finalizes the netlink message. Its return value becomes err: 0 on success, negative on failure (e.g. nla_put running out of skb tailroom, EMSGSIZE). This is where the sensitive algorithm state is copied toward userspace, so any uninitialized-padding or larval-state issue lives in this callee."
+    },
+    {
+      "file": "corpus/train/train_0249_cwe284.c",
+      "lines": "31-32",
+      "code": "drop_alg:\n\tcrypto_mod_put(alg);",
+      "explanation": "Shared cleanup label. crypto_mod_put(alg) releases the module/reference taken by crypto_alg_match, balancing the earlier acquire on both the skb-allocation-failure path and the normal completion path. Because the only goto into this label (line 22) occurs after alg is a valid non-NULL pointer, alg is always valid here."
+    },
+    {
+      "file": "corpus/train/train_0249_cwe284.c",
+      "lines": "34-37",
+      "code": "\tif (err) {\n\t\tkfree_skb(skb);\n\t\treturn err;\n\t}",
+      "explanation": "Error epilogue. If err is set (either -ENOMEM from a failed allocation, where skb is NULL and kfree_skb(NULL) is a documented no-op, or a non-zero return from crypto_reportstat_alg, where skb holds a partially built message), the reply buffer is freed and the errno propagated to userspace. This prevents leaking the skb on failure."
+    },
+    {
+      "file": "corpus/train/train_0249_cwe284.c",
+      "lines": "39",
+      "code": "\treturn nlmsg_unicast(net->crypto_nlsk, skb, NETLINK_CB(in_skb).portid);",
+      "explanation": "Success path. nlmsg_unicast sends the completed reply skb over the namespace's crypto netlink socket (net->crypto_nlsk) to the originating port id (NETLINK_CB(in_skb).portid). nlmsg_unicast takes ownership of skb and frees it internally whether it succeeds or fails, so there is no double free with the earlier kfree_skb (that branch is only reached when err != 0, which is mutually exclusive with reaching this line)."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0249_cwe284.c",
+      "lines": "6",
+      "code": "\tstruct crypto_user_alg *p = nlmsg_data(in_nlh);",
+      "explanation": "p is cast from the raw netlink payload with no length validation in this function. struct crypto_user_alg is ~208 bytes (three 64-byte name arrays plus four __u32). If the received message payload (nlmsg_len(in_nlh) - NLMSG_HDRLEN) is shorter than sizeof(struct crypto_user_alg), then the very next line's null_terminated(p->cru_name) / null_terminated(p->cru_driver_name) scans, and crypto_alg_match's string reads, run past the end of the skb data buffer. This is an out-of-bounds read (CWE-125) that can leak adjacent kernel memory into the match result or crash. The invariant is that the dispatcher must enforce nlmsg_len >= NLMSG_HDRLEN + sizeof(struct crypto_user_alg) (via the netlink message-min-length check in crypto_user_rcv_msg) BEFORE this handler dereferences p; nothing in the shown code re-checks it."
+    },
+    {
+      "file": "corpus/train/train_0249_cwe284.c",
+      "lines": "12-13",
+      "code": "\tif (!null_terminated(p->cru_name) || !null_terminated(p->cru_driver_name))\n\t\treturn -EINVAL;",
+      "explanation": "This is the guard that fixes the primary bug: without it, cru_name/cru_driver_name are attacker-controlled 64-byte arrays that crypto_alg_match compares as C strings, and a payload with no NUL byte in those arrays causes strcmp to read beyond the 64-byte field into adjacent struct/heap memory (CWE-125 out-of-bounds read, potential info leak or panic). Present here, it bounds the reads. Two residual notes: (1) cru_module_name is NOT checked, which is acceptable only because this path never string-compares it; if a future edit uses cru_module_name as a string the same OOB returns. (2) The guard presumes the whole struct is in-bounds, which folds back into the length concern above — null_terminated itself dereferences p->cru_name, so it is only safe once the message-length invariant holds."
+    },
+    {
+      "file": "corpus/train/train_0249_cwe284.c",
+      "lines": "15",
+      "code": "\talg = crypto_alg_match(p, 0);",
+      "explanation": "crypto_alg_match can return an algorithm that is still a larval (CRYPTO_ALG_LARVAL / not yet fully registered) or one whose cra_type/stats are not populated, because matching is by name over the full alg list. crypto_reportstat_alg(alg, &info) then reads statistics fields off that algorithm. Operating on a larval/incompletely-initialized algorithm reads uninitialized or transient state (CWE-457 use of uninitialized value / CWE-665 improper initialization) and, historically in this exact family, allowed operating on algorithms that should be invisible to userspace. The implementation must confirm alg is fully registered and exposes the queried stats before serializing them."
+    },
+    {
+      "file": "corpus/train/train_0249_cwe284.c",
+      "lines": "29",
+      "code": "\terr = crypto_reportstat_alg(alg, &info);",
+      "explanation": "crypto_reportstat_alg serializes a struct crypto_stat-style payload into info.out_skb and sends it toward userspace. This netlink-report family is the exact site of a documented memory-disclosure class: if the report structure (or its padding) is copied without being fully zero-initialized, uninitialized kernel stack/heap bytes leak to the unprivileged requester (CWE-200). This is latent in the callee, not visible in the header shown, but the contract of this line is that every byte placed into out_skb via nla_put must be initialized. The bug cannot be confirmed without crypto_reportstat_alg's body."
+    },
+    {
+      "file": "corpus/train/train_0249_cwe284.c",
+      "lines": "2-4",
+      "code": "int crypto_reportstat(struct sk_buff *in_skb, struct nlmsghdr *in_nlh,\n\t\t      struct nlattr **attrs)\n{",
+      "explanation": "Access control. This handler performs a privileged introspection operation (reading kernel crypto statistics) but contains no capability check of its own — it relies entirely on the netlink dispatch layer to have enforced netlink_capable(in_skb, CAP_NET_ADMIN) before calling it. Given the sample's CWE-284 (improper access control) label, the hazard is precisely that if the gating capability check is missing or mis-wired in the dispatcher, any unprivileged local process can enumerate and read algorithm statistics, an information-exposure and hardening-bypass condition. The invariant: the CRYPTO_MSG_GETSTAT entry in the netlink op table must require CAP_NET_ADMIN."
+    },
+    {
+      "file": "corpus/train/train_0249_cwe284.c",
+      "lines": "34-39",
+      "code": "\tif (err) {\n\t\tkfree_skb(skb);\n\t\treturn err;\n\t}\n\n\treturn nlmsg_unicast(net->crypto_nlsk, skb, NETLINK_CB(in_skb).portid);",
+      "explanation": "skb lifetime. This pattern is safe as written and is called out only to confirm it: when err != 0 the buffer is freed with kfree_skb (a no-op when skb is NULL on the -ENOMEM path); when err == 0 the buffer is handed to nlmsg_unicast, which consumes/frees it. The two branches are mutually exclusive, so there is no double free and no leak. A regression that removed the err guard, changed nlmsg_unicast to a variant that does not consume on error, or allowed fallthrough from the allocation-failure path into nlmsg_unicast would introduce a use-after-free/double-free (CWE-416/CWE-415); confirm the branch structure is preserved."
+    }
+  ],
+  "summary": "This is the 'fixed' revision of the Linux crypto-user netlink handler crypto_reportstat(): it now rejects non-NUL-terminated cru_name/cru_driver_name (closing the primary out-of-bounds string-read) and correctly balances its algorithm reference and reply-skb lifetimes. Residual risk is latent in code this snippet only calls: the function does not itself validate that the netlink payload is at least sizeof(struct crypto_user_alg) before dereferencing it, performs no capability check of its own (the CWE-284 concern is delegated to the dispatcher), may operate on larval algorithms, and the downstream report builder is the classic site for uninitialized-memory disclosure. On its own merits the shown code is low-to-medium risk given the guards present.",
+  "reviewed_anchors": [
+    {"anchor": "crypto_reportstat(struct sk_buff *in_skb, struct nlmsghdr *in_nlh, struct nlattr **attrs) — signature", "disposition": "finding", "reason": "Privileged netlink introspection handler with no in-function capability check (CWE-284 contract delegated to dispatcher)."},
+    {"anchor": "net = sock_net(in_skb->sk)", "disposition": "dismissed", "reason": "Namespace lookup on an already-validated socket; no attacker-controlled length or buffer involved."},
+    {"anchor": "p = nlmsg_data(in_nlh) (struct crypto_user_alg *)", "disposition": "finding", "reason": "Unchecked cast of untrusted payload; no verification that message length covers the full struct before dereference."},
+    {"anchor": "null_terminated(p->cru_name) / null_terminated(p->cru_driver_name)", "disposition": "finding", "reason": "The hardening guard bounding string reads on 64-byte fields; residual coupling to the message-length invariant and cru_module_name left unchecked."},
+    {"anchor": "crypto_alg_match(p, 0)", "disposition": "finding", "reason": "May return a larval/incompletely-initialized algorithm whose stats are then read."},
+    {"anchor": "alg reference / crypto_mod_put(alg)", "disposition": "dismissed", "reason": "Reference acquired on match is released on every reachable exit; pairing is correct."},
+    {"anchor": "nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_ATOMIC)", "disposition": "dismissed", "reason": "Standard bounded allocation; failure handled via preset -ENOMEM and NULL-safe kfree_skb."},
+    {"anchor": "struct crypto_dump_info info (in_skb/out_skb/nlmsg_seq/nlmsg_flags)", "disposition": "dismissed", "reason": "All four fields explicitly initialized before use; no uninitialized read in this function."},
+    {"anchor": "crypto_reportstat_alg(alg, &info)", "disposition": "finding", "reason": "Downstream report builder is the latent site for uninitialized-memory disclosure to userspace (CWE-200)."},
+    {"anchor": "kfree_skb(skb) / nlmsg_unicast(...) skb lifetime", "disposition": "dismissed", "reason": "Mutually exclusive free paths; no double free or leak as written (documented for regression watch)."},
+    {"anchor": "nlmsg_unicast(net->crypto_nlsk, skb, NETLINK_CB(in_skb).portid)", "disposition": "dismissed", "reason": "Consumes skb and targets the authenticated sender's portid; no additional attacker-controlled sizing."}
+  ],
+  "findings": [
+    {
+      "title": "Netlink payload length not validated before dereferencing struct crypto_user_alg",
+      "anchor": "p = nlmsg_data(in_nlh)",
+      "file": "corpus/train/train_0249_cwe284.c",
+      "line": "6",
+      "code": "struct crypto_user_alg *p = nlmsg_data(in_nlh);",
+      "bug_class": "Out-of-bounds read (missing minimum message-length check)",
+      "cwe": "CWE-125",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided) — the netlink dispatcher crypto_user_rcv_msg must enforce it; not re-checked here",
+      "invariant": "Before p is dereferenced, nlmsg_len(in_nlh) - NLMSG_HDRLEN must be >= sizeof(struct crypto_user_alg) so that cru_name, cru_driver_name and the trailing __u32 fields lie entirely within the received skb.",
+      "failure_mode": "A userspace process sends a CRYPTO_MSG_GETSTAT message with a truncated payload (shorter than struct crypto_user_alg). null_terminated(p->cru_name)/null_terminated(p->cru_driver_name) at line 12 and the strcmp inside crypto_alg_match then read past the end of the skb data buffer, disclosing adjacent kernel memory into the match/scan or triggering a fault.",
+      "cve_analog": "",
+      "what_to_confirm": "That the NETLINK_CRYPTO op-table entry for CRYPTO_MSG_GETSTAT declares a minimum length / policy covering sizeof(struct crypto_user_alg), or that crypto_user_rcv_msg rejects short messages before calling crypto_reportstat."
+    },
+    {
+      "title": "No in-function capability gate on a privileged crypto-stats query",
+      "anchor": "crypto_reportstat(...) function body",
+      "file": "corpus/train/train_0249_cwe284.c",
+      "line": "2-4",
+      "code": "int crypto_reportstat(struct sk_buff *in_skb, struct nlmsghdr *in_nlh,\n\t\t      struct nlattr **attrs)\n{",
+      "bug_class": "Improper access control (missing privilege check)",
+      "cwe": "CWE-284",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided) — the netlink op dispatch/registration table",
+      "invariant": "Access to algorithm statistics must be restricted; the CRYPTO_MSG_GETSTAT dispatch must require CAP_NET_ADMIN (netlink_capable(in_skb, CAP_NET_ADMIN)) before crypto_reportstat runs.",
+      "failure_mode": "If the dispatcher does not enforce CAP_NET_ADMIN for this op, any unprivileged local process can enumerate registered algorithms and read their runtime statistics, an information-exposure and security-hardening bypass. This function performs no check of its own, so the entire access-control decision is external.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether the crypto_user netlink op table marks CRYPTO_MSG_GETSTAT with a CAP_NET_ADMIN requirement / flags, and that no path reaches crypto_reportstat without that check."
+    },
+    {
+      "title": "Report may be generated for a larval / incompletely-registered algorithm",
+      "anchor": "alg = crypto_alg_match(p, 0)",
+      "file": "corpus/train/train_0249_cwe284.c",
+      "line": "15",
+      "code": "alg = crypto_alg_match(p, 0);",
+      "bug_class": "Use of uninitialized / improperly-initialized object state",
+      "cwe": "CWE-665",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided) — crypto_alg_match and crypto_reportstat_alg",
+      "invariant": "crypto_reportstat_alg must only read statistics from a fully-registered, non-larval algorithm; larval or type-less algorithms must be rejected (e.g. -ENOENT) rather than serialized.",
+      "failure_mode": "crypto_alg_match matches by name across the whole algorithm list and can return a CRYPTO_ALG_LARVAL entry still being set up. Reading its stats/cra_type fields yields uninitialized or transient values sent to userspace, or dereferences a not-yet-populated type handler.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether crypto_alg_match(p, 0) or crypto_reportstat_alg filters out CRYPTO_ALG_LARVAL / algorithms without a valid cra_type before reporting."
+    },
+    {
+      "title": "Latent uninitialized-memory disclosure in the statistics report builder",
+      "anchor": "err = crypto_reportstat_alg(alg, &info)",
+      "file": "corpus/train/train_0249_cwe284.c",
+      "line": "29",
+      "code": "err = crypto_reportstat_alg(alg, &info);",
+      "bug_class": "Information exposure via uninitialized structure/padding copied to userspace",
+      "cwe": "CWE-200",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided) — crypto_reportstat_alg and the struct crypto_stat nla_put helpers",
+      "invariant": "Every byte of any report structure placed into out_skb via nla_put (including struct padding and reserved fields) must be explicitly zero-initialized before serialization.",
+      "failure_mode": "If crypto_reportstat_alg copies a stack/heap crypto_stat structure whose padding or unused fields are not zeroed, those bytes are unicast to the requesting userspace socket, leaking kernel memory. This is the documented failure class for this netlink crypto-report family and cannot be confirmed from the shown snippet alone.",
+      "cve_analog": "CVE-2018-19854",
+      "what_to_confirm": "Whether crypto_reportstat_alg memset()s the report struct (or uses a fully-initialized on-stack struct) before each nla_put, leaving no uninitialized padding."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm the CRYPTO_MSG_GETSTAT dispatch enforces a minimum netlink payload length >= sizeof(struct crypto_user_alg) before crypto_reportstat dereferences nlmsg_data(in_nlh).",
+    "Confirm CAP_NET_ADMIN (netlink_capable) is required for this op in the crypto_user netlink op table; this handler performs no check itself.",
+    "Verify crypto_alg_match / crypto_reportstat_alg reject larval (CRYPTO_ALG_LARVAL) or type-less algorithms before reading their statistics.",
+    "Verify crypto_reportstat_alg fully zero-initializes every reported structure (incl. padding) prior to nla_put to prevent uninitialized-memory disclosure (see CVE-2018-19854 family).",
+    "Confirm the err-branch kfree_skb / nlmsg_unicast paths remain mutually exclusive and that kfree_skb tolerates the NULL skb from the -ENOMEM path (no double free / no leak).",
+    "Confirm the crypto_mod_put(alg) reference release balances crypto_alg_match on every reachable exit, including the skb-allocation-failure goto.",
+    "Confirm null_terminated bounds all string uses of the crypto_user_alg names; ensure cru_module_name is not later string-compared without its own NUL check."
+  ]
+}

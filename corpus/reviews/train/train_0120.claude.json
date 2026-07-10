@@ -1,0 +1,176 @@
+{
+  "subsystem": "Hermes JavaScript engine — IR constant-folding evaluator. `hermes::evalUnaryOperator` is the compile-time helper that tries to fold a JavaScript unary operator (`-`, `typeof`, `!`, `void`) applied to a compile-time-constant `Literal` operand into a new constant `Literal`, so the optimizer can replace the `UnaryOperatorInst` with its computed result. It returns the folded `Literal*` or `nullptr` when no static answer is possible.",
+  "provenance": "Identified from symbol names and namespaces: the `hermes::` namespace, `IRBuilder`, `UnaryOperatorInst::OpKind`, `Literal`/`LiteralNumber`, the `ValueKind` type-tag enum, and especially the `llvh::` namespace (Hermes ships a renamed fork of LLVM's ADT/support library as `llvh`, and `llvh::dyn_cast` is its RTTI-free downcast). This is Meta/Facebook's Hermes engine, from its IR/optimizer layer (e.g. lib/IR / lib/Optimizer). The sample tag `primevul_test_0025_fixed` and the file name `train_0120_cwe843.cpp` indicate this is the patched revision of a CWE-843 (type-confusion) case.",
+  "trust_boundary": "The ultimate attacker input is JavaScript source compiled by Hermes: an adversary who supplies a script controls which unary operators and which literal operands appear, hence which `OpKind`/`ValueKind` combinations reach this function. The immediate inputs are `kind` (an `OpKind` produced by the parser/IRGen) and `operand` (a `Literal*` produced by earlier IR building). The security-critical assumption is that `operand->getKind()`'s `ValueKind` tag faithfully matches the operand's real C++ runtime type; if a mis-tagged object ever reaches here, code that downcasts and reads type-specific fields would be a type confusion. This runs at compile/optimize time, so the impact surface is the compiler process (relevant for services that compile untrusted JS, e.g. bytecode-compilation-as-a-service).",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0120_cwe843.cpp",
+      "lines": "2-6",
+      "code": "Literal *hermes::evalUnaryOperator(\n    UnaryOperatorInst::OpKind kind,\n    IRBuilder &builder,\n    Literal *operand) {\n  switch (kind) {",
+      "explanation": "Definition of the free function `hermes::evalUnaryOperator`, returning a `Literal*`. It takes three parameters: `kind`, the enumerated operator being folded (`UnaryOperatorInst::OpKind`, one of MinusKind/TypeofKind/BangKind/VoidKind/...); `builder`, an `IRBuilder&` used as the factory that manufactures new literal IR nodes (numbers, strings, bools, undefined, NaN, negative zero); and `operand`, a pointer to the constant `Literal` the operator is applied to. The body opens an outer `switch (kind)` that selects the per-operator folding logic. The function's contract is 'return the folded constant, or return nullptr if this operator/operand pair cannot be statically evaluated.'"
+    },
+    {
+      "file": "corpus/train/train_0120_cwe843.cpp",
+      "lines": "7-15",
+      "code": "    case UnaryOperatorInst::OpKind::MinusKind:\n      // Negate constant integers.\n      switch (operand->getKind()) {\n        case ValueKind::LiteralNumberKind:\n          if (auto *literalNum = llvh::dyn_cast<LiteralNumber>(operand)) {\n            auto V = -literalNum->getValue();\n            return builder.getLiteralNumber(V);\n          }\n          break;",
+      "explanation": "The unary minus (`-x`) case. It opens an inner `switch (operand->getKind())` to dispatch on the operand's `ValueKind` type tag. For `LiteralNumberKind` it performs a CHECKED downcast: `llvh::dyn_cast<LiteralNumber>(operand)` returns a typed pointer only if `operand` truly is a `LiteralNumber`, otherwise `nullptr`. Only inside the `if` (i.e. only when the cast succeeded) does it read `literalNum->getValue()`, negate it (`V = -...`), and materialize a fresh number literal via `builder.getLiteralNumber(V)`. If the `dyn_cast` fails, the `break;` on line 15 leaves the inner switch and no type-specific field is dereferenced. This checked-cast-before-field-read pattern is precisely the CWE-843 guard that distinguishes this 'fixed' revision from a version that would blindly `cast<>` or call `->getValue()` on a tag alone."
+    },
+    {
+      "file": "corpus/train/train_0120_cwe843.cpp",
+      "lines": "16-17",
+      "code": "        case ValueKind::LiteralUndefinedKind:\n          return builder.getLiteralNaN();",
+      "explanation": "For `-undefined`, JavaScript semantics coerce `undefined` to the number `NaN`, and `-NaN` is `NaN`; the code returns a NaN literal directly. Note this branch does NOT downcast `operand` — the answer depends only on the `ValueKind` tag, not on any field of the object, so no type-specific memory is read and no confusion is possible even if the object were mis-tagged."
+    },
+    {
+      "file": "corpus/train/train_0120_cwe843.cpp",
+      "lines": "18-25",
+      "code": "        case ValueKind::LiteralBoolKind:\n          if (evalIsTrue(builder, operand)) {\n            return builder.getLiteralNumber(-1);\n          } else { // evalIsFalse(operand)\n            return builder.getLiteralNegativeZero();\n          }\n        case ValueKind::LiteralNullKind:\n          return builder.getLiteralNegativeZero();",
+      "explanation": "Two more operand cases for unary minus. For a boolean, it delegates truthiness to the helper `evalIsTrue(builder, operand)`: `-true` is `-1` (returns a number literal `-1`), and the `else` branch assumes `evalIsFalse` and returns negative zero for `-false` (since `+false` is `+0`, `-false` is `-0`). Both the `if` and `else` arms `return`, so control never falls through the (deliberately absent) `break`. The `LiteralNullKind` case returns negative zero for `-null` (`+null` is `+0`), again purely from the tag with no field access."
+    },
+    {
+      "file": "corpus/train/train_0120_cwe843.cpp",
+      "lines": "26-29",
+      "code": "        default:\n          break;\n      }\n      break;",
+      "explanation": "The inner switch's `default` handles any operand kind for which unary minus cannot be statically folded (e.g. a non-literal-like value that slipped through), falling out via `break`. The outer `break` on line 29 then exits the `MinusKind` case of the operator switch, so execution reaches the function's final `return nullptr` — the safe 'could not fold' fallback."
+    },
+    {
+      "file": "corpus/train/train_0120_cwe843.cpp",
+      "lines": "30-46",
+      "code": "    case UnaryOperatorInst::OpKind::TypeofKind:\n      switch (operand->getKind()) {\n        case ValueKind::GlobalObjectKind:\n        case ValueKind::LiteralNullKind:\n          return builder.getLiteralString(\"object\");\n        case ValueKind::LiteralUndefinedKind:\n          return builder.getLiteralString(\"undefined\");\n        case ValueKind::LiteralBoolKind:\n          return builder.getLiteralString(\"boolean\");\n        case ValueKind::LiteralNumberKind:\n          return builder.getLiteralString(\"number\");\n        case ValueKind::LiteralStringKind:\n          return builder.getLiteralString(\"string\");\n        default:\n          break;\n      }\n      break;",
+      "explanation": "The `typeof` case, which yields a string naming the operand's JS type. It dispatches on `operand->getKind()` and returns the corresponding constant string: `object` for the global object and for `null` (matching JS's well-known `typeof null === 'object'` quirk), `undefined`, `boolean`, `number`, and `string`. Every arm returns a string literal built purely from the tag — none of them downcasts `operand` or reads its value fields, so this whole block is inherently type-safe: even a mis-tagged operand only affects which constant string is returned, never memory safety. Unknown kinds fall to `default`/`break` and thence to `return nullptr`."
+    },
+    {
+      "file": "corpus/train/train_0120_cwe843.cpp",
+      "lines": "48-55",
+      "code": "    case UnaryOperatorInst::OpKind::BangKind:\n      if (evalIsTrue(builder, operand)) {\n        return builder.getLiteralBool(false);\n      }\n      if (evalIsFalse(builder, operand)) {\n        return builder.getLiteralBool(true);\n      }\n      break;",
+      "explanation": "The logical-not (`!x`) case. It asks the helper `evalIsTrue(builder, operand)` whether the operand is statically truthy; if so, `!truthy` is `false`. Otherwise it asks `evalIsFalse`; if the operand is statically falsy, `!falsy` is `true`. If neither predicate can decide (the operand's truthiness is not statically known), both `if`s are skipped and `break` leads to `return nullptr`. All the type inspection is delegated to the two helpers rather than done inline here."
+    },
+    {
+      "file": "corpus/train/train_0120_cwe843.cpp",
+      "lines": "57-58",
+      "code": "    case UnaryOperatorInst::OpKind::VoidKind:\n      return builder.getLiteralUndefined();",
+      "explanation": "The `void x` case. In JavaScript `void` evaluates its operand (already a constant here, no side effects) and always yields `undefined`, so the fold unconditionally returns an undefined literal regardless of the operand's kind. No operand inspection is needed."
+    },
+    {
+      "file": "corpus/train/train_0120_cwe843.cpp",
+      "lines": "60-65",
+      "code": "    default:\n      break;\n  }\n\n  return nullptr;\n}",
+      "explanation": "The outer switch's `default` handles any `OpKind` this function does not fold (e.g. bitwise-not or other operators handled elsewhere), and all `break` paths converge on `return nullptr`. Returning `nullptr` is the documented 'no constant fold available' signal; the caller in the optimizer must treat a null result as 'leave the original instruction in place.' The function has no heap allocation, no manual memory management, and no variable-length buffers of its own — its entire risk surface is the type-tag-driven dispatch and the helper calls."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0120_cwe843.cpp",
+      "lines": "9-14",
+      "code": "      switch (operand->getKind()) {\n        case ValueKind::LiteralNumberKind:\n          if (auto *literalNum = llvh::dyn_cast<LiteralNumber>(operand)) {\n            auto V = -literalNum->getValue();\n            return builder.getLiteralNumber(V);\n          }",
+      "explanation": "This is the core CWE-843 (type-confusion) contract, and it is where the 'fix' lives. The dispatch trusts the `ValueKind` tag returned by `operand->getKind()`, then in the number case treats the object as a `LiteralNumber` to read `getValue()`. If the code had used an unchecked `cast<LiteralNumber>(operand)` or called `operand->getValue()` on the strength of the tag alone, any path that could produce a `LiteralNumberKind` tag on an object whose real layout is not a `LiteralNumber` (a class-hierarchy/RTTI-tag mismatch, or a value whose kind is inspected before it is fully constructed) would reinterpret unrelated bytes as a double and could read out of bounds or return attacker-influenced data. The present code neutralizes that by using `llvh::dyn_cast`, which re-verifies the runtime type and yields `nullptr` on mismatch, and by reading `getValue()` ONLY inside the successful-cast branch. Invariant the implementation must uphold: never read a subclass field after a tag-only check — always confirm the concrete type (via `dyn_cast`/`isa`) before dereferencing type-specific members. This branch upholds it."
+    },
+    {
+      "file": "corpus/train/train_0120_cwe843.cpp",
+      "lines": "19-22",
+      "code": "          if (evalIsTrue(builder, operand)) {\n            return builder.getLiteralNumber(-1);\n          } else { // evalIsFalse(operand)\n            return builder.getLiteralNegativeZero();",
+      "explanation": "Latent type-confusion risk pushed into the helpers `evalIsTrue`/`evalIsFalse` (also called at lines 49 and 52), whose bodies are not in this file. This function hands them the raw `operand` and trusts them to determine truthiness. If those helpers dispatch on `getKind()` and then downcast to read a bool/number/string payload WITHOUT the same `dyn_cast`/null-check discipline shown at line 11, the type-confusion moves there. Additionally, the `else` arm here assumes that 'not statically true' is equivalent to 'statically false' (see the `// evalIsFalse(operand)` comment). That equivalence holds only for a genuine boolean literal; if `evalIsTrue` can return false for an operand whose truthiness is actually indeterminate, this arm would wrongly fold `-x` to `-0`, a correctness (mis-compilation) bug rather than a memory-safety one. Invariant: `evalIsTrue`/`evalIsFalse` must themselves type-check before reading fields, and for a `LiteralBoolKind` operand `evalIsTrue` and `evalIsFalse` must be exact complements. Confirm in the (unprovided) implementation."
+    },
+    {
+      "file": "corpus/train/train_0120_cwe843.cpp",
+      "lines": "12-13",
+      "code": "            auto V = -literalNum->getValue();\n            return builder.getLiteralNumber(V);",
+      "explanation": "Considered and dismissed as a false lead for integer overflow. `LiteralNumber::getValue()` in Hermes returns a JavaScript number, i.e. an IEEE-754 `double`; unary negation of a double is total and well-defined (it merely flips the sign bit — `-0.0`, `-Inf`, and `-NaN` are all valid results), so there is no signed-integer-overflow / INT_MIN hazard here and no CWE-190/191 to claim. The only subtlety is floating-point identity of results (e.g. negating a stored `0.0` must yield `-0.0`); that is a semantics detail, not a security bug. This step exists to document that no arithmetic-overflow finding should be fabricated for this line."
+    },
+    {
+      "file": "corpus/train/train_0120_cwe843.cpp",
+      "lines": "18-25",
+      "code": "        case ValueKind::LiteralBoolKind:\n          if (evalIsTrue(builder, operand)) {\n            return builder.getLiteralNumber(-1);\n          } else { // evalIsFalse(operand)\n            return builder.getLiteralNegativeZero();\n          }\n        case ValueKind::LiteralNullKind:\n          return builder.getLiteralNegativeZero();",
+      "explanation": "Switch fall-through hygiene. The `LiteralBoolKind` case has no explicit `break` before the following `LiteralNullKind` label, which normally invites a C/C++ fall-through bug. Here it is benign because BOTH the `if` and the `else` arms `return`, so control provably cannot reach the `LiteralNullKind` label from the bool case. This is worth noting as a maintenance hazard: if a future edit added a non-returning code path (or removed the `else`), execution would silently fall into the null-handling and mis-fold `-true`/`-false` as `-0`. Invariant: keep every non-breaking case exhaustively returning, or add explicit `break`/`[[fallthrough]]`. No current defect."
+    },
+    {
+      "file": "corpus/train/train_0120_cwe843.cpp",
+      "lines": "64-65",
+      "code": "  return nullptr;\n}",
+      "explanation": "Nullable-return contract. Every non-folding path returns `nullptr`, and several folding paths are conditional (the `dyn_cast` failing at line 11, the truthiness predicates being undecidable at lines 49/52, or an unhandled `OpKind`). The caller in the optimizer MUST treat `nullptr` as 'no fold' and keep the original `UnaryOperatorInst`; if any caller instead assumes a non-null `Literal*` and dereferences the result (e.g. to replace uses), a mis-tagged or non-constant-foldable operand would drive a NULL-pointer dereference (CWE-476) in that caller. This is a latent contract on code not shown here. Invariant: all call sites null-check the return before use. Confirm at the call sites in the optimizer pass."
+    }
+  ],
+  "summary": "This is the patched (CWE-843-fixed) revision of Hermes's unary-operator constant folder. It dispatches on the operand's `ValueKind` tag and, in the one branch that must read a subclass field (`LiteralNumber::getValue()` for unary minus), it uses a CHECKED `llvh::dyn_cast` with a null guard, so no type-specific memory is touched on a tag/type mismatch. Every other branch returns a constant derived from the tag alone. Residual risk is latent and lives outside this file: the `evalIsTrue`/`evalIsFalse` helpers must apply the same type-check discipline, and callers must honor the nullable return. As shown, the file is low-risk.",
+  "reviewed_anchors": [
+    {"anchor": "Signature `Literal *hermes::evalUnaryOperator(UnaryOperatorInst::OpKind kind, IRBuilder &builder, Literal *operand)` (lines 2-5)", "disposition": "finding", "reason": "Entry point; `operand` is an attacker-influenced Literal and its type must be validated before subclass fields are read (CWE-843 surface)."},
+    {"anchor": "`operand->getKind()` tag dispatch (lines 9, 31)", "disposition": "finding", "reason": "Type-tag-driven dispatch is the type-confusion decision point; safety hinges on the tag matching the runtime type."},
+    {"anchor": "`llvh::dyn_cast<LiteralNumber>(operand)` + null guard (line 11)", "disposition": "finding", "reason": "The security-relevant fix: checked downcast before field access; primary anchor of the CWE-843 contract."},
+    {"anchor": "`literalNum->getValue()` and `-literalNum->getValue()` (line 12)", "disposition": "dismissed", "reason": "Reads a JS double behind a successful dyn_cast; negation of a double is total, so no OOB read and no integer-overflow bug."},
+    {"anchor": "`evalIsTrue(builder, operand)` / `evalIsFalse(builder, operand)` (lines 19, 49, 52)", "disposition": "finding", "reason": "Out-of-file helpers receive the raw operand; latent type-confusion / complement-assumption contract lives in their implementation."},
+    {"anchor": "`builder.getLiteralNumber/getLiteralNaN/getLiteralNegativeZero/getLiteralString/getLiteralBool/getLiteralUndefined` factory calls", "disposition": "dismissed", "reason": "IR-node constructors given constant arguments; they allocate managed IR nodes and carry no untrusted-length or type-confusion contract here."},
+    {"anchor": "`UnaryOperatorInst::OpKind` values MinusKind/TypeofKind/BangKind/VoidKind + outer default (lines 7,30,48,57,60)", "disposition": "dismissed", "reason": "Enum dispatch over a fixed operator set with a safe default->nullptr; no field access, no security contract."},
+    {"anchor": "`ValueKind` cases (LiteralNumberKind/LiteralUndefinedKind/LiteralBoolKind/LiteralNullKind/GlobalObjectKind/LiteralStringKind) in Typeof and Minus", "disposition": "dismissed", "reason": "All except the number-minus branch return constants purely from the tag and never dereference subclass fields, so they are type-safe regardless of tag integrity."},
+    {"anchor": "Missing `break` after LiteralBoolKind case (lines 18-25)", "disposition": "finding", "reason": "Fall-through is currently benign because both arms return, but it is a maintenance hazard worth flagging."},
+    {"anchor": "`return nullptr` fallback (line 64)", "disposition": "finding", "reason": "Nullable-return contract; callers must null-check or risk CWE-476 downstream."}
+  ],
+  "findings": [
+    {
+      "title": "Type-confusion contract on ValueKind-tag dispatch — mitigated here by checked dyn_cast",
+      "anchor": "if (auto *literalNum = llvh::dyn_cast<LiteralNumber>(operand)) { auto V = -literalNum->getValue(); }",
+      "file": "corpus/train/train_0120_cwe843.cpp",
+      "line": "9-13",
+      "code": "      switch (operand->getKind()) {\n        case ValueKind::LiteralNumberKind:\n          if (auto *literalNum = llvh::dyn_cast<LiteralNumber>(operand)) {\n            auto V = -literalNum->getValue();\n            return builder.getLiteralNumber(V);\n          }",
+      "bug_class": "Type confusion / access of resource using incompatible type (tag-only dispatch reading subclass fields)",
+      "cwe": "CWE-843",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0120_cwe843.cpp",
+      "invariant": "Before reading any subclass-specific member (e.g. LiteralNumber::getValue), the code must confirm the operand's concrete runtime type with a checked cast (dyn_cast/isa), not rely on the ValueKind tag alone; on mismatch it must not dereference.",
+      "failure_mode": "If this branch read operand->getValue() on the strength of the LiteralNumberKind tag (or used an unchecked cast<>), an operand mis-tagged as a number — from an RTTI/tag inconsistency or an incompletely-constructed value — would be reinterpreted as a LiteralNumber, reading unrelated bytes as a double (out-of-bounds/garbage read, potentially attacker-influenced). The shown code prevents this by using llvh::dyn_cast with a null guard and reading getValue() only inside the successful-cast branch; this is the CWE-843 fix. Rated low because the guard is present and correct as shown.",
+      "cve_analog": "",
+      "what_to_confirm": "That no sibling folding routine in the same file/module reads a Literal subclass field after a bare getKind()/switch without a dyn_cast, and that ValueKind tags are set only after the concrete object is fully constructed."
+    },
+    {
+      "title": "Latent type-safety and complement assumptions in evalIsTrue/evalIsFalse helpers",
+      "anchor": "evalIsTrue(builder, operand) / evalIsFalse(builder, operand)",
+      "file": "corpus/train/train_0120_cwe843.cpp",
+      "line": "19-22, 49-53",
+      "code": "          if (evalIsTrue(builder, operand)) {\n            return builder.getLiteralNumber(-1);\n          } else { // evalIsFalse(operand)\n            return builder.getLiteralNegativeZero();\n          }",
+      "bug_class": "Latent type confusion / incorrect assumption of predicate complementarity",
+      "cwe": "CWE-843",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "evalIsTrue/evalIsFalse must themselves type-check the operand (dyn_cast) before reading any payload used to decide truthiness, and for a genuine boolean literal evalIsTrue and evalIsFalse must be exact logical complements so the `else` arm here is only taken for statically-false operands.",
+      "failure_mode": "These helpers receive the raw operand and are the real truthiness deciders for the Minus/Bool and Bang cases. If they dispatch on getKind() and downcast without a null-checked cast, the type confusion relocates into them. Separately, the `else` arm at line 21 assumes 'not true' == 'false'; if evalIsTrue can return false for an operand whose truthiness is not statically decidable, `-x` would be mis-folded to negative zero — a mis-compilation. Impact depends entirely on the unshown implementation.",
+      "cve_analog": "",
+      "what_to_confirm": "Read evalIsTrue/evalIsFalse: verify they use checked casts before reading fields and that, for LiteralBoolKind, they are strict complements (never both false / both true) for a valid boolean."
+    },
+    {
+      "title": "Nullable return must be honored by the optimizer caller",
+      "anchor": "return nullptr;",
+      "file": "corpus/train/train_0120_cwe843.cpp",
+      "line": "64",
+      "code": "  return nullptr;",
+      "bug_class": "NULL-pointer dereference in caller if the no-fold sentinel is not checked",
+      "cwe": "CWE-476",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "Every call site must treat a nullptr result as 'operand could not be constant-folded' and leave the original UnaryOperatorInst in place, dereferencing the returned Literal* only after a null check.",
+      "failure_mode": "Many paths return nullptr (dyn_cast failure at line 11, undecidable truthiness at lines 49/52, unhandled OpKind at the outer default). A caller that assumes a non-null Literal* and immediately uses it to replace instruction operands would dereference null and crash the compiler on an operand/operator combination that cannot be folded — reachable from attacker-supplied JS. No defect in this file; the contract is on the caller.",
+      "cve_analog": "",
+      "what_to_confirm": "At the call site(s) in the optimizer/IRGen, confirm the return value is null-checked before use."
+    },
+    {
+      "title": "Benign switch fall-through after LiteralBoolKind (maintenance hazard)",
+      "anchor": "case ValueKind::LiteralBoolKind: ... (no break) case ValueKind::LiteralNullKind:",
+      "file": "corpus/train/train_0120_cwe843.cpp",
+      "line": "18-25",
+      "code": "        case ValueKind::LiteralBoolKind:\n          if (evalIsTrue(builder, operand)) {\n            return builder.getLiteralNumber(-1);\n          } else { // evalIsFalse(operand)\n            return builder.getLiteralNegativeZero();\n          }\n        case ValueKind::LiteralNullKind:\n          return builder.getLiteralNegativeZero();",
+      "bug_class": "Missing break / implicit fall-through (latent correctness regression risk)",
+      "cwe": "CWE-484",
+      "severity": "info",
+      "where_it_lives": "corpus/train/train_0120_cwe843.cpp",
+      "invariant": "Each switch case must either terminate every path with a return or use an explicit break/[[fallthrough]]; the LiteralBoolKind case relies on both if/else arms returning so it never falls into LiteralNullKind.",
+      "failure_mode": "Currently safe: both arms of the bool case return, so control cannot reach the LiteralNullKind label. But if a later edit introduced a non-returning path (or dropped the else), execution would silently fall through and mis-fold a boolean minus as negative zero. This is a robustness/maintainability flag, not an exploitable bug.",
+      "cve_analog": "",
+      "what_to_confirm": "That the bool case keeps both arms returning, or add an explicit break/[[fallthrough]] to make intent unambiguous."
+    }
+  ],
+  "audit_checklist": [
+    "Grep every Literal-folding/evaluator routine for `getKind()`/switch followed by a subclass field read (`->getValue()`, etc.) WITHOUT a preceding dyn_cast/isa — those are the unfixed CWE-843 siblings of this function.",
+    "Read evalIsTrue and evalIsFalse: confirm they use checked casts before reading payloads and are exact complements for LiteralBoolKind operands.",
+    "Confirm every ValueKind tag is assigned only after the concrete Literal subclass object is fully constructed, so getKind() can never report a type the object is not yet/at all.",
+    "Verify all callers of evalUnaryOperator null-check the returned Literal* before dereferencing (no assumption of a successful fold).",
+    "Confirm floating-point folding preserves JS semantics for signed-zero/NaN/Inf (e.g. `-0.0`, `-NaN`) so constant folding does not change observable results.",
+    "Ensure the bool case retains total-return coverage or an explicit break to prevent a future fall-through into the null case."
+  ]
+}

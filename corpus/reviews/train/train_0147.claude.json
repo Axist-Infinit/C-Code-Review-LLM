@@ -1,0 +1,165 @@
+{
+  "subsystem": "Expat (libexpat) streaming XML parser — the public XML_GetBuffer() entry point. This function hands the application a writable region of the parser's internal input buffer so it can copy the next chunk of an XML document in before calling XML_ParseBuffer(). It is the growth/compaction routine for that internal buffer: it either returns the existing tail of the buffer if enough free space remains, compacts the buffer in place, or reallocates a larger one, preserving any as-yet-unconsumed bytes and up to XML_CONTEXT_BYTES of already-consumed context.",
+  "provenance": "Identified by the function name XML_GetBuffer and the parameter type XML_Parser, the XML_ERROR_* enum constants (XML_ERROR_NO_MEMORY, XML_ERROR_SUSPENDED, XML_ERROR_FINISHED), the parser state enum values XML_SUSPENDED/XML_FINISHED, the XML_CONTEXT_BYTES compile-time macro, the MALLOC/FREE/INIT_BUFFER_SIZE macros, and the buffer/bufferPtr/bufferEnd/bufferLim member accessors. These are the exact identifiers used in Expat's xmlparse.c. The in-file banner names it corpus/train/train_0147_cwe119.c and the sample tag is 'primevul_c_train_2457_vuln'.",
+  "trust_boundary": "XML_GetBuffer is a public API called by the application driving the parser, but in a streaming XML pipeline the value of 'len' and the parser's buffered state are directly shaped by attacker-controlled input: 'len' is the size of the next network/document chunk to be read, and (bufferEnd - bufferPtr) is how many bytes of the current document have been fed but not yet consumed by the tokenizer (e.g. a very long unterminated token). An attacker who can stream a large XML document, or supply a large single chunk, controls both addends of the size arithmetic and can push their sum toward INT_MAX. The hostile inputs are therefore: 'len', and the amount of unconsumed data the parser is holding (bufferEnd - bufferPtr) plus the retained context (bufferPtr - buffer).",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0147_cwe119.c",
+      "lines": "2-7",
+      "code": "XML_GetBuffer(XML_Parser parser, int len)\n{\n  if (len < 0) {\n    errorCode = XML_ERROR_NO_MEMORY;\n    return NULL;\n  }",
+      "explanation": "The function signature takes the parser handle and a signed int 'len' — the number of bytes of free space the caller wants to write into the returned buffer region (the return type is elided in this excerpt but is void* in Expat, actually char*). The first guard rejects a negative request: because 'len' is signed, a caller passing a negative value (or an int that has already overflowed elsewhere) would corrupt all downstream size math, so len<0 is turned into XML_ERROR_NO_MEMORY and a NULL return. This is the only bound on 'len' itself — there is no upper cap here; large positive values are allowed to flow into the arithmetic below."
+    },
+    {
+      "file": "corpus/train/train_0147_cwe119.c",
+      "lines": "8-16",
+      "code": "  switch (ps_parsing) {\n  case XML_SUSPENDED:\n    errorCode = XML_ERROR_SUSPENDED;\n    return NULL;\n  case XML_FINISHED:\n    errorCode = XML_ERROR_FINISHED;\n    return NULL;\n  default: ;\n  }",
+      "explanation": "A state gate on the parser's ps_parsing status field. If the parser is suspended (XML_SUSPENDED) or has finished (XML_FINISHED), it refuses to hand out a buffer and sets the corresponding error code, returning NULL. Any other state (default) falls through and proceeds. This enforces the API contract that you cannot request more input buffer once parsing is done or paused; it has no bearing on the size arithmetic that follows."
+    },
+    {
+      "file": "corpus/train/train_0147_cwe119.c",
+      "lines": "18-22",
+      "code": "  if (len > bufferLim - bufferEnd) {\n#ifdef XML_CONTEXT_BYTES\n    int keep;\n#endif  /* defined XML_CONTEXT_BYTES */\n    int neededSize = len + (int)(bufferEnd - bufferPtr);",
+      "explanation": "The fast path is skipped entirely if the requested 'len' already fits in the free tail of the current buffer: bufferLim is the end of the allocation, bufferEnd is the end of currently-buffered data, so (bufferLim - bufferEnd) is the free space. Only when 'len' exceeds that do we enter the grow/compact block. Inside, neededSize is computed as the requested len PLUS the amount of unconsumed data that must be preserved, (bufferEnd - bufferPtr) — the bytes between the parser's read cursor bufferPtr and the end of data bufferEnd. Both addends are attacker-influenced. The pointer difference is truncated to 'int' via the cast, and the addition is a signed int addition. 'keep' is declared only when XML_CONTEXT_BYTES is configured; it will hold how many already-consumed context bytes to retain."
+    },
+    {
+      "file": "corpus/train/train_0147_cwe119.c",
+      "lines": "23-26",
+      "code": "    if (neededSize < 0) {\n      errorCode = XML_ERROR_NO_MEMORY;\n      return NULL;\n    }",
+      "explanation": "This is the overflow guard added by the fix for CVE-2015-1283: if the len + (bufferEnd - bufferPtr) addition overflowed signed int, the sum wraps to a negative value, and this test catches it and returns NO_MEMORY. It is the sole defense against the size computation overflowing — and critically it runs BEFORE the XML_CONTEXT_BYTES 'keep' amount is added on the next lines, so it does not re-validate the final neededSize."
+    },
+    {
+      "file": "corpus/train/train_0147_cwe119.c",
+      "lines": "27-32",
+      "code": "#ifdef XML_CONTEXT_BYTES\n    keep = (int)(bufferPtr - buffer);\n    if (keep > XML_CONTEXT_BYTES)\n      keep = XML_CONTEXT_BYTES;\n    neededSize += keep;\n#endif  /* defined XML_CONTEXT_BYTES */",
+      "explanation": "When Expat is built with a nonzero XML_CONTEXT_BYTES, the parser keeps a window of already-consumed bytes (for reporting context / entity handling). 'keep' is the number of consumed bytes currently in front of the read cursor, (bufferPtr - buffer), capped at XML_CONTEXT_BYTES. That amount is added to neededSize so the new buffer will also hold the retained context. Note that this second addition to neededSize happens AFTER the neededSize<0 check at line 23-26, and it is NOT itself re-checked for overflow — this is the crux of the defect below."
+    },
+    {
+      "file": "corpus/train/train_0147_cwe119.c",
+      "lines": "33-46",
+      "code": "    if (neededSize  <= bufferLim - buffer) {\n#ifdef XML_CONTEXT_BYTES\n      if (keep < bufferPtr - buffer) {\n        int offset = (int)(bufferPtr - buffer) - keep;\n        memmove(buffer, &buffer[offset], bufferEnd - bufferPtr + keep);\n        bufferEnd -= offset;\n        bufferPtr -= offset;\n      }\n#else\n      memmove(buffer, bufferPtr, bufferEnd - bufferPtr);\n      bufferEnd = buffer + (bufferEnd - bufferPtr);\n      bufferPtr = buffer;\n#endif  /* not defined XML_CONTEXT_BYTES */\n    }",
+      "explanation": "If the total needed size still fits inside the CURRENT allocation (neededSize <= bufferLim - buffer, i.e. the whole buffer span), no reallocation is done; the buffer is compacted in place to reclaim the free space that precedes bufferPtr. In the XML_CONTEXT_BYTES build it slides data down by 'offset' bytes while retaining 'keep' context bytes, moving (bufferEnd - bufferPtr + keep) bytes and adjusting bufferEnd/bufferPtr. In the non-context build it moves the unconsumed data (bufferEnd - bufferPtr bytes) to the start of the buffer and resets the cursors. The memmove lengths here are computed from the REAL pointer distances, not from neededSize, so the copy sizes are correct; the danger is the DECISION to take this branch instead of reallocating."
+    },
+    {
+      "file": "corpus/train/train_0147_cwe119.c",
+      "lines": "47-64",
+      "code": "    else {\n      char *newBuf;\n      int bufferSize = (int)(bufferLim - bufferPtr);\n      if (bufferSize == 0)\n        bufferSize = INIT_BUFFER_SIZE;\n      do {\n        bufferSize *= 2;\n      } while (bufferSize < neededSize && bufferSize > 0);\n      if (bufferSize <= 0) {\n        errorCode = XML_ERROR_NO_MEMORY;\n        return NULL;\n      }\n      newBuf = (char *)MALLOC(bufferSize);\n      if (newBuf == 0) {\n        errorCode = XML_ERROR_NO_MEMORY;\n        return NULL;\n      }\n      bufferLim = newBuf + bufferSize;",
+      "explanation": "Otherwise a bigger buffer is allocated. bufferSize is seeded from the current allocation span (bufferLim - bufferPtr), or INIT_BUFFER_SIZE if empty, then doubled until it is at least neededSize. The loop condition '&& bufferSize > 0' plus the following 'if (bufferSize <= 0)' catch the case where doubling itself overflows int and wraps non-positive, returning NO_MEMORY. MALLOC is called and its return checked against 0 (NULL) — an out-of-memory allocation is handled. On success bufferLim is set to the end of the new allocation. Note bufferSize is sized to satisfy neededSize, so if neededSize was corrupted upstream, the allocation is sized wrongly."
+    },
+    {
+      "file": "corpus/train/train_0147_cwe119.c",
+      "lines": "65-88",
+      "code": "#ifdef XML_CONTEXT_BYTES\n      if (bufferPtr) {\n        int keep = (int)(bufferPtr - buffer);\n        if (keep > XML_CONTEXT_BYTES)\n          keep = XML_CONTEXT_BYTES;\n        memcpy(newBuf, &bufferPtr[-keep], bufferEnd - bufferPtr + keep);\n        FREE(buffer);\n        buffer = newBuf;\n        bufferEnd = buffer + (bufferEnd - bufferPtr) + keep;\n        bufferPtr = buffer + keep;\n      }\n      else {\n        bufferEnd = newBuf + (bufferEnd - bufferPtr);\n        bufferPtr = buffer = newBuf;\n      }\n#else\n      if (bufferPtr) {\n        memcpy(newBuf, bufferPtr, bufferEnd - bufferPtr);\n        FREE(buffer);\n      }\n      bufferEnd = newBuf + (bufferEnd - bufferPtr);\n      bufferPtr = buffer = newBuf;\n#endif  /* not defined XML_CONTEXT_BYTES */",
+      "explanation": "The existing data is migrated into the freshly allocated newBuf. In the XML_CONTEXT_BYTES build the copy starts 'keep' bytes before bufferPtr (&bufferPtr[-keep]) and copies (bufferEnd - bufferPtr + keep) bytes so the retained context is preserved, then frees the old buffer and repoints buffer/bufferEnd/bufferPtr into newBuf with the cursor offset by 'keep'. The non-context build simply copies the unconsumed data and repoints the cursors to the start of newBuf. Again the memcpy lengths derive from actual pointer distances, but they are copied into an allocation whose SIZE was chosen from neededSize — if neededSize under-counted, this migration into a too-small buffer is itself a heap write hazard."
+    },
+    {
+      "file": "corpus/train/train_0147_cwe119.c",
+      "lines": "89-93",
+      "code": "    eventPtr = eventEndPtr = NULL;\n    positionPtr = NULL;\n  }\n  return bufferEnd;\n}",
+      "explanation": "After any compaction/reallocation, pointers into the old buffer that recorded event positions (eventPtr, eventEndPtr, positionPtr) are cleared because the underlying storage may have moved. Finally the function returns bufferEnd — the start of the free region the caller may write into. The API contract is that the caller may write up to 'len' bytes at the returned pointer; the safety of every subsequent caller write depends on this function having actually guaranteed 'len' bytes of headroom past bufferEnd."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0147_cwe119.c",
+      "lines": "31-33",
+      "code": "    neededSize += keep;\n#endif  /* defined XML_CONTEXT_BYTES */\n    if (neededSize  <= bufferLim - buffer) {",
+      "explanation": "PRIMARY DEFECT (CVE-2022-23852). The overflow guard at line 23-26 validates neededSize = len + (bufferEnd - bufferPtr) BEFORE the context bytes are added, but line 31 then does 'neededSize += keep;' with no second check. When XML_CONTEXT_BYTES is nonzero, an attacker who arranges len + (bufferEnd - bufferPtr) to be just below INT_MAX passes the first check, and the added 'keep' (up to XML_CONTEXT_BYTES) tips neededSize over INT_MAX so it wraps to a negative value. A negative neededSize then makes 'neededSize <= bufferLim - buffer' at line 33 TRUE (a negative int compared against a positive ptrdiff_t), so the code takes the in-place compaction branch and does NOT reallocate a larger buffer. The parser buffer is left at its original size, yet the function returns bufferEnd advertising 'len' bytes of space. The caller then copies up to 'len' bytes at bufferEnd, writing far past the allocation — a heap buffer overflow (out-of-bounds write). Even if the reallocation branch were taken, a wrapped neededSize would size MALLOC too small and the line-70/82 memcpy would overflow the new allocation. The invariant the implementation must uphold: neededSize must be re-validated for overflow AFTER 'neededSize += keep', or the addition must be done in a type that cannot overflow, before it is used to size or place any buffer."
+    },
+    {
+      "file": "corpus/train/train_0147_cwe119.c",
+      "lines": "22-26",
+      "code": "    int neededSize = len + (int)(bufferEnd - bufferPtr);\n    if (neededSize < 0) {\n      errorCode = XML_ERROR_NO_MEMORY;\n      return NULL;\n    }",
+      "explanation": "The line-22 addition len + (int)(bufferEnd - bufferPtr) is itself signed integer overflow if both addends are large — this is the original CVE-2015-1283 primitive. The line-23 'neededSize < 0' check is the historical mitigation, but it is fragile in two ways: (1) signed integer overflow is undefined behavior in C, so a modern optimizing compiler is entitled to assume it never happens and delete the '< 0' test, resurrecting the overflow; the correct form computes the sum in an unsigned or wider type. (2) As shown above, the check is bypassed for the context-bytes contribution because 'keep' is added afterward. An attacker driving len and the unconsumed byte count toward INT_MAX exercises exactly this path. Invariant: the total requested size must be computed and range-checked without relying on signed overflow wraparound."
+    },
+    {
+      "file": "corpus/train/train_0147_cwe119.c",
+      "lines": "49-54",
+      "code": "      int bufferSize = (int)(bufferLim - bufferPtr);\n      if (bufferSize == 0)\n        bufferSize = INIT_BUFFER_SIZE;\n      do {\n        bufferSize *= 2;\n      } while (bufferSize < neededSize && bufferSize > 0);",
+      "explanation": "All the size math is done in 32-bit signed 'int' while the underlying quantities are 64-bit pointer differences. (int)(bufferLim - bufferPtr) at line 49, (int)(bufferEnd - bufferPtr) at line 22, and (int)(bufferPtr - buffer) at line 28/67 all TRUNCATE a ptrdiff_t to int. On a 64-bit platform a buffer larger than INT_MAX (feasible for a parser fed a multi-gigabyte unconsumed token) yields a truncated, possibly negative int, so neededSize, bufferSize, and the doubling loop all operate on wrong values, potentially selecting an undersized allocation. The 'bufferSize *= 2' doubling can also overflow int; that particular overflow is defended by the '&& bufferSize > 0' loop condition and the subsequent 'if (bufferSize <= 0)' at line 55, but the truncation-at-the-cast problem is not. Invariant: buffer sizes and offsets must be carried in a type (size_t/ptrdiff_t) wide enough for the actual allocation, not truncated to int."
+    },
+    {
+      "file": "corpus/train/train_0147_cwe119.c",
+      "lines": "18-22",
+      "code": "  if (len > bufferLim - bufferEnd) {\n#ifdef XML_CONTEXT_BYTES\n    int keep;\n#endif  /* defined XML_CONTEXT_BYTES */\n    int neededSize = len + (int)(bufferEnd - bufferPtr);",
+      "explanation": "The whole routine's safety rests on 'len' being a sane bound, but the only validation is len>=0 (line 4). 'len' is caller-supplied and, in a streaming decode, sized from attacker-controlled chunk lengths; there is no upper cap tying it to any resource limit. A caller that later writes 'len' bytes at the returned pointer is trusting XML_GetBuffer to have guaranteed that headroom. Any of the overflow/truncation paths above breaks that guarantee silently (the function still returns a non-NULL bufferEnd), turning a missing-guarantee into a memory-safety violation at the caller's write. Invariant: XML_GetBuffer must return NULL whenever it cannot actually guarantee 'len' contiguous writable bytes starting at the returned pointer."
+    }
+  ],
+  "summary": "This is Expat's XML_GetBuffer growth routine and it contains the classic CVE-2022-23852 signed-integer-overflow: the neededSize<0 overflow guard runs before 'neededSize += keep' (the XML_CONTEXT_BYTES contribution) is added, so with a nonzero XML_CONTEXT_BYTES an attacker can wrap neededSize negative, skip the reallocation, and cause the caller's subsequent write of 'len' bytes to overflow the heap buffer. It also relies on undefined signed-overflow behavior (CVE-2015-1283 lineage) and truncates 64-bit pointer differences to int throughout.",
+  "reviewed_anchors": [
+    {"anchor": "XML_GetBuffer(XML_Parser parser, int len) signature (line 2)", "disposition": "finding", "reason": "Public entry point; 'len' is the untrusted requested size that drives all buffer math and the caller's later write."},
+    {"anchor": "len < 0 guard (line 4)", "disposition": "dismissed", "reason": "Correctly rejects negative requests; the only concern (no upper bound on len) is captured in the len anchor finding."},
+    {"anchor": "ps_parsing switch / XML_SUSPENDED / XML_FINISHED (lines 8-15)", "disposition": "dismissed", "reason": "Pure state gate; returns NULL in disallowed states and does not touch size arithmetic."},
+    {"anchor": "grow condition 'len > bufferLim - bufferEnd' (line 18)", "disposition": "dismissed", "reason": "Correct free-space test; comparison of int against ptrdiff_t is benign here."},
+    {"anchor": "neededSize = len + (int)(bufferEnd - bufferPtr) (line 22)", "disposition": "finding", "reason": "Signed integer overflow primitive (CVE-2015-1283 lineage) and int-truncation of a pointer difference."},
+    {"anchor": "neededSize < 0 overflow guard (line 23-26)", "disposition": "finding", "reason": "Only overflow defense; UB-dependent and, crucially, runs before the 'keep' addition so it does not cover the final neededSize."},
+    {"anchor": "keep = (int)(bufferPtr - buffer), capped at XML_CONTEXT_BYTES (lines 28-30)", "disposition": "dismissed", "reason": "The cap itself is correct; its unchecked addition to neededSize is the finding at line 31."},
+    {"anchor": "neededSize += keep (line 31)", "disposition": "finding", "reason": "CVE-2022-23852: unchecked second overflow of neededSize after the guard, leading to heap overflow."},
+    {"anchor": "neededSize <= bufferLim - buffer branch selector (line 33)", "disposition": "finding", "reason": "A wrapped-negative neededSize makes this true, choosing in-place compaction instead of reallocation — the exploit's control point."},
+    {"anchor": "in-place memmove branches (lines 35-45)", "disposition": "dismissed", "reason": "Copy lengths use real pointer distances (bufferEnd - bufferPtr [+ keep]), so the moves are correctly sized; the hazard is the branch being reached, not the memmove."},
+    {"anchor": "bufferSize = (int)(bufferLim - bufferPtr) and doubling loop (lines 49-54)", "disposition": "finding", "reason": "int truncation of a 64-bit span; loop-doubling overflow is guarded but the truncation is not."},
+    {"anchor": "INIT_BUFFER_SIZE (line 51)", "disposition": "dismissed", "reason": "Compile-time seed constant; no attacker influence."},
+    {"anchor": "bufferSize <= 0 guard (line 55)", "disposition": "dismissed", "reason": "Correctly catches doubling overflow / non-positive size and returns NO_MEMORY."},
+    {"anchor": "MALLOC(bufferSize) and newBuf == 0 check (lines 59-63)", "disposition": "dismissed", "reason": "Allocation failure is checked; the sizing input (neededSize/bufferSize) is where corruption enters, covered above."},
+    {"anchor": "bufferLim = newBuf + bufferSize (line 64)", "disposition": "dismissed", "reason": "Correctly recomputes the allocation end from the just-allocated size."},
+    {"anchor": "memcpy(newBuf, &bufferPtr[-keep], bufferEnd - bufferPtr + keep) (line 70)", "disposition": "dismissed", "reason": "Copy length is a real distance; it only overflows if bufferSize was undersized, which is the neededSize finding, not a distinct copy bug."},
+    {"anchor": "FREE(buffer) after migration (lines 71, 83)", "disposition": "dismissed", "reason": "Old buffer freed exactly once after copying; no double-free or use-after-free in the shown flow."},
+    {"anchor": "eventPtr/eventEndPtr/positionPtr reset to NULL (lines 89-90)", "disposition": "dismissed", "reason": "Correct invalidation of stale pointers into a possibly-moved buffer."},
+    {"anchor": "return bufferEnd (line 92)", "disposition": "dismissed", "reason": "Return of the writable region start; its safety is entirely a function of the size guarantees above, already covered."}
+  ],
+  "findings": [
+    {
+      "title": "Signed integer overflow of neededSize after XML_CONTEXT_BYTES 'keep' addition bypasses the overflow guard (heap buffer overflow)",
+      "anchor": "neededSize += keep;",
+      "file": "corpus/train/train_0147_cwe119.c",
+      "line": "31",
+      "code": "    neededSize += keep;",
+      "bug_class": "Signed integer overflow leading to out-of-bounds heap write",
+      "cwe": "CWE-190",
+      "severity": "high",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "neededSize must be re-checked for overflow (or computed in a non-overflowing wider/unsigned type) AFTER 'keep' is added and before it is used to size an allocation or select the compaction branch.",
+      "failure_mode": "With a nonzero XML_CONTEXT_BYTES build, an attacker streams a document so that len + (bufferEnd - bufferPtr) is just under INT_MAX (passing the line-23 'neededSize < 0' guard), then the line-31 'neededSize += keep' pushes the sum over INT_MAX and it wraps negative. The negative neededSize makes 'neededSize <= bufferLim - buffer' (line 33) true, so the buffer is compacted in place rather than grown; XML_GetBuffer still returns bufferEnd claiming 'len' bytes of space, and the caller's copy of up to 'len' bytes overruns the undersized heap buffer (out-of-bounds write, remote memory corruption).",
+      "cve_analog": "CVE-2022-23852",
+      "what_to_confirm": "Confirm the implementation adds a range/overflow check on neededSize immediately after 'neededSize += keep' (e.g. rejecting when neededSize would exceed the max buffer size), and that no code path uses a wrapped neededSize to size MALLOC or choose the in-place branch."
+    },
+    {
+      "title": "Primary overflow guard depends on undefined signed-overflow wraparound and runs before the full size is known",
+      "anchor": "int neededSize = len + (int)(bufferEnd - bufferPtr);",
+      "file": "corpus/train/train_0147_cwe119.c",
+      "line": "22-26",
+      "code": "    int neededSize = len + (int)(bufferEnd - bufferPtr);\n    if (neededSize < 0) {\n      errorCode = XML_ERROR_NO_MEMORY;\n      return NULL;\n    }",
+      "bug_class": "Integer overflow with UB-dependent detection",
+      "cwe": "CWE-190",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "The requested total size must be computed in a type that cannot overflow (size_t/unsigned or a wider type with an explicit bound), so detection does not rely on signed wraparound the compiler may legally remove.",
+      "failure_mode": "len + (int)(bufferEnd - bufferPtr) is signed int addition; when both addends are large it overflows, which is undefined behavior. The 'neededSize < 0' test only works if the overflow wrapped as two's complement, but an optimizing compiler may assume signed overflow never occurs and eliminate the check, re-enabling the original CVE-2015-1283 heap overflow. Even when the check survives, it validates the wrong (pre-keep) value as shown in the primary finding.",
+      "cve_analog": "CVE-2015-1283",
+      "what_to_confirm": "Confirm the shipped code computes the size in an unsigned/size_t type with an explicit upper bound rather than relying on 'neededSize < 0', and that the check covers the final size including 'keep'."
+    },
+    {
+      "title": "64-bit pointer differences and sizes truncated to 32-bit int throughout the buffer math",
+      "anchor": "int bufferSize = (int)(bufferLim - bufferPtr);",
+      "file": "corpus/train/train_0147_cwe119.c",
+      "line": "49",
+      "code": "      int bufferSize = (int)(bufferLim - bufferPtr);",
+      "bug_class": "Numeric truncation of size/offset values",
+      "cwe": "CWE-197",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "Buffer sizes and offsets must be carried in a type wide enough for the real allocation (size_t/ptrdiff_t) so casting a pointer difference never loses or sign-flips high bits.",
+      "failure_mode": "The casts (int)(bufferLim - bufferPtr) at line 49, (int)(bufferEnd - bufferPtr) at line 22, and (int)(bufferPtr - buffer) at line 28/67 truncate a 64-bit ptrdiff_t to 32 bits. If the parser holds more than INT_MAX bytes of unconsumed/context data (a large document fed as one region), the truncated value can be small or negative, so neededSize and bufferSize are computed from wrong magnitudes and may select an undersized allocation. The doubling-loop overflow is separately guarded by 'bufferSize > 0' / 'bufferSize <= 0', but the cast truncation is not.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm whether the target platform can present buffers/offsets exceeding INT_MAX and whether the implementation performs the arithmetic in size_t/ptrdiff_t to avoid truncation."
+    }
+  ],
+  "audit_checklist": [
+    "Verify there is an overflow/range check on neededSize AFTER 'neededSize += keep' (line 31) in the XML_CONTEXT_BYTES build — this is the CVE-2022-23852 fix and its absence is directly exploitable.",
+    "Confirm the total size is computed in an unsigned/size_t type rather than relying on the UB-dependent 'neededSize < 0' test (CVE-2015-1283 hardening).",
+    "Check that all pointer differences (bufferEnd-bufferPtr, bufferPtr-buffer, bufferLim-bufferPtr) are handled without truncating to 32-bit int on 64-bit targets.",
+    "Confirm the MALLOC size chosen actually covers the real bytes copied by the line-70/82 memcpy, so migration into newBuf cannot overflow when neededSize was mis-sized.",
+    "Confirm 'len' has an appropriate upper bound relative to buffer/resource limits, and that the function returns NULL whenever it cannot guarantee 'len' writable bytes at the returned pointer.",
+    "Verify the doubling loop's 'bufferSize > 0' guard and the 'bufferSize <= 0' check reliably reject an overflowed size before MALLOC.",
+    "Confirm the old buffer is freed exactly once and no stale eventPtr/positionPtr survives the reallocation."
+  ]
+}

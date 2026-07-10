@@ -1,0 +1,190 @@
+{
+  "subsystem": "D-Bus reference library (libdbus) SASL authentication state machine — specifically the server-side handler for the DBUS_COOKIE_SHA1 authentication mechanism. sha1_handle_first_client_response() is the server callback that processes the client's first AUTH DBUS_COOKIE_SHA1 response, which carries the desired username, then builds and sends the SHA-1 cookie challenge (context, cookie id, and a random nonce) back to the client.",
+  "provenance": "Identified from the DBus-specific naming and API surface: the function name sha1_handle_first_client_response, the DBusAuth/DBusString/DBusCredentials/DBusError types, the _dbus_* helper family (_dbus_string_copy, _dbus_credentials_add_from_user, _dbus_keyring_new_for_credentials, _dbus_generate_random_bytes, _dbus_string_hex_encode), the DBUS_ERROR_* constants, the server_state_waiting_for_data state, and the N_CHALLENGE_BYTES nonce constant. These are the internal symbols of freedesktop.org dbus (libdbus) dbus-auth.c. The sample header comment 'primevul_c_train_2867_fixed' and the filename eval_0056_cwe59.c indicate this is the patched revision of a CWE-59 (link-following) issue.",
+  "trust_boundary": "The DBusString *data parameter is fully attacker-controlled: it is the raw payload the remote/peer client sends in its AUTH DBUS_COOKIE_SHA1 line over the D-Bus SASL handshake, before any authentication has succeeded. The client freely chooses the 'desired username' it asks to authenticate as (auth->desired_identity is derived from data via _dbus_credentials_add_from_user). Everything downstream that acts on desired_identity — most importantly opening/creating the per-user keyring file (~/.dbus-keyrings/<context>) in that user's home directory — is therefore driven by hostile input. auth (the DBusAuth object) and auth->context are server-side state. The security-critical boundary is: the server must never be induced to read or write a keyring in a directory owned by a DIFFERENT user than the process owner, because that directory (and any symlinks in it) is controlled by that other user.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/eval/eval_0056_cwe59.c",
+      "lines": "2-4",
+      "code": "sha1_handle_first_client_response (DBusAuth         *auth,\n                                   const DBusString *data)\n{",
+      "explanation": "The (static) server-side handler for the first client response in the DBUS_COOKIE_SHA1 SASL exchange. Its return type is on the truncated preceding line and is dbus_bool_t (TRUE/FALSE, where the boolean here conventionally means 'did we succeed without running out of memory', not 'did authentication pass'). Parameter auth is the per-connection DBusAuth state machine object; data is a const DBusString holding the untrusted bytes the client sent — expected to be the desired username the client wants to be authenticated as. This is the entry point of the trust boundary: data is remote/peer-controlled."
+    },
+    {
+      "file": "corpus/eval/eval_0056_cwe59.c",
+      "lines": "8-14",
+      "code": "  DBusString tmp;\n  DBusString tmp2;\n  dbus_bool_t retval = FALSE;\n  DBusError error = DBUS_ERROR_INIT;\n  DBusCredentials *myself = NULL;\n\n  _dbus_string_set_length (&auth->challenge, 0);",
+      "explanation": "Local scratch: tmp will hold the raw random challenge nonce, tmp2 will hold the assembled challenge line to send (context + cookie id + nonce). retval defaults to FALSE (i.e. failure/out-of-memory). error is a zero-initialized DBusError. myself will hold the credentials of the current server process, used later for the same-user check. Line 14 truncates any previously-stored challenge to length 0 so a stale challenge from a prior attempt cannot leak into this one."
+    },
+    {
+      "file": "corpus/eval/eval_0056_cwe59.c",
+      "lines": "16-31",
+      "code": "  if (_dbus_string_get_length (data) > 0)\n    {\n      if (_dbus_string_get_length (&auth->identity) > 0)\n        {\n          /* Tried to send two auth identities, wtf */\n          _dbus_verbose (\"%s: client tried to send auth identity, but we already have one\\n\",\n                         DBUS_AUTH_NAME (auth));\n          return send_rejected (auth);\n        }\n      else\n        {\n          /* this is our auth identity */\n          if (!_dbus_string_copy (data, 0, &auth->identity, 0))\n            return FALSE;\n        }\n    }",
+      "explanation": "If the client actually supplied a non-empty identity string, the handler enforces a once-only rule: if auth->identity is already populated (the client previously sent an identity), this is a protocol violation and the connection is rejected via send_rejected(). Otherwise the untrusted data is copied verbatim into auth->identity with _dbus_string_copy. DBusString is a growable, heap-backed, always-NUL-terminated string abstraction, so this copy allocates as needed and is not a fixed-buffer overwrite; on allocation failure it returns FALSE. Note send_rejected() returns a boolean about memory success, not about acceptance — rejection is the intended behavior here."
+    },
+    {
+      "file": "corpus/eval/eval_0056_cwe59.c",
+      "lines": "33-38",
+      "code": "  if (!_dbus_credentials_add_from_user (auth->desired_identity, data))\n    {\n      _dbus_verbose (\"%s: Did not get a valid username from client\\n\",\n                     DBUS_AUTH_NAME (auth));\n      return send_rejected (auth);\n    }",
+      "explanation": "The untrusted data is parsed as a username and recorded into auth->desired_identity (a DBusCredentials object). _dbus_credentials_add_from_user resolves the client-chosen name to a uid/credentials record. This is the point where the attacker names WHICH user identity they wish to authenticate as. If parsing/lookup fails the client is rejected. Everything that follows keys off desired_identity, so from here on a hostile username value flows into keyring path selection."
+    },
+    {
+      "file": "corpus/eval/eval_0056_cwe59.c",
+      "lines": "40-52",
+      "code": "  if (!_dbus_string_init (&tmp))\n    return FALSE;\n\n  if (!_dbus_string_init (&tmp2))\n    {\n      _dbus_string_free (&tmp);\n      return FALSE;\n    }\n\n  myself = _dbus_credentials_new_from_current_process ();\n\n  if (myself == NULL)\n    goto out;",
+      "explanation": "Initializes the two scratch DBusStrings, carefully freeing tmp if tmp2 init fails (correct paired-cleanup on the early-return path, since goto out is not yet valid because myself/other state is not set up). Then it captures the credentials of the server's OWN process into myself. If that allocation fails, it jumps to the out: cleanup label. myself is the ground-truth identity the server is entitled to act as."
+    },
+    {
+      "file": "corpus/eval/eval_0056_cwe59.c",
+      "lines": "54-75",
+      "code": "  if (!_dbus_credentials_same_user (myself, auth->desired_identity))\n    {\n      /*\n       * DBUS_COOKIE_SHA1 is not suitable for authenticating that the\n       * client is anyone other than the user owning the process\n       * containing the DBusServer: we probably aren't allowed to write\n       * to other users' home directories. Even if we can (for example\n       * uid 0 on traditional Unix or CAP_DAC_OVERRIDE on Linux), we\n       * must not, because the other user controls their home directory,\n       * and could carry out symlink attacks to make us read from or\n       * write to unintended locations. It's difficult to avoid symlink\n       * attacks in a portable way, so we just don't try. This isn't a\n       * regression, because DBUS_COOKIE_SHA1 never worked for other\n       * users anyway.\n       */\n      _dbus_verbose (\"%s: client tried to authenticate as \\\"%s\\\", \"\n                     \"but that doesn't match this process\",\n                     DBUS_AUTH_NAME (auth),\n                     _dbus_string_get_const_data (data));\n      retval = send_rejected (auth);\n      goto out;\n    }",
+      "explanation": "This is the security-critical gate and the actual CWE-59 fix. Before touching any keyring, the server compares the client's desired_identity against its own process credentials (myself) with _dbus_credentials_same_user. If they differ, the request is rejected outright. The verbatim comment states the rationale precisely: DBUS_COOKIE_SHA1 relies on a shared secret stored in ~/.dbus-keyrings/ inside the target user's home directory; if the server allowed authenticating as a DIFFERENT user, it would have to read/create a keyring in that other user's home directory, which that user controls and could booby-trap with symlinks to redirect the read/write to arbitrary locations. Refusing cross-user requests here removes that primitive. The rejection path also logs the client-supplied string via _dbus_string_get_const_data(data)."
+    },
+    {
+      "file": "corpus/eval/eval_0056_cwe59.c",
+      "lines": "81-87",
+      "code": "  if (auth->keyring &&\n      !_dbus_keyring_is_for_credentials (auth->keyring,\n                                         auth->desired_identity))\n    {\n      _dbus_keyring_unref (auth->keyring);\n      auth->keyring = NULL;\n    }",
+      "explanation": "A cached keyring is dropped if it does not belong to the (now-validated, same-user) desired_identity, so a stale keyring from a different credentials set is not reused. Because the same_user gate above already guaranteed desired_identity == process owner, this only ever selects the server owner's own keyring."
+    },
+    {
+      "file": "corpus/eval/eval_0056_cwe59.c",
+      "lines": "89-118",
+      "code": "  if (auth->keyring == NULL)\n    {\n      auth->keyring = _dbus_keyring_new_for_credentials (auth->desired_identity,\n                                                         &auth->context,\n                                                         &error);\n\n      if (auth->keyring == NULL)\n        {\n          if (dbus_error_has_name (&error,\n                                   DBUS_ERROR_NO_MEMORY))\n            {\n              dbus_error_free (&error);\n              goto out;\n            }\n          else\n            {\n              _DBUS_ASSERT_ERROR_IS_SET (&error);\n              _dbus_verbose (\"%s: Error loading keyring: %s\\n\",\n                             DBUS_AUTH_NAME (auth), error.message);\n              if (send_rejected (auth))\n                retval = TRUE; /* retval is only about mem */\n              dbus_error_free (&error);\n              goto out;\n            }\n        }\n      else\n        {\n          _dbus_assert (!dbus_error_is_set (&error));\n        }\n    }",
+      "explanation": "If no valid cached keyring exists, one is created/loaded for desired_identity within the named context (auth->context selects the keyring file, e.g. 'org_freedesktop_general'). This is the operation that actually opens files in a user's home directory — the exact action the same_user gate protects. Errors are split cleanly: on DBUS_ERROR_NO_MEMORY, error is freed and control falls to out with retval still FALSE (report OOM to caller); on any other error the client is rejected, retval is set to TRUE only in the sense of 'no memory problem', and error is freed before jumping to out. The success branch asserts no error is left set."
+    },
+    {
+      "file": "corpus/eval/eval_0056_cwe59.c",
+      "lines": "120-136",
+      "code": "  _dbus_assert (auth->keyring != NULL);\n\n  auth->cookie_id = _dbus_keyring_get_best_key (auth->keyring, &error);\n  if (auth->cookie_id < 0)\n    {\n      _DBUS_ASSERT_ERROR_IS_SET (&error);\n      _dbus_verbose (\"%s: Could not get a cookie ID to send to client: %s\\n\",\n                     DBUS_AUTH_NAME (auth), error.message);\n      if (send_rejected (auth))\n        retval = TRUE;\n      dbus_error_free (&error);\n      goto out;\n    }\n  else\n    {\n      _dbus_assert (!dbus_error_is_set (&error));\n    }",
+      "explanation": "Selects the best (most recent, non-expired) cookie from the keyring, storing its integer id in auth->cookie_id. A negative id signals failure: the error message is logged, the client is rejected, error is freed, and control falls to out. On success the code asserts no error remains set. The cookie_id is the secret index that will be echoed to the client so both sides can look up the same shared secret."
+    },
+    {
+      "file": "corpus/eval/eval_0056_cwe59.c",
+      "lines": "138-149",
+      "code": "  if (!_dbus_string_copy (&auth->context, 0,\n                          &tmp2, _dbus_string_get_length (&tmp2)))\n    goto out;\n\n  if (!_dbus_string_append (&tmp2, \" \"))\n    goto out;\n\n  if (!_dbus_string_append_int (&tmp2, auth->cookie_id))\n    goto out;\n\n  if (!_dbus_string_append (&tmp2, \" \"))\n    goto out;",
+      "explanation": "Begins assembling the challenge line the server will send. It appends the context name (copied at insert-position = current length of tmp2, which is 0 here so it becomes the prefix), then a space, then the decimal cookie_id, then another space, into tmp2. Each _dbus_string_* call can fail on out-of-memory and jumps to out with retval still FALSE. All of these operate on growable DBusStrings, so there is no fixed-size buffer being filled."
+    },
+    {
+      "file": "corpus/eval/eval_0056_cwe59.c",
+      "lines": "151-169",
+      "code": "  if (!_dbus_generate_random_bytes (&tmp, N_CHALLENGE_BYTES, &error))\n    {\n      if (dbus_error_has_name (&error, DBUS_ERROR_NO_MEMORY))\n        {\n          dbus_error_free (&error);\n          goto out;\n        }\n      else\n        {\n          _DBUS_ASSERT_ERROR_IS_SET (&error);\n          _dbus_verbose (\"%s: Error generating challenge: %s\\n\",\n                         DBUS_AUTH_NAME (auth), error.message);\n          if (send_rejected (auth))\n            retval = TRUE; /* retval is only about mem */\n\n          dbus_error_free (&error);\n          goto out;\n        }\n    }",
+      "explanation": "Fills tmp with N_CHALLENGE_BYTES cryptographically-random bytes — the server nonce that makes each SHA-1 challenge unique and prevents replay. Failure handling mirrors the keyring block: distinguish OOM (return failure) from other errors (reject client). N_CHALLENGE_BYTES is a compile-time constant, so the amount of entropy is fixed and not attacker-influenced; the correctness/entropy of _dbus_generate_random_bytes is the relevant security property here."
+    },
+    {
+      "file": "corpus/eval/eval_0056_cwe59.c",
+      "lines": "171-180",
+      "code": "  _dbus_string_set_length (&auth->challenge, 0);\n  if (!_dbus_string_hex_encode (&tmp, 0, &auth->challenge, 0))\n    goto out;\n\n  if (!_dbus_string_hex_encode (&tmp, 0, &tmp2,\n                                _dbus_string_get_length (&tmp2)))\n    goto out;\n\n  if (!send_data (auth, &tmp2))\n    goto out;",
+      "explanation": "The random nonce is hex-encoded twice: once into auth->challenge (stored so the server can later verify the client's SHA-1 response against the same nonce), and once appended to tmp2 (insert-position = current tmp2 length) so the full 'context cookie_id challenge' line can be sent. send_data(auth, &tmp2) transmits that assembled challenge to the client. On any OOM failure control falls through to out with retval FALSE."
+    },
+    {
+      "file": "corpus/eval/eval_0056_cwe59.c",
+      "lines": "182-195",
+      "code": "  goto_state (auth, &server_state_waiting_for_data);\n  retval = TRUE;\n\n out:\n  _dbus_string_zero (&tmp);\n  _dbus_string_free (&tmp);\n  _dbus_string_zero (&tmp2);\n  _dbus_string_free (&tmp2);\n\n  if (myself != NULL)\n    _dbus_credentials_unref (myself);\n\n  return retval;\n}",
+      "explanation": "On success the state machine advances to server_state_waiting_for_data (awaiting the client's SHA-1 digest) and retval becomes TRUE. The shared out: epilogue runs on every exit path: it zeroes tmp and tmp2 before freeing them (_dbus_string_zero scrubs the buffer so the random nonce and assembled secret material do not linger in freed heap memory — good hygiene), and unrefs myself only if it was allocated. retval is returned. Because myself is initialized to NULL and every DBusString is initialized before any goto out, the cleanup is safe on all branches."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/eval/eval_0056_cwe59.c",
+      "lines": "54-75",
+      "code": "  if (!_dbus_credentials_same_user (myself, auth->desired_identity))\n    {\n      /*\n       * DBUS_COOKIE_SHA1 is not suitable for authenticating that the\n       * client is anyone other than the user owning the process\n       * containing the DBusServer: ...\n       * and could carry out symlink attacks to make us read from or\n       * write to unintended locations. ...\n       */\n      ...\n      retval = send_rejected (auth);\n      goto out;\n    }",
+      "explanation": "This single conditional is the entire mitigation for the CWE-59 link-following vulnerability (the historical DBUS_COOKIE_SHA1 symlink attack). The attacker fully controls the desired username in data (line 33 feeds it into desired_identity). Without this same-user gate, a client could request authentication as a DIFFERENT local user; the server would then call _dbus_keyring_new_for_credentials on that victim's identity (line 91), causing it to open, create, and lock files under the victim's ~/.dbus-keyrings/ directory. Because the victim controls that directory, they can plant symlinks so the server (potentially running as root or with CAP_DAC_OVERRIDE) reads or writes to arbitrary attacker-chosen paths — an out-of-bounds-of-intended-directory file access leading to information disclosure, file corruption, or privilege escalation. The invariant the implementation MUST uphold: never touch a keyring belonging to any uid other than the server process's own uid. In THIS (fixed) revision the gate is present and correct, so the primitive is closed; the finding is that the whole security of the mechanism is load-bearing on this one comparison and on _dbus_credentials_same_user being implemented soundly (e.g. comparing real uids, not spoofable names)."
+    },
+    {
+      "file": "corpus/eval/eval_0056_cwe59.c",
+      "lines": "89-92",
+      "code": "      auth->keyring = _dbus_keyring_new_for_credentials (auth->desired_identity,\n                                                         &auth->context,\n                                                         &error);",
+      "explanation": "This is the sink the CWE-59 gate protects. It resolves a keyring file path from desired_identity's home directory and auth->context. The security of this call depends entirely on the earlier same_user check having run and rejected cross-user requests, AND on _dbus_keyring_new_for_credentials itself resolving/creating the path without following attacker symlinks and without a TOCTOU window between checking and opening the keyring/lock files. If the ordering were ever changed so the keyring were created before the same_user check, or if auth->context could be influenced by the client to escape the intended directory, the symlink primitive returns. Reviewers must confirm the keyring implementation opens files with O_NOFOLLOW / safe directory ownership checks and does not trust the resolved home directory blindly."
+    },
+    {
+      "file": "corpus/eval/eval_0056_cwe59.c",
+      "lines": "69-72",
+      "code": "      _dbus_verbose (\"%s: client tried to authenticate as \\\"%s\\\", \"\n                     \"but that doesn't match this process\",\n                     DBUS_AUTH_NAME (auth),\n                     _dbus_string_get_const_data (data));",
+      "explanation": "The untrusted client string data is emitted into the verbose/debug log via _dbus_string_get_const_data(data). It is correctly passed as a %s ARGUMENT (not as the format string), so this is not a format-string vulnerability. Residual, low-severity concerns: (1) log-injection — data may contain newlines or terminal control sequences that corrupt or spoof log lines when DBUS_VERBOSE is enabled; (2) it relies on DBusString's guarantee that get_const_data is NUL-terminated (true for DBusString), otherwise it would over-read. This is debug-only output and gated behind verbose mode, so impact is minor, but untrusted content should be treated as such in logs."
+    },
+    {
+      "file": "corpus/eval/eval_0056_cwe59.c",
+      "lines": "151-151",
+      "code": "  if (!_dbus_generate_random_bytes (&tmp, N_CHALLENGE_BYTES, &error))",
+      "explanation": "The challenge nonce quality is a security property of the DBUS_COOKIE_SHA1 handshake: if N_CHALLENGE_BYTES were too small or _dbus_generate_random_bytes returned predictable/low-entropy bytes, an attacker could predict or replay challenges and attempt to defeat the SHA-1 cookie proof-of-knowledge. This is not a memory-safety bug and N_CHALLENGE_BYTES is not attacker-controlled, so it is a latent design dependency rather than a defect in this file; it is called out so the implementation's RNG source and the constant's value are confirmed to provide adequate entropy."
+    }
+  ],
+  "summary": "This is the patched server-side DBUS_COOKIE_SHA1 handler from libdbus. The one genuinely security-critical contract — refusing to authenticate a client as any user other than the server process owner (line 54) — is the fix for the classic DBUS_COOKIE_SHA1 keyring symlink / link-following vulnerability (CWE-59), and it is PRESENT and correctly ordered before any keyring access. No memory-safety defect is visible: all string operations use growable, always-terminated DBusStrings (no fixed buffers, no length-vs-buffer or unsigned-underflow arithmetic), error/OOM paths are handled, and the cleanup epilogue scrubs and frees secret material safely. Residual items are low severity: reliance of the whole mechanism on the same-user check and on a symlink-safe keyring implementation, untrusted data in a debug log, and RNG/entropy quality.",
+  "reviewed_anchors": [
+    {"anchor": "sha1_handle_first_client_response(DBusAuth *auth, const DBusString *data) — signature", "disposition": "finding", "reason": "Entry point of the trust boundary; data is untrusted client input and drives keyring/user selection."},
+    {"anchor": "const DBusString *data — parameter", "disposition": "finding", "reason": "Attacker-controlled username payload; flows into desired_identity and into a debug log (line 72)."},
+    {"anchor": "_dbus_string_set_length(&auth->challenge, 0) — line 14 / line 171", "disposition": "dismissed", "reason": "Defensive reset of stored challenge to avoid stale-nonce reuse; no unsafe contract."},
+    {"anchor": "_dbus_string_get_length(data) > 0 — line 16", "disposition": "dismissed", "reason": "Length guard on a dynamic string; not compared against any fixed buffer."},
+    {"anchor": "_dbus_string_get_length(&auth->identity) > 0 double-identity guard — line 18-24", "disposition": "dismissed", "reason": "Correct once-only rule; rejects a second identity, no memory hazard."},
+    {"anchor": "_dbus_string_copy(data, 0, &auth->identity, 0) — line 28", "disposition": "dismissed", "reason": "Copy into a growable, heap-backed DBusString; not a fixed-size buffer, allocation checked."},
+    {"anchor": "_dbus_credentials_add_from_user(auth->desired_identity, data) — line 33", "disposition": "finding", "reason": "Point where attacker names the target user identity; feeds the keyring-selection sink protected by the same-user gate."},
+    {"anchor": "_dbus_string_init(&tmp)/(&tmp2) with paired free — line 40-47", "disposition": "dismissed", "reason": "Correct init and cleanup ordering on early-return path; no leak or double-free."},
+    {"anchor": "_dbus_credentials_new_from_current_process() + NULL check — line 49-52", "disposition": "dismissed", "reason": "Server's own credentials captured and NULL-checked before use; safe."},
+    {"anchor": "!_dbus_credentials_same_user(myself, auth->desired_identity) — line 54", "disposition": "finding", "reason": "The CWE-59 symlink mitigation; whole mechanism's safety is load-bearing on this comparison."},
+    {"anchor": "_dbus_string_get_const_data(data) in _dbus_verbose — line 72", "disposition": "finding", "reason": "Untrusted client string logged (as %s argument); low-severity log-injection / relies on NUL-termination."},
+    {"anchor": "keyring drop if !_dbus_keyring_is_for_credentials — line 81-87", "disposition": "dismissed", "reason": "Prevents reuse of a stale keyring; only reachable after same-user validation."},
+    {"anchor": "_dbus_keyring_new_for_credentials(auth->desired_identity, &auth->context, &error) — line 91", "disposition": "finding", "reason": "The file-system sink for CWE-59; opens keyring in a user's home dir and depends on the same-user gate and symlink-safe implementation."},
+    {"anchor": "_dbus_keyring_get_best_key + cookie_id < 0 check — line 122-136", "disposition": "dismissed", "reason": "Return value validated; negative id rejected with error handling."},
+    {"anchor": "_dbus_string_copy(&auth->context, 0, &tmp2, len)/append/append_int — line 138-149", "disposition": "dismissed", "reason": "Assembles the challenge line into growable DBusStrings; insert positions correct, OOM checked; no fixed buffer."},
+    {"anchor": "N_CHALLENGE_BYTES / _dbus_generate_random_bytes(&tmp, ...) — line 151", "disposition": "finding", "reason": "Nonce entropy is a security property; not attacker-controlled but its size/RNG quality must be confirmed."},
+    {"anchor": "_dbus_string_hex_encode(&tmp, ...) into challenge and tmp2 — line 172-177", "disposition": "dismissed", "reason": "Hex-encodes fixed-size nonce into growable strings; no overflow surface."},
+    {"anchor": "DBusError error lifecycle (dbus_error_free on each branch) — lines 100,110,130,155,166", "disposition": "dismissed", "reason": "Error freed on every path that sets it; out: does not double-free; correct."},
+    {"anchor": "out: _dbus_string_zero/_dbus_string_free(&tmp,&tmp2); credentials_unref(myself) — line 185-192", "disposition": "dismissed", "reason": "Secrets scrubbed before free; myself unref guarded by NULL check; safe cleanup on all paths."}
+  ],
+  "findings": [
+    {
+      "title": "DBUS_COOKIE_SHA1 cross-user keyring access — symlink/link-following contract (mitigation present)",
+      "anchor": "if (!_dbus_credentials_same_user (myself, auth->desired_identity))",
+      "file": "corpus/eval/eval_0056_cwe59.c",
+      "line": "54-75",
+      "code": "  if (!_dbus_credentials_same_user (myself, auth->desired_identity))\n    {\n      /*\n       * DBUS_COOKIE_SHA1 is not suitable for authenticating that the\n       * client is anyone other than the user owning the process\n       * containing the DBusServer: we probably aren't allowed to write\n       * to other users' home directories. Even if we can (for example\n       * uid 0 on traditional Unix or CAP_DAC_OVERRIDE on Linux), we\n       * must not, because the other user controls their home directory,\n       * and could carry out symlink attacks to make us read from or\n       * write to unintended locations. It's difficult to avoid symlink\n       * attacks in a portable way, so we just don't try. This isn't a\n       * regression, because DBUS_COOKIE_SHA1 never worked for other\n       * users anyway.\n       */\n      _dbus_verbose (\"%s: client tried to authenticate as \\\"%s\\\", \"\n                     \"but that doesn't match this process\",\n                     DBUS_AUTH_NAME (auth),\n                     _dbus_string_get_const_data (data));\n      retval = send_rejected (auth);\n      goto out;\n    }",
+      "bug_class": "Link following / symlink attack via keyring in attacker-controlled home directory (improper access to another user's directory)",
+      "cwe": "CWE-59",
+      "severity": "high",
+      "where_it_lives": "corpus/eval/eval_0056_cwe59.c (gate) and the keyring implementation (file not provided)",
+      "invariant": "The server must only ever create, lock, read, or write a DBUS_COOKIE_SHA1 keyring belonging to its own process uid; a client-supplied desired_identity naming a different user MUST be rejected BEFORE any keyring path is resolved or opened, and the keyring open path must not follow symlinks.",
+      "failure_mode": "If this same-user gate were absent, reordered after the keyring creation at line 91, or defeated (e.g. same_user comparing spoofable names instead of resolved uids), a client could request authentication as another local user, causing the server — possibly running as root or with CAP_DAC_OVERRIDE — to open/create ~/.dbus-keyrings/ files in that victim's home directory. The victim, who owns that directory, can plant symlinks to redirect those reads/writes to arbitrary paths, yielding information disclosure, file corruption, or privilege escalation. In this fixed revision the gate is present and correctly precedes all keyring access, so the primitive is closed; the residual risk is the mechanism's total dependence on this one check plus a symlink-safe keyring open.",
+      "cve_analog": "CVE-2019-3597",
+      "what_to_confirm": "Confirm _dbus_credentials_same_user compares resolved uids (not spoofable usernames), that this check cannot be bypassed/reordered, and that _dbus_keyring_new_for_credentials opens the keyring and its lock files with symlink-safe semantics (O_NOFOLLOW, directory ownership/permission checks) with no TOCTOU window."
+    },
+    {
+      "title": "Untrusted client string emitted into verbose log",
+      "anchor": "_dbus_string_get_const_data (data)",
+      "file": "corpus/eval/eval_0056_cwe59.c",
+      "line": "69-72",
+      "code": "      _dbus_verbose (\"%s: client tried to authenticate as \\\"%s\\\", \"\n                     \"but that doesn't match this process\",\n                     DBUS_AUTH_NAME (auth),\n                     _dbus_string_get_const_data (data));",
+      "bug_class": "Improper neutralization of untrusted data in log output (log injection)",
+      "cwe": "CWE-117",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0056_cwe59.c",
+      "invariant": "Untrusted client-controlled bytes written to logs must be treated as data: the value must be passed as a format ARGUMENT (not a format string) and ideally sanitized/escaped so embedded control characters cannot forge or corrupt log entries.",
+      "failure_mode": "data is fully attacker-controlled and may contain newlines or terminal control sequences; when verbose logging is enabled this can spoof or corrupt log lines. It is passed as a %s argument (so not a format-string bug) and DBusString guarantees NUL-termination (so no over-read), which bounds the impact to low-severity log injection in a debug-only code path.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm _dbus_verbose output is debug-gated and that no downstream log consumer trusts its structure; consider escaping control characters if verbose logs are shipped to a parser."
+    },
+    {
+      "title": "Challenge nonce entropy depends on fixed N_CHALLENGE_BYTES and RNG quality",
+      "anchor": "_dbus_generate_random_bytes (&tmp, N_CHALLENGE_BYTES, &error)",
+      "file": "corpus/eval/eval_0056_cwe59.c",
+      "line": "151",
+      "code": "  if (!_dbus_generate_random_bytes (&tmp, N_CHALLENGE_BYTES, &error))",
+      "bug_class": "Insufficient / predictable randomness in authentication challenge",
+      "cwe": "CWE-330",
+      "severity": "info",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "The DBUS_COOKIE_SHA1 challenge nonce must be generated from a cryptographically strong RNG and be long enough (N_CHALLENGE_BYTES sufficiently large) that challenges are non-repeating and unpredictable, preventing replay or offline correlation attacks on the SHA-1 cookie proof.",
+      "failure_mode": "If N_CHALLENGE_BYTES is too small or _dbus_generate_random_bytes returns low-entropy/predictable output, an attacker could predict or replay server challenges and undermine the mutual proof-of-secret. Not attacker-controlled and not a memory-safety issue; flagged as a design dependency to verify.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm N_CHALLENGE_BYTES provides adequate entropy (typically >= 16 bytes) and that _dbus_generate_random_bytes draws from a CSPRNG (e.g. /dev/urandom), failing closed on error."
+    }
+  ],
+  "audit_checklist": [
+    "Verify _dbus_credentials_same_user compares resolved numeric uids, not client-supplied names, and cannot be tricked into returning true across users.",
+    "Confirm the same-user gate at line 54 always executes before _dbus_keyring_new_for_credentials at line 91 on every path, with no way to reorder or skip it.",
+    "Inspect _dbus_keyring_new_for_credentials / keyring lock handling for symlink-safe file access (O_NOFOLLOW, directory ownership+permission checks, no TOCTOU) — this is the actual CWE-59 sink.",
+    "Confirm auth->context cannot be influenced by the client to select a keyring file outside the intended directory.",
+    "Verify N_CHALLENGE_BYTES value and that _dbus_generate_random_bytes uses a CSPRNG and fails closed.",
+    "Check that DBusError is freed exactly once on every branch and never re-freed at the out: label (no double-free).",
+    "Confirm tmp/tmp2 are zeroed before free so nonce and assembled secret material are scrubbed, and myself is unref'd only when non-NULL.",
+    "Confirm verbose logging of untrusted data (line 72) is debug-gated and control characters cannot corrupt downstream log processing."
+  ]
+}

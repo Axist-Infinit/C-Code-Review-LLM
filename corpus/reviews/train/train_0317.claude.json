@@ -1,0 +1,175 @@
+{
+  "subsystem": "TensorFlow shape-inference runtime. This is InferenceContext::InternalMakeShapeFromTensor, the helper that converts a shape-carrying Tensor (or an unknown-value tensor whose shape is known) into an internal ShapeHandle during graph shape inference. It reads the dimension values out of an int32/int64 rank-1 tensor (or the single dimension count when the tensor value itself is unknown) and materializes a std::vector<DimensionHandle> that becomes the inferred output shape.",
+  "provenance": "Identified from the fully-qualified method name InferenceContext::InternalMakeShapeFromTensor, the TensorFlow-specific types (Status, Tensor, ShapeHandle, DimensionHandle), TF idioms (TF_RETURN_IF_ERROR, errors::Internal/InvalidArgument, DataType::DT_INT32/DT_INT64, t->scalar<T>(), t->flat<T>(), DataTypeString), and the in-source TODO(mihaimaruseac) comment (a TensorFlow maintainer). This lives in TensorFlow's core shape_inference.cc. The header comment '/* sample: primevul_train_2047_fixed */' marks it as a PrimeVul sample; it is reviewed blind on its merits.",
+  "trust_boundary": "The Tensor* t and the ShapeHandle tensor_shape originate from a graph/model that TensorFlow is asked to run. In a serving or model-loading context the graph (and constant/attr tensors feeding shape ops) is attacker-controllable: an adversary supplies a SavedModel/GraphDef or feeds tensors whose contents and shapes are hostile. The values that matter are num_dims = Value(Dim(tensor_shape, 0)) (the requested number of unknown dimensions when the tensor value is unknown) and the element values and element count of the int32/int64 shape tensor t. Both the requested dimension count and the tensor length are therefore hostile inputs that drive allocation and iteration.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0317_cwe400.cpp",
+      "lines": "2-4",
+      "code": "Status InferenceContext::InternalMakeShapeFromTensor(\n    bool treat_unknown_scalar_tensor_as_unknown_shape, const Tensor* t,\n    ShapeHandle tensor_shape, ShapeHandle* out) {",
+      "explanation": "The function signature. It returns a TensorFlow Status (success or an error object). treat_unknown_scalar_tensor_as_unknown_shape is a caller policy flag deciding whether a scalar tensor with unknown value is allowed to represent an unknown shape. t is the actual shape tensor whose element values are the requested dimensions; it may be nullptr when the tensor value is not statically known. tensor_shape is the ShapeHandle describing the SHAPE OF the shape tensor (i.e. how many dimensions the shape vector has). out is an output parameter that receives the constructed ShapeHandle. Both t (its data and shape) and tensor_shape carry attacker-influenced values."
+    },
+    {
+      "file": "corpus/train/train_0317_cwe400.cpp",
+      "lines": "6-8",
+      "code": "  if (!treat_unknown_scalar_tensor_as_unknown_shape) {\n    TF_RETURN_IF_ERROR(WithRank(tensor_shape, 1, &tensor_shape));\n  }",
+      "explanation": "When the caller has NOT opted into the unknown-scalar behavior, the code constrains tensor_shape to be rank 1 via WithRank, propagating any error immediately with TF_RETURN_IF_ERROR. WithRank both validates and rewrites tensor_shape in place. This is a validation gate ensuring the shape-of-the-shape is a 1-D vector before its single dimension is read below."
+    },
+    {
+      "file": "corpus/train/train_0317_cwe400.cpp",
+      "lines": "9-19",
+      "code": "  if (t == nullptr) {\n    // This is guarded by the check above.\n    if (Rank(tensor_shape) == 0) {\n      return ReturnUnknownShape(out);\n    }\n    // Shape tensor is not known, but if the shape of the shape tensor is then\n    // the right number of unknown dims can be created.\n    DimensionHandle shape_dim = Dim(tensor_shape, 0);\n    if (!ValueKnown(shape_dim)) {\n      return ReturnUnknownShape(out);\n    }",
+      "explanation": "This is the branch where the shape tensor's VALUE is unknown (t == nullptr) but its shape may be known. If tensor_shape is a scalar (Rank == 0), nothing about the number of dims is known, so it returns a fully unknown shape. Otherwise it fetches the first dimension of tensor_shape (Dim(tensor_shape, 0)) — that dimension's VALUE is the number of dimensions the resulting shape should have. If that value is not statically known (!ValueKnown), it again returns an unknown shape. ValueKnown is true only when the dimension holds a concrete, non-negative value, so the code beyond this point assumes shape_dim carries a known count."
+    },
+    {
+      "file": "corpus/train/train_0317_cwe400.cpp",
+      "lines": "20-33",
+      "code": "    const auto num_dims = Value(shape_dim);\n    // TODO(mihaimaruseac): Should be `TensorShape::MaxDimensions()` as we are\n    // not able to materialize shapes with more than this number of dimensions\n    // but then shape inference would fail for operations such as\n    // `tf.range`/`tf.ones`, etc. where the shape is not really materialized,\n    // only used during the inference. Hence, just prevent doing a `reserve`\n    // with a very large argument.\n    const int64_t max_dimensions = 1 << 20;\n    if (num_dims >= max_dimensions) {\n      return errors::Internal(\n          \"Cannot create a tensor with \", num_dims,\n          \" dimensions, as these would be more than maximum of \",\n          max_dimensions);\n    }",
+      "explanation": "num_dims is extracted from the known first dimension of tensor_shape — i.e. the attacker-influenced count of unknown dimensions to create. The comment explains this is a deliberate cap: rather than the semantically-correct TensorShape::MaxDimensions(), the authors clamp num_dims to a hard ceiling of 1 << 20 (1,048,576) precisely to avoid calling reserve with an enormous argument. If num_dims reaches or exceeds that ceiling the function returns an Internal error and never allocates. This block is the mitigation for an uncontrolled-allocation denial-of-service."
+    },
+    {
+      "file": "corpus/train/train_0317_cwe400.cpp",
+      "lines": "34-38",
+      "code": "    std::vector<DimensionHandle> dims;\n    dims.reserve(num_dims);\n    for (int i = 0; i < num_dims; i++) dims.push_back(UnknownDim());\n    return ReturnCreatedShape(dims, out);\n  }",
+      "explanation": "Having bounded num_dims below 2^20, the code reserves that many slots in the dims vector and appends num_dims UnknownDim() handles, producing a shape with the requested number of unknown dimensions, then hands the vector to ReturnCreatedShape which writes the result to out. The reserve is the resource-sensitive operation the cap above protects. Note the loop counter i is a plain int while num_dims is int64_t; this is safe only because num_dims is already clamped below 2^20 (< INT_MAX)."
+    },
+    {
+      "file": "corpus/train/train_0317_cwe400.cpp",
+      "lines": "40-69",
+      "code": "  if (t->shape().dims() == 0) {\n    if (t->dtype() == DataType::DT_INT32) {\n      auto flat_t = t->scalar<int32>();\n      if (flat_t() != -1) {\n        *out = nullptr;\n        return errors::InvalidArgument(\n            \"Input tensor must be rank 1, or if its rank 0 it must have value \"\n            \"-1 \"\n            \"(representing an unknown shape).  Saw value: \",\n            flat_t());\n      }\n      return ReturnUnknownShape(out);\n    } else if (t->dtype() == DataType::DT_INT64) {\n      auto flat_t = t->scalar<int64_t>();\n      if (flat_t() != -1) {\n        *out = nullptr;\n        return errors::InvalidArgument(\n            \"Input tensor must be rank 1, or if its rank 0 it must have value \"\n            \"-1 \"\n            \"(representing an unknown shape).  Saw value: \",\n            flat_t());\n      }\n      return ReturnUnknownShape(out);\n    } else {\n      *out = nullptr;\n      return errors::InvalidArgument(\n          \"Input tensor must be int32 or int64, but was \",\n          DataTypeString(t->dtype()));\n    }\n  }",
+      "explanation": "This branch runs when t is present (t != nullptr) and is a scalar (dims() == 0). A scalar shape tensor is only legal if its single value is -1, meaning 'unknown shape'. For each supported dtype (DT_INT32, DT_INT64) it reads the scalar via t->scalar<T>(); if the value is anything other than -1 it clears *out to nullptr and returns InvalidArgument echoing the offending value, otherwise it returns an unknown shape. Any other dtype is rejected with InvalidArgument. The dtype checks gate the typed scalar<T>() accessor so the read matches the tensor's real element type."
+    },
+    {
+      "file": "corpus/train/train_0317_cwe400.cpp",
+      "lines": "71-80",
+      "code": "  if (t->shape().dims() != 1) {\n    *out = nullptr;\n    return errors::InvalidArgument(\n        \"Input tensor must be rank 1, but was rank \", t->shape().dims(), \".\",\n        ((t->shape().dims() == 0)\n             ? \"If it is rank 0 rank 0 it must have statically known value -1 \"\n               \"(representing an unknown shape). \"\n             : \" \"),\n        \"Saw tensor shape \", t->shape().DebugString());",
+      "explanation": "By this point t is non-null and not a scalar, so the only remaining legal case is a rank-1 vector of dimension values. Any other rank is rejected with InvalidArgument (clearing *out). This is the structural validation gate ensuring the following loop iterates over a 1-D vector of dimension entries. The ternary's message text is duplicated ('rank 0 rank 0') — a cosmetic wording bug, not a security issue."
+    },
+    {
+      "file": "corpus/train/train_0317_cwe400.cpp",
+      "lines": "81-92",
+      "code": "  std::vector<DimensionHandle> dims;\n  if (t->dtype() == DataType::DT_INT32) {\n    auto flat_t = t->flat<int32>();\n    for (int i = 0; i < flat_t.size(); ++i) {\n      const int32_t val = flat_t(i);\n      if (val < -1) {\n        return errors::InvalidArgument(\n            \"Invalid value in tensor used for shape: \", val);\n      }\n      // -1 will become an unknown dim.\n      dims.push_back(MakeDim(val));\n    }",
+      "explanation": "For a rank-1 int32 shape tensor, the code flattens the tensor and iterates over every element. Each value must be >= -1: -1 encodes an unknown dimension, and any value below -1 is rejected as invalid. Valid values are converted to a DimensionHandle via MakeDim(val) and appended to dims. The vector grows to one entry per tensor element. Unlike the t == nullptr branch, this path does NOT reserve or cap the element count — its size is bounded only by the length of the input tensor."
+    },
+    {
+      "file": "corpus/train/train_0317_cwe400.cpp",
+      "lines": "93-109",
+      "code": "  } else if (t->dtype() == DataType::DT_INT64) {\n    auto flat_t = t->flat<int64_t>();\n    for (int i = 0; i < flat_t.size(); ++i) {\n      const int64_t val = flat_t(i);\n      if (val < -1) {\n        return errors::InvalidArgument(\n            \"Invalid value in tensor used for shape: \", val);\n      }\n      // -1 will become an unknown dim.\n      dims.push_back(MakeDim(val));\n    }\n  } else {\n    *out = nullptr;\n    return errors::InvalidArgument(\n        \"Input tensor must be int32 or int64, but was \",\n        DataTypeString(t->dtype()));\n  }",
+      "explanation": "The int64 mirror of the previous block: it flattens the tensor as int64_t, validates each element is >= -1, and appends MakeDim(val) for each. Any dtype other than int32/int64 falls through to the else clause which clears *out and returns InvalidArgument. The same absence of a per-element count cap applies here."
+    },
+    {
+      "file": "corpus/train/train_0317_cwe400.cpp",
+      "lines": "111-112",
+      "code": "  return ReturnCreatedShape(dims, out);\n}",
+      "explanation": "After building the dims vector from the tensor's values, the constructed shape is finalized by ReturnCreatedShape, which writes the ShapeHandle to out and returns OK. This is the success exit for the rank-1 tensor path."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0317_cwe400.cpp",
+      "lines": "34-36",
+      "code": "    std::vector<DimensionHandle> dims;\n    dims.reserve(num_dims);\n    for (int i = 0; i < num_dims; i++) dims.push_back(UnknownDim());",
+      "explanation": "num_dims (line 20) is the value of the first dimension of the shape-of-the-shape tensor — an attacker-influenced count. Passed straight to dims.reserve(num_dims), a huge value would demand an immediate contiguous allocation of num_dims * sizeof(DimensionHandle) bytes, and the subsequent loop would push that many handles, causing memory exhaustion / bad_alloc / process abort: a classic uncontrolled-resource-consumption denial of service. The invariant is that num_dims MUST be bounded before it drives reserve/loop. In THIS revision that invariant is upheld by the max_dimensions = 1<<20 gate at lines 27-33 (the comment says so explicitly: 'just prevent doing a reserve with a very large argument'). Residual risk: the 2^20 ceiling still permits reserving ~1,048,575 DimensionHandles per call, and nothing rate-limits repeated calls, so a graph with many such shape ops can still amplify memory pressure — the cap prevents catastrophic single-shot OOM, not all resource abuse."
+    },
+    {
+      "file": "corpus/train/train_0317_cwe400.cpp",
+      "lines": "84-84",
+      "code": "    for (int i = 0; i < flat_t.size(); ++i) {",
+      "explanation": "The loop counter i is a signed int (32-bit), while flat_t.size() returns a 64-bit element count (Eigen index / int64). For a rank-1 tensor with more than INT_MAX (2^31-1) elements the comparison i < flat_t.size() promotes i and never terminates as expected: once i overflows past INT_MAX it becomes negative (signed overflow, UB) and the loop can spin or index incorrectly. The same construct appears at line 95 for the int64 path. The invariant is that the loop bound must be an integer type wide enough for the tensor length (use int64_t i, or Eigen::Index). Impact is bounded because materializing a >2-billion-element int32 tensor already requires ~8 GB, so this is a latent, low-severity overflow rather than a readily-triggered one, but it is real defensive-hardening debt on an attacker-sized input."
+    },
+    {
+      "file": "corpus/train/train_0317_cwe400.cpp",
+      "lines": "81-83",
+      "code": "  std::vector<DimensionHandle> dims;\n  if (t->dtype() == DataType::DT_INT32) {\n    auto flat_t = t->flat<int32>();",
+      "explanation": "The t != nullptr rank-1 path builds dims with one entry per tensor element and, unlike the t == nullptr path, applies NO explicit 2^20 cap — the vector size is bounded only by flat_t.size(), the length of the input tensor. An attacker who can supply a very long rank-1 int32/int64 constant forces a second large vector of DimensionHandles plus per-element MakeDim work. This is a milder resource path than the reserve case because the source tensor of length N already occupies N*4 or N*8 bytes of committed memory, so the amplification factor is small; still, the asymmetry (capped in one branch, uncapped here) is worth confirming against TensorShape::MaxDimensions() expectations. The invariant: the produced shape's dimension count should be bounded by the same materialization limit the other branch enforces."
+    },
+    {
+      "file": "corpus/train/train_0317_cwe400.cpp",
+      "lines": "28-28",
+      "code": "    if (num_dims >= max_dimensions) {",
+      "explanation": "The guard checks only the UPPER bound (num_dims >= 2^20). It does not reject a negative num_dims. If Value(shape_dim) could ever be negative, dims.reserve(num_dims) would convert it to an enormous size_t and abort. In practice this is not reachable here: ValueKnown(shape_dim) at line 17 is true only for concrete non-negative dimension values (unknown/negative-sentinel dims fail ValueKnown), so num_dims >= 0 is already established. Flagged as the invariant to confirm — if a future change let a negative known value through, the one-sided bound would become an allocation bug."
+    }
+  ],
+  "summary": "This is TensorFlow's InternalMakeShapeFromTensor shape-inference helper, which turns an attacker-influenced shape tensor into a ShapeHandle. Its central security contract is an uncontrolled-resource-consumption (CWE-400/CWE-770) DoS via dims.reserve(num_dims); in this revision that risk is mitigated by an explicit max_dimensions = 1<<20 cap before the reserve, so the shown code is low-to-medium residual risk. Secondary latent issues are a signed int loop counter compared against a 64-bit tensor length and an uncapped second (t != nullptr) allocation path.",
+  "reviewed_anchors": [
+    {"anchor": "InternalMakeShapeFromTensor(bool, const Tensor* t, ShapeHandle tensor_shape, ShapeHandle* out)", "disposition": "finding", "reason": "Entry point; t and tensor_shape carry untrusted values that drive allocation and iteration."},
+    {"anchor": "treat_unknown_scalar_tensor_as_unknown_shape (bool)", "disposition": "dismissed", "reason": "Caller policy flag; only selects a validation path, no memory/size contract."},
+    {"anchor": "WithRank(tensor_shape, 1, &tensor_shape) (line 7)", "disposition": "dismissed", "reason": "Validation gate constraining the shape-of-the-shape to rank 1; error is propagated."},
+    {"anchor": "t == nullptr (line 9)", "disposition": "dismissed", "reason": "Branch guard selecting the unknown-value path; safe null check."},
+    {"anchor": "Rank(tensor_shape) == 0 (line 11)", "disposition": "dismissed", "reason": "Guard returning unknown shape for a scalar shape-of-shape; no risk."},
+    {"anchor": "Dim(tensor_shape, 0) / shape_dim (line 16)", "disposition": "dismissed", "reason": "Reads first dim handle; the risk is in its VALUE, tracked under num_dims."},
+    {"anchor": "ValueKnown(shape_dim) (line 17)", "disposition": "dismissed", "reason": "Guard; true only for concrete non-negative values, establishing num_dims >= 0."},
+    {"anchor": "num_dims = Value(shape_dim) (line 20)", "disposition": "finding", "reason": "Attacker-influenced dimension count that drives reserve and the loop."},
+    {"anchor": "max_dimensions = 1 << 20 (line 27)", "disposition": "finding", "reason": "The allocation cap constant; it is the mitigation for the reserve DoS and must be reviewed for coverage."},
+    {"anchor": "num_dims >= max_dimensions (line 28)", "disposition": "finding", "reason": "One-sided upper-bound guard; confirm negative values cannot reach reserve."},
+    {"anchor": "dims.reserve(num_dims) (line 35)", "disposition": "finding", "reason": "Resource-sensitive allocation sized by untrusted count; primary DoS surface."},
+    {"anchor": "for (int i = 0; i < num_dims; i++) (line 36)", "disposition": "dismissed", "reason": "int counter vs int64 num_dims, but num_dims is already clamped below 2^20 so no overflow."},
+    {"anchor": "t->shape().dims() == 0 (line 40)", "disposition": "dismissed", "reason": "Scalar-tensor branch selector; no size contract."},
+    {"anchor": "t->dtype() == DT_INT32 / DT_INT64 checks (lines 41,52,82,93)", "disposition": "dismissed", "reason": "dtype validation gating the typed accessor; correct."},
+    {"anchor": "t->scalar<int32>() / t->scalar<int64_t>() (lines 42,53)", "disposition": "dismissed", "reason": "Typed scalar read guarded by matching dtype check; single element."},
+    {"anchor": "flat_t() != -1 (lines 43,54)", "disposition": "dismissed", "reason": "Value validation for scalar case; no memory effect."},
+    {"anchor": "*out = nullptr on error paths (lines 44,55,64,72,105)", "disposition": "dismissed", "reason": "Defensive clearing of the out param before returning an error; safe."},
+    {"anchor": "t->shape().dims() != 1 (line 71)", "disposition": "dismissed", "reason": "Rank validation gate ensuring the following loop sees a 1-D vector."},
+    {"anchor": "t->flat<int32>() / t->flat<int64_t>() (lines 83,94)", "disposition": "dismissed", "reason": "Typed flatten guarded by dtype; access bounded by flat_t.size()."},
+    {"anchor": "for (int i = 0; i < flat_t.size(); ++i) (lines 84,95)", "disposition": "finding", "reason": "Signed int loop counter compared against a 64-bit element count; latent overflow for >INT_MAX elements."},
+    {"anchor": "val = flat_t(i); if (val < -1) (lines 85-86,96-97)", "disposition": "dismissed", "reason": "Per-element value validation; rejects values below -1 correctly."},
+    {"anchor": "dims.push_back(MakeDim(val)) (lines 91,102)", "disposition": "dismissed", "reason": "Append bounded by tensor length; see uncapped-path finding for the aggregate size concern."},
+    {"anchor": "std::vector<DimensionHandle> dims (line 81)", "disposition": "finding", "reason": "Second allocation path with no explicit dimension-count cap, unlike the t==nullptr path."},
+    {"anchor": "ReturnCreatedShape / ReturnUnknownShape / UnknownDim / MakeDim (helpers)", "disposition": "dismissed", "reason": "Helper calls whose implementations are not shown; no contract visible here."}
+  ],
+  "findings": [
+    {
+      "title": "Uncontrolled memory allocation from attacker-influenced dimension count (reserve DoS)",
+      "anchor": "dims.reserve(num_dims); with num_dims = Value(shape_dim)",
+      "file": "corpus/train/train_0317_cwe400.cpp",
+      "line": "34-36",
+      "code": "    std::vector<DimensionHandle> dims;\n    dims.reserve(num_dims);\n    for (int i = 0; i < num_dims; i++) dims.push_back(UnknownDim());",
+      "bug_class": "Uncontrolled resource consumption (unbounded allocation from untrusted count)",
+      "cwe": "CWE-770",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0317_cwe400.cpp (this file), backed by implementation of reserve/ReturnCreatedShape (file not provided)",
+      "invariant": "num_dims must be clamped to a sane maximum BEFORE it is passed to reserve() or used as a loop bound, so a hostile shape tensor cannot force an arbitrarily large allocation.",
+      "failure_mode": "num_dims is read from the first dimension of the shape-of-the-shape tensor (line 20), an attacker-influenced value. Fed directly to reserve(num_dims), a very large value triggers an enormous contiguous allocation -> bad_alloc/abort/OOM, a denial of service reachable from a crafted graph. This revision MITIGATES it: lines 27-33 reject num_dims >= 1<<20 before the reserve, so single-shot catastrophic OOM is prevented. Residual: the 2^20 ceiling still allows ~1M DimensionHandles per call and there is no cross-call rate limiting, so many shape ops can still amplify memory pressure.",
+      "cve_analog": "",
+      "what_to_confirm": "That the max_dimensions gate at lines 27-33 executes on EVERY path that reaches reserve (it does here) and that 1<<20 is an acceptable ceiling relative to TensorShape::MaxDimensions(); also confirm no negative num_dims can slip past the one-sided >= check."
+    },
+    {
+      "title": "Signed 32-bit loop counter compared against 64-bit tensor length",
+      "anchor": "for (int i = 0; i < flat_t.size(); ++i)",
+      "file": "corpus/train/train_0317_cwe400.cpp",
+      "line": "84",
+      "code": "    for (int i = 0; i < flat_t.size(); ++i) {",
+      "bug_class": "Integer overflow of loop index (signed int vs 64-bit size)",
+      "cwe": "CWE-190",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0317_cwe400.cpp (this file); identical construct at line 95",
+      "invariant": "The loop induction variable must be wide enough to represent flat_t.size() (int64/Eigen::Index), so iteration over a tensor with more than INT_MAX elements terminates correctly and indexes in-bounds.",
+      "failure_mode": "flat_t.size() is a 64-bit count but i is a 32-bit signed int. For a rank-1 tensor with > 2^31-1 elements, i overflows to a negative value (signed overflow, undefined behavior) before the loop reaches the end, causing a non-terminating or mis-indexing loop. Practically bounded because such a tensor needs multiple GB of memory, so it is a latent hardening issue rather than an easily triggered bug.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether flat_t.size() can exceed INT_MAX in supported deployments; change i to int64_t/Eigen::Index at lines 84 and 95 to remove the UB."
+    },
+    {
+      "title": "Uncapped dimension count on the t != nullptr rank-1 path",
+      "anchor": "std::vector<DimensionHandle> dims; ... dims.push_back(MakeDim(val));",
+      "file": "corpus/train/train_0317_cwe400.cpp",
+      "line": "81-102",
+      "code": "  std::vector<DimensionHandle> dims;\n  if (t->dtype() == DataType::DT_INT32) {\n    auto flat_t = t->flat<int32>();\n    for (int i = 0; i < flat_t.size(); ++i) {\n      const int32_t val = flat_t(i);\n      if (val < -1) {\n        return errors::InvalidArgument(\n            \"Invalid value in tensor used for shape: \", val);\n      }\n      // -1 will become an unknown dim.\n      dims.push_back(MakeDim(val));\n    }",
+      "bug_class": "Missing resource cap (asymmetric with the guarded branch)",
+      "cwe": "CWE-400",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0317_cwe400.cpp (this file); mirror block at lines 93-103",
+      "invariant": "The number of dimensions produced from a materialized shape tensor should be bounded by the same materialization limit (TensorShape::MaxDimensions() / 2^20) applied on the t == nullptr path.",
+      "failure_mode": "Unlike the t == nullptr branch (which caps num_dims at 2^20 before allocating), this path builds dims with one DimensionHandle per input element and applies no explicit count cap; the size is limited only by flat_t.size(). A very long rank-1 constant tensor forces a correspondingly large vector plus per-element MakeDim work. The amplification is small because the source tensor of length N already occupies N*4/N*8 bytes, but the missing cap is an inconsistency that lets a shape far exceeding the intended dimension limit be constructed.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether a downstream MaxDimensions() check rejects the oversized shape, or whether this branch should also enforce the 1<<20 ceiling before/while building dims."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm the max_dimensions = 1<<20 gate (lines 27-33) is reached on every path that calls dims.reserve(num_dims), and that 1<<20 matches or is stricter than TensorShape::MaxDimensions().",
+    "Verify Value(shape_dim) can never be negative when ValueKnown(shape_dim) is true, so the one-sided num_dims >= max_dimensions check (line 28) cannot let a negative value into reserve().",
+    "Widen the loop counters at lines 84 and 95 from int to int64_t/Eigen::Index, or otherwise bound flat_t.size() below INT_MAX, to avoid signed overflow of i.",
+    "Decide whether the t != nullptr rank-1 path (lines 81-109) needs the same dimension-count cap as the t == nullptr path, and cap it if a downstream check does not already reject oversized shapes.",
+    "Check that ReturnCreatedShape/ReturnUnknownShape/MakeDim correctly handle the produced dims (including -1 -> unknown dim) and that no path leaves *out uninitialized on error (error paths set *out = nullptr; the t == nullptr early-returns rely on Return* helpers to set out).",
+    "Confirm the dtype gating (DT_INT32/DT_INT64) fully matches the typed scalar<T>()/flat<T>() accessors so no type-confused read of tensor data occurs."
+  ]
+}

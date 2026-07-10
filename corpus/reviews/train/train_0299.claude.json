@@ -1,0 +1,187 @@
+{
+  "subsystem": "uWebSockets WebSocket permessage-deflate (RFC 7692) decompression path. Hub::inflate() takes a compressed WebSocket message payload and runs it through a persistent zlib inflate stream, accumulating the decompressed bytes and returning a pointer to them. It is the server-side inflate half of the permessage-deflate extension.",
+  "provenance": "Identified by the class/method name Hub::inflate, the zlib z_stream member usage (inflationStream.next_in / avail_in / next_out / avail_out, ::inflate(..., Z_FINISH), inflateReset), and the member buffers inflationBuffer / dynamicInflationBuffer with the LARGE_BUFFER_SIZE and INFLATE_LESS_THAN_ROUGHLY constants — these names are the uWebSockets (Alex Hultman) Hub::inflate implementation. The header comment `sample: primevul_train_2190_fixed` and filename `train_0299_cwe20.cpp` mark it as a PrimeVul 'fixed' sample tagged CWE-20.",
+  "trust_boundary": "The `data`/`length` pair passed to Hub::inflate is the raw, attacker-controlled compressed payload of an inbound WebSocket frame (permessage-deflate). Everything the zlib stream reads is hostile: the compressed byte stream can be a crafted 'zip bomb' that expands to an unbounded size, can be malformed, or can carry trailing bytes after the deflate stream end. The decompressed output and the returned pointer are then handed back to the caller (message dispatch) which treats them as a decoded application message. The z_stream, inflationBuffer, and dynamicInflationBuffer are per-Hub (per-connection-loop) members reused across every call, so the lifetime of returned pointers is a second, intra-process trust concern.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0299_cwe20.cpp",
+      "lines": "2-3",
+      "code": "char *Hub::inflate(char *data, size_t &length) {\n    dynamicInflationBuffer.clear();",
+      "explanation": "Entry point. `data` is a pointer to the compressed WebSocket payload and `length` is its size passed by reference — `length` doubles as an out-parameter, rewritten before return to the size of the decompressed result (or 0 on failure). The first action clears `dynamicInflationBuffer`, a per-Hub std::string used to accumulate output when the decompressed message does not fit in the single fixed staging buffer. Because it is a member (not a local), clear() only resets its logical length; the previous call's contents are logically discarded but the backing storage may be retained/reused, which matters for the lifetime of any pointer a previous call handed out."
+    },
+    {
+      "file": "corpus/train/train_0299_cwe20.cpp",
+      "lines": "5-6",
+      "code": "inflationStream.next_in = (Bytef *) data;\n    inflationStream.avail_in = length;",
+      "explanation": "The persistent zlib stream `inflationStream` is pointed at the untrusted input: `next_in` = the compressed bytes, `avail_in` = how many bytes are available. This is the exact point where attacker-controlled data crosses into the zlib state machine. `avail_in` is a uInt (32-bit); `length` is size_t (potentially 64-bit), so on a message larger than 4 GiB this assignment truncates, though WebSocket framing normally bounds this upstream."
+    },
+    {
+      "file": "corpus/train/train_0299_cwe20.cpp",
+      "lines": "8-18",
+      "code": "int err;\n    do {\n        inflationStream.next_out = (Bytef *) inflationBuffer;\n        inflationStream.avail_out = LARGE_BUFFER_SIZE;\n        err = ::inflate(&inflationStream, Z_FINISH);\n        if (!inflationStream.avail_in) {\n            break;\n        }\n\n        dynamicInflationBuffer.append(inflationBuffer, LARGE_BUFFER_SIZE - inflationStream.avail_out);\n    } while (err == Z_BUF_ERROR && dynamicInflationBuffer.length() <= INFLATE_LESS_THAN_ROUGHLY);",
+      "explanation": "The core decompression loop. Each iteration resets the output window to the fixed member buffer `inflationBuffer` with capacity `LARGE_BUFFER_SIZE`, then calls zlib `::inflate` with `Z_FINISH`. After the call, `avail_out` is how much of the staging buffer is still unused, so `LARGE_BUFFER_SIZE - avail_out` is the number of decompressed bytes produced this pass. If all input was consumed (`!avail_in`), the loop breaks immediately WITHOUT appending this pass's output — the final chunk is intentionally left in `inflationBuffer` to be handled after the loop (lines 28 or 34). Otherwise the produced chunk is appended to `dynamicInflationBuffer` and the loop repeats only while zlib reported `Z_BUF_ERROR` (staging buffer filled, more output pending) AND the accumulated length has not yet exceeded the anti-bomb cap `INFLATE_LESS_THAN_ROUGHLY`. This cap-in-the-loop-condition is the decompression-bomb guard."
+    },
+    {
+      "file": "corpus/train/train_0299_cwe20.cpp",
+      "lines": "20",
+      "code": "inflateReset(&inflationStream);",
+      "explanation": "After the loop, `inflateReset` returns the zlib stream to a clean initial state so the same `inflationStream` object can be reused for the next message on this connection without a full inflateInit/inflateEnd cycle. Note it resets internal state but does not alter the `avail_out`/`next_out` fields, so the post-loop code (lines 28 and 34) can still read `inflationStream.avail_out` from the last `::inflate` call to learn how many bytes the final pass produced."
+    },
+    {
+      "file": "corpus/train/train_0299_cwe20.cpp",
+      "lines": "22-25",
+      "code": "if ((err != Z_BUF_ERROR && err != Z_OK) || dynamicInflationBuffer.length() > INFLATE_LESS_THAN_ROUGHLY) {\n        length = 0;\n        return nullptr;\n    }",
+      "explanation": "The failure gate. If zlib ended with anything other than `Z_BUF_ERROR` or `Z_OK` (i.e. a real error such as Z_DATA_ERROR from a corrupt stream, or Z_STREAM_ERROR), OR if the accumulated output exceeded the bomb cap, the function reports failure by setting `length = 0` and returning nullptr. This is the enforcement half of the anti-bomb check: the loop condition stops accumulating once past the cap, and this line converts an over-cap result into an outright rejection so an over-large message is never returned to the caller."
+    },
+    {
+      "file": "corpus/train/train_0299_cwe20.cpp",
+      "lines": "27-32",
+      "code": "if (dynamicInflationBuffer.length()) {\n        dynamicInflationBuffer.append(inflationBuffer, LARGE_BUFFER_SIZE - inflationStream.avail_out);\n\n        length = dynamicInflationBuffer.length();\n        return (char *) dynamicInflationBuffer.data();\n    }",
+      "explanation": "Multi-pass path: if any chunk was appended during the loop, the message spanned more than one staging buffer, so `dynamicInflationBuffer` holds the earlier chunks. The loop broke on `!avail_in` before appending the FINAL pass, so line 28 appends that last chunk (`LARGE_BUFFER_SIZE - avail_out` bytes still sitting in `inflationBuffer`). It then writes the total decompressed size into the out-parameter `length` and returns a raw `char*` into the std::string's internal storage via `dynamicInflationBuffer.data()`. That pointer aliases a per-Hub member buffer and is only valid until the string is next mutated (the very next inflate() call begins with clear())."
+    },
+    {
+      "file": "corpus/train/train_0299_cwe20.cpp",
+      "lines": "34-35",
+      "code": "length = LARGE_BUFFER_SIZE - inflationStream.avail_out;\n    return inflationBuffer;",
+      "explanation": "Single-pass fast path: the loop broke on `!avail_in` on the first iteration and nothing was ever appended, so the entire decompressed message fits in `inflationBuffer`. `length` is set to the bytes produced in that one pass and the function returns the fixed member buffer `inflationBuffer` directly (no copy). As with the multi-pass path, this pointer is a shared per-Hub buffer that the next inflate() call will overwrite, so the caller must consume it before invoking inflate again."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0299_cwe20.cpp",
+      "lines": "30-31",
+      "code": "length = dynamicInflationBuffer.length();\n        return (char *) dynamicInflationBuffer.data();",
+      "explanation": "The returned pointer aliases the internal storage of the per-Hub member std::string `dynamicInflationBuffer`. `.data()` is valid only while that string is alive AND unmodified. The very next call to Hub::inflate() begins with `dynamicInflationBuffer.clear()` (line 3) and appends fresh data, which can reallocate or overwrite that storage, so any caller that retains the returned pointer across a second inflate() (or across message dispatch that can re-enter inflate) reads freed/overwritten memory — a use-after-free / stale-read (CWE-416). The implementation's implicit contract is 'consume the returned buffer fully before the next inflate() call and never store it'; nothing in this function enforces that, so the safety depends entirely on the caller."
+    },
+    {
+      "file": "corpus/train/train_0299_cwe20.cpp",
+      "lines": "34-35",
+      "code": "length = LARGE_BUFFER_SIZE - inflationStream.avail_out;\n    return inflationBuffer;",
+      "explanation": "Same aliasing hazard on the single-pass path: `inflationBuffer` is a fixed-size member reused by every call and by both branches. The returned pointer is overwritten on the next inflate() (line 10 sets next_out back to it and ::inflate rewrites it). Additionally the caller learns the valid length only through the by-reference out-parameter `length`; if the caller uses inflationBuffer without honoring `length`, it reads stale bytes beyond the decompressed region (uninitialized-buffer read, CWE-125). The invariant the caller must uphold is: treat exactly `length` bytes as valid and copy them out before the next call."
+    },
+    {
+      "file": "corpus/train/train_0299_cwe20.cpp",
+      "lines": "18",
+      "code": "} while (err == Z_BUF_ERROR && dynamicInflationBuffer.length() <= INFLATE_LESS_THAN_ROUGHLY);",
+      "explanation": "Decompression-bomb defense. A crafted permessage-deflate payload can expand enormously (classic zip bomb → uncontrolled resource consumption / memory exhaustion DoS, CWE-400). The cap `INFLATE_LESS_THAN_ROUGHLY` bounds it, but note the guard is checked AFTER an append: the loop appends one full `LARGE_BUFFER_SIZE` chunk, then tests `length() <= cap`. So the accumulated buffer can overshoot the cap by up to one LARGE_BUFFER_SIZE chunk before the loop stops, and the post-loop gate (line 22) then rejects it. This bounds memory to roughly cap + LARGE_BUFFER_SIZE per call, which is the intended fix, but the exactness of the bound depends on LARGE_BUFFER_SIZE being modest; the invariant is that cap + one chunk must stay within acceptable per-connection memory, and that this routine cannot be driven concurrently to multiply that cost across many connections faster than they are drained."
+    },
+    {
+      "file": "corpus/train/train_0299_cwe20.cpp",
+      "lines": "13-28",
+      "code": "if (!inflationStream.avail_in) {\n            break;\n        }\n\n        dynamicInflationBuffer.append(inflationBuffer, LARGE_BUFFER_SIZE - inflationStream.avail_out);\n    } while (err == Z_BUF_ERROR && dynamicInflationBuffer.length() <= INFLATE_LESS_THAN_ROUGHLY);\n\n    inflateReset(&inflationStream);\n\n    if ((err != Z_BUF_ERROR && err != Z_OK) || dynamicInflationBuffer.length() > INFLATE_LESS_THAN_ROUGHLY) {\n        length = 0;\n        return nullptr;\n    }\n\n    if (dynamicInflationBuffer.length()) {\n        dynamicInflationBuffer.append(inflationBuffer, LARGE_BUFFER_SIZE - inflationStream.avail_out);",
+      "explanation": "Double-append / duplicated-data logic hazard. The loop's 'skip the append and handle it after the loop' design (break at line 14 leaving the final chunk in inflationBuffer, re-appended at line 28) is only correct when the loop exits via the `!avail_in` break. Consider an attacker who appends extra trailing bytes after a complete deflate stream: ::inflate can return Z_OK with `avail_in != 0`. Then the break at line 13 is NOT taken, line 17 appends the produced chunk, and the while-condition `err == Z_BUF_ERROR` is false so the loop exits — but line 27 sees a non-empty buffer and line 28 appends `LARGE_BUFFER_SIZE - avail_out` AGAIN from the same, unchanged inflationBuffer/avail_out, duplicating the last chunk into the returned message. That is a content-integrity defect (CWE-20 improper input handling): the decompressed message handed to the application contains duplicated trailing bytes under attacker-influenced conditions. The invariant is that each produced chunk is appended exactly once; the break-then-reappend structure does not hold when the loop exits for a reason other than `!avail_in`."
+    },
+    {
+      "file": "corpus/train/train_0299_cwe20.cpp",
+      "lines": "17",
+      "code": "dynamicInflationBuffer.append(inflationBuffer, LARGE_BUFFER_SIZE - inflationStream.avail_out);",
+      "explanation": "The length argument `LARGE_BUFFER_SIZE - inflationStream.avail_out` is unsigned arithmetic. It is safe only under zlib's contract that `avail_out <= LARGE_BUFFER_SIZE` (zlib never leaves more space than it was given). If that invariant were ever violated — e.g. a corrupted/mismatched z_stream, or a build where inflationBuffer is smaller than LARGE_BUFFER_SIZE — the subtraction wraps to a near-SIZE_MAX value and std::string::append reads far past inflationBuffer, an out-of-bounds read and likely crash (CWE-191 leading to CWE-125). This is latent: it depends on the buffer/constant pairing in the header (not shown), so it must be confirmed that sizeof(inflationBuffer) == LARGE_BUFFER_SIZE and that next_out was always set to inflationBuffer before each ::inflate."
+    },
+    {
+      "file": "corpus/train/train_0299_cwe20.cpp",
+      "lines": "5-6",
+      "code": "inflationStream.next_in = (Bytef *) data;\n    inflationStream.avail_in = length;",
+      "explanation": "Trust boundary and truncation. `length` is size_t but `avail_in` is a 32-bit uInt; a message length above 4 GiB truncates, so `avail_in` could understate the real input and leave attacker bytes unconsumed (the framing layer normally caps this, but this routine does not validate it). More generally, this is the sole point of ingestion of hostile compressed data and there is no validation of `data`/`length` here (e.g. `data` non-null when `length` > 0); a null `data` with non-zero `length` would fault inside zlib (CWE-476/CWE-20). The invariant is that the caller has already bounded `length` to a sane maximum and guaranteed `data` validity."
+    }
+  ],
+  "summary": "This is the uWebSockets permessage-deflate Hub::inflate routine, the 'fixed' variant that added the INFLATE_LESS_THAN_ROUGHLY zip-bomb cap. The residual security-relevant contracts are all latent and caller-dependent: (1) both return paths hand back pointers into per-Hub reusable buffers (dynamicInflationBuffer.data() and inflationBuffer) that the next inflate() call overwrites — a use-after-free if retained (CWE-416); (2) the bomb cap is enforced but overshoots by one LARGE_BUFFER_SIZE chunk (CWE-400); (3) the break-then-reappend logic duplicates the final chunk when zlib returns Z_OK with trailing bytes still in avail_in (CWE-20). None is a memory-corruption bug within this function itself; the danger lives in the invariants the caller and the header constants must uphold.",
+  "reviewed_anchors": [
+    {"anchor": "char *Hub::inflate(char *data, size_t &length)", "disposition": "finding", "reason": "Untrusted-input entry; returns a raw pointer into a reused member buffer and mutates the length out-parameter — lifetime and validation contract."},
+    {"anchor": "dynamicInflationBuffer (member std::string) / .data() / .clear() / .append() / .length()", "disposition": "finding", "reason": "Returned .data() pointer aliases member storage invalidated by the next call's clear()/append() — CWE-416."},
+    {"anchor": "inflationBuffer (fixed member buffer, size LARGE_BUFFER_SIZE)", "disposition": "finding", "reason": "Returned directly on the single-pass path and reused every call; stale-read hazard and the base for the LARGE_BUFFER_SIZE - avail_out length arithmetic."},
+    {"anchor": "LARGE_BUFFER_SIZE (macro)", "disposition": "finding", "reason": "Must equal sizeof(inflationBuffer) or LARGE_BUFFER_SIZE - avail_out underflows; also the per-chunk overshoot amount for the bomb cap."},
+    {"anchor": "INFLATE_LESS_THAN_ROUGHLY (macro)", "disposition": "finding", "reason": "The decompression-bomb cap; enforced with a post-append check so it overshoots by one chunk — CWE-400 bound analysis."},
+    {"anchor": "inflationStream (zlib z_stream member) next_in/avail_in/next_out/avail_out", "disposition": "finding", "reason": "avail_in is 32-bit (size_t length truncation) and is the ingestion point for hostile compressed data; avail_out underpins the append-length arithmetic."},
+    {"anchor": "err = ::inflate(&inflationStream, Z_FINISH)", "disposition": "finding", "reason": "Z_OK with residual avail_in drives the double-append logic defect; error codes are gated at line 22."},
+    {"anchor": "if (!inflationStream.avail_in) break; (lines 13-15)", "disposition": "finding", "reason": "The break-before-append design is only correct on this exit path; other exits (Z_OK with leftover input) cause the final chunk to be appended twice."},
+    {"anchor": "dynamicInflationBuffer.append(inflationBuffer, LARGE_BUFFER_SIZE - inflationStream.avail_out) (lines 17,28)", "disposition": "finding", "reason": "Unsigned subtraction as an append length; safe only under zlib's avail_out <= LARGE_BUFFER_SIZE invariant — CWE-191 latent."},
+    {"anchor": "if ((err != Z_BUF_ERROR && err != Z_OK) || length() > INFLATE_LESS_THAN_ROUGHLY) reject (lines 22-25)", "disposition": "dismissed", "reason": "This is the enforcement gate that correctly rejects zlib errors and over-cap output; it is the fix, not a defect."},
+    {"anchor": "inflateReset(&inflationStream) (line 20)", "disposition": "dismissed", "reason": "Correct stream reuse; does not alter avail_out/next_out so post-loop reads remain valid — no security contract violated."},
+    {"anchor": "length as size_t& out-parameter", "disposition": "dismissed", "reason": "Set to 0 on every failure path and to the produced size on success; aliasing/truncation covered under the avail_in and inflationBuffer anchors."}
+  ],
+  "findings": [
+    {
+      "title": "Returned pointer aliases per-Hub buffers invalidated by the next inflate() call (use-after-free if retained)",
+      "anchor": "return (char *) dynamicInflationBuffer.data(); / return inflationBuffer;",
+      "file": "corpus/train/train_0299_cwe20.cpp",
+      "line": "31,35",
+      "code": "return (char *) dynamicInflationBuffer.data();",
+      "bug_class": "Dangling pointer into reused member buffer (use-after-free / stale read)",
+      "cwe": "CWE-416",
+      "severity": "high",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "The caller must fully consume (or copy out) the returned buffer, using exactly the returned `length`, before invoking Hub::inflate() again and must never store the pointer; dynamicInflationBuffer.data() and inflationBuffer are per-Hub members that clear()/append() and the next decompression overwrite.",
+      "failure_mode": "If the caller retains the returned pointer across a subsequent inflate() (or across re-entrant message dispatch that can call inflate again), line 3's dynamicInflationBuffer.clear() plus fresh appends reallocate/overwrite the storage, or line 10 rewrites inflationBuffer, so the retained pointer now reads freed or clobbered memory — information disclosure or crash driven by ordinary attacker message traffic.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm at every call site that the decompressed bytes are copied into a per-message owned buffer (or dispatched synchronously) before the next inflate() call, and that no code path stores the returned pointer beyond that window."
+    },
+    {
+      "title": "Decompression-bomb cap is checked after appending a full chunk, so accumulated memory overshoots INFLATE_LESS_THAN_ROUGHLY by one LARGE_BUFFER_SIZE",
+      "anchor": "} while (err == Z_BUF_ERROR && dynamicInflationBuffer.length() <= INFLATE_LESS_THAN_ROUGHLY);",
+      "file": "corpus/train/train_0299_cwe20.cpp",
+      "line": "18",
+      "code": "} while (err == Z_BUF_ERROR && dynamicInflationBuffer.length() <= INFLATE_LESS_THAN_ROUGHLY);",
+      "bug_class": "Uncontrolled resource consumption (decompression bomb, bounded but with overshoot)",
+      "cwe": "CWE-400",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0299_cwe20.cpp",
+      "invariant": "Peak per-call decompression memory must stay within an acceptable budget; because the length test runs after a LARGE_BUFFER_SIZE append, the true bound is INFLATE_LESS_THAN_ROUGHLY + LARGE_BUFFER_SIZE, which must be small enough that many connections cannot exhaust memory.",
+      "failure_mode": "A crafted permessage-deflate payload with a very high compression ratio inflates until the cap is crossed; the loop still appends one final full chunk before the condition stops it, then line 22 rejects the result. Memory peaks at roughly cap + LARGE_BUFFER_SIZE per in-flight message; without connection-level backpressure or concurrency limits, many simultaneous bomb messages can still pressure memory even though each single call is bounded.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the concrete values of INFLATE_LESS_THAN_ROUGHLY and LARGE_BUFFER_SIZE in the header and that cap + one chunk, multiplied by the maximum concurrent decompressions, fits the process memory budget."
+    },
+    {
+      "title": "Final decompressed chunk appended twice when zlib returns Z_OK with residual input (trailing bytes after the deflate stream)",
+      "anchor": "if (!inflationStream.avail_in) { break; } ... if (dynamicInflationBuffer.length()) { dynamicInflationBuffer.append(inflationBuffer, LARGE_BUFFER_SIZE - inflationStream.avail_out);",
+      "file": "corpus/train/train_0299_cwe20.cpp",
+      "line": "13-28",
+      "code": "if (dynamicInflationBuffer.length()) {\n        dynamicInflationBuffer.append(inflationBuffer, LARGE_BUFFER_SIZE - inflationStream.avail_out);",
+      "bug_class": "Improper handling of exit condition -> duplicated output bytes",
+      "cwe": "CWE-20",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0299_cwe20.cpp",
+      "invariant": "Each chunk produced by ::inflate must be appended to the output exactly once; the 'break before append, re-append after loop' pattern is only correct when the loop exits via the `!avail_in` break, not when it exits because err != Z_BUF_ERROR while avail_in is still non-zero.",
+      "failure_mode": "An attacker sends a valid deflate stream followed by extra trailing bytes so ::inflate returns Z_OK with avail_in != 0. The break at line 13 is skipped, the chunk is appended at line 17, and the while-condition (err == Z_BUF_ERROR) is false so the loop exits; then line 27 sees a non-empty buffer and line 28 appends the same inflationBuffer/avail_out chunk a second time (avail_out is unchanged since no further ::inflate ran). The message delivered to the application contains duplicated trailing content — a data-integrity flaw that can corrupt downstream length/format parsing.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm whether ::inflate(Z_FINISH) can return Z_OK with avail_in != 0 for this input class, and whether the multi-pass path can execute line 28 after line 17 already appended the same chunk; add a flag/track of whether the final chunk was already appended."
+    },
+    {
+      "title": "Append length LARGE_BUFFER_SIZE - avail_out relies on zlib's avail_out<=capacity invariant (unsigned underflow if violated)",
+      "anchor": "dynamicInflationBuffer.append(inflationBuffer, LARGE_BUFFER_SIZE - inflationStream.avail_out);",
+      "file": "corpus/train/train_0299_cwe20.cpp",
+      "line": "17",
+      "code": "dynamicInflationBuffer.append(inflationBuffer, LARGE_BUFFER_SIZE - inflationStream.avail_out);",
+      "bug_class": "Unsigned integer underflow feeding a copy length",
+      "cwe": "CWE-191",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "avail_out must always be <= LARGE_BUFFER_SIZE (guaranteed by zlib as long as next_out=inflationBuffer and avail_out=LARGE_BUFFER_SIZE are set before each ::inflate, as they are at lines 10-11) and sizeof(inflationBuffer) must equal LARGE_BUFFER_SIZE.",
+      "failure_mode": "If the header ever defines inflationBuffer smaller than LARGE_BUFFER_SIZE, or the z_stream is corrupted so avail_out exceeds LARGE_BUFFER_SIZE, the subtraction wraps to a near-SIZE_MAX value and std::string::append performs a massive out-of-bounds read from inflationBuffer, crashing or leaking memory. In the shown code next_out/avail_out are reset each pass so this is latent, contingent on the header's buffer/constant pairing.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm in the header that char inflationBuffer[LARGE_BUFFER_SIZE] (exact size match) and that no path calls ::inflate without first setting avail_out = LARGE_BUFFER_SIZE."
+    },
+    {
+      "title": "No validation of untrusted data/length at ingestion; size_t length truncated into 32-bit avail_in",
+      "anchor": "inflationStream.avail_in = length;",
+      "file": "corpus/train/train_0299_cwe20.cpp",
+      "line": "5-6",
+      "code": "inflationStream.next_in = (Bytef *) data;\n    inflationStream.avail_in = length;",
+      "bug_class": "Missing input validation / size truncation at trust boundary",
+      "cwe": "CWE-20",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0299_cwe20.cpp",
+      "invariant": "The caller must guarantee `data` is non-null whenever `length` > 0 and must bound `length` to a sane maximum (and to <= UINT_MAX) before calling; this routine performs no such checks.",
+      "failure_mode": "A message length above 4 GiB truncates when assigned to the 32-bit avail_in, causing zlib to process fewer bytes than intended (attacker bytes left unconsumed, affecting the avail_in==0 break logic). A null `data` with non-zero `length` faults inside ::inflate (CWE-476). Impact is normally prevented by upstream WebSocket framing limits, so this is a defense-in-depth gap rather than a direct exploit.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the framing layer caps message length below the configured maximum and rejects oversized/malformed frames before Hub::inflate is reached, and that data is never null with length>0."
+    }
+  ],
+  "audit_checklist": [
+    "Trace every Hub::inflate() call site: is the returned pointer (dynamicInflationBuffer.data() or inflationBuffer) fully consumed/copied before the next inflate() call, and never stored?",
+    "Verify in the header that inflationBuffer is declared with size exactly LARGE_BUFFER_SIZE so LARGE_BUFFER_SIZE - avail_out can never underflow.",
+    "Check the concrete values of INFLATE_LESS_THAN_ROUGHLY and LARGE_BUFFER_SIZE and compute worst-case peak memory (cap + one chunk) times max concurrent decompressions.",
+    "Determine whether ::inflate(Z_FINISH) can return Z_OK with avail_in != 0 for attacker input, and whether the multi-pass path then double-appends the final chunk (lines 17 then 28).",
+    "Confirm upstream framing bounds message length to <= UINT_MAX and to the configured max, and that data is non-null whenever length>0, since Hub::inflate validates neither.",
+    "Confirm inflateReset error return is not silently ignored in a way that leaves a corrupted stream reused on the next message."
+  ]
+}

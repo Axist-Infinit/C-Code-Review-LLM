@@ -1,0 +1,179 @@
+{
+  "subsystem": "TensorFlow SparseDenseBinaryOpShared / SparseDenseCwise{Add,Mul,Div} CPU op kernel. This is the Compute() method of an OpKernel that takes a sparse tensor in coordinate (COO) form — sp_indices (a matrix of int64 coordinates), sp_values (a vector of the T-typed non-zero values), sp_shape (an int64 vector giving the dense shape) — plus a dense tensor, broadcasts the dense operand onto the sparse pattern, gathers the matching dense coefficients, and applies an elementwise binary functor (add/mul/div) producing an output_values vector aligned with the sparse entries.",
+  "provenance": "Identified by the TensorFlow op-kernel idioms: Compute(OpKernelContext *ctx) override, ctx->input(...) with named inputs \"sp_indices\"/\"sp_values\"/\"sp_shape\"/\"dense\", the OP_REQUIRES / OP_REQUIRES_OK macros, errors::InvalidArgument, TensorShapeUtils, TensorShape::BuildTensorShape, BCast, TensorRef, Eigen::Tensor, internal::SubtleMustCopy, FastBoundsCheck, and the diagnostic string \"SparseDenseBinaryOpShared broadcasts dense to sparse only\". The op type is discovered at runtime via ctx->op_kernel().type_string_view() and matched against \"Div\". Sample banner labels it primevul_test_0045_fixed (a post-fix snapshot).",
+  "trust_boundary": "All four inputs are graph tensors fully controlled by whoever supplies the model/inputs (a SavedModel, a serialized GraphDef, or a caller feeding the op). Their ranks, dimensions, element counts, and every element value are attacker-controllable: sp_indices contents (the int64 coordinates), sp_shape contents (the claimed dense dimensions), the number of non-zeros nnz = indices rows, and the dense tensor's shape and values. The kernel must therefore treat shapes, the coordinate values, and nnz as hostile and validate every arithmetic/indexing use of them before dereferencing memory.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0223_cwe190.cpp",
+      "lines": "2-7",
+      "code": "  void Compute(OpKernelContext *ctx) override {\n    const Tensor *indices_t, *values_t, *shape_t, *dense_t;\n    OP_REQUIRES_OK(ctx, ctx->input(\"sp_indices\", &indices_t));\n    OP_REQUIRES_OK(ctx, ctx->input(\"sp_values\", &values_t));\n    OP_REQUIRES_OK(ctx, ctx->input(\"sp_shape\", &shape_t));\n    OP_REQUIRES_OK(ctx, ctx->input(\"dense\", &dense_t));",
+      "explanation": "Entry point of the kernel. It fetches four input tensors by name into const pointers: indices_t (the COO coordinate matrix), values_t (the non-zero values), shape_t (the dense shape as an int64 vector), and dense_t (the dense operand). OP_REQUIRES_OK aborts the op with the returned Status if any input is missing. At this point nothing about the CONTENT of these tensors is trusted — only that the inputs exist. Everything downstream derives sizes and indices from these attacker-controlled tensors."
+    },
+    {
+      "file": "corpus/train/train_0223_cwe190.cpp",
+      "lines": "9-25",
+      "code": "    // Validations.\n    OP_REQUIRES(ctx, TensorShapeUtils::IsMatrix(indices_t->shape()),\n                errors::InvalidArgument(\n                    \"Input sp_indices should be a matrix but received shape: \",\n                    indices_t->shape().DebugString()));\n    OP_REQUIRES(ctx,\n                TensorShapeUtils::IsVector(values_t->shape()) &&\n                    TensorShapeUtils::IsVector(shape_t->shape()),\n                errors::InvalidArgument(\n                    \"Inputs sp_values and sp_shape should be vectors \"\n                    \"but received shapes: \",\n                    values_t->shape().DebugString(), \" and \",\n                    shape_t->shape().DebugString()));\n    OP_REQUIRES(\n        ctx, TensorShapeUtils::IsVector(shape_t->shape()),\n        errors::InvalidArgument(\"Input sp_shape must be a vector. Got: \",\n                                shape_t->shape().DebugString()));",
+      "explanation": "Rank/structure gate. It requires indices_t to be a 2-D matrix (COO indices are [nnz, ndims]), and requires values_t and shape_t to be 1-D vectors (a redundant second check re-asserts shape_t is a vector). OP_REQUIRES is the standard TF guard: if the predicate is false it sets ctx status to InvalidArgument and returns from Compute immediately. These checks establish the shape skeleton the later element-count arithmetic relies on, so that indices_t->dim_size(0/1), values_t->dim_size(0), and shape_t->dim_size(0) are meaningful."
+    },
+    {
+      "file": "corpus/train/train_0223_cwe190.cpp",
+      "lines": "26-39",
+      "code": "    OP_REQUIRES(\n        ctx, values_t->dim_size(0) == indices_t->dim_size(0),\n        errors::InvalidArgument(\n            \"The first dimension of values and indices should match. (\",\n            values_t->dim_size(0), \" vs. \", indices_t->dim_size(0), \")\"));\n    OP_REQUIRES(\n        ctx, shape_t->shape().dim_size(0) == indices_t->shape().dim_size(1),\n        errors::InvalidArgument(\n            \"Number of dimensions must match second dimension of indices. \",\n            \"Got \", shape_t->shape().dim_size(0),\n            \" dimensions, indices shape: \", indices_t->shape().DebugString()));\n    OP_REQUIRES(ctx, shape_t->NumElements() > 0,\n                errors::InvalidArgument(\n                    \"The shape argument requires at least one element.\"));",
+      "explanation": "Cross-consistency gate. First it enforces values.dim_size(0) == indices.dim_size(0), i.e. the number of values equals the number of coordinate rows (nnz). Second it enforces shape.dim_size(0) == indices.dim_size(1): the length of the shape vector (the declared rank of the dense space) equals the number of COLUMNS of the indices matrix, so every coordinate row has exactly one entry per dimension. Third it requires the shape vector to be non-empty. These three invariants are what later lets the inner loop index indices_mat(i, d) for d in [0, ndims) without walking off the matrix, and lets the final binaryExpr pair values with the gathered dense coefficients one-to-one."
+    },
+    {
+      "file": "corpus/train/train_0223_cwe190.cpp",
+      "lines": "41-47",
+      "code": "    const auto indices_mat = indices_t->matrix<int64_t>();\n    const auto shape_vec = shape_t->vec<int64_t>();\n    TensorShape lhs_shape;\n    OP_REQUIRES_OK(ctx, TensorShape::BuildTensorShape(shape_vec, &lhs_shape));\n    const auto lhs_dims = BCast::FromShape(lhs_shape);\n    const auto rhs_dims = BCast::FromShape(dense_t->shape());\n    BCast b(lhs_dims, rhs_dims, false);  // false for keeping the same num dims.",
+      "explanation": "Typed views and shape construction. indices_mat is a typed int64 matrix accessor over indices_t; shape_vec is a typed int64 vector view over the attacker-supplied shape. The security-critical line is BuildTensorShape(shape_vec, &lhs_shape): this constructs a TensorShape from the untrusted int64 shape values and — crucially — returns an error Status (caught by OP_REQUIRES_OK) if the dimensions are negative, exceed the max rank, or if the product of dimensions OVERFLOWS int64. This is the guard that turns a hostile shape vector into either a valid bounded TensorShape or a clean abort. lhs_dims/rhs_dims are the broadcast dimension lists, and BCast b computes the broadcast plan between the sparse (lhs) and dense (rhs) shapes with same-rank semantics."
+    },
+    {
+      "file": "corpus/train/train_0223_cwe190.cpp",
+      "lines": "49-63",
+      "code": "    // True iff (size(lhs) >= size(rhs)) and all dims in lhs is greater or equal\n    // to dims in rhs (from right to left).\n    auto VecGreaterEq = [](ArraySlice<int64_t> lhs, ArraySlice<int64_t> rhs) {\n      if (lhs.size() < rhs.size()) return false;\n      for (size_t i = 0; i < rhs.size(); ++i) {\n        if (lhs[lhs.size() - 1 - i] < rhs[rhs.size() - 1 - i]) return false;\n      }\n      return true;\n    };\n    OP_REQUIRES(ctx, VecGreaterEq(lhs_dims, rhs_dims) && b.IsValid(),\n                errors::InvalidArgument(\n                    \"SparseDenseBinaryOpShared broadcasts dense to sparse \"\n                    \"only; got incompatible shapes: [\",\n                    absl::StrJoin(lhs_dims, \",\"), \"] vs. [\",\n                    absl::StrJoin(rhs_dims, \",\"), \"]\"));",
+      "explanation": "Directional broadcast check. This op only supports broadcasting the DENSE operand up to the sparse shape (not the reverse). The VecGreaterEq lambda returns true only when lhs (sparse) has at least as many dims as rhs (dense) and, aligned from the right, every lhs dimension is >= the corresponding rhs dimension. Note the reverse-indexed access lhs[lhs.size()-1-i]: because the loop bound is rhs.size() and the early return guarantees lhs.size() >= rhs.size(), lhs.size()-1-i stays within lhs, so the unsigned subtraction cannot underflow. OP_REQUIRES additionally requires b.IsValid(), rejecting genuinely incompatible broadcast shapes before any gather occurs."
+    },
+    {
+      "file": "corpus/train/train_0223_cwe190.cpp",
+      "lines": "65-72",
+      "code": "    Tensor *output_values = nullptr;\n    Tensor dense_gathered;\n    const int64_t nnz = indices_t->dim_size(0);\n    OP_REQUIRES_OK(ctx,\n                   ctx->allocate_output(0, TensorShape({nnz}), &output_values));\n    OP_REQUIRES_OK(\n        ctx, ctx->allocate_temp(DataTypeToEnum<T>::value, TensorShape({nnz}),\n                                &dense_gathered));",
+      "explanation": "Output/scratch allocation. nnz is the number of non-zero entries, taken as the first dimension of the indices matrix, held as int64_t. It allocates output_values as a 1-D tensor of nnz elements and a temporary dense_gathered (type T) also of nnz elements. These two buffers are both sized by the same attacker-influenced nnz, and both are indexed by the loop counter later; their sizes are consistent with each other and with values_t (whose dim_size(0) was already required to equal nnz)."
+    },
+    {
+      "file": "corpus/train/train_0223_cwe190.cpp",
+      "lines": "73-83",
+      "code": "    bool op_is_div = false;\n    if (absl::StrContains(ctx->op_kernel().type_string_view(), \"Div\")) {\n      op_is_div = true;\n    }\n    // Pulls relevant entries from the dense side, with reshape and broadcasting\n    // *of the dense side* taken into account.  Use a TensorRef to avoid blowing\n    // up memory.\n    //\n    // We can directly use the sparse indices to look up dense side, because\n    // \"b.y_reshape()\" and \"b.y_bcast()\" are guaranteed to have rank \"ndims\".\n    auto dense_gathered_flat = dense_gathered.flat<T>();",
+      "explanation": "op_is_div is set when the registered op type string contains \"Div\", enabling a runtime divide-by-zero guard later. The comment explains the strategy: rather than materializing a fully broadcast dense tensor (which could be huge), the code uses a TensorRef with reshape+broadcast metadata and pulls only the coefficients the sparse indices point at. dense_gathered_flat is the flat T view of the scratch buffer that will receive the gathered coefficients, one per non-zero entry."
+    },
+    {
+      "file": "corpus/train/train_0223_cwe190.cpp",
+      "lines": "84-113",
+      "code": "    const int ndims = lhs_dims.size();\n    switch (ndims) {\n#define CASE(NDIM)                                                             \\\n  case NDIM: {                                                                 \\\n    TensorRef<Eigen::Tensor<const T, NDIM, Eigen::RowMajor>> rhs_ref =         \\\n        dense_t->shaped<T, NDIM>(b.y_reshape())                                \\\n            .broadcast(BCast::ToIndexArray<NDIM>(b.y_bcast()));                \\\n    Eigen::array<Eigen::DenseIndex, NDIM> idx;                                 \\\n    bool indices_valid = true;                                                 \\\n    for (int i = 0; i < nnz; ++i) {                                            \\\n      for (int d = 0; d < NDIM; ++d) {                                         \\\n        idx[d] = internal::SubtleMustCopy(indices_mat(i, d));                  \\\n        if (!FastBoundsCheck(idx[d], rhs_ref.dimension(d))) {                  \\\n          indices_valid = false;                                               \\\n        }                                                                      \\\n      }                                                                        \\\n      OP_REQUIRES(                                                             \\\n          ctx, indices_valid,                                                  \\\n          errors::InvalidArgument(\"Provided indices are out-of-bounds w.r.t. \" \\\n                                  \"dense side with broadcasted shape\"));       \\\n      dense_gathered_flat(i) = rhs_ref.coeff(idx);                             \\\n      if (op_is_div) {                                                         \\\n        OP_REQUIRES(ctx, dense_gathered_flat(i) != 0,                          \\\n                    errors::InvalidArgument(                                   \\\n                        \"SparseDenseCwiseDiv cannot divide by zero,\"           \\\n                        \"but input dense tensor contains zero \"));             \\\n      }                                                                        \\\n    }                                                                          \\\n    break;                                                                     \\\n  }",
+      "explanation": "The core gather, generated once per supported rank by the CASE(NDIM) macro. ndims is the sparse rank, narrowed from lhs_dims.size() (a size_t) into an int for the switch. For a given NDIM it builds rhs_ref: a rank-NDIM TensorRef over the dense tensor, reshaped to b.y_reshape() and broadcast to b.y_bcast(), so its logical dimensions match the sparse shape. The outer loop walks all nnz non-zero entries; the inner loop reads each coordinate idx[d] = SubtleMustCopy(indices_mat(i,d)). SubtleMustCopy makes a defensive copy so the value cannot be changed between the bounds check and use (guards against a TOCTOU on shared memory). FastBoundsCheck(idx[d], rhs_ref.dimension(d)) verifies 0 <= idx[d] < dimension(d); if ANY coordinate is out of range indices_valid becomes false and the following OP_REQUIRES aborts BEFORE rhs_ref.coeff(idx) is dereferenced. On success it gathers the dense coefficient into dense_gathered_flat(i); for Div ops it additionally rejects a zero divisor. Note the loop counter i is a plain int while nnz is int64_t."
+    },
+    {
+      "file": "corpus/train/train_0223_cwe190.cpp",
+      "lines": "115-127",
+      "code": "      CASE(1);\n      CASE(2);\n      CASE(3);\n      CASE(4);\n      CASE(5);\n      default:\n        OP_REQUIRES(\n            ctx, false,\n            errors::InvalidArgument(\"Only tensors with ranks between 1 and 5 \"\n                                    \"are currently supported.  Tensor rank: \",\n                                    ndims));\n#undef CASE\n    }",
+      "explanation": "The macro is instantiated for ranks 1 through 5, and the default branch unconditionally fails the op for any other rank. This caps NDIM to a small compile-time set, so the fixed-size Eigen::array<Eigen::DenseIndex, NDIM> idx and the inner d-loop bound NDIM are always small constants. Because the default rejects unsupported ranks, ndims (even though narrowed to int) can only reach the gather code with a value in 1..5; any larger or malformed rank is turned into an InvalidArgument error rather than undefined behavior."
+    },
+    {
+      "file": "corpus/train/train_0223_cwe190.cpp",
+      "lines": "129-131",
+      "code": "    output_values->flat<T>().device(ctx->eigen_device<Device>()) =\n        values_t->flat<T>().binaryExpr(dense_gathered_flat,\n                                       typename Functor::func());",
+      "explanation": "Final elementwise combine. It applies the op's binary functor (add/mul/div) pairwise between the sparse values (values_t flat, length nnz) and the gathered dense coefficients (dense_gathered_flat, length nnz), writing into output_values (length nnz) on the appropriate Eigen device. All three operands share the nnz length that was cross-checked earlier, so the elementwise expression is size-consistent."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0223_cwe190.cpp",
+      "lines": "93-95",
+      "code": "    for (int i = 0; i < nnz; ++i) {                                            \\\n      for (int d = 0; d < NDIM; ++d) {                                         \\\n        idx[d] = internal::SubtleMustCopy(indices_mat(i, d));                  \\",
+      "explanation": "The gather loop counter i is declared int while its bound nnz is int64_t (line 67: const int64_t nnz = indices_t->dim_size(0)). nnz is attacker-influenced — it is the row count of the sp_indices matrix. If an input supplies more than INT_MAX (2^31-1) non-zero rows, then once i reaches INT_MAX the ++i increments a signed int past its maximum, which is undefined behavior in C++ and in practice wraps to a large negative value. The comparison i < nnz promotes i to int64_t, so a wrapped-negative i is still < nnz and the loop continues, now calling indices_mat(i, d) and dense_gathered_flat(i) with a negative/incorrect index — an out-of-bounds read of the indices matrix and an out-of-bounds write into the gathered buffer. This is the CWE-190 (integer overflow/truncation) primitive that the sample name flags. The invariant the implementation must uphold is that the loop index type can represent every valid entry count, i.e. iterate with int64_t (for (int64_t i = 0; i < nnz; ++i)). Note it is only reachable with an enormous indices tensor (billions of rows), so exploitability is memory-gated, but the truncation defect is real and present in the shown code."
+    },
+    {
+      "file": "corpus/train/train_0223_cwe190.cpp",
+      "lines": "44",
+      "code": "    OP_REQUIRES_OK(ctx, TensorShape::BuildTensorShape(shape_vec, &lhs_shape));",
+      "explanation": "This line is the primary mitigation and also the single most safety-critical contract: lhs_shape is built from the untrusted int64 shape_vec. If the implementation of BuildTensorShape did NOT validate — rejecting negative dims, over-max rank, and a dimension PRODUCT that overflows int64 — then a hostile sp_shape could create a TensorShape whose element count wraps, mismatching later allocations and the BCast plan and producing out-of-bounds gathers. The fixed code correctly routes through BuildTensorShape (whose Status is checked by OP_REQUIRES_OK), which is precisely the overflow-safe replacement for directly constructing a TensorShape from raw user dimensions. The invariant: every dimension from shape_vec must be individually validated and their product bounded before the shape is used to drive BCast reshape/broadcast and coefficient lookups. Confirm BuildTensorShape performs the overflow/negative-dim checks in this TF version."
+    },
+    {
+      "file": "corpus/train/train_0223_cwe190.cpp",
+      "lines": "95-104",
+      "code": "        idx[d] = internal::SubtleMustCopy(indices_mat(i, d));                  \\\n        if (!FastBoundsCheck(idx[d], rhs_ref.dimension(d))) {                  \\\n          indices_valid = false;                                               \\\n        }                                                                      \\\n      }                                                                        \\\n      OP_REQUIRES(                                                             \\\n          ctx, indices_valid,                                                  \\\n          errors::InvalidArgument(\"Provided indices are out-of-bounds w.r.t. \" \\\n                                  \"dense side with broadcasted shape\"));       \\\n      dense_gathered_flat(i) = rhs_ref.coeff(idx);                             \\",
+      "explanation": "The sparse coordinates are fully attacker-controlled and are used to index the (broadcast) dense operand via rhs_ref.coeff(idx). The safety of that dereference depends entirely on the FastBoundsCheck loop plus the OP_REQUIRES gate: every idx[d] is validated against rhs_ref.dimension(d), and OP_REQUIRES aborts the op BEFORE coeff(idx) runs if any coordinate is out of range. This is correct as written — SubtleMustCopy prevents a TOCTOU between check and use, and the require sits between the check and the access. The invariant to preserve is ordering: the bounds check and its OP_REQUIRES must remain before rhs_ref.coeff(idx). If a refactor moved the require after the coeff access (or dropped SubtleMustCopy), a crafted indices tensor would produce an out-of-bounds read (CWE-125) of dense memory. As shown, no OOB occurs here; flagged as the contract to keep."
+    },
+    {
+      "file": "corpus/train/train_0223_cwe190.cpp",
+      "lines": "84",
+      "code": "    const int ndims = lhs_dims.size();",
+      "explanation": "lhs_dims.size() is a size_t narrowed to int. In principle a size_t->int narrowing could produce a negative or wrapped value, but here it is benign: lhs_dims comes from lhs_shape which BuildTensorShape already bounded to TF's maximum rank (<= 254), and the switch's default branch rejects any ndims outside 1..5 before the gather runs. So the narrowing cannot deliver a hostile ndims to the indexing code. Noted for hygiene only — no exploitable path given the upstream rank cap and the default-case rejection."
+    },
+    {
+      "file": "corpus/train/train_0223_cwe190.cpp",
+      "lines": "105-110",
+      "code": "      if (op_is_div) {                                                         \\\n        OP_REQUIRES(ctx, dense_gathered_flat(i) != 0,                          \\\n                    errors::InvalidArgument(                                   \\\n                        \"SparseDenseCwiseDiv cannot divide by zero,\"           \\\n                        \"but input dense tensor contains zero \"));             \\",
+      "explanation": "For Div ops the code guards against a zero divisor drawn from the attacker-controlled dense tensor, aborting with InvalidArgument rather than performing an integer division by zero (which for integer T would be undefined behavior / a crash). This is a correct present mitigation. The residual consideration is that op_is_div is decided by a substring match on the op type string (absl::StrContains(..., \"Div\")): any Div-family op registered to this kernel must contain \"Div\" in its type name for the guard to engage — a mis-registered integer Div op whose type string lacked \"Div\" would skip the check. Confirm all integer Div registrations carry \"Div\" in their type_string."
+    }
+  ],
+  "summary": "This is the post-fix TensorFlow SparseDenseBinaryOpShared gather kernel. It is well-guarded: shapes are rank/consistency-checked, the untrusted sp_shape is turned into a TensorShape through the overflow-safe BuildTensorShape, every sparse coordinate is FastBoundsCheck'd (with SubtleMustCopy) before the dense coefficient is read, and Div guards against a zero divisor. The one latent defect that survives is the gather loop using an int counter (for (int i = 0; i < nnz; ++i)) against an int64_t nnz, a CWE-190 signed-overflow/truncation that would corrupt indexing for indices tensors with more than INT_MAX rows; exploitability is gated by the enormous memory required, so overall risk is low-to-medium.",
+  "reviewed_anchors": [
+    {"anchor": "void Compute(OpKernelContext *ctx) override", "disposition": "dismissed", "reason": "Kernel entry signature; the ctx pointer is framework-supplied and non-null, no contract to violate here."},
+    {"anchor": "ctx->input(\"sp_indices\"/\"sp_values\"/\"sp_shape\"/\"dense\", &..._t) (lines 4-7)", "disposition": "dismissed", "reason": "Presence-checked via OP_REQUIRES_OK; the untrusted content of these tensors is where the real contracts live, covered by later anchors."},
+    {"anchor": "IsMatrix/IsVector shape validations (lines 10-25)", "disposition": "dismissed", "reason": "Correct rank gates that establish the shape skeleton; they mitigate rather than introduce risk."},
+    {"anchor": "values_t->dim_size(0) == indices_t->dim_size(0) (line 27)", "disposition": "dismissed", "reason": "nnz consistency check between values and indices; a correct guard, no violation."},
+    {"anchor": "shape_t->dim_size(0) == indices_t->shape().dim_size(1) (line 32)", "disposition": "dismissed", "reason": "Ensures indices column count equals rank, which bounds the inner d-loop against the indices matrix; a correct guard."},
+    {"anchor": "shape_t->NumElements() > 0 (line 37)", "disposition": "dismissed", "reason": "Rejects empty shape vector; correct guard."},
+    {"anchor": "indices_mat = indices_t->matrix<int64_t>() (line 41)", "disposition": "dismissed", "reason": "Typed accessor; its element reads are bounds-checked at use (lines 95-96)."},
+    {"anchor": "shape_vec = shape_t->vec<int64_t>() (line 42)", "disposition": "finding", "reason": "Untrusted shape values fed to shape construction; safety hinges on BuildTensorShape validating them (see line 44 finding)."},
+    {"anchor": "TensorShape::BuildTensorShape(shape_vec, &lhs_shape) (line 44)", "disposition": "finding", "reason": "The critical overflow/negative-dim/rank gate for the untrusted shape; the fix that prevents a shape-driven integer overflow."},
+    {"anchor": "BCast b(lhs_dims, rhs_dims, false) + b.IsValid() (lines 47,58)", "disposition": "dismissed", "reason": "Broadcast plan validated by b.IsValid() and VecGreaterEq before use; incompatible shapes rejected."},
+    {"anchor": "VecGreaterEq lambda reverse index lhs[lhs.size()-1-i] (lines 51-56)", "disposition": "dismissed", "reason": "The early lhs.size() < rhs.size() return guarantees the reverse subtraction stays in-bounds; no unsigned underflow."},
+    {"anchor": "const int64_t nnz = indices_t->dim_size(0) (line 67)", "disposition": "finding", "reason": "Attacker-influenced entry count; consumed by an int loop counter at line 93, the CWE-190 anchor."},
+    {"anchor": "allocate_output(0, TensorShape({nnz})) / allocate_temp(...,{nnz}) (lines 69-72)", "disposition": "dismissed", "reason": "Both sized by the same nnz and consistent with values length; allocation itself is bounds/overflow-checked by the allocator."},
+    {"anchor": "op_is_div = StrContains(type_string_view(), \"Div\") (line 74)", "disposition": "finding", "reason": "Substring test that gates the divide-by-zero guard; a Div op whose type string omits \"Div\" would bypass the guard."},
+    {"anchor": "const int ndims = lhs_dims.size() (line 84)", "disposition": "dismissed", "reason": "size_t->int narrowing, but rank is capped by BuildTensorShape and the switch default rejects ranks outside 1..5; not exploitable."},
+    {"anchor": "CASE(NDIM) macro / for (int i = 0; i < nnz; ++i) (lines 86-93)", "disposition": "finding", "reason": "int loop counter against int64_t nnz — signed overflow/truncation (CWE-190) for >INT_MAX rows."},
+    {"anchor": "idx[d] = SubtleMustCopy(indices_mat(i,d)); FastBoundsCheck(...) (lines 95-96)", "disposition": "finding", "reason": "Attacker coordinates index the dense side; bounds-check + require ordering is the invariant that keeps rhs_ref.coeff(idx) safe."},
+    {"anchor": "Eigen::array<Eigen::DenseIndex, NDIM> idx (line 91)", "disposition": "dismissed", "reason": "Fixed-size stack array indexed only by d in [0,NDIM); NDIM is a compile-time constant 1..5, no overflow."},
+    {"anchor": "dense_gathered_flat(i) = rhs_ref.coeff(idx) (line 104)", "disposition": "dismissed", "reason": "coeff read is gated by the preceding bounds check + OP_REQUIRES; write index i shares the nnz-sized buffer (safe unless the line-93 truncation triggers)."},
+    {"anchor": "divide-by-zero OP_REQUIRES (lines 106-110)", "disposition": "dismissed", "reason": "Correct guard preventing integer division by zero for Div ops; mitigation, not a defect."},
+    {"anchor": "CASE(1..5) + default rank rejection (lines 115-125)", "disposition": "dismissed", "reason": "Unsupported ranks are turned into InvalidArgument; caps NDIM to a small constant set."},
+    {"anchor": "output_values->flat<T>() = values_t->flat<T>().binaryExpr(...) (lines 129-131)", "disposition": "dismissed", "reason": "All three operands share the cross-checked nnz length; size-consistent elementwise expression."}
+  ],
+  "findings": [
+    {
+      "title": "Gather loop counter truncation: int i iterates over int64_t nnz",
+      "anchor": "for (int i = 0; i < nnz; ++i)",
+      "file": "corpus/train/train_0223_cwe190.cpp",
+      "line": "93",
+      "code": "    for (int i = 0; i < nnz; ++i) {                                            \\",
+      "bug_class": "Signed integer overflow / loop-counter truncation leading to out-of-bounds access",
+      "cwe": "CWE-190",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0223_cwe190.cpp (the CASE(NDIM) macro body, instantiated for ranks 1-5)",
+      "invariant": "The loop that walks all nnz non-zero entries must use a counter whose type can represent every valid index (int64_t), matching nnz = indices_t->dim_size(0); it must never truncate the entry count into a 32-bit int.",
+      "failure_mode": "nnz is the row count of the attacker-supplied sp_indices matrix and is held as int64_t (line 67). The loop counter i is a 32-bit int. If more than INT_MAX (2^31-1) non-zero rows are supplied, incrementing i past its maximum is undefined behavior and in practice wraps negative; because i < nnz promotes i to int64_t, the loop keeps running with a negative/wrong index, so indices_mat(i, d) reads out of bounds of the indices matrix and dense_gathered_flat(i) writes out of bounds of the nnz-sized scratch buffer (CWE-125/CWE-787 downstream of the CWE-190 truncation). Reachable only with a multi-billion-row indices tensor, so it is memory-gated, but the truncation is a genuine defect.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm whether upstream TF changed this counter to int64_t; if it is still `int i`, verify no earlier check caps nnz at INT_MAX (dim_size is int64 and can exceed it), and that indices_mat(i,d)/dense_gathered_flat(i) have no independent 64-bit index guard."
+    },
+    {
+      "title": "Untrusted sp_shape must be validated by BuildTensorShape (overflow/negative-dim gate)",
+      "anchor": "TensorShape::BuildTensorShape(shape_vec, &lhs_shape)",
+      "file": "corpus/train/train_0223_cwe190.cpp",
+      "line": "44",
+      "code": "    OP_REQUIRES_OK(ctx, TensorShape::BuildTensorShape(shape_vec, &lhs_shape));",
+      "bug_class": "Integer overflow in shape construction from untrusted dimensions (latent, in BuildTensorShape impl)",
+      "cwe": "CWE-190",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided) — TensorShape::BuildTensorShape",
+      "invariant": "Constructing a TensorShape from the attacker-controlled int64 shape_vec must reject negative dimensions, over-max rank, and any dimension whose running product overflows int64, returning an error Status rather than a shape with a wrapped element count.",
+      "failure_mode": "shape_vec is entirely attacker-controlled. If shape construction did not bound-check (as in the pre-fix direct-construction path this sample replaces), a shape like {2^40, 2^40, ...} could overflow the element-count product, yielding a TensorShape inconsistent with the BCast plan and downstream nnz-sized buffers, enabling out-of-bounds gathers. The shown code correctly routes through BuildTensorShape with OP_REQUIRES_OK, so the risk is realized only if that function's validation is incomplete for this TF version.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify BuildTensorShape in this TF version rejects negative dims and detects num-elements overflow; confirm this replaced a prior unchecked TensorShape(shape_vec) construction (the actual fix)."
+    },
+    {
+      "title": "Divide-by-zero guard gated by a substring match on the op type string",
+      "anchor": "if (absl::StrContains(ctx->op_kernel().type_string_view(), \"Div\"))",
+      "file": "corpus/train/train_0223_cwe190.cpp",
+      "line": "74",
+      "code": "    if (absl::StrContains(ctx->op_kernel().type_string_view(), \"Div\")) {",
+      "bug_class": "Guard-selection by string match; divide-by-zero if a Div op is mis-named",
+      "cwe": "CWE-369",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0223_cwe190.cpp",
+      "invariant": "Every integer-typed Div op routed to this shared kernel must engage the zero-divisor OP_REQUIRES; the enabling condition must reliably identify all Div registrations.",
+      "failure_mode": "op_is_div is true only when the runtime op type string contains the literal \"Div\". If a Div-family op were registered under a type name that does not contain \"Div\", the divide-by-zero check at lines 106-110 would be skipped, and an integer T divided by a zero coefficient from the attacker-controlled dense tensor would be undefined behavior / a crash (CWE-369). With the standard SparseDenseCwiseDiv registration the match holds, so this is a low-severity fragility rather than an active bug.",
+      "cve_analog": "",
+      "what_to_confirm": "Enumerate all op registrations bound to this kernel and confirm each integer Div variant's type_string contains \"Div\" so the guard always engages."
+    }
+  ],
+  "audit_checklist": [
+    "Change the gather loop counter to int64_t (for (int64_t i = 0; i < nnz; ++i)) or prove nnz can never exceed INT_MAX before this loop.",
+    "Confirm TensorShape::BuildTensorShape validates negative dims, max rank, and num-elements overflow for the untrusted shape_vec, and that it replaced a prior unchecked TensorShape construction.",
+    "Verify the FastBoundsCheck + OP_REQUIRES(indices_valid) gate always executes before rhs_ref.coeff(idx), and that SubtleMustCopy is retained to prevent a TOCTOU on indices values.",
+    "Confirm every non-zero coordinate column count equals ndims (indices.dim_size(1) == shape.dim_size(0)) so indices_mat(i,d) for d in [0,NDIM) cannot walk off the matrix.",
+    "Confirm all integer Div op registrations bound to this kernel carry \"Div\" in their type_string so the divide-by-zero guard engages.",
+    "Verify allocate_output/allocate_temp handle very large nnz safely (allocator overflow checks) and that values/output/gathered lengths stay equal to nnz throughout."
+  ]
+}

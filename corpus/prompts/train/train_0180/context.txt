@@ -1,0 +1,329 @@
+Files under review: corpus/train/train_0180_cwe294.cpp
+
+<<<BEGIN_UNTRUSTED_CODE>>>
+/* ===== FILE: corpus/train/train_0180_cwe294.cpp ===== */
+   1| /* sample: primevul_train_2406_fixed */
+   2| CtPtr ProtocolV1::handle_connect_message_2() {
+   3|   ldout(cct, 20) << __func__ << dendl;
+   4| 
+   5|   ldout(cct, 20) << __func__ << " accept got peer connect_seq "
+   6|                  << connect_msg.connect_seq << " global_seq "
+   7|                  << connect_msg.global_seq << dendl;
+   8| 
+   9|   connection->set_peer_type(connect_msg.host_type);
+  10|   connection->policy = messenger->get_policy(connect_msg.host_type);
+  11| 
+  12|   ldout(cct, 10) << __func__ << " accept of host_type " << connect_msg.host_type
+  13|                  << ", policy.lossy=" << connection->policy.lossy
+  14|                  << " policy.server=" << connection->policy.server
+  15|                  << " policy.standby=" << connection->policy.standby
+  16|                  << " policy.resetcheck=" << connection->policy.resetcheck
+  17| 		 << " features 0x" << std::hex << (uint64_t)connect_msg.features
+  18| 		 << std::dec
+  19|                  << dendl;
+  20| 
+  21|   ceph_msg_connect_reply reply;
+  22|   bufferlist authorizer_reply;
+  23| 
+  24|   // FIPS zeroization audit 20191115: this memset is not security related.
+  25|   memset(&reply, 0, sizeof(reply));
+  26|   reply.protocol_version =
+  27|       messenger->get_proto_version(connection->peer_type, false);
+  28| 
+  29|   // mismatch?
+  30|   ldout(cct, 10) << __func__ << " accept my proto " << reply.protocol_version
+  31|                  << ", their proto " << connect_msg.protocol_version << dendl;
+  32| 
+  33|   if (connect_msg.protocol_version != reply.protocol_version) {
+  34|     return send_connect_message_reply(CEPH_MSGR_TAG_BADPROTOVER, reply,
+  35|                                       authorizer_reply);
+  36|   }
+  37| 
+  38|   // require signatures for cephx?
+  39|   if (connect_msg.authorizer_protocol == CEPH_AUTH_CEPHX) {
+  40|     if (connection->peer_type == CEPH_ENTITY_TYPE_OSD ||
+  41|         connection->peer_type == CEPH_ENTITY_TYPE_MDS ||
+  42|         connection->peer_type == CEPH_ENTITY_TYPE_MGR) {
+  43|       if (cct->_conf->cephx_require_signatures ||
+  44|           cct->_conf->cephx_cluster_require_signatures) {
+  45|         ldout(cct, 10)
+  46|             << __func__
+  47|             << " using cephx, requiring MSG_AUTH feature bit for cluster"
+  48|             << dendl;
+  49|         connection->policy.features_required |= CEPH_FEATURE_MSG_AUTH;
+  50|       }
+  51|       if (cct->_conf->cephx_require_version >= 2 ||
+  52|           cct->_conf->cephx_cluster_require_version >= 2) {
+  53|         ldout(cct, 10)
+  54|             << __func__
+  55|             << " using cephx, requiring cephx v2 feature bit for cluster"
+  56|             << dendl;
+  57|         connection->policy.features_required |= CEPH_FEATUREMASK_CEPHX_V2;
+  58|       }
+  59|     } else {
+  60|       if (cct->_conf->cephx_require_signatures ||
+  61|           cct->_conf->cephx_service_require_signatures) {
+  62|         ldout(cct, 10)
+  63|             << __func__
+  64|             << " using cephx, requiring MSG_AUTH feature bit for service"
+  65|             << dendl;
+  66|         connection->policy.features_required |= CEPH_FEATURE_MSG_AUTH;
+  67|       }
+  68|       if (cct->_conf->cephx_require_version >= 2 ||
+  69|           cct->_conf->cephx_service_require_version >= 2) {
+  70|         ldout(cct, 10)
+  71|             << __func__
+  72|             << " using cephx, requiring cephx v2 feature bit for service"
+  73|             << dendl;
+  74|         connection->policy.features_required |= CEPH_FEATUREMASK_CEPHX_V2;
+  75|       }
+  76|     }
+  77|   }
+  78| 
+  79|   uint64_t feat_missing =
+  80|       connection->policy.features_required & ~(uint64_t)connect_msg.features;
+  81|   if (feat_missing) {
+  82|     ldout(cct, 1) << __func__ << " peer missing required features " << std::hex
+  83|                   << feat_missing << std::dec << dendl;
+  84|     return send_connect_message_reply(CEPH_MSGR_TAG_FEATURES, reply,
+  85|                                       authorizer_reply);
+  86|   }
+  87| 
+  88|   bufferlist auth_bl_copy = authorizer_buf;
+  89|   connection->lock.unlock();
+  90|   ldout(cct,10) << __func__ << " authorizor_protocol "
+  91| 		<< connect_msg.authorizer_protocol
+  92| 		<< " len " << auth_bl_copy.length()
+  93| 		<< dendl;
+  94|   bool authorizer_valid;
+  95|   bool need_challenge = HAVE_FEATURE(connect_msg.features, CEPHX_V2);
+  96|   bool had_challenge = (bool)authorizer_challenge;
+  97|   if (!messenger->ms_deliver_verify_authorizer(
+  98|           connection, connection->peer_type, connect_msg.authorizer_protocol,
+  99|           auth_bl_copy, authorizer_reply, authorizer_valid, session_key,
+ 100| 	  nullptr /* connection_secret */,
+ 101|           need_challenge ? &authorizer_challenge : nullptr) ||
+ 102|       !authorizer_valid) {
+ 103|     connection->lock.lock();
+ 104|     if (state != ACCEPTING_WAIT_CONNECT_MSG_AUTH) {
+ 105|       ldout(cct, 1) << __func__
+ 106| 		    << " state changed while accept, it must be mark_down"
+ 107| 		    << dendl;
+ 108|       ceph_assert(state == CLOSED);
+ 109|       return _fault();
+ 110|     }
+ 111| 
+ 112|     if (need_challenge && !had_challenge && authorizer_challenge) {
+ 113|       ldout(cct, 10) << __func__ << ": challenging authorizer" << dendl;
+ 114|       ceph_assert(authorizer_reply.length());
+ 115|       return send_connect_message_reply(CEPH_MSGR_TAG_CHALLENGE_AUTHORIZER,
+ 116|                                         reply, authorizer_reply);
+ 117|     } else {
+ 118|       ldout(cct, 0) << __func__ << ": got bad authorizer, auth_reply_len="
+ 119|                     << authorizer_reply.length() << dendl;
+ 120|       session_security.reset();
+ 121|       return send_connect_message_reply(CEPH_MSGR_TAG_BADAUTHORIZER, reply,
+ 122|                                         authorizer_reply);
+ 123|     }
+ 124|   }
+ 125| 
+ 126|   // We've verified the authorizer for this AsyncConnection, so set up the
+ 127|   // session security structure.  PLR
+ 128|   ldout(cct, 10) << __func__ << " accept setting up session_security." << dendl;
+ 129| 
+ 130|   // existing?
+ 131|   AsyncConnectionRef existing = messenger->lookup_conn(*connection->peer_addrs);
+ 132| 
+ 133|   connection->inject_delay();
+ 134| 
+ 135|   connection->lock.lock();
+ 136|   if (state != ACCEPTING_WAIT_CONNECT_MSG_AUTH) {
+ 137|     ldout(cct, 1) << __func__
+ 138|                   << " state changed while accept, it must be mark_down"
+ 139|                   << dendl;
+ 140|     ceph_assert(state == CLOSED);
+ 141|     return _fault();
+ 142|   }
+ 143| 
+ 144|   if (existing == connection) {
+ 145|     existing = nullptr;
+ 146|   }
+ 147|   if (existing && existing->protocol->proto_type != 1) {
+ 148|     ldout(cct,1) << __func__ << " existing " << existing << " proto "
+ 149| 		 << existing->protocol.get() << " version is "
+ 150| 		 << existing->protocol->proto_type << ", marking down" << dendl;
+ 151|     existing->mark_down();
+ 152|     existing = nullptr;
+ 153|   }
+ 154| 
+ 155|   if (existing) {
+ 156|     // There is no possible that existing connection will acquire this
+ 157|     // connection's lock
+ 158|     existing->lock.lock();  // skip lockdep check (we are locking a second
+ 159|                             // AsyncConnection here)
+ 160| 
+ 161|     ldout(cct,10) << __func__ << " existing=" << existing << " exproto="
+ 162| 		  << existing->protocol.get() << dendl;
+ 163|     ProtocolV1 *exproto = dynamic_cast<ProtocolV1 *>(existing->protocol.get());
+ 164|     ceph_assert(exproto);
+ 165|     ceph_assert(exproto->proto_type == 1);
+ 166| 
+ 167|     if (exproto->state == CLOSED) {
+ 168|       ldout(cct, 1) << __func__ << " existing " << existing
+ 169| 		    << " already closed." << dendl;
+ 170|       existing->lock.unlock();
+ 171|       existing = nullptr;
+ 172| 
+ 173|       return open(reply, authorizer_reply);
+ 174|     }
+ 175| 
+ 176|     if (exproto->replacing) {
+ 177|       ldout(cct, 1) << __func__
+ 178|                     << " existing racing replace happened while replacing."
+ 179|                     << " existing_state="
+ 180|                     << connection->get_state_name(existing->state) << dendl;
+ 181|       reply.global_seq = exproto->peer_global_seq;
+ 182|       existing->lock.unlock();
+ 183|       return send_connect_message_reply(CEPH_MSGR_TAG_RETRY_GLOBAL, reply,
+ 184|                                         authorizer_reply);
+ 185|     }
+ 186| 
+ 187|     if (connect_msg.global_seq < exproto->peer_global_seq) {
+ 188|       ldout(cct, 10) << __func__ << " accept existing " << existing << ".gseq "
+ 189|                      << exproto->peer_global_seq << " > "
+ 190|                      << connect_msg.global_seq << ", RETRY_GLOBAL" << dendl;
+ 191|       reply.global_seq = exproto->peer_global_seq;  // so we can send it below..
+ 192|       existing->lock.unlock();
+ 193|       return send_connect_message_reply(CEPH_MSGR_TAG_RETRY_GLOBAL, reply,
+ 194|                                         authorizer_reply);
+ 195|     } else {
+ 196|       ldout(cct, 10) << __func__ << " accept existing " << existing << ".gseq "
+ 197|                      << exproto->peer_global_seq
+ 198|                      << " <= " << connect_msg.global_seq << ", looks ok"
+ 199|                      << dendl;
+ 200|     }
+ 201| 
+ 202|     if (existing->policy.lossy) {
+ 203|       ldout(cct, 0)
+ 204|           << __func__
+ 205|           << " accept replacing existing (lossy) channel (new one lossy="
+ 206|           << connection->policy.lossy << ")" << dendl;
+ 207|       exproto->session_reset();
+ 208|       return replace(existing, reply, authorizer_reply);
+ 209|     }
+ 210| 
+ 211|     ldout(cct, 1) << __func__ << " accept connect_seq "
+ 212|                   << connect_msg.connect_seq
+ 213|                   << " vs existing csq=" << exproto->connect_seq
+ 214|                   << " existing_state="
+ 215|                   << connection->get_state_name(existing->state) << dendl;
+ 216| 
+ 217|     if (connect_msg.connect_seq == 0 && exproto->connect_seq > 0) {
+ 218|       ldout(cct, 0)
+ 219|           << __func__
+ 220|           << " accept peer reset, then tried to connect to us, replacing"
+ 221|           << dendl;
+ 222|       // this is a hard reset from peer
+ 223|       is_reset_from_peer = true;
+ 224|       if (connection->policy.resetcheck) {
+ 225|         exproto->session_reset();  // this resets out_queue, msg_ and
+ 226|                                    // connect_seq #'s
+ 227|       }
+ 228|       return replace(existing, reply, authorizer_reply);
+ 229|     }
+ 230| 
+ 231|     if (connect_msg.connect_seq < exproto->connect_seq) {
+ 232|       // old attempt, or we sent READY but they didn't get it.
+ 233|       ldout(cct, 10) << __func__ << " accept existing " << existing << ".cseq "
+ 234|                      << exproto->connect_seq << " > " << connect_msg.connect_seq
+ 235|                      << ", RETRY_SESSION" << dendl;
+ 236|       reply.connect_seq = exproto->connect_seq + 1;
+ 237|       existing->lock.unlock();
+ 238|       return send_connect_message_reply(CEPH_MSGR_TAG_RETRY_SESSION, reply,
+ 239|                                         authorizer_reply);
+ 240|     }
+ 241| 
+ 242|     if (connect_msg.connect_seq == exproto->connect_seq) {
+ 243|       // if the existing connection successfully opened, and/or
+ 244|       // subsequently went to standby, then the peer should bump
+ 245|       // their connect_seq and retry: this is not a connection race
+ 246|       // we need to resolve here.
+ 247|       if (exproto->state == OPENED || exproto->state == STANDBY) {
+ 248|         ldout(cct, 10) << __func__ << " accept connection race, existing "
+ 249|                        << existing << ".cseq " << exproto->connect_seq
+ 250|                        << " == " << connect_msg.connect_seq
+ 251|                        << ", OPEN|STANDBY, RETRY_SESSION " << dendl;
+ 252|         // if connect_seq both zero, dont stuck into dead lock. it's ok to
+ 253|         // replace
+ 254|         if (connection->policy.resetcheck && exproto->connect_seq == 0) {
+ 255|           return replace(existing, reply, authorizer_reply);
+ 256|         }
+ 257| 
+ 258|         reply.connect_seq = exproto->connect_seq + 1;
+ 259|         existing->lock.unlock();
+ 260|         return send_connect_message_reply(CEPH_MSGR_TAG_RETRY_SESSION, reply,
+ 261|                                           authorizer_reply);
+ 262|       }
+ 263| 
+ 264|       // connection race?
+ 265|       if (connection->peer_addrs->legacy_addr() < messenger->get_myaddr_legacy() ||
+ 266|           existing->policy.server) {
+ 267|         // incoming wins
+ 268|         ldout(cct, 10) << __func__ << " accept connection race, existing "
+ 269|                        << existing << ".cseq " << exproto->connect_seq
+ 270|                        << " == " << connect_msg.connect_seq
+ 271|                        << ", or we are server, replacing my attempt" << dendl;
+ 272|         return replace(existing, reply, authorizer_reply);
+ 273|       } else {
+ 274|         // our existing outgoing wins
+ 275|         ldout(messenger->cct, 10)
+ 276|             << __func__ << " accept connection race, existing " << existing
+ 277|             << ".cseq " << exproto->connect_seq
+ 278|             << " == " << connect_msg.connect_seq << ", sending WAIT" << dendl;
+ 279|         ceph_assert(connection->peer_addrs->legacy_addr() >
+ 280|                     messenger->get_myaddr_legacy());
+ 281|         existing->lock.unlock();
+ 282| 	// make sure we follow through with opening the existing
+ 283| 	// connection (if it isn't yet open) since we know the peer
+ 284| 	// has something to send to us.
+ 285| 	existing->send_keepalive();
+ 286|         return send_connect_message_reply(CEPH_MSGR_TAG_WAIT, reply,
+ 287|                                           authorizer_reply);
+ 288|       }
+ 289|     }
+ 290| 
+ 291|     ceph_assert(connect_msg.connect_seq > exproto->connect_seq);
+ 292|     ceph_assert(connect_msg.global_seq >= exproto->peer_global_seq);
+ 293|     if (connection->policy.resetcheck &&  // RESETSESSION only used by servers;
+ 294|                                           // peers do not reset each other
+ 295|         exproto->connect_seq == 0) {
+ 296|       ldout(cct, 0) << __func__ << " accept we reset (peer sent cseq "
+ 297|                     << connect_msg.connect_seq << ", " << existing
+ 298|                     << ".cseq = " << exproto->connect_seq
+ 299|                     << "), sending RESETSESSION " << dendl;
+ 300|       existing->lock.unlock();
+ 301|       return send_connect_message_reply(CEPH_MSGR_TAG_RESETSESSION, reply,
+ 302|                                         authorizer_reply);
+ 303|     }
+ 304| 
+ 305|     // reconnect
+ 306|     ldout(cct, 10) << __func__ << " accept peer sent cseq "
+ 307|                    << connect_msg.connect_seq << " > " << exproto->connect_seq
+ 308|                    << dendl;
+ 309|     return replace(existing, reply, authorizer_reply);
+ 310|   }  // existing
+ 311|   else if (!replacing && connect_msg.connect_seq > 0) {
+ 312|     // we reset, and they are opening a new session
+ 313|     ldout(cct, 0) << __func__ << " accept we reset (peer sent cseq "
+ 314|                   << connect_msg.connect_seq << "), sending RESETSESSION"
+ 315|                   << dendl;
+ 316|     return send_connect_message_reply(CEPH_MSGR_TAG_RESETSESSION, reply,
+ 317|                                       authorizer_reply);
+ 318|   } else {
+ 319|     // new session
+ 320|     ldout(cct, 10) << __func__ << " accept new session" << dendl;
+ 321|     existing = nullptr;
+ 322|     return open(reply, authorizer_reply);
+ 323|   }
+ 324| }
+<<<END_UNTRUSTED_CODE>>>

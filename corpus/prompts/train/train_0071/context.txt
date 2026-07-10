@@ -1,0 +1,642 @@
+Files under review: corpus/train/train_0071_cwe327.c
+
+<<<BEGIN_UNTRUSTED_CODE>>>
+/* ===== FILE: corpus/train/train_0071_cwe327.c ===== */
+   1| /* sample: primevul_c_train_3184_fixed */
+   2| keyfetch_done(isc_task_t *task, isc_event_t *event) {
+   3| 	isc_result_t result, eresult;
+   4| 	dns_fetchevent_t *devent;
+   5| 	dns_keyfetch_t *kfetch;
+   6| 	dns_zone_t *zone;
+   7| 	isc_mem_t *mctx = NULL;
+   8| 	dns_keytable_t *secroots = NULL;
+   9| 	dns_dbversion_t *ver = NULL;
+  10| 	dns_diff_t diff;
+  11| 	bool alldone = false;
+  12| 	bool commit = false;
+  13| 	dns_name_t *keyname;
+  14| 	dns_rdata_t sigrr = DNS_RDATA_INIT;
+  15| 	dns_rdata_t dnskeyrr = DNS_RDATA_INIT;
+  16| 	dns_rdata_t keydatarr = DNS_RDATA_INIT;
+  17| 	dns_rdata_rrsig_t sig;
+  18| 	dns_rdata_dnskey_t dnskey;
+  19| 	dns_rdata_keydata_t keydata;
+  20| 	bool initializing;
+  21| 	char namebuf[DNS_NAME_FORMATSIZE];
+  22| 	unsigned char key_buf[4096];
+  23| 	isc_buffer_t keyb;
+  24| 	dst_key_t *dstkey;
+  25| 	isc_stdtime_t now;
+  26| 	int pending = 0;
+  27| 	bool secure = false, initial = false;
+  28| 	bool free_needed;
+  29| 
+  30| 	UNUSED(task);
+  31| 	INSIST(event != NULL && event->ev_type == DNS_EVENT_FETCHDONE);
+  32| 	INSIST(event->ev_arg != NULL);
+  33| 
+  34| 	kfetch = event->ev_arg;
+  35| 	zone = kfetch->zone;
+  36| 	isc_mem_attach(zone->mctx, &mctx);
+  37| 	keyname = dns_fixedname_name(&kfetch->name);
+  38| 
+  39| 	devent = (dns_fetchevent_t *) event;
+  40| 	eresult = devent->result;
+  41| 
+  42| 	/* Free resources which are not of interest */
+  43| 	if (devent->node != NULL) {
+  44| 		dns_db_detachnode(devent->db, &devent->node);
+  45| 	}
+  46| 	if (devent->db != NULL) {
+  47| 		dns_db_detach(&devent->db);
+  48| 	}
+  49| 	isc_event_free(&event);
+  50| 	dns_resolver_destroyfetch(&kfetch->fetch);
+  51| 
+  52| 	LOCK_ZONE(zone);
+  53| 	if (DNS_ZONE_FLAG(zone, DNS_ZONEFLG_EXITING) || zone->view == NULL) {
+  54| 		goto cleanup;
+  55| 	}
+  56| 
+  57| 	isc_stdtime_get(&now);
+  58| 	dns_name_format(keyname, namebuf, sizeof(namebuf));
+  59| 
+  60| 	result = dns_view_getsecroots(zone->view, &secroots);
+  61| 	INSIST(result == ISC_R_SUCCESS);
+  62| 
+  63| 	dns_diff_init(mctx, &diff);
+  64| 
+  65| 	CHECK(dns_db_newversion(kfetch->db, &ver));
+  66| 
+  67| 	zone->refreshkeycount--;
+  68| 	alldone = (zone->refreshkeycount == 0);
+  69| 
+  70| 	if (alldone) {
+  71| 		DNS_ZONE_CLRFLAG(zone, DNS_ZONEFLG_REFRESHING);
+  72| 	}
+  73| 
+  74| 	dnssec_log(zone, ISC_LOG_DEBUG(3),
+  75| 		   "Returned from key fetch in keyfetch_done() for '%s': %s",
+  76| 		   namebuf, dns_result_totext(eresult));
+  77| 
+  78| 	/* Fetch failed */
+  79| 	if (eresult != ISC_R_SUCCESS ||
+  80| 	    !dns_rdataset_isassociated(&kfetch->dnskeyset))
+  81| 	{
+  82| 		dnssec_log(zone, ISC_LOG_WARNING,
+  83| 			   "Unable to fetch DNSKEY set '%s': %s",
+  84| 			   namebuf, dns_result_totext(eresult));
+  85| 		CHECK(minimal_update(kfetch, ver, &diff));
+  86| 		goto done;
+  87| 	}
+  88| 
+  89| 	/* No RRSIGs found */
+  90| 	if (!dns_rdataset_isassociated(&kfetch->dnskeysigset)) {
+  91| 		dnssec_log(zone, ISC_LOG_WARNING,
+  92| 			   "No DNSKEY RRSIGs found for '%s': %s",
+  93| 			   namebuf, dns_result_totext(eresult));
+  94| 		CHECK(minimal_update(kfetch, ver, &diff));
+  95| 		goto done;
+  96| 	}
+  97| 
+  98| 	/*
+  99| 	 * Clear any cached trust level, as we need to run validation
+ 100| 	 * over again; trusted keys might have changed.
+ 101| 	 */
+ 102| 	kfetch->dnskeyset.trust = kfetch->dnskeysigset.trust = dns_trust_none;
+ 103| 
+ 104| 	/*
+ 105| 	 * Validate the dnskeyset against the current trusted keys.
+ 106| 	 */
+ 107| 	for (result = dns_rdataset_first(&kfetch->dnskeysigset);
+ 108| 	     result == ISC_R_SUCCESS;
+ 109| 	     result = dns_rdataset_next(&kfetch->dnskeysigset))
+ 110| 	{
+ 111| 		dns_keynode_t *keynode = NULL;
+ 112| 
+ 113| 		dns_rdata_reset(&sigrr);
+ 114| 		dns_rdataset_current(&kfetch->dnskeysigset, &sigrr);
+ 115| 		result = dns_rdata_tostruct(&sigrr, &sig, NULL);
+ 116| 		RUNTIME_CHECK(result == ISC_R_SUCCESS);
+ 117| 
+ 118| 		result = dns_keytable_find(secroots, keyname, &keynode);
+ 119| 		while (result == ISC_R_SUCCESS) {
+ 120| 			dns_keynode_t *nextnode = NULL;
+ 121| 			dns_fixedname_t fixed;
+ 122| 			dns_fixedname_init(&fixed);
+ 123| 
+ 124| 			dstkey = dns_keynode_key(keynode);
+ 125| 			if (dstkey == NULL) {
+ 126| 				/* fail_secure() was called */
+ 127| 				break;
+ 128| 			}
+ 129| 
+ 130| 			if (dst_key_alg(dstkey) == sig.algorithm &&
+ 131| 			    dst_key_id(dstkey) == sig.keyid)
+ 132| 			{
+ 133| 				result = dns_dnssec_verify(keyname,
+ 134| 							   &kfetch->dnskeyset,
+ 135| 							   dstkey, false,
+ 136| 							   0,
+ 137| 							   zone->view->mctx,
+ 138| 							   &sigrr,
+ 139| 							   dns_fixedname_name(
+ 140| 							   &fixed));
+ 141| 
+ 142| 				dnssec_log(zone, ISC_LOG_DEBUG(3),
+ 143| 					   "Verifying DNSKEY set for zone "
+ 144| 					   "'%s' using key %d/%d: %s",
+ 145| 					   namebuf, sig.keyid, sig.algorithm,
+ 146| 					   dns_result_totext(result));
+ 147| 
+ 148| 				if (result == ISC_R_SUCCESS) {
+ 149| 					kfetch->dnskeyset.trust =
+ 150| 						dns_trust_secure;
+ 151| 					kfetch->dnskeysigset.trust =
+ 152| 						dns_trust_secure;
+ 153| 					secure = true;
+ 154| 					initial = dns_keynode_initial(keynode);
+ 155| 					dns_keynode_trust(keynode);
+ 156| 					break;
+ 157| 				}
+ 158| 			}
+ 159| 
+ 160| 			result = dns_keytable_nextkeynode(secroots,
+ 161| 							  keynode, &nextnode);
+ 162| 			dns_keytable_detachkeynode(secroots, &keynode);
+ 163| 			keynode = nextnode;
+ 164| 		}
+ 165| 
+ 166| 		if (keynode != NULL) {
+ 167| 			dns_keytable_detachkeynode(secroots, &keynode);
+ 168| 		}
+ 169| 
+ 170| 		if (secure) {
+ 171| 			break;
+ 172| 		}
+ 173| 	}
+ 174| 
+ 175| 	/*
+ 176| 	 * If we were not able to verify the answer using the current
+ 177| 	 * trusted keys then all we can do is look at any revoked keys.
+ 178| 	 */
+ 179| 	if (!secure) {
+ 180| 		dnssec_log(zone, ISC_LOG_INFO,
+ 181| 			   "DNSKEY set for zone '%s' could not be verified "
+ 182| 			   "with current keys", namebuf);
+ 183| 	}
+ 184| 
+ 185| 	/*
+ 186| 	 * First scan keydataset to find keys that are not in dnskeyset
+ 187| 	 *   - Missing keys which are not scheduled for removal,
+ 188| 	 *     log a warning
+ 189| 	 *   - Missing keys which are scheduled for removal and
+ 190| 	 *     the remove hold-down timer has completed should
+ 191| 	 *     be removed from the key zone
+ 192| 	 *   - Missing keys whose acceptance timers have not yet
+ 193| 	 *     completed, log a warning and reset the acceptance
+ 194| 	 *     timer to 30 days in the future
+ 195| 	 *   - All keys not being removed have their refresh timers
+ 196| 	 *     updated
+ 197| 	 */
+ 198| 	initializing = true;
+ 199| 	for (result = dns_rdataset_first(&kfetch->keydataset);
+ 200| 	     result == ISC_R_SUCCESS;
+ 201| 	     result = dns_rdataset_next(&kfetch->keydataset))
+ 202| 	{
+ 203| 		dns_keytag_t keytag;
+ 204| 
+ 205| 		dns_rdata_reset(&keydatarr);
+ 206| 		dns_rdataset_current(&kfetch->keydataset, &keydatarr);
+ 207| 		result = dns_rdata_tostruct(&keydatarr, &keydata, NULL);
+ 208| 		RUNTIME_CHECK(result == ISC_R_SUCCESS);
+ 209| 
+ 210| 		dns_keydata_todnskey(&keydata, &dnskey, NULL);
+ 211| 		result = compute_tag(keyname, &dnskey, mctx, &keytag);
+ 212| 		if (result != ISC_R_SUCCESS) {
+ 213| 			/*
+ 214| 			 * Skip if we cannot compute the key tag.
+ 215| 			 * This may happen if the algorithm is unsupported
+ 216| 			 */
+ 217| 			dns_zone_log(zone, ISC_LOG_ERROR,
+ 218| 				"Cannot compute tag for key in zone %s: %s "
+ 219| 				"(skipping)",
+ 220| 				namebuf, dns_result_totext(result));
+ 221| 			continue;
+ 222| 		}
+ 223| 		RUNTIME_CHECK(result == ISC_R_SUCCESS);
+ 224| 
+ 225| 		/*
+ 226| 		 * If any keydata record has a nonzero add holddown, then
+ 227| 		 * there was a pre-existing trust anchor for this domain;
+ 228| 		 * that means we are *not* initializing it and shouldn't
+ 229| 		 * automatically trust all the keys we find at the zone apex.
+ 230| 		 */
+ 231| 		initializing = initializing && (keydata.addhd == 0);
+ 232| 
+ 233| 		if (! matchkey(&kfetch->dnskeyset, &keydatarr)) {
+ 234| 			bool deletekey = false;
+ 235| 
+ 236| 			if (!secure) {
+ 237| 				if (keydata.removehd != 0 &&
+ 238| 				    keydata.removehd <= now)
+ 239| 				{
+ 240| 					deletekey = true;
+ 241| 				}
+ 242| 			} else if (keydata.addhd == 0) {
+ 243| 				deletekey = true;
+ 244| 			} else if (keydata.addhd > now) {
+ 245| 				dnssec_log(zone, ISC_LOG_INFO,
+ 246| 					   "Pending key %d for zone %s "
+ 247| 					   "unexpectedly missing "
+ 248| 					   "restarting 30-day acceptance "
+ 249| 					   "timer", keytag, namebuf);
+ 250| 				if (keydata.addhd < now + dns_zone_mkey_month) {
+ 251| 					keydata.addhd =
+ 252| 						now + dns_zone_mkey_month;
+ 253| 				}
+ 254| 				keydata.refresh = refresh_time(kfetch, false);
+ 255| 			} else if (keydata.removehd == 0) {
+ 256| 				dnssec_log(zone, ISC_LOG_INFO,
+ 257| 					   "Active key %d for zone %s "
+ 258| 					   "unexpectedly missing",
+ 259| 					   keytag, namebuf);
+ 260| 				keydata.refresh = now + dns_zone_mkey_hour;
+ 261| 			} else if (keydata.removehd <= now) {
+ 262| 				deletekey = true;
+ 263| 				dnssec_log(zone, ISC_LOG_INFO,
+ 264| 					   "Revoked key %d for zone %s "
+ 265| 					   "missing: deleting from "
+ 266| 					   "managed keys database",
+ 267| 					   keytag, namebuf);
+ 268| 			} else {
+ 269| 				keydata.refresh = refresh_time(kfetch, false);
+ 270| 			}
+ 271| 
+ 272| 			if (secure || deletekey) {
+ 273| 				/* Delete old version */
+ 274| 				CHECK(update_one_rr(kfetch->db, ver, &diff,
+ 275| 						    DNS_DIFFOP_DEL, keyname, 0,
+ 276| 						    &keydatarr));
+ 277| 			}
+ 278| 
+ 279| 			if (!secure || deletekey) {
+ 280| 				continue;
+ 281| 			}
+ 282| 
+ 283| 			dns_rdata_reset(&keydatarr);
+ 284| 			isc_buffer_init(&keyb, key_buf, sizeof(key_buf));
+ 285| 			dns_rdata_fromstruct(&keydatarr, zone->rdclass,
+ 286| 					     dns_rdatatype_keydata,
+ 287| 					     &keydata, &keyb);
+ 288| 
+ 289| 			/* Insert updated version */
+ 290| 			CHECK(update_one_rr(kfetch->db, ver, &diff,
+ 291| 					    DNS_DIFFOP_ADD, keyname, 0,
+ 292| 					    &keydatarr));
+ 293| 
+ 294| 			set_refreshkeytimer(zone, &keydata, now, false);
+ 295| 		}
+ 296| 	}
+ 297| 
+ 298| 	/*
+ 299| 	 * Next scan dnskeyset:
+ 300| 	 *   - If new keys are found (i.e., lacking a match in keydataset)
+ 301| 	 *     add them to the key zone and set the acceptance timer
+ 302| 	 *     to 30 days in the future (or to immediately if we've
+ 303| 	 *     determined that we're initializing the zone for the
+ 304| 	 *     first time)
+ 305| 	 *   - Previously-known keys that have been revoked
+ 306| 	 *     must be scheduled for removal from the key zone (or,
+ 307| 	 *     if they hadn't been accepted as trust anchors yet
+ 308| 	 *     anyway, removed at once)
+ 309| 	 *   - Previously-known unrevoked keys whose acceptance timers
+ 310| 	 *     have completed are promoted to trust anchors
+ 311| 	 *   - All keys not being removed have their refresh
+ 312| 	 *     timers updated
+ 313| 	 */
+ 314| 	for (result = dns_rdataset_first(&kfetch->dnskeyset);
+ 315| 	     result == ISC_R_SUCCESS;
+ 316| 	     result = dns_rdataset_next(&kfetch->dnskeyset))
+ 317| 	{
+ 318| 		bool revoked = false;
+ 319| 		bool newkey = false;
+ 320| 		bool updatekey = false;
+ 321| 		bool deletekey = false;
+ 322| 		bool trustkey = false;
+ 323| 		dns_keytag_t keytag;
+ 324| 
+ 325| 		dns_rdata_reset(&dnskeyrr);
+ 326| 		dns_rdataset_current(&kfetch->dnskeyset, &dnskeyrr);
+ 327| 		result = dns_rdata_tostruct(&dnskeyrr, &dnskey, NULL);
+ 328| 		RUNTIME_CHECK(result == ISC_R_SUCCESS);
+ 329| 
+ 330| 		/* Skip ZSK's */
+ 331| 		if ((dnskey.flags & DNS_KEYFLAG_KSK) == 0) {
+ 332| 			continue;
+ 333| 		}
+ 334| 
+ 335| 		result = compute_tag(keyname, &dnskey, mctx, &keytag);
+ 336| 		if (result != ISC_R_SUCCESS) {
+ 337| 			/*
+ 338| 			 * Skip if we cannot compute the key tag.
+ 339| 			 * This may happen if the algorithm is unsupported
+ 340| 			 */
+ 341| 			dns_zone_log(zone, ISC_LOG_ERROR,
+ 342| 				"Cannot compute tag for key in zone %s: %s "
+ 343| 				"(skipping)",
+ 344| 				namebuf, dns_result_totext(result));
+ 345| 			continue;
+ 346| 		}
+ 347| 		RUNTIME_CHECK(result == ISC_R_SUCCESS);
+ 348| 
+ 349| 		revoked = ((dnskey.flags & DNS_KEYFLAG_REVOKE) != 0);
+ 350| 
+ 351| 		if (matchkey(&kfetch->keydataset, &dnskeyrr)) {
+ 352| 			dns_rdata_reset(&keydatarr);
+ 353| 			dns_rdataset_current(&kfetch->keydataset, &keydatarr);
+ 354| 			result = dns_rdata_tostruct(&keydatarr, &keydata, NULL);
+ 355| 			RUNTIME_CHECK(result == ISC_R_SUCCESS);
+ 356| 
+ 357| 			if (revoked && revocable(kfetch, &keydata)) {
+ 358| 				if (keydata.addhd > now) {
+ 359| 					/*
+ 360| 					 * Key wasn't trusted yet, and now
+ 361| 					 * it's been revoked?  Just remove it
+ 362| 					 */
+ 363| 					deletekey = true;
+ 364| 					dnssec_log(zone, ISC_LOG_INFO,
+ 365| 						   "Pending key %d for "
+ 366| 						   "zone %s is now revoked: "
+ 367| 						   "deleting from the "
+ 368| 						   "managed keys database",
+ 369| 						   keytag, namebuf);
+ 370| 				} else if (keydata.removehd == 0) {
+ 371| 					/*
+ 372| 					 * Remove key from secroots.
+ 373| 					 */
+ 374| 					dns_view_untrust(zone->view, keyname,
+ 375| 							 &dnskey, mctx);
+ 376| 
+ 377| 					/* If initializing, delete now */
+ 378| 					if (keydata.addhd == 0) {
+ 379| 						deletekey = true;
+ 380| 					} else {
+ 381| 						keydata.removehd = now +
+ 382| 							dns_zone_mkey_month;
+ 383| 						keydata.flags |=
+ 384| 							DNS_KEYFLAG_REVOKE;
+ 385| 					}
+ 386| 
+ 387| 					dnssec_log(zone, ISC_LOG_INFO,
+ 388| 						   "Trusted key %d for "
+ 389| 						   "zone %s is now revoked",
+ 390| 						   keytag, namebuf);
+ 391| 				} else if (keydata.removehd < now) {
+ 392| 					/* Scheduled for removal */
+ 393| 					deletekey = true;
+ 394| 
+ 395| 					dnssec_log(zone, ISC_LOG_INFO,
+ 396| 						   "Revoked key %d for "
+ 397| 						   "zone %s removal timer "
+ 398| 						   "complete: deleting from "
+ 399| 						   "the managed keys database",
+ 400| 						   keytag, namebuf);
+ 401| 				}
+ 402| 			} else if (revoked && keydata.removehd == 0) {
+ 403| 				dnssec_log(zone, ISC_LOG_WARNING,
+ 404| 					   "Active key %d for zone "
+ 405| 					   "%s is revoked but "
+ 406| 					   "did not self-sign; "
+ 407| 					   "ignoring", keytag, namebuf);
+ 408| 				continue;
+ 409| 			} else if (secure) {
+ 410| 				if (keydata.removehd != 0) {
+ 411| 					/*
+ 412| 					 * Key isn't revoked--but it
+ 413| 					 * seems it used to be.
+ 414| 					 * Remove it now and add it
+ 415| 					 * back as if it were a fresh key,
+ 416| 					 * with a 30-day acceptance timer.
+ 417| 					 */
+ 418| 					deletekey = true;
+ 419| 					newkey = true;
+ 420| 					keydata.removehd = 0;
+ 421| 					keydata.addhd =
+ 422| 						now + dns_zone_mkey_month;
+ 423| 
+ 424| 					dnssec_log(zone, ISC_LOG_INFO,
+ 425| 						   "Revoked key %d for "
+ 426| 						   "zone %s has returned: "
+ 427| 						   "starting 30-day "
+ 428| 						   "acceptance timer",
+ 429| 						   keytag, namebuf);
+ 430| 				} else if (keydata.addhd > now) {
+ 431| 					pending++;
+ 432| 				} else if (keydata.addhd == 0) {
+ 433| 					keydata.addhd = now;
+ 434| 				}
+ 435| 
+ 436| 				if (keydata.addhd <= now) {
+ 437| 					trustkey = true;
+ 438| 					dnssec_log(zone, ISC_LOG_INFO,
+ 439| 						   "Key %d for zone %s "
+ 440| 						   "is now trusted (%s)",
+ 441| 						   keytag, namebuf,
+ 442| 						   initial
+ 443| 						    ? "initializing key "
+ 444| 						       "verified"
+ 445| 						    : "acceptance timer "
+ 446| 						       "complete");
+ 447| 				}
+ 448| 			} else if (keydata.addhd > now) {
+ 449| 				/*
+ 450| 				 * Not secure, and key is pending:
+ 451| 				 * reset the acceptance timer
+ 452| 				 */
+ 453| 				pending++;
+ 454| 				keydata.addhd = now + dns_zone_mkey_month;
+ 455| 				dnssec_log(zone, ISC_LOG_INFO,
+ 456| 					   "Pending key %d "
+ 457| 					   "for zone %s was "
+ 458| 					   "not validated: restarting "
+ 459| 					   "30-day acceptance timer",
+ 460| 					   keytag, namebuf);
+ 461| 			}
+ 462| 
+ 463| 			if (!deletekey && !newkey) {
+ 464| 				updatekey = true;
+ 465| 			}
+ 466| 		} else if (secure) {
+ 467| 			/*
+ 468| 			 * Key wasn't in the key zone but it's
+ 469| 			 * revoked now anyway, so just skip it
+ 470| 			 */
+ 471| 			if (revoked) {
+ 472| 				continue;
+ 473| 			}
+ 474| 
+ 475| 			/* Key wasn't in the key zone: add it */
+ 476| 			newkey = true;
+ 477| 
+ 478| 			if (initializing) {
+ 479| 				dnssec_log(zone, ISC_LOG_WARNING,
+ 480| 					   "Initializing automatic trust "
+ 481| 					   "anchor management for zone '%s'; "
+ 482| 					   "DNSKEY ID %d is now trusted, "
+ 483| 					   "waiving the normal 30-day "
+ 484| 					   "waiting period.",
+ 485| 					   namebuf, keytag);
+ 486| 				trustkey = true;
+ 487| 			} else {
+ 488| 				dnssec_log(zone, ISC_LOG_INFO,
+ 489| 					   "New key %d observed "
+ 490| 					   "for zone '%s': "
+ 491| 					   "starting 30-day "
+ 492| 					   "acceptance timer",
+ 493| 					   keytag, namebuf);
+ 494| 			}
+ 495| 		} else {
+ 496| 			/*
+ 497| 			 * No previously known key, and the key is not
+ 498| 			 * secure, so skip it.
+ 499| 			 */
+ 500| 			continue;
+ 501| 		}
+ 502| 
+ 503| 		/* Delete old version */
+ 504| 		if (deletekey || !newkey) {
+ 505| 			CHECK(update_one_rr(kfetch->db, ver, &diff,
+ 506| 					    DNS_DIFFOP_DEL, keyname, 0,
+ 507| 					    &keydatarr));
+ 508| 		}
+ 509| 
+ 510| 		if (updatekey) {
+ 511| 			/* Set refresh timer */
+ 512| 			keydata.refresh = refresh_time(kfetch, false);
+ 513| 			dns_rdata_reset(&keydatarr);
+ 514| 			isc_buffer_init(&keyb, key_buf, sizeof(key_buf));
+ 515| 			dns_rdata_fromstruct(&keydatarr, zone->rdclass,
+ 516| 					     dns_rdatatype_keydata,
+ 517| 					     &keydata, &keyb);
+ 518| 
+ 519| 			/* Insert updated version */
+ 520| 			CHECK(update_one_rr(kfetch->db, ver, &diff,
+ 521| 					    DNS_DIFFOP_ADD, keyname, 0,
+ 522| 					    &keydatarr));
+ 523| 		} else if (newkey) {
+ 524| 			/* Convert DNSKEY to KEYDATA */
+ 525| 			result = dns_rdata_tostruct(&dnskeyrr, &dnskey, NULL);
+ 526| 			RUNTIME_CHECK(result == ISC_R_SUCCESS);
+ 527| 			dns_keydata_fromdnskey(&keydata, &dnskey, 0, 0, 0,
+ 528| 					       NULL);
+ 529| 			keydata.addhd = initializing
+ 530| 					 ? now : now + dns_zone_mkey_month;
+ 531| 			keydata.refresh = refresh_time(kfetch, false);
+ 532| 			dns_rdata_reset(&keydatarr);
+ 533| 			isc_buffer_init(&keyb, key_buf, sizeof(key_buf));
+ 534| 			dns_rdata_fromstruct(&keydatarr, zone->rdclass,
+ 535| 					     dns_rdatatype_keydata,
+ 536| 					     &keydata, &keyb);
+ 537| 
+ 538| 			/* Insert into key zone */
+ 539| 			CHECK(update_one_rr(kfetch->db, ver, &diff,
+ 540| 					    DNS_DIFFOP_ADD, keyname, 0,
+ 541| 					    &keydatarr));
+ 542| 		}
+ 543| 
+ 544| 		if (trustkey) {
+ 545| 			/* Trust this key. */
+ 546| 			result = dns_rdata_tostruct(&dnskeyrr, &dnskey, NULL);
+ 547| 			RUNTIME_CHECK(result == ISC_R_SUCCESS);
+ 548| 			trust_key(zone, keyname, &dnskey, false, mctx);
+ 549| 		}
+ 550| 
+ 551| 		if (secure && !deletekey) {
+ 552| 			INSIST(newkey || updatekey);
+ 553| 			set_refreshkeytimer(zone, &keydata, now, false);
+ 554| 		}
+ 555| 	}
+ 556| 
+ 557| 	/*
+ 558| 	 * RFC5011 says, "A trust point that has all of its trust anchors
+ 559| 	 * revoked is considered deleted and is treated as if the trust
+ 560| 	 * point was never configured."  But if someone revoked their
+ 561| 	 * active key before the standby was trusted, that would mean the
+ 562| 	 * zone would suddenly be nonsecured.  We avoid this by checking to
+ 563| 	 * see if there's pending keydata.  If so, we put a null key in
+ 564| 	 * the security roots; then all queries to the zone will fail.
+ 565| 	 */
+ 566| 	if (pending != 0) {
+ 567| 		fail_secure(zone, keyname);
+ 568| 	}
+ 569| 
+ 570|  done:
+ 571| 	if (!ISC_LIST_EMPTY(diff.tuples)) {
+ 572| 		/* Write changes to journal file. */
+ 573| 		CHECK(update_soa_serial(kfetch->db, ver, &diff, mctx,
+ 574| 					zone->updatemethod));
+ 575| 		CHECK(zone_journal(zone, &diff, NULL, "keyfetch_done"));
+ 576| 		commit = true;
+ 577| 
+ 578| 		DNS_ZONE_SETFLAG(zone, DNS_ZONEFLG_LOADED);
+ 579| 		zone_needdump(zone, 30);
+ 580| 	} else if (result == ISC_R_NOMORE) {
+ 581| 		/*
+ 582| 		 * If "updatekey" was true for all keys found in the DNSKEY
+ 583| 		 * response and the previous update of those keys happened
+ 584| 		 * during the same second (only possible if a key refresh was
+ 585| 		 * externally triggered), it may happen that all relevant
+ 586| 		 * update_one_rr() calls will return ISC_R_SUCCESS, but
+ 587| 		 * diff.tuples will remain empty.  Reset result to
+ 588| 		 * ISC_R_SUCCESS to prevent a bogus warning from being logged.
+ 589| 		 */
+ 590| 		result = ISC_R_SUCCESS;
+ 591| 	}
+ 592| 
+ 593|  failure:
+ 594| 	if (result != ISC_R_SUCCESS) {
+ 595| 		dnssec_log(zone, ISC_LOG_ERROR,
+ 596| 			   "error during managed-keys processing (%s): "
+ 597| 			   "DNSSEC validation may be at risk",
+ 598| 			   isc_result_totext(result));
+ 599| 	}
+ 600| 	dns_diff_clear(&diff);
+ 601| 	if (ver != NULL) {
+ 602| 		dns_db_closeversion(kfetch->db, &ver, commit);
+ 603| 	}
+ 604| 
+ 605|  cleanup:
+ 606| 	dns_db_detach(&kfetch->db);
+ 607| 
+ 608| 	INSIST(zone->irefs > 0);
+ 609| 	zone->irefs--;
+ 610| 	kfetch->zone = NULL;
+ 611| 
+ 612| 	if (dns_rdataset_isassociated(&kfetch->keydataset)) {
+ 613| 		dns_rdataset_disassociate(&kfetch->keydataset);
+ 614| 	}
+ 615| 	if (dns_rdataset_isassociated(&kfetch->dnskeyset)) {
+ 616| 		dns_rdataset_disassociate(&kfetch->dnskeyset);
+ 617| 	}
+ 618| 	if (dns_rdataset_isassociated(&kfetch->dnskeysigset)) {
+ 619| 		dns_rdataset_disassociate(&kfetch->dnskeysigset);
+ 620| 	}
+ 621| 
+ 622| 	dns_name_free(keyname, mctx);
+ 623| 	isc_mem_put(mctx, kfetch, sizeof(dns_keyfetch_t));
+ 624| 	isc_mem_detach(&mctx);
+ 625| 
+ 626| 	if (secroots != NULL) {
+ 627| 		dns_keytable_detach(&secroots);
+ 628| 	}
+ 629| 
+ 630| 	free_needed = exit_check(zone);
+ 631| 	UNLOCK_ZONE(zone);
+ 632| 	if (free_needed) {
+ 633| 		zone_free(zone);
+ 634| 	}
+ 635| 
+ 636| 	INSIST(ver == NULL);
+ 637| }
+<<<END_UNTRUSTED_CODE>>>

@@ -1,0 +1,183 @@
+{
+  "subsystem": "GStreamer MPEG-TS section parsing. This is _parse_pat(), the decoder for the Program Association Table (PAT) of an MPEG-2 Transport Stream, part of the libgstmpegts helper library in gst-plugins-bad. Given a GstMpegtsSection that already holds the raw bytes of a PSI section, it walks the program loop and builds a GPtrArray of GstMpegtsPatProgram entries, each carrying a 16-bit program_number and a 13-bit network_or_program_map_PID.",
+  "provenance": "Identified from the GStreamer/GLib naming: GstMpegtsSection, GstMpegtsPatProgram, GST_READ_UINT16_BE, g_ptr_array_new_full / g_ptr_array_index / g_ptr_array_unref, g_slice_new0, GDestroyNotify, GST_ERROR, and the guint8/guint16 typedefs. The function name _parse_pat and the _mpegts_pat_program_free destroy-notify are the exact symbols in gstmpegtssection.c of gst-plugins-bad's libgstmpegts. The in-tree sample banner marks it 'primevul_c_train_2797_vuln'. PID masking with & 0x1FFF (13 bits) confirms MPEG-TS PSI/PAT semantics.",
+  "trust_boundary": "section->data and section->section_length originate from an MPEG-TS stream (network, file, capture device, or upstream demuxer) and are fully attacker-controllable. section_length is the 12-bit length field carried in the PSI section header, so an attacker can set it to any value the outer parser permits. The parser assumes an 8-byte fixed header precedes the program loop (data = section->data + 8) and a 4-byte CRC follows it (end - 4). Every pointer computed here (data, end) and every count derived from them (nb_programs, loop trip count) is therefore a function of hostile input; none of it is re-validated inside this function.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0294_cwe476.c",
+      "lines": "2-7",
+      "code": "_parse_pat (GstMpegtsSection * section)\n{\n  GPtrArray *pat;\n  guint16 i = 0, nb_programs;\n  GstMpegtsPatProgram *program;\n  guint8 *data, *end;",
+      "explanation": "The function takes a single argument, section, a pointer to a GstMpegtsSection that already contains the raw bytes of a parsed PSI section (the return type, elided from the shown fragment, is gpointer as the cast on line 42 shows). It declares local state: pat is the output GPtrArray of program entries; i is a 16-bit loop/index counter initialised to 0 and nb_programs is a 16-bit count of programs (both guint16, so both saturate at 65535 and silently wrap on overflow); program is a scratch pointer to the current GstMpegtsPatProgram being filled; and data and end are the byte cursors that will walk the section payload. The choice of guint16 for nb_programs is significant: the program count is computed by pointer arithmetic that yields a signed ptrdiff_t, and narrowing that into an unsigned 16-bit field is where several of the hazards below originate."
+    },
+    {
+      "file": "corpus/train/train_0294_cwe476.c",
+      "lines": "9-13",
+      "code": "  /* Skip already parsed data */\n  data = section->data + 8;\n\n  /* stop at the CRC */\n  end = section->data + section->section_length;",
+      "explanation": "data is positioned 8 bytes into the section buffer, unconditionally skipping the fixed PAT/PSI header (table_id, section_syntax/length, transport_stream_id, version/current_next, section_number, last_section_number). end is set to section->data + section->section_length, i.e. one past the last byte the section header claims to occupy. Note that section_length is attacker-supplied and is used directly as a byte offset with no lower or upper bound check here: the code trusts that at least 8 header bytes and 4 trailing CRC bytes exist inside the buffer, and that section_length does not exceed the actual allocation of section->data. Both the '+8' skip and the 'end' computation are pure offset arithmetic with no validation gate."
+    },
+    {
+      "file": "corpus/train/train_0294_cwe476.c",
+      "lines": "16-19",
+      "code": "  nb_programs = (end - 4 - data) / 4;\n  pat =\n      g_ptr_array_new_full (nb_programs,\n      (GDestroyNotify) _mpegts_pat_program_free);",
+      "explanation": "nb_programs is the number of 4-byte program entries between the end of the header and the start of the 4-byte CRC. (end - 4 - data) is a ptrdiff_t equal to section_length - 8 - 4 = section_length - 12; dividing by 4 gives the entry count, which is then narrowed into the guint16 nb_programs. This single value is then used for two independent purposes: it is passed as the reserved_size to g_ptr_array_new_full, pre-sizing the underlying pdata array, and (later, on line 33) it is stored directly as the array's logical length. _mpegts_pat_program_free is registered as the element destroy-notify so that unref-ing the array frees every element it believes it holds. Because nb_programs is a signed subtraction truncated into an unsigned 16-bit type, its value is trustworthy only when section_length is at least 12 AND section_length - 12 is a clean multiple of 4."
+    },
+    {
+      "file": "corpus/train/train_0294_cwe476.c",
+      "lines": "21-27",
+      "code": "  while (data < end - 4) {\n    program = g_slice_new0 (GstMpegtsPatProgram);\n    program->program_number = GST_READ_UINT16_BE (data);\n    data += 2;\n\n    program->network_or_program_map_PID = GST_READ_UINT16_BE (data) & 0x1FFF;\n    data += 2;",
+      "explanation": "The loop iterates while the cursor is more than 4 bytes short of end (i.e. while there is at least one 4-byte program entry before the CRC). Each pass allocates a zero-initialised GstMpegtsPatProgram, reads a big-endian 16-bit program_number from the first two bytes, advances the cursor, then reads a big-endian 16-bit value masked to 13 bits (& 0x1FFF) as network_or_program_map_PID and advances again. Critically, the loop's termination is governed by the byte cursor (data < end - 4), advancing 4 bytes per pass, whereas the allocation on line 16-19 was sized by the integer-divided count nb_programs. The number of times this body executes is ceil((section_length - 12) / 4) when there is any leftover, which is not the same as floor((section_length - 12) / 4) = nb_programs whenever (section_length - 12) is not a multiple of 4. That mismatch is the seam this code splits on."
+    },
+    {
+      "file": "corpus/train/train_0294_cwe476.c",
+      "lines": "29-33",
+      "code": "    g_ptr_array_index (pat, i) = program;\n\n    i++;\n  }\n  pat->len = nb_programs;",
+      "explanation": "Instead of calling g_ptr_array_add (which both stores the pointer AND grows/reallocates pdata and increments len under the container's control), the code writes directly with g_ptr_array_index(pat, i) = program. The g_ptr_array_index macro is a raw subscript into pdata with no bounds check and no growth: it expands to ((pat)->pdata)[i] = program. After the loop the code manually sets pat->len = nb_programs, hand-forging the container's logical length rather than letting the API maintain it. This bypasses every invariant GPtrArray normally guarantees (len <= alloc, every slot below len populated, pdata non-NULL before subscript). The array's correctness now depends entirely on the arithmetic on line 16 matching the loop trip count on line 21 and on pdata having been allocated large enough — neither of which the code verifies."
+    },
+    {
+      "file": "corpus/train/train_0294_cwe476.c",
+      "lines": "35-43",
+      "code": "  if (data != end - 4) {\n    GST_ERROR (\"at the end of PAT data != end - 4\");\n    g_ptr_array_unref (pat);\n\n    return NULL;\n  }\n\n  return (gpointer) pat;\n}",
+      "explanation": "After the loop, the code performs a consistency check: the cursor must have landed exactly on end - 4 (the start of the CRC). If it did not — which happens precisely when (section_length - 12) was not a multiple of 4 and the loop overshot — it logs an error, unref's the array, and returns NULL. On the success path it returns the populated GPtrArray as a gpointer. The problem is that this validation happens AFTER the loop body has already written into pat and after pat->len was set; any out-of-bounds or NULL write on lines 29/33 has already occurred by the time this guard runs, and the g_ptr_array_unref on line 37 will itself walk pat->len slots invoking _mpegts_pat_program_free on whatever those slots contain (uninitialised or partially populated)."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0294_cwe476.c",
+      "lines": "16-29",
+      "code": "  nb_programs = (end - 4 - data) / 4;\n  pat =\n      g_ptr_array_new_full (nb_programs,\n      (GDestroyNotify) _mpegts_pat_program_free);\n\n  while (data < end - 4) {\n    program = g_slice_new0 (GstMpegtsPatProgram);\n    program->program_number = GST_READ_UINT16_BE (data);\n    data += 2;\n\n    program->network_or_program_map_PID = GST_READ_UINT16_BE (data) & 0x1FFF;\n    data += 2;\n\n    g_ptr_array_index (pat, i) = program;",
+      "explanation": "NULL-pointer write (CWE-476). An attacker who sets section_length to 13, 14, or 15 makes (end - 4 - data) = section_length - 12 equal to 1, 2, or 3, so nb_programs = floor(1..3 / 4) = 0. g_ptr_array_new_full(0, ...) reserves nothing, leaving the GPtrArray's pdata as a NULL pointer (GLib only allocates pdata on first expansion). But the loop condition data < end - 4 is still true (there is 1..3 leftover bytes past the header before the CRC boundary), so the body runs once and executes g_ptr_array_index(pat, 0) = program, which expands to pat->pdata[0] = program — a write through a NULL base pointer. This dereferences NULL and crashes the process (denial of service on any pipeline decoding the malicious stream). The implementation MUST validate that section_length is large enough to contain the header, at least one whole program entry, and the CRC (section_length >= 12 and the payload aligned to 4) before ever indexing the array, and MUST use g_ptr_array_add so the container allocates pdata for it."
+    },
+    {
+      "file": "corpus/train/train_0294_cwe476.c",
+      "lines": "16-16",
+      "code": "  nb_programs = (end - 4 - data) / 4;",
+      "explanation": "Integer underflow / narrowing (CWE-191). If section_length < 12 (for example 8, so the section is only its header), then end - 4 - data = section_length - 12 is negative. The subtraction is a signed ptrdiff_t (say -4), and dividing by 4 gives a small negative number that is then truncated into the unsigned 16-bit nb_programs, wrapping to a huge value (e.g. -1 -> 65535). That poisoned count is passed to g_ptr_array_new_full as reserved_size (a large speculative allocation / memory-pressure DoS) and, more dangerously, is stored verbatim into pat->len on line 33. The invariant the implementation must uphold is to reject any section whose section_length is smaller than 8 (header) + 4 (CRC) BEFORE performing the subtraction, so the count can never be computed from a negative difference."
+    },
+    {
+      "file": "corpus/train/train_0294_cwe476.c",
+      "lines": "21-29",
+      "code": "  while (data < end - 4) {\n    program = g_slice_new0 (GstMpegtsPatProgram);\n    program->program_number = GST_READ_UINT16_BE (data);\n    data += 2;\n\n    program->network_or_program_map_PID = GST_READ_UINT16_BE (data) & 0x1FFF;\n    data += 2;\n\n    g_ptr_array_index (pat, i) = program;",
+      "explanation": "Out-of-bounds heap write past the reserved pdata (CWE-787). When (section_length - 12) is not a multiple of 4 but is >= 4 (e.g. section_length = 18, leftover 6 bytes), nb_programs = floor(6/4) = 1 reserves room for one pointer, yet the byte-driven loop runs ceil(6/4) = 2 times and executes g_ptr_array_index(pat, 1) = program. Because g_ptr_array_index is an unchecked subscript that neither bounds-checks nor grows the array, this writes a pointer one slot beyond the reserved allocation. The general defect is that the allocation is sized by an integer-divided count (line 16) while the write loop is bounded by the raw byte cursor (line 21); they disagree whenever the payload is not 4-byte aligned. (Whether the extra write lands in GLib's rounding slack or in adjacent heap depends on g_ptr_array's capacity rounding, so this is corruption-or-crash rather than always exploitable, but the code provides no guarantee either way.) The implementation MUST derive the loop bound and the allocation from the same validated count and reject non-4-byte-aligned program regions."
+    },
+    {
+      "file": "corpus/train/train_0294_cwe476.c",
+      "lines": "29-37",
+      "code": "    g_ptr_array_index (pat, i) = program;\n\n    i++;\n  }\n  pat->len = nb_programs;\n\n  if (data != end - 4) {\n    GST_ERROR (\"at the end of PAT data != end - 4\");\n    g_ptr_array_unref (pat);",
+      "explanation": "Container length desynchronised from populated slots -> use of uninitialised/NULL pointer on teardown or downstream (CWE-476 / CWE-665). pat->len is force-set to nb_programs regardless of how many slots the loop actually wrote. When they disagree (leftover bytes, or nb_programs wrapped huge from the underflow above), pat->len exposes slots the loop never populated. Two consumers then read them: (1) the g_ptr_array_unref on the error path (line 37) walks pat->len entries and calls _mpegts_pat_program_free on each, dereferencing uninitialised/garbage pointers in the reserved-but-unwritten region; and (2) any downstream caller that receives the returned array and iterates pat[0..len-1] dereferences the same wild/NULL slots. The invariant is that pat->len must always equal the number of elements actually stored, which is exactly what g_ptr_array_add would maintain and what the manual assignment breaks."
+    },
+    {
+      "file": "corpus/train/train_0294_cwe476.c",
+      "lines": "10-13",
+      "code": "  data = section->data + 8;\n\n  /* stop at the CRC */\n  end = section->data + section->section_length;",
+      "explanation": "Missing input validation / out-of-bounds read (CWE-20, CWE-125). section_length is taken directly from the untrusted section header and used as an offset with no upper-bound check against the real size of the section->data allocation. If section_length is larger than the number of bytes actually buffered, end points past the allocation and every GST_READ_UINT16_BE(data) on lines 23/26 reads out of bounds until the cursor reaches the bogus end. There is also no lower-bound check that at least 8 header bytes exist before the '+8' skip. The implementation MUST clamp section_length to the validated on-wire section size and confirm section->data holds at least section_length bytes before any cursor arithmetic; the outer PSI section parser is the natural place to enforce this, and this function must not assume it did."
+    }
+  ],
+  "summary": "This PAT parser derives a guint16 program count from unchecked pointer arithmetic on the attacker-controlled section_length and then writes into a GPtrArray with the raw, unbounded g_ptr_array_index subscript while hand-forging pat->len. A crafted section_length (e.g. 13-15) makes the reserved size 0 so the first g_ptr_array_index write dereferences a NULL pdata (CWE-476 crash); non-4-byte-aligned or too-short lengths cause count/loop desync leading to out-of-bounds writes (CWE-787) and length-vs-populated desynchronisation that dereferences uninitialised pointers on teardown, plus an integer underflow (CWE-191) when section_length < 12. Remotely triggerable denial of service / memory corruption from a malicious MPEG-TS stream.",
+  "reviewed_anchors": [
+    {"anchor": "_parse_pat (GstMpegtsSection * section) — function signature / untrusted input container", "disposition": "finding", "reason": "section carries attacker-controlled data and section_length; every hazard flows from it."},
+    {"anchor": "section->data (raw section byte pointer)", "disposition": "finding", "reason": "base of all cursor arithmetic; its true allocation size is never checked against section_length (OOB read)."},
+    {"anchor": "section->section_length (length field)", "disposition": "finding", "reason": "attacker-supplied offset driving end, nb_programs, and the loop bound with no lower/upper bound check."},
+    {"anchor": "guint16 nb_programs", "disposition": "finding", "reason": "signed ptrdiff subtraction narrowed to unsigned 16-bit; underflows/wraps and desyncs from loop trip count."},
+    {"anchor": "guint16 i (index counter)", "disposition": "finding", "reason": "used as the unchecked g_ptr_array_index subscript; can exceed the reserved pdata size."},
+    {"anchor": "guint8 *data, *end (cursors)", "disposition": "finding", "reason": "end = data + section_length can exceed the buffer; data < end - 4 governs the write loop count."},
+    {"anchor": "data = section->data + 8 (line 10)", "disposition": "finding", "reason": "unconditional 8-byte skip with no check the header bytes exist."},
+    {"anchor": "nb_programs = (end - 4 - data) / 4 (line 16)", "disposition": "finding", "reason": "core underflow/narrowing site and the count that both sizes and lengths the array."},
+    {"anchor": "g_ptr_array_new_full (nb_programs, ...) (lines 17-19)", "disposition": "finding", "reason": "reserved_size 0 leaves pdata NULL; a poisoned count causes huge/near-zero allocation."},
+    {"anchor": "_mpegts_pat_program_free (GDestroyNotify)", "disposition": "finding", "reason": "invoked by g_ptr_array_unref on pat->len slots, some uninitialised/NULL, on the error path."},
+    {"anchor": "while (data < end - 4) (line 21)", "disposition": "finding", "reason": "byte-cursor loop bound disagrees with the divided nb_programs when payload is not 4-byte aligned."},
+    {"anchor": "g_slice_new0 (GstMpegtsPatProgram) (line 22)", "disposition": "dismissed", "reason": "fixed-size zero-initialised allocation; no attacker-controlled size."},
+    {"anchor": "program->program_number = GST_READ_UINT16_BE (data) (line 23)", "disposition": "dismissed", "reason": "2-byte read is in bounds relative to the loop guard; risk is the guard itself (covered by end/OOB-read finding)."},
+    {"anchor": "program->network_or_program_map_PID = GST_READ_UINT16_BE (data) & 0x1FFF (line 26)", "disposition": "dismissed", "reason": "13-bit-masked read; value is sanitised and read stays within the loop bound."},
+    {"anchor": "g_ptr_array_index (pat, i) = program (line 29)", "disposition": "finding", "reason": "unchecked subscript write; NULL pdata write and OOB-past-reserved write."},
+    {"anchor": "pat->len = nb_programs (line 33)", "disposition": "finding", "reason": "hand-forged length desynchronised from populated slots; exposes uninitialised pointers."},
+    {"anchor": "if (data != end - 4) guard (line 35)", "disposition": "dismissed", "reason": "a consistency check, but it runs only AFTER the dangerous writes; it detects misalignment too late to prevent the bug."},
+    {"anchor": "GST_ERROR (\"...\") (line 36)", "disposition": "dismissed", "reason": "static-string log call, no handle dereference, no format-string of attacker data."},
+    {"anchor": "g_ptr_array_unref (pat) (line 37)", "disposition": "finding", "reason": "walks pat->len slots invoking the destroy-notify on possibly-uninitialised/NULL pointers (teardown deref)."},
+    {"anchor": "return (gpointer) pat (line 42)", "disposition": "dismissed", "reason": "cast of the container to the declared return type; carries the desync risk already covered by the pat->len finding."}
+  ],
+  "findings": [
+    {
+      "title": "NULL-pointer write when reserved size is 0 (short/odd section_length)",
+      "anchor": "g_ptr_array_new_full (nb_programs, ...) feeding g_ptr_array_index (pat, i) = program",
+      "file": "corpus/train/train_0294_cwe476.c",
+      "line": "16-29",
+      "code": "  nb_programs = (end - 4 - data) / 4;\n  pat =\n      g_ptr_array_new_full (nb_programs,\n      (GDestroyNotify) _mpegts_pat_program_free);\n\n  while (data < end - 4) {\n    program = g_slice_new0 (GstMpegtsPatProgram);\n    program->program_number = GST_READ_UINT16_BE (data);\n    data += 2;\n\n    program->network_or_program_map_PID = GST_READ_UINT16_BE (data) & 0x1FFF;\n    data += 2;\n\n    g_ptr_array_index (pat, i) = program;",
+      "bug_class": "NULL pointer dereference (write through unallocated pdata)",
+      "cwe": "CWE-476",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0294_cwe476.c",
+      "invariant": "The array must have pdata allocated (and be indexed via a bounds-safe API such as g_ptr_array_add) before any element is stored; section_length must be validated to contain header + at least one aligned program entry + CRC first.",
+      "failure_mode": "section_length in {13,14,15} makes nb_programs = floor((section_length-12)/4) = 0, so g_ptr_array_new_full(0, ...) leaves pdata NULL, yet the leftover 1-3 bytes keep data < end - 4 true; the single loop pass executes pat->pdata[0] = program, writing through NULL and crashing the decoder (remote DoS on any pipeline parsing the stream).",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm g_ptr_array_new_full(0) does not pre-allocate pdata in the linked GLib, and that no earlier caller rejects section_length < 12 or non-4-byte-aligned PAT payloads before _parse_pat runs."
+    },
+    {
+      "title": "Out-of-bounds heap write past reserved pdata on unaligned payload",
+      "anchor": "g_ptr_array_index (pat, i) = program vs nb_programs reservation",
+      "file": "corpus/train/train_0294_cwe476.c",
+      "line": "21-29",
+      "code": "  while (data < end - 4) {\n    program = g_slice_new0 (GstMpegtsPatProgram);\n    program->program_number = GST_READ_UINT16_BE (data);\n    data += 2;\n\n    program->network_or_program_map_PID = GST_READ_UINT16_BE (data) & 0x1FFF;\n    data += 2;\n\n    g_ptr_array_index (pat, i) = program;",
+      "bug_class": "Out-of-bounds write (loop count exceeds allocation)",
+      "cwe": "CWE-787",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0294_cwe476.c",
+      "invariant": "The number of write iterations must never exceed the number of slots reserved; the loop bound and the allocation size must be derived from the same validated, 4-byte-aligned count.",
+      "failure_mode": "When (section_length-12) is not a multiple of 4 (e.g. section_length=18 -> nb_programs=1 reserved, loop runs ceil(6/4)=2), the unchecked g_ptr_array_index subscript writes pat->pdata[1] one pointer beyond the reserved region, corrupting adjacent heap (or, at reservation 0, writing through NULL as in finding 1). g_ptr_array_index performs no bounds check or growth, unlike g_ptr_array_add.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm GLib's capacity rounding for the reserved size and whether the off-by-one write lands in slack or in live heap; confirm the loop and allocation counts can legitimately diverge for attacker-chosen section_length."
+    },
+    {
+      "title": "Integer underflow narrowing negative program count into guint16",
+      "anchor": "nb_programs = (end - 4 - data) / 4",
+      "file": "corpus/train/train_0294_cwe476.c",
+      "line": "16",
+      "code": "  nb_programs = (end - 4 - data) / 4;",
+      "bug_class": "Integer underflow / unsigned narrowing",
+      "cwe": "CWE-191",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0294_cwe476.c",
+      "invariant": "Reject any section where section_length < 12 (header + CRC) before computing (end - 4 - data); never narrow a possibly-negative ptrdiff_t into an unsigned count.",
+      "failure_mode": "section_length < 12 makes end - 4 - data negative; the /4 signed result is truncated into unsigned guint16, wrapping to a large value (e.g. 65535). That poisoned count drives a large speculative g_ptr_array_new_full allocation and is stored into pat->len, feeding the length-desync teardown crash (finding 4).",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm no upstream guard guarantees section_length >= 12 before _parse_pat, and observe nb_programs for section_length in 8..11."
+    },
+    {
+      "title": "pat->len forged from count, desynchronised from populated slots",
+      "anchor": "pat->len = nb_programs; g_ptr_array_unref (pat)",
+      "file": "corpus/train/train_0294_cwe476.c",
+      "line": "29-37",
+      "code": "    g_ptr_array_index (pat, i) = program;\n\n    i++;\n  }\n  pat->len = nb_programs;\n\n  if (data != end - 4) {\n    GST_ERROR (\"at the end of PAT data != end - 4\");\n    g_ptr_array_unref (pat);",
+      "bug_class": "Improper initialization / dereference of uninitialised pointer",
+      "cwe": "CWE-476",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0294_cwe476.c",
+      "invariant": "A container's logical length must always equal the number of elements actually stored; use g_ptr_array_add so len tracks writes, rather than hand-assigning pat->len.",
+      "failure_mode": "When nb_programs (wrapped huge, or > loop writes) exceeds the slots actually populated, pat->len exposes uninitialised reserved slots. The error-path g_ptr_array_unref then invokes _mpegts_pat_program_free on those garbage pointers, and any downstream consumer iterating pat[0..len-1] dereferences the same wild/NULL entries.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the reserved-but-unwritten pdata slots are not zeroed by GLib, and trace consumers of the returned PAT that iterate up to pat->len."
+    },
+    {
+      "title": "Unvalidated section_length allows out-of-bounds reads",
+      "anchor": "end = section->data + section->section_length",
+      "file": "corpus/train/train_0294_cwe476.c",
+      "line": "10-13",
+      "code": "  data = section->data + 8;\n\n  /* stop at the CRC */\n  end = section->data + section->section_length;",
+      "bug_class": "Missing input validation leading to out-of-bounds read",
+      "cwe": "CWE-125",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0294_cwe476.c",
+      "invariant": "section_length must be validated to be no larger than the actual number of bytes buffered in section->data, and at least 8+4, before any cursor arithmetic or GST_READ_UINT16_BE.",
+      "failure_mode": "If section_length exceeds the real allocation of section->data, end points past the buffer and the loop's GST_READ_UINT16_BE(data) reads walk off the end of the heap allocation until the cursor reaches the bogus end, leaking or crashing on adjacent memory.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm whether the generic PSI/section parser clamps section_length to the received byte count before constructing the GstMpegtsSection handed to _parse_pat."
+    }
+  ],
+  "audit_checklist": [
+    "Verify a guard rejects section_length < 12 (8-byte header + 4-byte CRC) BEFORE computing nb_programs = (end - 4 - data) / 4, so the ptrdiff can never be negative when narrowed to guint16.",
+    "Confirm the PAT program region length (section_length - 12) is required to be a positive multiple of 4, so the byte-cursor loop count and the divided nb_programs cannot diverge.",
+    "Replace g_ptr_array_index(pat, i) = program with g_ptr_array_add(pat, program) so pdata is allocated/grown and len is maintained by the container instead of the manual pat->len = nb_programs.",
+    "Check GLib behaviour of g_ptr_array_new_full(0): confirm pdata is NULL and that the first g_ptr_array_index write would dereference NULL.",
+    "Confirm section_length is clamped to the real buffered size of section->data upstream, preventing end from pointing past the allocation and GST_READ_UINT16_BE from reading out of bounds.",
+    "Trace all consumers of the returned GPtrArray (and the error-path g_ptr_array_unref) to ensure none iterate pat->len slots that the loop may have left uninitialised."
+  ]
+}

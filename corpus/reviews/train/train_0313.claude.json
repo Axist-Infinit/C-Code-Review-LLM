@@ -1,0 +1,258 @@
+{
+  "subsystem": "A single member function, QPDF::resolve(int objid, int generation), from the qpdf C++ library. QPDF is a program/library for structural inspection and transformation of PDF files. resolve() is the core object-dereferencing routine: given an indirect object reference (object number + generation number) parsed from a PDF, it materialises the corresponding PDF object, either by returning it from the in-memory object cache, or by seeking to its byte offset in the file (xref type 1), or by extracting it from a compressed object stream (xref type 2). Every indirect-reference dereference in the whole library funnels through here.",
+  "provenance": "Identified from the fully-qualified method name 'QPDF::resolve', qpdf-specific types (QPDFObjGen, QPDFXRefEntry, QPDFObjectHandle, QPDF_Null, QPDFExc), qpdf utility calls (QUtil::int_to_string, QTC::TC test coverage macro), and the qpdf error enum qpdf_e_damaged_pdf. The header banner names the file corpus/train/train_0313_cwe399.cpp and the sample tag 'primevul_train_2598_fixed' (line 1) marks this as the FIXED variant of a PrimeVul sample; the CWE-399 (Resource Management Errors) filename hint and the 'QPDF recursion loop in resolve' test-coverage string identify the bug class as recursion/resource exhaustion during object resolution.",
+  "trust_boundary": "The entire input is an attacker-controlled PDF file. objid and generation originate from indirect references ('12 0 R') that the parser reads out of that file, so both integer parameters are hostile. The xref_table is built from the file's cross-reference table/streams, so entry.getType(), entry.getOffset(), and entry.getObjStreamNumber() are all attacker-chosen. Critically, the KEY STRUCTURE of references is attacker-controlled: an object can be crafted to reference itself (directly or transitively) in a field that must be resolved WHILE that object is being parsed (e.g. a stream /Length that is an indirect reference to the very object owning the stream). resolve() is therefore re-entered from deep inside its own call chain, and the depth and cyclicity of that re-entry are dictated by the malicious file.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0313_cwe399.cpp",
+      "lines": "2-3",
+      "code": "QPDF::resolve(int objid, int generation)\n{",
+      "explanation": "This is the out-of-class definition of QPDF::resolve. Its return type (a QPDFObjectHandle, per the body's final return) is on the line above the shown snippet. It takes an object number 'objid' and a 'generation' number - the two components of a PDF indirect reference. The job of the function is to turn that numeric reference into an actual in-memory object, doing whatever file I/O and caching are required. Because it is the universal dereference primitive, its behaviour on malformed input governs the safety of every higher-level parser in the library."
+    },
+    {
+      "file": "corpus/train/train_0313_cwe399.cpp",
+      "lines": "4-7",
+      "code": "    // Check object cache before checking xref table.  This allows us\n    // to insert things into the object cache that don't actually\n    // exist in the file.\n    QPDFObjGen og(objid, generation);",
+      "explanation": "A QPDFObjGen value 'og' is constructed from (objid, generation). QPDFObjGen is the hashable/comparable key type used throughout qpdf to index objects. The comment explains the ordering choice: the object cache is consulted before the xref table so that synthetic objects (ones qpdf inserted that do not physically exist in the file) can still be resolved. 'og' is used as the lookup key into three maps below: resolving, obj_cache, and xref_table."
+    },
+    {
+      "file": "corpus/train/train_0313_cwe399.cpp",
+      "lines": "8-20",
+      "code": "    if (this->resolving.count(og))\n    {\n        // This can happen if an object references itself directly or\n        // indirectly in some key that has to be resolved during\n        // object parsing, such as stream length.\n\tQTC::TC(\"qpdf\", \"QPDF recursion loop in resolve\");\n\twarn(QPDFExc(qpdf_e_damaged_pdf, this->file->getName(),\n\t\t     \"\", this->file->getLastOffset(),\n\t\t     \"loop detected resolving object \" +\n\t\t     QUtil::int_to_string(objid) + \" \" +\n\t\t     QUtil::int_to_string(generation)));\n        return new QPDF_Null;\n    }",
+      "explanation": "This is the recursion/loop-detection guard - the heart of the fix. this->resolving is a set of QPDFObjGen values currently 'in flight' (being resolved higher up the call stack). If 'og' is already present, we have re-entered resolve() for the same object before the outer call completed - a resolution cycle. The comment (lines 10-12) states the trigger precisely: an object that references itself directly or indirectly in a key resolved during parsing, such as a stream length. Rather than recursing forever, the code records a test-coverage point (QTC::TC), emits a warning wrapped in a QPDFExc carrying the file name, last offset, and the offending objid/generation, and returns a fresh QPDF_Null object to break the cycle. The warning is non-fatal; resolution continues for the rest of the document."
+    },
+    {
+      "file": "corpus/train/train_0313_cwe399.cpp",
+      "lines": "21",
+      "code": "    ResolveRecorder rr(this, og);",
+      "explanation": "ResolveRecorder is an RAII guard. Its constructor (not shown) inserts 'og' into this->resolving; its destructor removes it when 'rr' goes out of scope at function exit - including exit via the thrown QPDFExc in the default case, because stack unwinding runs the destructor. This is the mechanism that makes the line-8 membership test meaningful: while this call (and anything it transitively calls) is resolving 'og', 'og' is marked, so a nested resolve(og) will hit the line-8 early return instead of recursing. Note it is registered AFTER the line-8 check, which is correct: the check must observe entries left by OUTER frames, and this frame must not see itself."
+    },
+    {
+      "file": "corpus/train/train_0313_cwe399.cpp",
+      "lines": "23-29",
+      "code": "    if (! this->obj_cache.count(og))\n    {\n\tif (! this->xref_table.count(og))\n\t{\n\t    // PDF spec says unknown objects resolve to the null object.\n\t    return new QPDF_Null;\n\t}",
+      "explanation": "If 'og' is not already in obj_cache, the object must be produced. First it is looked up in xref_table (the parsed cross-reference table). If absent, the PDF specification says an unknown/dangling indirect reference resolves to the null object, so a new QPDF_Null is returned. Both this early return and the one at line 19 return raw 'new' pointers that are implicitly adopted by qpdf's owning smart-pointer wrapper via the QPDFObjectHandle conversion."
+    },
+    {
+      "file": "corpus/train/train_0313_cwe399.cpp",
+      "lines": "31-33",
+      "code": "\tQPDFXRefEntry const& entry = this->xref_table[og];\n\tswitch (entry.getType())\n\t{",
+      "explanation": "The xref entry for 'og' is fetched by reference and the code switches on its type. Note the map is indexed with operator[] (xref_table[og]) rather than find(); this is safe only because the preceding count() check (line 25) guarantees the key exists, so no spurious default entry is inserted. QPDFXRefEntry::getType() returns the xref record type: 1 = a normal object located at a byte offset in the file, 2 = an object stored inside a compressed object stream. (Type 0 = free entry.)"
+    },
+    {
+      "file": "corpus/train/train_0313_cwe399.cpp",
+      "lines": "34-44",
+      "code": "\t  case 1:\n\t    {\n\t\tqpdf_offset_t offset = entry.getOffset();\n\t\t// Object stored in cache by readObjectAtOffset\n\t\tint aobjid;\n\t\tint ageneration;\n\t\tQPDFObjectHandle oh =\n\t\t    readObjectAtOffset(true, offset, \"\", objid, generation,\n\t\t\t\t       aobjid, ageneration);\n\t    }\n\t    break;",
+      "explanation": "Type-1 (uncompressed) handling. The object's byte offset is read from the xref entry, then readObjectAtOffset is called to seek there and parse the object. The 'true' flag requests exact object-id checking; objid/generation are passed as the EXPECTED ids and aobjid/ageneration receive the ids ACTUALLY found at that offset. The returned QPDFObjectHandle 'oh' is deliberately discarded - the comment on line 37 notes that readObjectAtOffset stores the parsed object into obj_cache as a side effect, which is what the final return (line 59) relies on. This nested parse is exactly where resolve() can be re-entered for the same or another object."
+    },
+    {
+      "file": "corpus/train/train_0313_cwe399.cpp",
+      "lines": "46-48",
+      "code": "\t  case 2:\n\t    resolveObjectsInStream(entry.getObjStreamNumber());\n\t    break;",
+      "explanation": "Type-2 (compressed) handling. The object lives inside an object stream; resolveObjectsInStream is called with the object-stream number from the xref entry to decompress that stream and cache all of its contained objects (including 'og'). Like the type-1 path, this relies on obj_cache being populated as a side effect, and it can recurse back into resolve() while decoding the stream's own /Length or /N entries."
+    },
+    {
+      "file": "corpus/train/train_0313_cwe399.cpp",
+      "lines": "50-56",
+      "code": "\t  default:\n\t    throw QPDFExc(qpdf_e_damaged_pdf, this->file->getName(), \"\", 0,\n\t\t\t  \"object \" +\n\t\t\t  QUtil::int_to_string(objid) + \"/\" +\n\t\t\t  QUtil::int_to_string(generation) +\n\t\t\t  \" has unexpected xref entry type\");\n\t}",
+      "explanation": "Any xref entry type other than 1 or 2 (e.g. a corrupt or free entry reached via a malformed xref) is treated as damage: a QPDFExc(qpdf_e_damaged_pdf ...) is thrown identifying the objid/generation. Because 'rr' is a stack object, this throw unwinds through its destructor, correctly removing 'og' from the resolving set on the way out."
+    },
+    {
+      "file": "corpus/train/train_0313_cwe399.cpp",
+      "lines": "57-60",
+      "code": "    }\n\n    return this->obj_cache[og].object;\n}",
+      "explanation": "After the switch has (supposedly) populated the cache, the function returns obj_cache[og].object - the QPDFObjectHandle for the resolved object. obj_cache is a map whose value type is a cache entry with a '.object' member. This single return point serves both the cache-hit path (og already present at line 23) and the just-loaded path."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0313_cwe399.cpp",
+      "lines": "8-21",
+      "code": "    if (this->resolving.count(og))\n    {\n        // ...\n        return new QPDF_Null;\n    }\n    ResolveRecorder rr(this, og);",
+      "explanation": "The once-guard detects a cycle only when the SAME QPDFObjGen re-enters. It does not bound total recursion DEPTH. A malicious PDF can build a long, strictly non-cyclic chain of distinct objects - object A's stream /Length is an indirect ref to B, B's to C, and so on for tens of thousands of distinct object numbers - or deeply nested container objects (arrays/dictionaries thousands deep). Each distinct 'og' passes the line-8 test, registers via ResolveRecorder, and recurses one frame deeper through readObjectAtOffset/resolveObjectsInStream. The resolving set grows but never trips, so the native call stack is driven to exhaustion, crashing the process (denial of service). The invariant the implementation must uphold is an absolute recursion/nesting DEPTH cap (or conversion to an explicit worklist), independent of the per-object cycle guard shown here. This is the CWE-399/CWE-674 resource-management surface the sample name points at."
+    },
+    {
+      "file": "corpus/train/train_0313_cwe399.cpp",
+      "lines": "59",
+      "code": "    return this->obj_cache[og].object;",
+      "explanation": "The return uses std::map::operator[] on obj_cache. If the type-1 path ran but readObjectAtOffset did NOT insert an entry for 'og' - which happens when the object physically found at the attacker-chosen offset has a DIFFERENT id/generation than requested (aobjid/ageneration != objid/generation), or when the object at that offset was damaged and parsing bailed out without caching under 'og' - then obj_cache[og] default-constructs a fresh, empty cache entry and returns its '.object'. That handle is backed by a null/uninitialised object pointer, which downstream callers dereference expecting a valid PDF object, yielding a NULL-pointer dereference / crash (CWE-476). It also silently pollutes obj_cache with a bogus entry. The invariant: after the switch, obj_cache MUST contain a valid 'og' entry; the code should verify insertion (or use find() and fall back to QPDF_Null) rather than trusting the side effect."
+    },
+    {
+      "file": "corpus/train/train_0313_cwe399.cpp",
+      "lines": "36-42",
+      "code": "\t\tqpdf_offset_t offset = entry.getOffset();\n\t\t// Object stored in cache by readObjectAtOffset\n\t\tint aobjid;\n\t\tint ageneration;\n\t\tQPDFObjectHandle oh =\n\t\t    readObjectAtOffset(true, offset, \"\", objid, generation,\n\t\t\t\t       aobjid, ageneration);",
+      "explanation": "offset comes straight from entry.getOffset(), i.e. the file's xref table, and is passed to readObjectAtOffset with no range check here. A crafted or corrupt xref can point 'offset' at an arbitrary position - past EOF, into the middle of another object, or a negative qpdf_offset_t. Safety therefore depends entirely on readObjectAtOffset validating the offset against the file bounds before seeking/reading; if it does not, the result is an out-of-bounds read or a mis-parse of unrelated bytes (CWE-125 / CWE-20). Additionally, the returned 'oh' is discarded and aobjid/ageneration (declared uninitialised on lines 38-39) are examined by no one, so an id/generation MISMATCH between what was requested and what was found is not acted upon at this call site - feeding straight into the line-59 empty-cache hazard above."
+    },
+    {
+      "file": "corpus/train/train_0313_cwe399.cpp",
+      "lines": "47",
+      "code": "\t    resolveObjectsInStream(entry.getObjStreamNumber());",
+      "explanation": "The type-2 path hands an attacker-controlled object-stream number to resolveObjectsInStream. A crafted xref can name a stream number that is itself a type-2 (compressed) object, or a stream whose /N or /First fields are hostile. Because resolving an object stream re-enters resolve() for the stream object and its members, this is another recursion entry point governed only by the same per-object cycle guard - an object stream that (transitively) requires resolving objects inside a different object stream can build the depth chain described in the first risk. The implementation must bound object-stream nesting and validate the stream's declared object count against its actual decoded size."
+    },
+    {
+      "file": "corpus/train/train_0313_cwe399.cpp",
+      "lines": "19",
+      "code": "        return new QPDF_Null;",
+      "explanation": "Both null-return sites (lines 19 and 28) allocate with raw 'new QPDF_Null' and rely on an implicit QPDFObjectHandle conversion to take ownership. If the conversion the return type performs does not adopt the raw pointer into qpdf's reference-counted holder on every path (e.g. an intermediate temporary or an exception between allocation and adoption), the allocation leaks (CWE-401). This is a minor, latent resource concern relative to the recursion issue, but on the loop-detection path it fires once per detected cycle, so a file with many self-references could leak repeatedly. Confirm the return type wraps the pointer in an owning smart pointer with no gap."
+    }
+  ],
+  "summary": "QPDF::resolve is the universal indirect-object dereference routine and processes a fully attacker-controlled PDF. The shown code is the FIXED variant that adds a per-object cycle guard (resolving set + ResolveRecorder RAII) to stop the classic self-reference infinite recursion. The residual, still-real risk is that the guard bounds cyclicity but not recursion DEPTH, so long non-cyclic reference/nesting chains still exhaust the stack (CWE-399/CWE-674 DoS); a secondary hazard is the final 'obj_cache[og]' operator[] which can return an empty, null-backed handle when readObjectAtOffset fails to cache under 'og' (CWE-476).",
+  "reviewed_anchors": [
+    {
+      "anchor": "QPDF::resolve(int objid, int generation) signature (lines 2-3)",
+      "disposition": "finding",
+      "reason": "objid/generation are attacker-controlled from PDF indirect references; the routine's recursion behaviour is the central resource-management surface."
+    },
+    {
+      "anchor": "QPDFObjGen og(objid, generation) (line 7)",
+      "disposition": "dismissed",
+      "reason": "Constructs a hashable lookup key from two ints; no buffer or length contract of its own."
+    },
+    {
+      "anchor": "this->resolving.count(og) cycle check (line 8)",
+      "disposition": "finding",
+      "reason": "The loop-detection gate; catches same-object re-entry but not overall recursion depth."
+    },
+    {
+      "anchor": "warn(QPDFExc(...)) loop warning (lines 14-18)",
+      "disposition": "dismissed",
+      "reason": "Non-fatal diagnostic using known-non-null this->file and validated ints; no dereference-of-null or format hazard."
+    },
+    {
+      "anchor": "return new QPDF_Null (lines 19, 28)",
+      "disposition": "finding",
+      "reason": "Raw allocation adopted by implicit handle conversion; latent leak (CWE-401) if adoption is not guaranteed on every path."
+    },
+    {
+      "anchor": "ResolveRecorder rr(this, og) RAII guard (line 21)",
+      "disposition": "finding",
+      "reason": "Registers/deregisters og in the resolving set; correctness of the whole guard depends on its constructor/destructor semantics (implementation not shown)."
+    },
+    {
+      "anchor": "this->obj_cache.count(og) (line 23)",
+      "disposition": "dismissed",
+      "reason": "Read-only membership test that gates the load path; safe by itself."
+    },
+    {
+      "anchor": "this->xref_table.count(og) (line 25)",
+      "disposition": "dismissed",
+      "reason": "Membership test guarding the following operator[]; prevents spurious insertion, correct."
+    },
+    {
+      "anchor": "QPDFXRefEntry const& entry = this->xref_table[og] (line 31)",
+      "disposition": "dismissed",
+      "reason": "operator[] is safe here because line-25 count() guarantees the key exists; no attacker-driven insertion."
+    },
+    {
+      "anchor": "switch (entry.getType()) with cases 1/2/default (lines 32-56)",
+      "disposition": "dismissed",
+      "reason": "Type dispatch is exhaustive with a damage-throw default; the hazards live in the case bodies, captured separately."
+    },
+    {
+      "anchor": "entry.getOffset() -> readObjectAtOffset(true, offset, ...) (lines 36-42)",
+      "disposition": "finding",
+      "reason": "Attacker-controlled file offset passed without a bounds check at this site; discarded aobjid/ageneration means id-mismatch is unhandled here."
+    },
+    {
+      "anchor": "aobjid / ageneration uninitialised out-params (lines 38-39)",
+      "disposition": "dismissed",
+      "reason": "Pure output parameters written by readObjectAtOffset; never read here, so no use-of-uninitialised at this site (though their being ignored feeds the line-59 hazard)."
+    },
+    {
+      "anchor": "resolveObjectsInStream(entry.getObjStreamNumber()) (line 47)",
+      "disposition": "finding",
+      "reason": "Attacker-controlled object-stream number and a second recursion entry point into resolve()."
+    },
+    {
+      "anchor": "return this->obj_cache[og].object (line 59)",
+      "disposition": "finding",
+      "reason": "operator[] default-inserts and returns an empty, null-backed handle when the switch failed to cache og; NULL-deref downstream."
+    }
+  ],
+  "findings": [
+    {
+      "title": "Unbounded resolution recursion depth (cycle guard does not cap depth) -> stack exhaustion",
+      "anchor": "this->resolving.count(og) + ResolveRecorder rr(this, og)",
+      "file": "corpus/train/train_0313_cwe399.cpp",
+      "line": "8-21",
+      "code": "    if (this->resolving.count(og))\n    {\n        // ...\n        return new QPDF_Null;\n    }\n    ResolveRecorder rr(this, og);",
+      "bug_class": "Uncontrolled recursion / stack exhaustion (resource management)",
+      "cwe": "CWE-674",
+      "severity": "high",
+      "where_it_lives": "This file (guard) plus readObjectAtOffset / resolveObjectsInStream implementation (file not provided)",
+      "invariant": "Object resolution must enforce an absolute recursion/nesting-depth limit (or use an explicit iterative worklist), not merely detect same-object cycles.",
+      "failure_mode": "A crafted PDF supplies a long chain of DISTINCT indirect references (A->B->C->... via stream /Length or deeply nested containers). Each distinct og passes the line-8 cycle check and recurses one frame deeper through readObjectAtOffset/resolveObjectsInStream; the resolving set grows but never trips, driving the native stack to overflow and crashing the process (DoS).",
+      "cve_analog": "",
+      "what_to_confirm": "Whether any caller of resolve() (or readObjectAtOffset/resolveObjectsInStream) imposes a maximum recursion depth; the shown guard only prevents same-og re-entry."
+    },
+    {
+      "title": "obj_cache operator[] returns empty null-backed handle when object was not cached",
+      "anchor": "return this->obj_cache[og].object",
+      "file": "corpus/train/train_0313_cwe399.cpp",
+      "line": "59",
+      "code": "    return this->obj_cache[og].object;",
+      "bug_class": "NULL / uninitialised object dereference via default-inserted map entry",
+      "cwe": "CWE-476",
+      "severity": "medium",
+      "where_it_lives": "This file (return) plus readObjectAtOffset implementation (file not provided)",
+      "invariant": "After the type-1/type-2 switch, obj_cache must contain a valid entry for og; the code must verify the insertion rather than trusting readObjectAtOffset's side effect.",
+      "failure_mode": "If the object physically found at the attacker-chosen offset has a different id/generation than requested, or parsing bailed without caching under og, std::map::operator[] default-constructs an empty cache entry and returns its .object - a handle backed by a null object pointer. Callers dereference it as a valid PDF object, causing a NULL-pointer dereference/crash, and obj_cache is silently polluted.",
+      "cve_analog": "",
+      "what_to_confirm": "That readObjectAtOffset always inserts obj_cache[og] on the requested key even under id/generation mismatch or parse failure; otherwise switch to find() with a QPDF_Null fallback."
+    },
+    {
+      "title": "Attacker-controlled xref offset passed to readObjectAtOffset without a bounds check here; id mismatch ignored",
+      "anchor": "readObjectAtOffset(true, offset, \"\", objid, generation, aobjid, ageneration)",
+      "file": "corpus/train/train_0313_cwe399.cpp",
+      "line": "36-42",
+      "code": "\t\tqpdf_offset_t offset = entry.getOffset();\n\t\t// Object stored in cache by readObjectAtOffset\n\t\tint aobjid;\n\t\tint ageneration;\n\t\tQPDFObjectHandle oh =\n\t\t    readObjectAtOffset(true, offset, \"\", objid, generation,\n\t\t\t\t       aobjid, ageneration);",
+      "bug_class": "Out-of-bounds read / missing input validation (attacker-controlled file offset)",
+      "cwe": "CWE-125",
+      "severity": "medium",
+      "where_it_lives": "readObjectAtOffset implementation (file not provided)",
+      "invariant": "readObjectAtOffset must validate 'offset' against the file length (and reject negative offsets) before seeking, and the caller must act on an aobjid/ageneration mismatch.",
+      "failure_mode": "A corrupt xref sets entry.getOffset() past EOF, negative, or mid-object; if readObjectAtOffset does not range-check, it reads out of bounds or mis-parses unrelated bytes. The returned handle and the found aobjid/ageneration are discarded, so a requested-vs-found id mismatch is not handled at this site, feeding the line-59 empty-cache hazard.",
+      "cve_analog": "",
+      "what_to_confirm": "That readObjectAtOffset bounds-checks the offset and that mismatched object ids are detected/rejected rather than silently cached under the wrong key."
+    },
+    {
+      "title": "Object-stream resolution is a second unbounded recursion entry point",
+      "anchor": "resolveObjectsInStream(entry.getObjStreamNumber())",
+      "file": "corpus/train/train_0313_cwe399.cpp",
+      "line": "47",
+      "code": "\t    resolveObjectsInStream(entry.getObjStreamNumber());",
+      "bug_class": "Uncontrolled recursion via nested object streams (resource management)",
+      "cwe": "CWE-674",
+      "severity": "medium",
+      "where_it_lives": "resolveObjectsInStream implementation (file not provided)",
+      "invariant": "Object-stream nesting must be depth-limited and the stream's declared object count/offsets validated against the decoded stream size.",
+      "failure_mode": "An attacker-chosen object-stream number can point at a stream whose members require resolving objects in yet another object stream, re-entering resolve() for distinct ogs and extending the depth chain of finding 1; malformed /N or /First fields can also drive over-reads inside the stream parser.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether resolveObjectsInStream limits object-stream nesting depth and validates the object count against the decompressed size."
+    },
+    {
+      "title": "Raw new QPDF_Null on null-object return paths relies on implicit ownership adoption",
+      "anchor": "return new QPDF_Null;",
+      "file": "corpus/train/train_0313_cwe399.cpp",
+      "line": "19",
+      "code": "        return new QPDF_Null;",
+      "bug_class": "Potential memory leak (ownership of raw allocation)",
+      "cwe": "CWE-401",
+      "severity": "low",
+      "where_it_lives": "This file plus the QPDFObjectHandle conversion (implementation not provided)",
+      "invariant": "The QPDFObjectHandle return conversion must adopt the raw pointer into an owning reference-counted holder on every path.",
+      "failure_mode": "If the implicit conversion does not take ownership on some path (temporary/exception between allocation and adoption), each null-object return (lines 19 and 28) leaks; the line-19 site fires once per detected reference loop, so a file with many self-references leaks repeatedly.",
+      "cve_analog": "",
+      "what_to_confirm": "That QPDF_Null* is wrapped in qpdf's owning PointerHolder/smart pointer with no leak window."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm there is an absolute recursion/nesting DEPTH limit somewhere in the resolve/readObjectAtOffset/resolveObjectsInStream chain - the shown cycle guard stops only same-object re-entry, not deep non-cyclic chains.",
+    "Verify readObjectAtOffset always inserts obj_cache[og] under the REQUESTED key before resolve() returns obj_cache[og].object at line 59; otherwise replace operator[] with find()+QPDF_Null fallback.",
+    "Check that readObjectAtOffset validates the attacker-supplied 'offset' (from entry.getOffset()) against file bounds and rejects negative offsets before seeking.",
+    "Confirm that a mismatch between requested (objid/generation) and found (aobjid/ageneration) object ids is detected and handled, not silently cached.",
+    "Verify resolveObjectsInStream bounds object-stream nesting depth and validates the declared object count/offsets against the decoded stream size.",
+    "Confirm ResolveRecorder's constructor inserts og into resolving and its destructor always removes it, including during exception unwinding from the default-case throw.",
+    "Confirm the QPDFObjectHandle return conversion adopts 'new QPDF_Null' into an owning smart pointer on every return path (lines 19 and 28)."
+  ]
+}

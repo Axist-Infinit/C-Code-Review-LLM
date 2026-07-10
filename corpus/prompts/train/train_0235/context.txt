@@ -1,0 +1,192 @@
+Files under review: corpus/train/train_0235_cwe401.c
+
+<<<BEGIN_UNTRUSTED_CODE>>>
+/* ===== FILE: corpus/train/train_0235_cwe401.c ===== */
+   1| /* sample: primevul_c_train_3056_fixed */
+   2| int sdma_init(struct hfi1_devdata *dd, u8 port)
+   3| {
+   4| 	unsigned this_idx;
+   5| 	struct sdma_engine *sde;
+   6| 	struct rhashtable *tmp_sdma_rht;
+   7| 	u16 descq_cnt;
+   8| 	void *curr_head;
+   9| 	struct hfi1_pportdata *ppd = dd->pport + port;
+  10| 	u32 per_sdma_credits;
+  11| 	uint idle_cnt = sdma_idle_cnt;
+  12| 	size_t num_engines = chip_sdma_engines(dd);
+  13| 	int ret = -ENOMEM;
+  14| 
+  15| 	if (!HFI1_CAP_IS_KSET(SDMA)) {
+  16| 		HFI1_CAP_CLEAR(SDMA_AHG);
+  17| 		return 0;
+  18| 	}
+  19| 	if (mod_num_sdma &&
+  20| 	    /* can't exceed chip support */
+  21| 	    mod_num_sdma <= chip_sdma_engines(dd) &&
+  22| 	    /* count must be >= vls */
+  23| 	    mod_num_sdma >= num_vls)
+  24| 		num_engines = mod_num_sdma;
+  25| 
+  26| 	dd_dev_info(dd, "SDMA mod_num_sdma: %u\n", mod_num_sdma);
+  27| 	dd_dev_info(dd, "SDMA chip_sdma_engines: %u\n", chip_sdma_engines(dd));
+  28| 	dd_dev_info(dd, "SDMA chip_sdma_mem_size: %u\n",
+  29| 		    chip_sdma_mem_size(dd));
+  30| 
+  31| 	per_sdma_credits =
+  32| 		chip_sdma_mem_size(dd) / (num_engines * SDMA_BLOCK_SIZE);
+  33| 
+  34| 	/* set up freeze waitqueue */
+  35| 	init_waitqueue_head(&dd->sdma_unfreeze_wq);
+  36| 	atomic_set(&dd->sdma_unfreeze_count, 0);
+  37| 
+  38| 	descq_cnt = sdma_get_descq_cnt();
+  39| 	dd_dev_info(dd, "SDMA engines %zu descq_cnt %u\n",
+  40| 		    num_engines, descq_cnt);
+  41| 
+  42| 	/* alloc memory for array of send engines */
+  43| 	dd->per_sdma = kcalloc_node(num_engines, sizeof(*dd->per_sdma),
+  44| 				    GFP_KERNEL, dd->node);
+  45| 	if (!dd->per_sdma)
+  46| 		return ret;
+  47| 
+  48| 	idle_cnt = ns_to_cclock(dd, idle_cnt);
+  49| 	if (idle_cnt)
+  50| 		dd->default_desc1 =
+  51| 			SDMA_DESC1_HEAD_TO_HOST_FLAG;
+  52| 	else
+  53| 		dd->default_desc1 =
+  54| 			SDMA_DESC1_INT_REQ_FLAG;
+  55| 
+  56| 	if (!sdma_desct_intr)
+  57| 		sdma_desct_intr = SDMA_DESC_INTR;
+  58| 
+  59| 	/* Allocate memory for SendDMA descriptor FIFOs */
+  60| 	for (this_idx = 0; this_idx < num_engines; ++this_idx) {
+  61| 		sde = &dd->per_sdma[this_idx];
+  62| 		sde->dd = dd;
+  63| 		sde->ppd = ppd;
+  64| 		sde->this_idx = this_idx;
+  65| 		sde->descq_cnt = descq_cnt;
+  66| 		sde->desc_avail = sdma_descq_freecnt(sde);
+  67| 		sde->sdma_shift = ilog2(descq_cnt);
+  68| 		sde->sdma_mask = (1 << sde->sdma_shift) - 1;
+  69| 
+  70| 		/* Create a mask specifically for each interrupt source */
+  71| 		sde->int_mask = (u64)1 << (0 * TXE_NUM_SDMA_ENGINES +
+  72| 					   this_idx);
+  73| 		sde->progress_mask = (u64)1 << (1 * TXE_NUM_SDMA_ENGINES +
+  74| 						this_idx);
+  75| 		sde->idle_mask = (u64)1 << (2 * TXE_NUM_SDMA_ENGINES +
+  76| 					    this_idx);
+  77| 		/* Create a combined mask to cover all 3 interrupt sources */
+  78| 		sde->imask = sde->int_mask | sde->progress_mask |
+  79| 			     sde->idle_mask;
+  80| 
+  81| 		spin_lock_init(&sde->tail_lock);
+  82| 		seqlock_init(&sde->head_lock);
+  83| 		spin_lock_init(&sde->senddmactrl_lock);
+  84| 		spin_lock_init(&sde->flushlist_lock);
+  85| 		seqlock_init(&sde->waitlock);
+  86| 		/* insure there is always a zero bit */
+  87| 		sde->ahg_bits = 0xfffffffe00000000ULL;
+  88| 
+  89| 		sdma_set_state(sde, sdma_state_s00_hw_down);
+  90| 
+  91| 		/* set up reference counting */
+  92| 		kref_init(&sde->state.kref);
+  93| 		init_completion(&sde->state.comp);
+  94| 
+  95| 		INIT_LIST_HEAD(&sde->flushlist);
+  96| 		INIT_LIST_HEAD(&sde->dmawait);
+  97| 
+  98| 		sde->tail_csr =
+  99| 			get_kctxt_csr_addr(dd, this_idx, SD(TAIL));
+ 100| 
+ 101| 		tasklet_init(&sde->sdma_hw_clean_up_task, sdma_hw_clean_up_task,
+ 102| 			     (unsigned long)sde);
+ 103| 
+ 104| 		tasklet_init(&sde->sdma_sw_clean_up_task, sdma_sw_clean_up_task,
+ 105| 			     (unsigned long)sde);
+ 106| 		INIT_WORK(&sde->err_halt_worker, sdma_err_halt_wait);
+ 107| 		INIT_WORK(&sde->flush_worker, sdma_field_flush);
+ 108| 
+ 109| 		sde->progress_check_head = 0;
+ 110| 
+ 111| 		timer_setup(&sde->err_progress_check_timer,
+ 112| 			    sdma_err_progress_check, 0);
+ 113| 
+ 114| 		sde->descq = dma_alloc_coherent(&dd->pcidev->dev,
+ 115| 						descq_cnt * sizeof(u64[2]),
+ 116| 						&sde->descq_phys, GFP_KERNEL);
+ 117| 		if (!sde->descq)
+ 118| 			goto bail;
+ 119| 		sde->tx_ring =
+ 120| 			kvzalloc_node(array_size(descq_cnt,
+ 121| 						 sizeof(struct sdma_txreq *)),
+ 122| 				      GFP_KERNEL, dd->node);
+ 123| 		if (!sde->tx_ring)
+ 124| 			goto bail;
+ 125| 	}
+ 126| 
+ 127| 	dd->sdma_heads_size = L1_CACHE_BYTES * num_engines;
+ 128| 	/* Allocate memory for DMA of head registers to memory */
+ 129| 	dd->sdma_heads_dma = dma_alloc_coherent(&dd->pcidev->dev,
+ 130| 						dd->sdma_heads_size,
+ 131| 						&dd->sdma_heads_phys,
+ 132| 						GFP_KERNEL);
+ 133| 	if (!dd->sdma_heads_dma) {
+ 134| 		dd_dev_err(dd, "failed to allocate SendDMA head memory\n");
+ 135| 		goto bail;
+ 136| 	}
+ 137| 
+ 138| 	/* Allocate memory for pad */
+ 139| 	dd->sdma_pad_dma = dma_alloc_coherent(&dd->pcidev->dev, sizeof(u32),
+ 140| 					      &dd->sdma_pad_phys, GFP_KERNEL);
+ 141| 	if (!dd->sdma_pad_dma) {
+ 142| 		dd_dev_err(dd, "failed to allocate SendDMA pad memory\n");
+ 143| 		goto bail;
+ 144| 	}
+ 145| 
+ 146| 	/* assign each engine to different cacheline and init registers */
+ 147| 	curr_head = (void *)dd->sdma_heads_dma;
+ 148| 	for (this_idx = 0; this_idx < num_engines; ++this_idx) {
+ 149| 		unsigned long phys_offset;
+ 150| 
+ 151| 		sde = &dd->per_sdma[this_idx];
+ 152| 
+ 153| 		sde->head_dma = curr_head;
+ 154| 		curr_head += L1_CACHE_BYTES;
+ 155| 		phys_offset = (unsigned long)sde->head_dma -
+ 156| 			      (unsigned long)dd->sdma_heads_dma;
+ 157| 		sde->head_phys = dd->sdma_heads_phys + phys_offset;
+ 158| 		init_sdma_regs(sde, per_sdma_credits, idle_cnt);
+ 159| 	}
+ 160| 	dd->flags |= HFI1_HAS_SEND_DMA;
+ 161| 	dd->flags |= idle_cnt ? HFI1_HAS_SDMA_TIMEOUT : 0;
+ 162| 	dd->num_sdma = num_engines;
+ 163| 	ret = sdma_map_init(dd, port, ppd->vls_operational, NULL);
+ 164| 	if (ret < 0)
+ 165| 		goto bail;
+ 166| 
+ 167| 	tmp_sdma_rht = kzalloc(sizeof(*tmp_sdma_rht), GFP_KERNEL);
+ 168| 	if (!tmp_sdma_rht) {
+ 169| 		ret = -ENOMEM;
+ 170| 		goto bail;
+ 171| 	}
+ 172| 
+ 173| 	ret = rhashtable_init(tmp_sdma_rht, &sdma_rht_params);
+ 174| 	if (ret < 0) {
+ 175| 		kfree(tmp_sdma_rht);
+ 176| 		goto bail;
+ 177| 	}
+ 178| 
+ 179| 	dd->sdma_rht = tmp_sdma_rht;
+ 180| 
+ 181| 	dd_dev_info(dd, "SDMA num_sdma: %u\n", dd->num_sdma);
+ 182| 	return 0;
+ 183| 
+ 184| bail:
+ 185| 	sdma_clean(dd, num_engines);
+ 186| 	return ret;
+ 187| }
+<<<END_UNTRUSTED_CODE>>>

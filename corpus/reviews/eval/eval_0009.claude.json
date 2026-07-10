@@ -1,0 +1,239 @@
+{
+  "subsystem": "RPM (RPM Package Manager) header-blob parser. hdrblobInit() takes a raw header image (the on-disk/on-wire RPM header: an 8-byte prefix giving an index-entry count and a data length, followed by a table of 16-byte index entries and a data store) and populates a struct hdrblob_s with derived pointers and lengths (ei, il, dl, pe, pvlen, dataStart, dataEnd) after running a chain of structural validators. It is the first parsing gate every RPM header passes through when a package is read, imported, or verified.",
+  "provenance": "Identified by RPM-specific types and symbols visible in the code: return type rpmRC with RPMRC_FAIL/RPMRC_OK, rpmTagVal regionTag, struct hdrblob_s, the entryInfo typedef, the headerMaxbytes size cap, rpm's rasprintf()/_() i18n error helpers, and the il/dl (index length / data length) header layout read via ntohl. The function name hdrblobInit and the sibling validators hdrblobVerifyLengths/hdrblobVerifyRegion/hdrblobVerifyInfo match rpm's lib/header.c. The sample banner comment `primevul_c_validation_0176_fixed` labels this as the post-fix variant, but it was reviewed blind on its merits.",
+  "trust_boundary": "uh/uc is a raw RPM header image originating from a package file, a header import, or any channel that delivers RPM metadata; it is fully attacker-controllable. An attacker who crafts a .rpm (or feeds a header directly) controls every byte of uh, including the 8-byte prefix that becomes blob->il (entry count) and blob->dl (data length), and controls uc (the claimed length) when the caller propagates an attacker-supplied value. blob->il and blob->dl are the hostile length fields; all pointer bounds (pe, dataStart, dataEnd) and the size total (pvlen) are derived from them, so their correctness governs every subsequent read in hdrblobVerifyInfo and the region walk.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/eval/eval_0009_cwe125.c",
+      "lines": "2-4",
+      "code": "rpmRC hdrblobInit(const void *uh, size_t uc,\n\t\trpmTagVal regionTag, int exact_size,\n\t\tstruct hdrblob_s *blob, char **emsg)",
+      "explanation": "The entry point. `uh` is the raw header image (const void*) and `uc` is its claimed byte length (size_t); together they are the untrusted input. `regionTag` selects which region tag (e.g. header image vs. signature) the header is expected to declare and is passed to the validators. `exact_size` is a flag telling hdrblobVerifyRegion whether the region must consume the blob exactly. `blob` is a caller-owned out-parameter of type struct hdrblob_s* that this function fills in. `emsg` is an out-parameter that receives a heap-allocated human-readable error string on failure. The function is the first structural gate for any RPM header and returns rpmRC (RPMRC_OK / RPMRC_FAIL)."
+    },
+    {
+      "file": "corpus/eval/eval_0009_cwe125.c",
+      "lines": "6-7",
+      "code": "rpmRC rc = RPMRC_FAIL;\n    memset(blob, 0, sizeof(*blob));",
+      "explanation": "rc is initialised to RPMRC_FAIL so that every early `goto exit` returns failure by default (fail-closed). The memset zeroes the entire caller-supplied blob struct before any field is written, guaranteeing that pointers such as ei/pe/dataStart/dataEnd and the lengths il/dl/pvlen do not carry stale values into the validators if the function bails out early. This is defensive and correct in itself; note it dereferences and writes through `blob`, so `blob` must be a valid, writable struct of at least sizeof(*blob) bytes — a caller contract, not attacker-controlled here."
+    },
+    {
+      "file": "corpus/eval/eval_0009_cwe125.c",
+      "lines": "8-11",
+      "code": "if (uc && uc < 8) {\n\trasprintf(emsg, _(\"hdr length: BAD\"));\n\tgoto exit;\n    }",
+      "explanation": "The only explicit minimum-length guard on the input. It rejects the blob when the claimed length uc is non-zero AND smaller than 8 bytes, because the code is about to read an 8-byte prefix (two int32_t words). Crucially the guard is conditional on `uc` being non-zero: when uc == 0 the caller is asserting 'length unknown / already trusted', so the guard is skipped entirely and no minimum size is enforced before the 8-byte read that follows. This uc==0 escape hatch is a deliberate RPM convention (used when the buffer is believed pre-validated), and it shifts the burden of guaranteeing >=8 readable bytes onto the caller."
+    },
+    {
+      "file": "corpus/eval/eval_0009_cwe125.c",
+      "lines": "13-15",
+      "code": "blob->ei = (int32_t *) uh; /* discards const */\n    blob->il = ntohl((uint32_t)(blob->ei[0]));\n    blob->dl = ntohl((uint32_t)(blob->ei[1]));",
+      "explanation": "blob->ei aliases the untrusted buffer as an int32_t*, deliberately discarding the const qualifier so later code (region byte-swapping) can treat it as mutable. blob->il is read from the first 4 bytes (ei[0]) and blob->dl from the next 4 bytes (ei[1]); ntohl converts each from big-endian wire order to host order. `il` is the number of index entries (each 16 bytes) and `dl` is the size of the trailing data store in bytes. Both values are attacker-controlled and are read here BEFORE any range validation — the two ntohl reads are the first and only dereference of the raw buffer in this function, so they are the concrete out-of-bounds-read site if the buffer is shorter than 8 bytes."
+    },
+    {
+      "file": "corpus/eval/eval_0009_cwe125.c",
+      "lines": "16-17",
+      "code": "if (hdrblobVerifyLengths(regionTag, blob->il, blob->dl, emsg) != RPMRC_OK)\n\tgoto exit;",
+      "explanation": "The first range check on the attacker-controlled lengths. hdrblobVerifyLengths (implementation not shown) is expected to reject il/dl that are out of the sane range for the given regionTag — e.g. il < 1, or il/dl so large that the derived total would exceed headerMaxbytes. This validator is the linchpin of memory safety here: the multiplication and pointer arithmetic that follow are only safe because il and dl are assumed bounded by this call. Its contract (that it rejects il/dl large enough to overflow pvlen or push dataEnd past the buffer) cannot be confirmed from this file."
+    },
+    {
+      "file": "corpus/eval/eval_0009_cwe125.c",
+      "lines": "19-21",
+      "code": "blob->pe = (entryInfo) &(blob->ei[2]);\n    blob->pvlen = sizeof(blob->il) + sizeof(blob->dl) +\n\t\t  (blob->il * sizeof(*blob->pe)) + blob->dl;",
+      "explanation": "blob->pe points at the index-entry table, which begins immediately after the 8-byte prefix (&ei[2]). blob->pvlen is the total expected byte size of the whole header: 4 (sizeof il) + 4 (sizeof dl) + il * sizeof(entryInfo_s) (the 16-byte index entries) + dl (the data store). Because sizeof() yields size_t, the sub-expression `blob->il * sizeof(*blob->pe)` is evaluated in size_t (typically 64-bit) arithmetic; the result is then stored into pvlen, whose declared width lives in the unshown struct. This computed total is the value cross-checked against the claimed length and the global cap in the next block."
+    },
+    {
+      "file": "corpus/eval/eval_0009_cwe125.c",
+      "lines": "22-23",
+      "code": "blob->dataStart = (uint8_t *) (blob->pe + blob->il);\n    blob->dataEnd = blob->dataStart + blob->dl;",
+      "explanation": "dataStart is computed as pe advanced by il entries (pe + il, i.e. past the whole index table) and dataEnd as dataStart + dl (past the whole data store). These two pointers are the bounds that downstream consumers such as hdrblobVerifyInfo use to know where the data store lives and how far reads may go. They are pure attacker-arithmetic: both are derived from il and dl and are computed BEFORE the pvlen size check on the next lines, so at this instant they may point far outside the actual buffer; nothing is dereferenced through them yet, but they are established as the (possibly invalid) read window."
+    },
+    {
+      "file": "corpus/eval/eval_0009_cwe125.c",
+      "lines": "26-30",
+      "code": "if (blob->pvlen >= headerMaxbytes || (uc && blob->pvlen != uc)) {\n\trasprintf(emsg, _(\"blob size(%d): BAD, 8 + 16 * il(%d) + dl(%d)\"),\n\t\t\tblob->pvlen, blob->il, blob->dl);\n\tgoto exit;\n    }",
+      "explanation": "The central size sanity gate. It rejects the header if the computed total pvlen reaches the global cap headerMaxbytes (a hard upper bound on any RPM header, ~256MB), OR — only when uc is non-zero — if pvlen does not exactly equal the claimed length uc. The second clause is what actually ties the internally-declared lengths to the real buffer size: when the caller supplies a real uc, pvlen must match it exactly, which pins il/dl to a size the buffer actually has. When uc == 0, that cross-check is skipped and the ONLY size defence is the headerMaxbytes ceiling. The rasprintf error prints the offending sizes; note it formats pvlen with %d."
+    },
+    {
+      "file": "corpus/eval/eval_0009_cwe125.c",
+      "lines": "32-33",
+      "code": "if (hdrblobVerifyRegion(regionTag, exact_size, blob, emsg) == RPMRC_FAIL)\n\tgoto exit;",
+      "explanation": "Validates the header's region trailer: hdrblobVerifyRegion (not shown) checks that the first index entry describes the expected region tag, that the region length is consistent, and — when exact_size is set — that the region spans the whole blob. This is where the il/dl-derived pointers (pe, dataStart, dataEnd) begin to be consumed, so its correctness depends on the earlier bounds being sound. Only a hard RPMRC_FAIL aborts here; other non-OK codes are treated as acceptable."
+    },
+    {
+      "file": "corpus/eval/eval_0009_cwe125.c",
+      "lines": "36-37",
+      "code": "if (hdrblobVerifyInfo(blob, emsg))\n\tgoto exit;",
+      "explanation": "The final structural check: hdrblobVerifyInfo (not shown) walks all il index entries in pe[], validating each entry's tag/type/offset/count and that every entry's data lies within [dataStart, dataEnd). This is the primary consumer of the attacker-derived read window and the place where an over-large dl or a dataEnd past the real buffer would turn into actual out-of-bounds reads. A non-zero (truthy) return aborts."
+    },
+    {
+      "file": "corpus/eval/eval_0009_cwe125.c",
+      "lines": "39-43",
+      "code": "rc = RPMRC_OK;\n\nexit:\n    return rc;",
+      "explanation": "Only after every validator has passed is rc flipped to RPMRC_OK; the single `exit` label is the common return path for both the success case and every early `goto exit` failure. The fail-closed default set at line 6 means any skipped validation returns RPMRC_FAIL. The populated blob is returned to the caller by side effect through the out-parameter."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/eval/eval_0009_cwe125.c",
+      "lines": "8-15",
+      "code": "if (uc && uc < 8) {\n\trasprintf(emsg, _(\"hdr length: BAD\"));\n\tgoto exit;\n    }\n\n    blob->ei = (int32_t *) uh; /* discards const */\n    blob->il = ntohl((uint32_t)(blob->ei[0]));\n    blob->dl = ntohl((uint32_t)(blob->ei[1]));",
+      "explanation": "Out-of-bounds read of the 8-byte prefix (CWE-125). The minimum-length guard is gated on `uc` being non-zero: if a caller invokes hdrblobInit with uc == 0 while uh points at fewer than 8 readable bytes, the guard is skipped and blob->ei[0]/blob->ei[1] read 8 bytes past a short (or empty) buffer. The attacker/caller controls both the buffer contents and the uc==0 convention; the impact is an over-read of adjacent memory whose bytes then become il/dl and steer all later arithmetic. The invariant the implementation must uphold: every caller that passes uc==0 must independently guarantee at least 8 bytes are mapped and readable at uh; hdrblobInit itself does not enforce it."
+    },
+    {
+      "file": "corpus/eval/eval_0009_cwe125.c",
+      "lines": "20-21",
+      "code": "blob->pvlen = sizeof(blob->il) + sizeof(blob->dl) +\n\t\t  (blob->il * sizeof(*blob->pe)) + blob->dl;",
+      "explanation": "Integer overflow / truncation in the size total (CWE-190). `blob->il * sizeof(*blob->pe)` is evaluated in 64-bit size_t, but the sum is stored back into blob->pvlen, whose type is declared in the unshown struct (historically a 32-bit int/uint32). With il up to 0x0FFFFFFF and dl up to ~256MB, 8 + il*16 + dl can exceed 2^32 and truncate when narrowed into a 32-bit pvlen, yielding a small pvlen that then slips under the `pvlen >= headerMaxbytes` ceiling. If uc==0 (so the exact `pvlen != uc` cross-check is inactive), a truncated pvlen defeats the size gate while dataStart/dataEnd are still computed from the true (huge) il/dl. Safety here rests entirely on hdrblobVerifyLengths having already bounded il and dl so the product cannot wrap; that guarantee is not visible in this file and must be confirmed."
+    },
+    {
+      "file": "corpus/eval/eval_0009_cwe125.c",
+      "lines": "22-23",
+      "code": "blob->dataStart = (uint8_t *) (blob->pe + blob->il);\n    blob->dataEnd = blob->dataStart + blob->dl;",
+      "explanation": "Attacker-controlled read window (CWE-125, latent in the consumers). dataStart and dataEnd are computed purely from il and dl and are the bounds hdrblobVerifyInfo/hdrblobVerifyRegion use to read the index table and data store. If il/dl are mis-validated (or pvlen was truncated so the size gate passed), dataEnd points beyond the real end of uh, and the downstream entry/data walk reads out of bounds — potentially leaking adjacent heap/mmap contents or crashing. The invariant: dataEnd must be <= uh + uc (the true buffer end). This is enforced tightly only when uc>0 (via pvlen == uc); when uc==0 it is bounded only indirectly by headerMaxbytes, which caps total size but does not tie it to the buffer that actually exists."
+    },
+    {
+      "file": "corpus/eval/eval_0009_cwe125.c",
+      "lines": "26-26",
+      "code": "if (blob->pvlen >= headerMaxbytes || (uc && blob->pvlen != uc)) {",
+      "explanation": "Weak size validation on the uc==0 path (CWE-20). The exact-length cross-check `blob->pvlen != uc` is disabled whenever uc==0, leaving only the coarse `pvlen >= headerMaxbytes` ceiling. A header taken from a source where the caller did not supply a true length is therefore accepted as long as its self-declared total is merely below the 256MB cap — the parser trusts the blob's own il/dl to describe its own extent with no external corroboration. The implementation must ensure that the uc==0 path is only ever reached with a buffer whose real size already equals the header's self-described pvlen (e.g. a buffer that was itself read using il/dl), otherwise the size gate provides no real bound."
+    },
+    {
+      "file": "corpus/eval/eval_0009_cwe125.c",
+      "lines": "13-13",
+      "code": "blob->ei = (int32_t *) uh; /* discards const */",
+      "explanation": "Const-correctness / write-through hazard (CWE-alignment: input handling / potential invalid write, low). The cast strips const from uh and stores it as a mutable int32_t* in blob->ei. This function only reads through ei, but the alias is retained in blob and RPM's later region handling byte-swaps entries in place through this pointer. If uh actually references a read-only mapping (e.g. an mmap'd package with PROT_READ), an in-place swap through blob->ei would fault; if it references a shared buffer, the swap mutates data other code may still read. The invariant: whoever later writes through blob->ei must own a writable copy of the header."
+    },
+    {
+      "file": "corpus/eval/eval_0009_cwe125.c",
+      "lines": "27-28",
+      "code": "rasprintf(emsg, _(\"blob size(%d): BAD, 8 + 16 * il(%d) + dl(%d)\"),\n\t\t\tblob->pvlen, blob->il, blob->dl);",
+      "explanation": "Format-specifier type mismatch (info, not exploitable). The format string is a fixed literal (no attacker-controlled format, so no format-string vulnerability), but pvlen is printed with %d while its declared type may be unsigned/wider; on a mismatch this is technically undefined behaviour and can print a misleading (negative) size in the diagnostic. The impact is limited to a confusing error message, but it is worth normalising the specifier to the actual type."
+    }
+  ],
+  "summary": "hdrblobInit parses fully attacker-controlled RPM header images and derives all of its memory bounds (pe, dataStart, dataEnd, pvlen) from two untrusted 32-bit length fields (il, dl) read before validation. The function is defensively structured (fail-closed, memset, a length guard, and a chain of validators) and appears to be the hardened variant, but its safety rests on contracts that are not visible in this file: hdrblobVerifyLengths must bound il/dl tightly enough that pvlen cannot overflow, and every caller using the uc==0 escape hatch must independently guarantee at least 8 mapped bytes and a buffer whose real size matches the self-declared pvlen. The residual risks are an out-of-bounds read of the 8-byte prefix on the uc==0 path (CWE-125) and pvlen truncation weakening the size gate (CWE-190); both are latent and depend on the unshown validators and callers.",
+  "reviewed_anchors": [
+    {"anchor": "hdrblobInit(const void *uh, size_t uc, rpmTagVal regionTag, int exact_size, struct hdrblob_s *blob, char **emsg) signature", "disposition": "finding", "reason": "Trust boundary entry point; uh/uc are untrusted and every derived bound flows from here."},
+    {"anchor": "uh (const void *) — raw header image", "disposition": "finding", "reason": "Attacker-controlled buffer; source of the 8-byte prefix over-read."},
+    {"anchor": "uc (size_t) — claimed header length", "disposition": "finding", "reason": "Its zero value disables both the minimum-length guard and the exact-size cross-check."},
+    {"anchor": "regionTag (rpmTagVal)", "disposition": "dismissed", "reason": "A validation selector passed through to the verifiers, not a buffer or length."},
+    {"anchor": "exact_size (int)", "disposition": "dismissed", "reason": "Boolean flag forwarded to hdrblobVerifyRegion; carries no direct memory contract here."},
+    {"anchor": "blob (struct hdrblob_s *) out-parameter", "disposition": "dismissed", "reason": "Caller-owned aggregate; its individual fields are the real anchors and are enumerated below."},
+    {"anchor": "emsg (char **) out-parameter", "disposition": "dismissed", "reason": "Receives a heap error string; no attacker influence on control flow."},
+    {"anchor": "memset(blob, 0, sizeof(*blob)) (line 7)", "disposition": "dismissed", "reason": "Bounded by sizeof(*blob); safe zero-init that prevents stale-field use."},
+    {"anchor": "if (uc && uc < 8) guard (line 8)", "disposition": "finding", "reason": "Minimum-length check is bypassed when uc==0, enabling an 8-byte over-read."},
+    {"anchor": "blob->ei = (int32_t *) uh (line 13)", "disposition": "finding", "reason": "Discards const, retaining a mutable alias into a possibly read-only/shared buffer."},
+    {"anchor": "blob->il = ntohl((uint32_t)(blob->ei[0])) (line 14)", "disposition": "finding", "reason": "Untrusted entry count read before validation; drives multiplication and pointer arithmetic."},
+    {"anchor": "blob->dl = ntohl((uint32_t)(blob->ei[1])) (line 15)", "disposition": "finding", "reason": "Untrusted data length read before validation; drives dataEnd and the read window."},
+    {"anchor": "hdrblobVerifyLengths(regionTag, blob->il, blob->dl, emsg) (line 16)", "disposition": "dismissed", "reason": "External validator (not shown); its contract underpins safety but it is a check, not itself a vulnerable anchor — its adequacy is captured in the pvlen/dataEnd findings."},
+    {"anchor": "blob->pe = (entryInfo) &(blob->ei[2]) (line 19)", "disposition": "dismissed", "reason": "Fixed +8-byte offset to the index table; the +8 is constant and already guarded by the length check, so it carries no independent overflow."},
+    {"anchor": "blob->pvlen = sizeof(il)+sizeof(dl)+(il*sizeof(*pe))+dl (lines 20-21)", "disposition": "finding", "reason": "Size total computed in size_t then narrowed into pvlen; truncation can defeat the size gate."},
+    {"anchor": "blob->dataStart = (uint8_t *)(blob->pe + blob->il) (line 22)", "disposition": "finding", "reason": "Read-window start derived from unvalidated il; can point past the buffer."},
+    {"anchor": "blob->dataEnd = blob->dataStart + blob->dl (line 23)", "disposition": "finding", "reason": "Read-window end derived from unvalidated dl; OOB reads in the consumers if dl is over-large."},
+    {"anchor": "if (blob->pvlen >= headerMaxbytes || (uc && blob->pvlen != uc)) (line 26)", "disposition": "finding", "reason": "Exact-size cross-check is disabled when uc==0, leaving only the coarse headerMaxbytes ceiling."},
+    {"anchor": "headerMaxbytes (size cap macro/global)", "disposition": "dismissed", "reason": "A fixed upper-bound constant defined elsewhere; correct as a ceiling, not a vulnerable anchor itself."},
+    {"anchor": "rasprintf(emsg, _(\"blob size(%d)...\"), blob->pvlen, blob->il, blob->dl) (lines 27-28)", "disposition": "finding", "reason": "%d specifier likely mismatches pvlen's type; info-level correctness issue (format is a fixed literal, not attacker-controlled)."},
+    {"anchor": "hdrblobVerifyRegion(regionTag, exact_size, blob, emsg) (line 32)", "disposition": "dismissed", "reason": "External validator (not shown); consumes the derived bounds but is a check, not a vulnerable anchor in this file."},
+    {"anchor": "hdrblobVerifyInfo(blob, emsg) (line 36)", "disposition": "dismissed", "reason": "External validator (not shown); the primary consumer of dataStart/dataEnd — its risk is captured in the dataEnd finding."},
+    {"anchor": "RPMRC_FAIL / RPMRC_OK return codes and the exit label (lines 6, 39-43)", "disposition": "dismissed", "reason": "Fail-closed control-flow scaffolding; correct and carries no memory contract."}
+  ],
+  "findings": [
+    {
+      "title": "Out-of-bounds read of the 8-byte il/dl prefix when uc==0 bypasses the length guard",
+      "anchor": "if (uc && uc < 8) ... blob->il = ntohl((uint32_t)(blob->ei[0])); blob->dl = ntohl((uint32_t)(blob->ei[1]));",
+      "file": "corpus/eval/eval_0009_cwe125.c",
+      "line": "8-15",
+      "code": "if (uc && uc < 8) {\n\trasprintf(emsg, _(\"hdr length: BAD\"));\n\tgoto exit;\n    }\n\n    blob->ei = (int32_t *) uh; /* discards const */\n    blob->il = ntohl((uint32_t)(blob->ei[0]));\n    blob->dl = ntohl((uint32_t)(blob->ei[1]));",
+      "bug_class": "Out-of-bounds read (missing minimum-length check on the zero-length path)",
+      "cwe": "CWE-125",
+      "severity": "medium",
+      "where_it_lives": "corpus/eval/eval_0009_cwe125.c (over-read); enforcement must live in every caller that passes uc==0 — implementation (file not provided)",
+      "invariant": "Before reading blob->ei[0] and blob->ei[1], the code must know at least 8 bytes are mapped and readable at uh. The `uc && uc < 8` guard only proves this when uc is non-zero; on the uc==0 path the caller must independently guarantee >=8 readable bytes.",
+      "failure_mode": "A caller invokes hdrblobInit with uc==0 (the 'length unknown / trusted' convention) while uh references fewer than 8 bytes (a short or empty buffer). The `uc && uc < 8` test is false because uc==0, so execution reaches lines 14-15 and reads 8 bytes past the buffer via ei[0]/ei[1]. The over-read bytes become il/dl and are then used to compute pvlen and the dataStart/dataEnd bounds, so the leak can also mis-steer downstream parsing. Impact: out-of-bounds read (info leak or crash).",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm that no caller can reach hdrblobInit with uc==0 unless the buffer at uh is guaranteed to hold at least 8 bytes; if such a path exists, add an unconditional `if (uc < 8 && <buffer shorter than 8>)` style guard or require uc to always carry the true length."
+    },
+    {
+      "title": "pvlen integer overflow/truncation can defeat the size ceiling when uc==0",
+      "anchor": "blob->pvlen = sizeof(blob->il) + sizeof(blob->dl) + (blob->il * sizeof(*blob->pe)) + blob->dl;",
+      "file": "corpus/eval/eval_0009_cwe125.c",
+      "line": "20-21",
+      "code": "blob->pvlen = sizeof(blob->il) + sizeof(blob->dl) +\n\t\t  (blob->il * sizeof(*blob->pe)) + blob->dl;",
+      "bug_class": "Integer overflow / narrowing truncation of a computed size total",
+      "cwe": "CWE-190",
+      "severity": "medium",
+      "where_it_lives": "corpus/eval/eval_0009_cwe125.c; bounding of il/dl lives in hdrblobVerifyLengths — implementation (file not provided)",
+      "invariant": "8 + il*16 + dl must be representable in pvlen's type without wrapping, AND hdrblobVerifyLengths must reject any il/dl whose product/sum could exceed headerMaxbytes, so that the `pvlen >= headerMaxbytes` gate at line 26 sees the true magnitude.",
+      "failure_mode": "The product `blob->il * sizeof(*blob->pe)` is computed in 64-bit size_t but stored into pvlen, whose declared width (in the unshown struct) is historically 32-bit. With il near 0x0FFFFFFF and a large dl the true total exceeds 2^32 and truncates to a small pvlen. If uc==0 (so the exact `pvlen != uc` check is inactive), the small pvlen also passes `pvlen >= headerMaxbytes`, so the size gate is defeated while dataStart/dataEnd are still built from the true (huge) il/dl — downstream reads then run off the buffer. Safety depends entirely on hdrblobVerifyLengths bounding il/dl first.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm pvlen's declared type and that hdrblobVerifyLengths rejects il/dl large enough to overflow it; ideally compute the total in size_t and compare against headerMaxbytes before narrowing, and require the exact uc cross-check on all header-load paths."
+    },
+    {
+      "title": "dataStart/dataEnd read window derived from unvalidated il/dl",
+      "anchor": "blob->dataStart = (uint8_t *) (blob->pe + blob->il); blob->dataEnd = blob->dataStart + blob->dl;",
+      "file": "corpus/eval/eval_0009_cwe125.c",
+      "line": "22-23",
+      "code": "blob->dataStart = (uint8_t *) (blob->pe + blob->il);\n    blob->dataEnd = blob->dataStart + blob->dl;",
+      "bug_class": "Out-of-bounds read via attacker-controlled pointer bounds",
+      "cwe": "CWE-125",
+      "severity": "medium",
+      "where_it_lives": "corpus/eval/eval_0009_cwe125.c (bounds established here); consumed by hdrblobVerifyInfo/hdrblobVerifyRegion — implementation (file not provided)",
+      "invariant": "dataStart and dataEnd must lie within [uh, uh+uc]; specifically dataEnd = uh + 8 + il*16 + dl must not exceed the true end of the buffer, so that the index/data walk in hdrblobVerifyInfo never reads outside uh.",
+      "failure_mode": "il and dl are attacker-controlled and only checked by hdrblobVerifyLengths; if that check (or the pvlen gate under the uc==0 path) is too loose, dataEnd points beyond the real buffer. hdrblobVerifyInfo then iterates il entries and dereferences data in [dataStart, dataEnd), reading adjacent heap/mmap memory — an information leak or crash. The bounds are computed here before the size gate runs, so their validity is entirely contingent on the later checks matching the true buffer size.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm that after line 26 (and hdrblobVerifyRegion) dataEnd is provably <= uh + uc on every path, including uc==0, and that hdrblobVerifyInfo re-bounds each entry's offset+count against [dataStart, dataEnd)."
+    },
+    {
+      "title": "Exact-size validation disabled on the uc==0 path leaves only a coarse ceiling",
+      "anchor": "if (blob->pvlen >= headerMaxbytes || (uc && blob->pvlen != uc))",
+      "file": "corpus/eval/eval_0009_cwe125.c",
+      "line": "26",
+      "code": "if (blob->pvlen >= headerMaxbytes || (uc && blob->pvlen != uc)) {",
+      "bug_class": "Insufficient input validation (self-described length trusted without external corroboration)",
+      "cwe": "CWE-20",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0009_cwe125.c; the uc==0 callers — implementation (file not provided)",
+      "invariant": "The header's self-declared total (pvlen) must be tied to the real buffer extent. When uc>0 the `pvlen != uc` clause enforces this exactly; when uc==0 the code must have another guarantee that the buffer truly holds pvlen bytes.",
+      "failure_mode": "With uc==0 the exact-length clause short-circuits, so a crafted header is accepted whenever its own pvlen is merely below headerMaxbytes (~256MB). Nothing confirms the buffer actually contains pvlen bytes, so the parser proceeds to read a data store sized by the attacker's own dl. This is the enabling condition for findings #1-#3 and by itself weakens the safety of the whole parse whenever a uc==0 entry path exists.",
+      "cve_analog": "",
+      "what_to_confirm": "Enumerate all callers that pass uc==0 and verify each supplies a buffer whose real length already equals pvlen (e.g. it was read using il/dl); otherwise thread the true length through as uc so the exact cross-check applies."
+    },
+    {
+      "title": "const-discarding alias of the input buffer retained for in-place mutation",
+      "anchor": "blob->ei = (int32_t *) uh; /* discards const */",
+      "file": "corpus/eval/eval_0009_cwe125.c",
+      "line": "13",
+      "code": "blob->ei = (int32_t *) uh; /* discards const */",
+      "bug_class": "Improper const handling / potential write to read-only or shared memory",
+      "cwe": "CWE-20",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0009_cwe125.c (alias created here); in-place byte-swap occurs in region handling — implementation (file not provided)",
+      "invariant": "If any later code writes through blob->ei (RPM byte-swaps region entries in place), blob->ei must point at a private, writable copy of the header, not a read-only mapping or a buffer shared with other readers.",
+      "failure_mode": "The cast strips const from uh so blob->ei is a mutable alias. This function only reads through it, but the alias is handed to callers/verifiers that perform in-place endian swaps. If uh is a read-only mmap of a package file, an in-place write faults (crash/DoS); if it is a shared buffer, the swap corrupts data other code still expects in wire order. No exploitation is possible from the shown reads alone, hence low severity.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm whether downstream region handling writes through blob->ei and, if so, that the buffer at uh is always a writable private copy."
+    },
+    {
+      "title": "Format specifier mismatch printing pvlen with %d",
+      "anchor": "rasprintf(emsg, _(\"blob size(%d): BAD, 8 + 16 * il(%d) + dl(%d)\"), blob->pvlen, blob->il, blob->dl);",
+      "file": "corpus/eval/eval_0009_cwe125.c",
+      "line": "27-28",
+      "code": "rasprintf(emsg, _(\"blob size(%d): BAD, 8 + 16 * il(%d) + dl(%d)\"),\n\t\t\tblob->pvlen, blob->il, blob->dl);",
+      "bug_class": "Format-specifier/type mismatch (diagnostic only; format string is a fixed literal, not attacker-controlled)",
+      "cwe": "CWE-686",
+      "severity": "info",
+      "where_it_lives": "corpus/eval/eval_0009_cwe125.c",
+      "invariant": "Each printf conversion must match its argument's type; the format string must remain a literal so no format-string injection is possible (it already is).",
+      "failure_mode": "pvlen is printed with %d, but if pvlen is unsigned or wider than int, the conversion is a type mismatch and technically undefined behaviour, at worst printing a misleading/negative size in the error text. There is no attacker-controlled format string here, so this is a correctness/quality issue, not a memory-safety vulnerability.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm pvlen's declared type and switch the specifier to match (e.g. %u or the appropriate width macro)."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm hdrblobVerifyLengths rejects il/dl large enough that 8 + il*16 + dl could overflow or truncate pvlen's declared type, and that it enforces il>=1 for region headers.",
+    "Confirm pvlen's declared type in struct hdrblob_s and whether the size total should be computed and compared in size_t before any narrowing.",
+    "Enumerate every caller that passes uc==0 and verify each guarantees at least 8 readable bytes at uh AND a buffer whose real size equals the header's self-declared pvlen.",
+    "Confirm that after the line-26 gate and hdrblobVerifyRegion, dataEnd is provably within [uh, uh+uc] on all paths, including uc==0.",
+    "Confirm hdrblobVerifyInfo re-bounds each index entry's data offset+count against [dataStart, dataEnd) rather than trusting them.",
+    "Confirm whether region handling writes through blob->ei in place and, if so, that uh is always a writable private copy (not a read-only mmap or shared buffer).",
+    "Confirm regionTag/exact_size are validated by hdrblobVerifyRegion such that the region trailer cannot describe a length inconsistent with il/dl.",
+    "Normalise the rasprintf %d specifier for pvlen to its actual type."
+  ]
+}

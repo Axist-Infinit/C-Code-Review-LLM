@@ -1,0 +1,257 @@
+{
+  "subsystem": "BootDoctor::fix() from deepin-clone (Deepin disk clone/backup utility). This is a privileged repair routine that takes a partition device path, temporarily mounts the target partition, drops a boot-repair repo ISO and an architecture-specific boot_fix.sh into it, bind-mounts /dev, /dev/pts, /proc and /sys, chroots into the target root filesystem, runs boot_fix.sh to reinstall/repair the bootloader, then rewrites /etc/fstab and /etc/crypttab so their UUID references match the (possibly reset) partition UUID. Because it performs mount, bind-mount, chroot and UUID resets, it necessarily runs with root privileges.",
+  "provenance": "Identified by naming and API surface: the Qt/DTK types (QString, QFile, QDir, QProcess, QStandardPaths, QObject::tr) and the DTK/deepin classes DDevicePartInfo, DDeviceDiskInfo, DPartInfo, plus the Helper facade (Helper::processExec, Helper::temporaryMountDevice, Helper::mountDevice, Helper::resetPartUUID), the dCError/dCWarning/dCDebug logging macros, the resource paths ':/repo_%1.iso' and ':/scripts/boot_fix_%1.sh', and the HOST_ARCH_* preprocessor branches all match the deepin-clone codebase (BootDoctor). The banner 'primevul_train_2255_vuln' and the sample id 'eval_0057_cwe61' indicate this is a labeled vulnerable sample in the CWE-61 (UNIX symbolic link following) class.",
+  "trust_boundary": "This routine runs as root. Two distinct untrusted producers cross the boundary: (1) any unprivileged local user, who can pre-create files, directories and symlinks in the world-writable temp directory whose name is fully predictable ('/tmp/.deepin-clone', '/tmp/.deepin-clone/repo.iso'); and (2) the partition being 'repaired' itself, whose filesystem contents (the whole tree reachable through mount_root, including mount_root+'/etc/fstab', '/etc/crypttab', '/boot_fix.sh', '/boot/efi') are attacker-controllable when the partDevice is a removable disk, a malicious disk image, or a filesystem prepared by a lower-privileged user. Every path the privileged process builds by concatenating a fixed name onto '/tmp' or onto mount_root, and every string interpolated into a shell/mount/chroot command, is therefore hostile.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/eval/eval_0057_cwe61.cpp",
+      "lines": "2-7",
+      "code": "bool BootDoctor::fix(const QString &partDevice)\n{\n    m_lastErrorString.clear();\n\n    DDevicePartInfo part_info(partDevice);\n    const QString part_old_uuid = part_info.uuid();",
+      "explanation": "Entry point. fix() takes the caller-supplied partition device path partDevice (e.g. '/dev/sdb2') by const reference and returns success/failure. It clears the member error string m_lastErrorString, constructs a DDevicePartInfo wrapper around the partition, and records the partition's current filesystem UUID in part_old_uuid. That old UUID is used later both to search lsblk output and to rewrite /etc/fstab and /etc/crypttab, and to restore the UUID on the failure path. partDevice is the primary function input and drives every subsequent mount and command."
+    },
+    {
+      "file": "corpus/eval/eval_0057_cwe61.cpp",
+      "lines": "9-21",
+      "code": "    if (Helper::processExec(\"lsblk -s -d -n -o UUID\") == 0) {\n        if (Helper::lastProcessStandardOutput().contains(part_old_uuid.toLatin1())) {\n            // reset uuid\n            if (Helper::resetPartUUID(part_info)) {\n                QThread::sleep(1);\n                part_info.refresh();\n\n                qDebug() << part_old_uuid << part_info.uuid();\n            } else {\n                dCWarning(\"Failed to reset uuid\");\n            }\n        }\n    }",
+      "explanation": "Runs 'lsblk -s -d -n -o UUID' via Helper::processExec and, if it succeeds (exit 0), checks whether the captured standard output contains the partition's current UUID. If it does (a UUID collision with another visible block device), it calls Helper::resetPartUUID(part_info) to assign a fresh random UUID, sleeps one second for the kernel/udev to settle, refreshes part_info so part_info.uuid() now returns the new UUID, and logs the old/new pair. The purpose is to avoid two devices sharing a UUID after clone; the new UUID diverging from part_old_uuid is what later triggers the fstab/crypttab rewrite."
+    },
+    {
+      "file": "corpus/eval/eval_0057_cwe61.cpp",
+      "lines": "23-29",
+      "code": "    bool device_is_mounted = Helper::isMounted(partDevice);\n    const QString &mount_root = Helper::temporaryMountDevice(partDevice, QFileInfo(partDevice).fileName());\n\n    if (mount_root.isEmpty()) {\n        m_lastErrorString = QObject::tr(\"Failed to mount partition \\\"%1\\\"\").arg(partDevice);\n        goto failed;\n    }",
+      "explanation": "Remembers whether the partition was already mounted (device_is_mounted) so it can be unmounted only if fix() mounted it. It then mounts the partition at a temporary location via Helper::temporaryMountDevice(), which returns the mount-point path mount_root. Everything downstream is built by concatenating fixed sub-paths onto mount_root, so mount_root points into the untrusted target filesystem. If the mount failed (empty string) it records a translated error and jumps to the 'failed' cleanup label."
+    },
+    {
+      "file": "corpus/eval/eval_0057_cwe61.cpp",
+      "lines": "31-38",
+      "code": "    {\n        const QStringList &tmp_paths = QStandardPaths::standardLocations(QStandardPaths::TempLocation);\n        const QString tmp_dir = (tmp_paths.isEmpty() ? \"/tmp\" : tmp_paths.first()) + \"/.deepin-clone\";\n\n        if (!QDir::current().mkpath(tmp_dir)) {\n            dCError(\"mkpath \\\"%s\\\" failed\", qPrintable(tmp_dir));\n            goto failed;\n        }",
+      "explanation": "Opens a block scope (needed because of the goto label). It computes a temp base directory: QStandardPaths TempLocation, falling back to the literal '/tmp' if the query returns nothing, then appends the fixed subdirectory name '/.deepin-clone'. So tmp_dir is a fully predictable path, typically '/tmp/.deepin-clone', in a world-writable directory. mkpath() creates it (and succeeds if it already exists). Note it does NOT create an owner-only randomized directory (no QTemporaryDir, no mkdtemp), and does not verify ownership or that the path is not a symlink."
+    },
+    {
+      "file": "corpus/eval/eval_0057_cwe61.cpp",
+      "lines": "40-46",
+      "code": "        const QString &repo_path = tmp_dir + \"/repo.iso\";\n\n        if (!QFile::exists(repo_path)\n                && !QFile::copy(QString(\":/repo_%1.iso\").arg(HOST_ARCH), repo_path)) {\n            dCError(\"copy file failed, new name: %s\", qPrintable(repo_path));\n            goto failed;\n        }",
+      "explanation": "Builds repo_path = tmp_dir + '/repo.iso' (again a fixed, predictable name inside the predictable temp dir). It then does a check-then-act: if repo_path does not already exist, it copies the arch-specific embedded Qt resource ':/repo_<HOST_ARCH>.iso' out to repo_path on disk. QFile::copy resolves and opens the destination path; if the destination is a symlink it follows it. On copy failure it logs and jumps to 'failed'. This ISO is subsequently loop-mounted."
+    },
+    {
+      "file": "corpus/eval/eval_0057_cwe61.cpp",
+      "lines": "48-57",
+      "code": "        bool ok = false;\n\n        const QString &repo_mount_point = mount_root + \"/deepin-clone\";\n        QFile file_boot_fix(mount_root + \"/boot_fix.sh\");\n\n        do {\n            if (!QDir(mount_root).exists(\"deepin-clone\") && !QDir(mount_root).mkdir(\"deepin-clone\")) {\n                dCError(\"Create \\\"deepin-clone\\\" dir failed(\\\"%s\\\")\", qPrintable(mount_root));\n                break;\n            }",
+      "explanation": "Declares the success flag ok. repo_mount_point (mount_root + '/deepin-clone') is where the repo ISO will be mounted, and file_boot_fix is a QFile bound to mount_root + '/boot_fix.sh' - both paths live inside the untrusted target filesystem. A do/while(0) block begins as a structured way to 'break' out on any error. First it ensures the 'deepin-clone' directory exists inside the target, creating it if needed."
+    },
+    {
+      "file": "corpus/eval/eval_0057_cwe61.cpp",
+      "lines": "59-62",
+      "code": "            if (!Helper::mountDevice(repo_path, repo_mount_point, true)) {\n                m_lastErrorString = QObject::tr(\"Failed to mount partition \\\"%1\\\"\").arg(repo_path);\n                break;\n            }",
+      "explanation": "Loop-mounts the repo ISO (repo_path from /tmp) onto repo_mount_point (mount_root+'/deepin-clone'), read-only-ish (the third arg true). If mounting fails it records an error and breaks out of the do/while. This makes the repo contents available inside the chroot target so boot_fix.sh can pull packages from it."
+    },
+    {
+      "file": "corpus/eval/eval_0057_cwe61.cpp",
+      "lines": "64-84",
+      "code": "            if (file_boot_fix.exists()) {\n                file_boot_fix.remove();\n            }\n\n            if (!QFile::copy(QString(\":/scripts/boot_fix_%1.sh\").arg(\n                     #if defined(HOST_ARCH_x86_64) || defined(HOST_ARCH_i386) || defined(HOST_ARCH_i686)\n                                 \"x86\"\n                     #elif defined(HOST_ARCH_mips64) || defined(HOST_ARCH_mips32)\n                                 \"mips\"\n                     #elif defined(HOST_ARCH_sw_64)\n                                 \"sw_64\"\n                     #elif defined(HOST_ARCH_aarch64)\n                                 \"aarch64\"\n                     #else\n                     #pragma message \"Machine: \" HOST_ARCH\n                                \"unknow\"\n                     #endif\n                                 ), file_boot_fix.fileName())) {\n                dCError(\"copy file failed, new name: %s\", qPrintable(file_boot_fix.fileName()));\n                break;\n            }",
+      "explanation": "If a stale boot_fix.sh exists at mount_root+'/boot_fix.sh' it is removed, then the arch-appropriate embedded script resource (':/scripts/boot_fix_x86.sh', '_mips.sh', '_sw_64.sh', '_aarch64.sh', or '_unknow.sh' selected at compile time by the HOST_ARCH_* macros) is copied to file_boot_fix.fileName(), i.e. into the target filesystem's root. QFile::copy again opens/writes the destination path and will follow a symlink placed at that name. On failure it logs and breaks."
+    },
+    {
+      "file": "corpus/eval/eval_0057_cwe61.cpp",
+      "lines": "86-89",
+      "code": "            if (!file_boot_fix.setPermissions(file_boot_fix.permissions() | QFile::ExeUser)) {\n                dCError(\"Set \\\"%s\\\" permissions failed\", qPrintable(file_boot_fix.fileName()));\n                break;\n            }",
+      "explanation": "Adds the owner-execute bit (QFile::ExeUser) to the freshly copied boot_fix.sh so it can be run via chroot later. On failure it logs and breaks. Because file_boot_fix.fileName() lives inside the untrusted mount, permissions are being changed on a path an attacker may control."
+    },
+    {
+      "file": "corpus/eval/eval_0057_cwe61.cpp",
+      "lines": "91-112",
+      "code": "            if (Helper::processExec(QString(\"mount --bind -v --bind /dev %1/dev\").arg(mount_root)) != 0) {\n                dCError(\"Failed to bind /dev\");\n                break;\n            }\n\n            if (Helper::processExec(QString(\"mount --bind -v --bind /dev/pts %1/dev/pts\").arg(mount_root)) != 0) {\n                dCError(\"Failed to bind /dev/pts\");\n                break;\n            }\n\n            if (Helper::processExec(QString(\"mount --bind -v --bind /proc %1/proc\").arg(mount_root)) != 0) {\n                dCError(\"Failed to bind /proc\");\n                break;\n            }\n\n            if (Helper::processExec(QString(\"mount --bind -v --bind /sys %1/sys\").arg(mount_root)) != 0) {\n                dCError(\"Failed to bind /sys\");\n                break;\n            }\n\n            ok = true;\n        } while (0);",
+      "explanation": "Bind-mounts the host's /dev, /dev/pts, /proc and /sys into the target under mount_root so that the chroot'd repair script has working device nodes and kernel filesystems. Each mount command is built by string-interpolating mount_root into a command template passed to Helper::processExec. If all four succeed, ok is set true and the do/while(0) exits normally. These four bind mounts are the environment the subsequent chroot depends on."
+    },
+    {
+      "file": "corpus/eval/eval_0057_cwe61.cpp",
+      "lines": "114-154",
+      "code": "        QProcess process;\n\n        if (ok) {\n            const QString &parent_device = Helper::parentDevice(partDevice);\n\n            bool is_efi = false;\n\n            if (!parent_device.isEmpty()) {\n                DDeviceDiskInfo info(parent_device);\n\n                dCDebug(\"Disk partition table type: %d\", info.ptType());\n\n                if (info.ptType() == DDeviceDiskInfo::GPT) {\n                    for (const DPartInfo &part : info.childrenPartList()) {\n                        if (part.guidType() == DPartInfo::EFI_SP_None) {\n                            const QString &efi_path = mount_root + \"/boot/efi\";\n\n                            QDir::current().mkpath(efi_path);\n\n                            if (Helper::processExec(QString(\"mount %1 %2\").arg(part.filePath()).arg(efi_path)) != 0) {\n                                dCError(\"Failed to mount EFI partition\");\n                                m_lastErrorString = QObject::tr(\"Failed to mount partition \\\"%1\\\"\").arg(part.filePath());\n                                ok = false;\n                                break;\n                            }\n\n                            is_efi = true;\n\n                            break;\n                        }\n                    }\n\n                    if (!is_efi && m_lastErrorString.isEmpty()) {\n                        m_lastErrorString = QObject::tr(\"EFI partition not found\");\n                        ok = false;\n                    }\n                } else if (info.ptType() == DDeviceDiskInfo::Unknow) {\n                    m_lastErrorString = QObject::tr(\"Unknown partition style\");\n                    ok = false;\n                }\n            }",
+      "explanation": "If the bind mounts succeeded, it resolves the whole-disk device (parent_device) for partDevice and inspects its partition table. For a GPT disk it iterates the child partitions looking for an EFI system partition (guidType == EFI_SP_None); when found it creates mount_root+'/boot/efi' and mounts the EFI partition there via an interpolated 'mount %1 %2' command using part.filePath() and efi_path, setting is_efi. If no EFI partition is found on GPT, or the table type is Unknow, it records an error and clears ok. This decides whether boot_fix.sh is told the system is UEFI."
+    },
+    {
+      "file": "corpus/eval/eval_0057_cwe61.cpp",
+      "lines": "156-181",
+      "code": "            if (ok) {\n                process.setProcessChannelMode(QProcess::MergedChannels);\n                process.start(QString(\"chroot %1 ./boot_fix.sh %2 %3 /deepin-clone\")\n                              .arg(mount_root)\n                              .arg(parent_device)\n                              .arg(is_efi ? \"true\" : \"false\"));\n\n                while (process.waitForReadyRead()) {\n                    const QByteArray &data = process.readAll().simplified().constData();\n\n                    dCDebug(data.constData());\n                }\n\n                process.waitForFinished(-1);\n\n                switch (process.exitCode()) {\n                case 1:\n                    m_lastErrorString = QObject::tr(\"Boot for install system failed\");\n                    break;\n                case 2:\n                    m_lastErrorString = QObject::tr(\"Boot for update system failed\");\n                    break;\n                default:\n                    break;\n                }\n            }\n        }",
+      "explanation": "The core action: it chroots into the target root (mount_root) and executes ./boot_fix.sh with parent_device and the is_efi flag ('true'/'false') plus '/deepin-clone' (the mounted repo). The chroot command string is built by interpolating mount_root and parent_device. Output is streamed and logged, it waits indefinitely for completion, and maps exit codes 1/2 to human-readable errors. Executing a script inside the target root means the resolved script and every binary it invokes (mount, dpkg, grub, the shell interpreter) come from the untrusted target filesystem while the process runs as root."
+    },
+    {
+      "file": "corpus/eval/eval_0057_cwe61.cpp",
+      "lines": "184-192",
+      "code": "        // clear\n        Helper::processExec(\"umount \" + repo_mount_point);\n        QDir(mount_root).rmdir(\"deepin-clone\");\n        file_boot_fix.remove();\n        Helper::processExec(\"umount \" + mount_root + \"/dev/pts\");\n        Helper::processExec(\"umount \" + mount_root + \"/dev\");\n        Helper::processExec(\"umount \" + mount_root + \"/proc\");\n        Helper::processExec(\"umount \" + mount_root + \"/sys\");\n        Helper::processExec(\"umount \" + mount_root + \"/boot/efi\");",
+      "explanation": "Cleanup, always run once past the do/while. It unmounts the repo ISO, removes the deepin-clone dir and the boot_fix.sh file, and unmounts the four bind mounts plus the EFI mount, each via string-concatenated 'umount <path>' commands. Note there is no error checking here; a failed unmount (e.g. because the chroot left something busy) is ignored, which can leave host /dev, /proc, /sys bind mounts pinned under the target."
+    },
+    {
+      "file": "corpus/eval/eval_0057_cwe61.cpp",
+      "lines": "194-226",
+      "code": "        if (ok && process.exitCode() == 0) {\n            if (part_old_uuid != part_info.uuid()) {\n                dCDebug(\"Reset the uuid from \\\"%s\\\" to \\\"%s\\\"\", qPrintable(part_old_uuid), qPrintable(part_info.uuid()));\n\n                // update /etc/fstab\n                QFile file(mount_root + \"/etc/fstab\");\n\n                if (file.exists() && file.open(QIODevice::ReadWrite)) {\n                    QByteArray data = file.readAll();\n\n                    if (file.seek(0)) {\n                        file.write(data.replace(part_old_uuid.toLatin1(), part_info.uuid().toLatin1()));\n                    }\n\n                    file.close();\n                } else {\n                    dCWarning(\"Failed to update /etc/fstab, error: %s\", qPrintable(file.errorString()));\n                }\n\n                file.setFileName(mount_root + \"/etc/crypttab\");\n\n                if (file.exists() && file.open(QIODevice::ReadWrite)) {\n                    QByteArray data = file.readAll();\n\n                    if (file.seek(0)) {\n                        file.write(data.replace(part_old_uuid.toLatin1(), part_info.uuid().toLatin1()));\n                    }\n\n                    file.close();\n                } else {\n                    dCWarning(\"Failed to update /etc/crypttab, error: %s\", qPrintable(file.errorString()));\n                }\n            }",
+      "explanation": "On overall success and only if the UUID actually changed, it rewrites the target's /etc/fstab and /etc/crypttab so old-UUID references become the new UUID. For each it opens mount_root+'/etc/fstab' (then '/etc/crypttab') read-write, reads the whole file, seeks to 0, and writes back the byte-array with QByteArray::replace(old_uuid, new_uuid). Note replace() does an in-place substring replacement but does NOT truncate: if the new content is shorter than the original the tail of the old file is left in place (though UUIDs are the same length here). The QFile open resolves the path through whatever symlinks exist inside the untrusted target tree."
+    },
+    {
+      "file": "corpus/eval/eval_0057_cwe61.cpp",
+      "lines": "228-233",
+      "code": "            if (!device_is_mounted)\n                Helper::umountDevice(partDevice);\n\n            return true;\n        }\n    }",
+      "explanation": "On the success path, if fix() itself mounted the partition (it was not already mounted), it unmounts it, then returns true. The closing braces end the success 'if' and the outer scoped block opened at line 31."
+    },
+    {
+      "file": "corpus/eval/eval_0057_cwe61.cpp",
+      "lines": "235-249",
+      "code": "failed:\n    if (!device_is_mounted)\n        Helper::umountDevice(partDevice);\n\n    if (m_lastErrorString.isEmpty())\n        m_lastErrorString = QObject::tr(\"Boot for repair system failed\");\n\n    dCDebug(\"Restore partition uuid\");\n\n    if (!Helper::resetPartUUID(part_info, part_old_uuid.toLatin1())) {\n        dCWarning(\"Failed to restore partition uuid, part: %s, uuid: %s\", qPrintable(partDevice), qPrintable(part_old_uuid));\n    }\n\n    return false;\n}",
+      "explanation": "The 'failed' cleanup label (reached via the earlier gotos, and fallen through to if the success block did not return). It unmounts the partition if fix() mounted it, sets a generic error string if none was set, and restores the original partition UUID (undoing the earlier reset) via Helper::resetPartUUID(part_info, part_old_uuid). It returns false. Note the goto from line 28/37/45 jumps over the declarations at lines 32-51 into this label; those objects are scoped inside the block, so the goto is legal only because it targets a label outside that block - but any partial state (e.g. a temp dir already created, or an ISO already mounted before a later goto could not have run) is not cleaned up by this path."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/eval/eval_0057_cwe61.cpp",
+      "lines": "32-40",
+      "code": "        const QStringList &tmp_paths = QStandardPaths::standardLocations(QStandardPaths::TempLocation);\n        const QString tmp_dir = (tmp_paths.isEmpty() ? \"/tmp\" : tmp_paths.first()) + \"/.deepin-clone\";\n\n        if (!QDir::current().mkpath(tmp_dir)) {\n            dCError(\"mkpath \\\"%s\\\" failed\", qPrintable(tmp_dir));\n            goto failed;\n        }\n\n        const QString &repo_path = tmp_dir + \"/repo.iso\";",
+      "explanation": "The temp path is fully predictable and lives in a world-writable directory: when TempLocation resolves to a shared /tmp (the default when the tool is run as root, since XDG points root's TempLocation at /tmp), tmp_dir is exactly '/tmp/.deepin-clone' and repo_path is '/tmp/.deepin-clone/repo.iso'. A local unprivileged attacker can, before or between runs, create '/tmp/.deepin-clone' (or any component of it) as a symlink pointing at a directory they choose, or plant 'repo.iso' as a symlink. mkpath() will happily accept a pre-existing directory or symlinked directory and does not verify that the path is owned by root, is not a symlink, and has safe permissions. This is the CWE-61 setup: a root process operating on attacker-chosen names in a shared directory. The safe invariant is that privileged temp state must live in a per-invocation, mode-0700, root-owned directory created with mkdtemp/QTemporaryDir, and every open must use O_NOFOLLOW semantics."
+    },
+    {
+      "file": "corpus/eval/eval_0057_cwe61.cpp",
+      "lines": "42-46",
+      "code": "        if (!QFile::exists(repo_path)\n                && !QFile::copy(QString(\":/repo_%1.iso\").arg(HOST_ARCH), repo_path)) {\n            dCError(\"copy file failed, new name: %s\", qPrintable(repo_path));\n            goto failed;\n        }",
+      "explanation": "Symlink-following arbitrary file write / overwrite as root (CWE-61), plus a TOCTOU race (CWE-367). If the attacker plants '/tmp/.deepin-clone/repo.iso' as a symlink to a victim file (e.g. /etc/ld.so.preload, a cron file, or any path the attacker wants to control), then: QFile::exists() follows the link - if the link target does not yet exist, exists() returns false and QFile::copy() opens the destination path following the symlink and writes the ISO bytes to the attacker-chosen target, creating or clobbering a root-owned file at an arbitrary location. Even if exists() returns true (target present), the check-then-copy is a race: the attacker can swap repo_path between the exists() test and any later use. Impact is privilege escalation via arbitrary root-owned file creation/overwrite, or at minimum denial of service. The invariant: never write through an unvalidated path in a shared directory; open with O_NOFOLLOW|O_EXCL and fail closed."
+    },
+    {
+      "file": "corpus/eval/eval_0057_cwe61.cpp",
+      "lines": "199-206",
+      "code": "                // update /etc/fstab\n                QFile file(mount_root + \"/etc/fstab\");\n\n                if (file.exists() && file.open(QIODevice::ReadWrite)) {\n                    QByteArray data = file.readAll();\n\n                    if (file.seek(0)) {\n                        file.write(data.replace(part_old_uuid.toLatin1(), part_info.uuid().toLatin1()));\n                    }",
+      "explanation": "Symlink following inside the untrusted mounted filesystem (CWE-61), applying equally to mount_root+'/etc/crypttab' at lines 213-219 and to the boot_fix.sh copy at line 81 and the ExeUser chmod at line 86. mount_root is the root of the partition being repaired; when that partition is attacker-controlled (removable media, a downloaded/clone image, or a filesystem a lower-privileged user prepared), the attacker can make '/etc/fstab' inside it a symlink pointing back out to a host file such as '/etc/fstab', '/etc/passwd', or '/root/.ssh/authorized_keys'. The root process opens the path ReadWrite following the symlink and writes attacker-influenced content (the UUID substitution, or the boot_fix.sh bytes / execute bit) into the host file outside the mount. Because the substituted new UUID is itself derived from resetPartUUID, and the file contents are attacker-provided, this is a path to corrupting or controlling host configuration as root. Invariant: when touching files inside an untrusted mount, resolve and confine every path under the mount (openat2 RESOLVE_BENEATH / O_NOFOLLOW on each component) and never follow links out of the mount tree."
+    },
+    {
+      "file": "corpus/eval/eval_0057_cwe61.cpp",
+      "lines": "91-96",
+      "code": "            if (Helper::processExec(QString(\"mount --bind -v --bind /dev %1/dev\").arg(mount_root)) != 0) {\n                dCError(\"Failed to bind /dev\");\n                break;\n            }\n\n            if (Helper::processExec(QString(\"mount --bind -v --bind /dev/pts %1/dev/pts\").arg(mount_root)) != 0) {",
+      "explanation": "Command/argument injection via string-built command lines (CWE-78/CWE-88), latent because Helper::processExec is not shown. mount_root, partDevice, parent_device and part.filePath() are interpolated into command strings passed to processExec at lines 91-106, 133 and 158. If processExec forwards the string to a shell (system()/sh -c), any shell metacharacter in these values yields arbitrary command execution as root; if it merely splits on whitespace (QProcess::start(QString)), a value containing spaces still causes argument-splitting/injection (extra mount flags or targets). mount_root comes from Helper::temporaryMountDevice and part.filePath()/parent_device from device enumeration, but if any of these can carry attacker-influenced characters (a crafted device/label name), the mount and chroot commands are subvertible. Invariant: build argv arrays with explicit, individually-quoted arguments (QProcess::start(program, QStringList)) and never concatenate untrusted data into a command string."
+    },
+    {
+      "file": "corpus/eval/eval_0057_cwe61.cpp",
+      "lines": "158-161",
+      "code": "                process.start(QString(\"chroot %1 ./boot_fix.sh %2 %3 /deepin-clone\")\n                              .arg(mount_root)\n                              .arg(parent_device)\n                              .arg(is_efi ? \"true\" : \"false\"));",
+      "explanation": "Executing code inside an untrusted root filesystem (CWE-829 / untrusted execution). chroot into mount_root and then run './boot_fix.sh' means the shell interpreter, dynamic loader, and every command boot_fix.sh calls (mount, grub-install, dpkg, etc.) are resolved from the attacker-controlled target filesystem while the outer process is root. A malicious target image can ship a trojaned /bin/sh or a boot_fix.sh path that resolves through a symlink, causing attacker code to run as root on the host kernel (chroot is not a security boundary and the bind-mounted host /dev/proc/sys give broad reach). The './boot_fix.sh' relative path also depends on chroot's working directory being the copied script rather than an attacker file. Invariant: treat the repaired filesystem as hostile - do not execute its binaries as root, or run the repair in a strongly isolated sandbox (separate mount/pid/user namespace, seccomp), and invoke the script by an absolute, validated path."
+    },
+    {
+      "file": "corpus/eval/eval_0057_cwe61.cpp",
+      "lines": "184-192",
+      "code": "        // clear\n        Helper::processExec(\"umount \" + repo_mount_point);\n        QDir(mount_root).rmdir(\"deepin-clone\");\n        file_boot_fix.remove();\n        Helper::processExec(\"umount \" + mount_root + \"/dev/pts\");\n        Helper::processExec(\"umount \" + mount_root + \"/dev\");\n        Helper::processExec(\"umount \" + mount_root + \"/proc\");\n        Helper::processExec(\"umount \" + mount_root + \"/sys\");\n        Helper::processExec(\"umount \" + mount_root + \"/boot/efi\");",
+      "explanation": "Unchecked cleanup / incomplete teardown (reliability and a secondary security concern). None of these umount calls have their return value checked. If a bind mount cannot be unmounted (still busy after the chroot), the host's /dev, /proc, /sys stay bind-mounted under mount_root; a later attacker who can reach that stale path gains a window into host filesystems, and repeated runs can stack mounts. rmdir/remove failures are likewise ignored, so attacker-planted content in the deepin-clone dir or a symlinked boot_fix.sh may persist. Invariant: verify each unmount succeeded, unmount in reverse dependency order, and refuse to report success (or to re-run) while any bind mount remains, so untrusted state is never left mounted under a privileged path."
+    }
+  ],
+  "summary": "A root-privileged boot-repair routine (deepin-clone BootDoctor::fix) that operates on attacker-reachable names in two untrusted spheres: a predictable, world-writable temp directory ('/tmp/.deepin-clone/repo.iso') and the mounted target partition it is repairing (mount_root+'/etc/fstab', '/etc/crypttab', '/boot_fix.sh'). The primary defect is UNIX symbolic-link following (CWE-61): copies and opens through these unvalidated paths let a local user or a malicious partition redirect root's writes to arbitrary host files, yielding privilege escalation. Secondary risks are a check-then-copy TOCTOU race, command/argument injection through string-built mount/chroot commands, and executing binaries from an untrusted chroot as root.",
+  "reviewed_anchors": [
+    {"anchor": "bool BootDoctor::fix(const QString &partDevice) (line 2)", "disposition": "finding", "reason": "partDevice is the untrusted device-path input that drives all mounts, chroot and commands; it crosses the trust boundary."},
+    {"anchor": "part_old_uuid = part_info.uuid() (line 7)", "disposition": "dismissed", "reason": "A read of the partition UUID; used only for search/replace and restore - no memory or path contract of its own."},
+    {"anchor": "Helper::processExec(\"lsblk -s -d -n -o UUID\") (line 9)", "disposition": "dismissed", "reason": "Static, fully literal command with no interpolated input; no injection surface."},
+    {"anchor": "Helper::resetPartUUID(part_info) (line 12)", "disposition": "dismissed", "reason": "Reassigns a random UUID via an unshown helper; no attacker-controlled data flows into it here."},
+    {"anchor": "Helper::temporaryMountDevice(partDevice, ...) -> mount_root (line 24)", "disposition": "finding", "reason": "mount_root roots every subsequent path built into the untrusted target filesystem and is interpolated into mount/chroot commands."},
+    {"anchor": "tmp_dir = (tmp_paths.isEmpty() ? \"/tmp\" : tmp_paths.first()) + \"/.deepin-clone\" (line 33)", "disposition": "finding", "reason": "Predictable fixed name in a world-writable directory created/used by a root process - the CWE-61 root cause."},
+    {"anchor": "QDir::current().mkpath(tmp_dir) (line 35)", "disposition": "finding", "reason": "Accepts a pre-existing / symlinked directory without ownership or nofollow checks."},
+    {"anchor": "repo_path = tmp_dir + \"/repo.iso\" (line 40)", "disposition": "finding", "reason": "Predictable file name in shared temp dir, later written via QFile::copy that follows symlinks."},
+    {"anchor": "QFile::exists(repo_path) && QFile::copy(\":/repo_%1.iso\", repo_path) (lines 42-43)", "disposition": "finding", "reason": "Check-then-act TOCTOU plus symlink-following write - arbitrary root file overwrite."},
+    {"anchor": "repo_mount_point = mount_root + \"/deepin-clone\" (line 50)", "disposition": "dismissed", "reason": "Path inside the untrusted mount, but its risk is covered by the mount_root symlink/injection findings; no separate contract."},
+    {"anchor": "QFile file_boot_fix(mount_root + \"/boot_fix.sh\") (line 51)", "disposition": "finding", "reason": "Path inside the untrusted target; copied/chmod'd/executed - a symlink here redirects a root write (part of the mount_root CWE-61 finding)."},
+    {"anchor": "Helper::mountDevice(repo_path, repo_mount_point, true) (line 59)", "disposition": "dismissed", "reason": "Mounts the ISO fetched from /tmp; the exposure is the /tmp symlink surface already flagged, not this call itself."},
+    {"anchor": "QFile::copy(\":/scripts/boot_fix_%1.sh\", file_boot_fix.fileName()) (lines 68-81)", "disposition": "finding", "reason": "Writes into the untrusted mount at a fixed name; symlink-following write covered by the mount_root CWE-61 finding."},
+    {"anchor": "HOST_ARCH_* preprocessor branches selecting x86/mips/sw_64/aarch64/unknow (lines 69-80)", "disposition": "dismissed", "reason": "Compile-time architecture selection of a resource name; no runtime attacker input."},
+    {"anchor": "file_boot_fix.setPermissions(... | QFile::ExeUser) (line 86)", "disposition": "dismissed", "reason": "Adds exec bit to a path in the untrusted mount; risk is the symlink-target write already captured by the mount_root finding."},
+    {"anchor": "processExec(\"mount --bind ... %1/dev\").arg(mount_root) x4 (lines 91-106)", "disposition": "finding", "reason": "Untrusted mount_root interpolated into command strings - command/argument injection surface."},
+    {"anchor": "processExec(\"mount %1 %2\").arg(part.filePath()).arg(efi_path) (line 133)", "disposition": "finding", "reason": "Device path and mount point interpolated into a command string - same injection class."},
+    {"anchor": "efi_path = mount_root + \"/boot/efi\"; mkpath(efi_path) (lines 129-131)", "disposition": "dismissed", "reason": "Directory inside the untrusted mount; covered by the mount_root symlink finding."},
+    {"anchor": "process.start(\"chroot %1 ./boot_fix.sh %2 %3 /deepin-clone\") (lines 158-161)", "disposition": "finding", "reason": "Executes a script inside an untrusted root filesystem as root and interpolates mount_root/parent_device - untrusted-execution and injection surface."},
+    {"anchor": "process.exitCode() switch cases 1/2 (lines 171-180)", "disposition": "dismissed", "reason": "Maps exit codes to messages; no security contract."},
+    {"anchor": "cleanup umount / rmdir / remove block (lines 185-192)", "disposition": "finding", "reason": "All teardown return values unchecked; can leave host bind mounts stacked under a privileged path."},
+    {"anchor": "QFile file(mount_root + \"/etc/fstab\") open ReadWrite + replace (lines 199-206)", "disposition": "finding", "reason": "Opens/writes a file inside the untrusted mount following symlinks - CWE-61 arbitrary host-file overwrite."},
+    {"anchor": "QFile file(mount_root + \"/etc/crypttab\") open ReadWrite + replace (lines 213-219)", "disposition": "finding", "reason": "Same symlink-following write hazard as the fstab path; covered by the same CWE-61 finding."},
+    {"anchor": "QByteArray::replace(part_old_uuid, part_info.uuid()) without truncation (lines 205,219)", "disposition": "dismissed", "reason": "In-place substring replace; UUIDs are equal length so no residual-tail corruption in practice - noted, low risk."},
+    {"anchor": "goto failed over in-block declarations (lines 28,37,45 -> 235)", "disposition": "dismissed", "reason": "Legal because the label is outside the declaring block; the partial-cleanup nuance is noted but not a memory-safety bug."},
+    {"anchor": "Helper::resetPartUUID(part_info, part_old_uuid.toLatin1()) restore (line 244)", "disposition": "dismissed", "reason": "Restores the original UUID on failure; no attacker-controlled path or buffer."}
+  ],
+  "findings": [
+    {
+      "title": "Symlink following on predictable /tmp/.deepin-clone/repo.iso lets a local user overwrite arbitrary root-owned files",
+      "anchor": "tmp_dir = (tmp_paths.isEmpty() ? \"/tmp\" : tmp_paths.first()) + \"/.deepin-clone\"; repo_path = tmp_dir + \"/repo.iso\"; QFile::copy(\":/repo_%1.iso\", repo_path)",
+      "file": "corpus/eval/eval_0057_cwe61.cpp",
+      "line": "33-46",
+      "code": "        const QString tmp_dir = (tmp_paths.isEmpty() ? \"/tmp\" : tmp_paths.first()) + \"/.deepin-clone\";\n\n        if (!QDir::current().mkpath(tmp_dir)) {\n            dCError(\"mkpath \\\"%s\\\" failed\", qPrintable(tmp_dir));\n            goto failed;\n        }\n\n        const QString &repo_path = tmp_dir + \"/repo.iso\";\n\n        if (!QFile::exists(repo_path)\n                && !QFile::copy(QString(\":/repo_%1.iso\").arg(HOST_ARCH), repo_path)) {",
+      "bug_class": "UNIX symbolic link following (arbitrary file create/overwrite as root)",
+      "cwe": "CWE-61",
+      "severity": "high",
+      "where_it_lives": "corpus/eval/eval_0057_cwe61.cpp (and Qt QFile::copy/mkpath - implementation in Qt, file not provided)",
+      "invariant": "Privileged temp state must be created in a per-invocation, root-owned, mode-0700 directory (mkdtemp/QTemporaryDir) and every write must refuse to traverse symlinks (O_NOFOLLOW|O_EXCL), so a shared-directory name an attacker controls can never redirect a root write.",
+      "failure_mode": "Running as root, the tool uses the fixed, predictable path '/tmp/.deepin-clone/repo.iso' in a world-writable directory. A local unprivileged user pre-creates that directory (or the repo.iso name) as a symlink to a victim path (e.g. /etc/ld.so.preload). mkpath() accepts the pre-existing/symlinked directory without ownership or nofollow checks, and QFile::copy() follows the symlink and writes the embedded ISO's bytes into the attacker-chosen file, creating/clobbering a root-owned file at an arbitrary location - a direct local privilege-escalation primitive (or at least DoS).",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the process runs as root, that TempLocation resolves to a shared /tmp in deployment, and that neither mkpath nor QFile::copy validate ownership / use O_NOFOLLOW; check whether any hardening (QTemporaryDir, per-run random name) was added in the fixed revision."
+    },
+    {
+      "title": "Symlink following inside the untrusted mounted partition redirects root writes to host files",
+      "anchor": "QFile file(mount_root + \"/etc/fstab\"); file.open(QIODevice::ReadWrite); file.write(data.replace(...))",
+      "file": "corpus/eval/eval_0057_cwe61.cpp",
+      "line": "199-219",
+      "code": "                QFile file(mount_root + \"/etc/fstab\");\n\n                if (file.exists() && file.open(QIODevice::ReadWrite)) {\n                    QByteArray data = file.readAll();\n\n                    if (file.seek(0)) {\n                        file.write(data.replace(part_old_uuid.toLatin1(), part_info.uuid().toLatin1()));\n                    }",
+      "bug_class": "UNIX symbolic link following through an untrusted filesystem (host file overwrite as root)",
+      "cwe": "CWE-61",
+      "severity": "high",
+      "where_it_lives": "corpus/eval/eval_0057_cwe61.cpp (path resolution in Qt/libc - implementation not provided)",
+      "invariant": "When operating on files inside a mounted, untrusted filesystem, every path must be confined beneath the mount (openat2 RESOLVE_BENEATH or per-component O_NOFOLLOW) so a symlink in the target tree can never resolve to a file outside the mount.",
+      "failure_mode": "mount_root is the root of the partition being repaired, whose contents are attacker-controlled when partDevice is removable media, a supplied image, or a filesystem a lesser-privileged user prepared. The attacker makes 'etc/fstab' (or 'etc/crypttab', or 'boot_fix.sh' at line 81) inside that filesystem a symlink pointing out of the mount to a host path (e.g. /etc/fstab, /root/.ssh/authorized_keys). The root process opens mount_root+'/etc/fstab' ReadWrite following the symlink and writes attacker-influenced content to the host file, corrupting or controlling privileged host configuration. The same hazard applies to the boot_fix.sh copy/chmod/execute at lines 68-86.",
+      "cve_analog": "",
+      "what_to_confirm": "Determine whether partDevice can be attacker-supplied/removable, and whether any code confines paths beneath mount_root or opens with O_NOFOLLOW; verify Helper::temporaryMountDevice does not mount with nosymfollow or otherwise mitigate."
+    },
+    {
+      "title": "TOCTOU race between QFile::exists and QFile::copy on the shared repo path",
+      "anchor": "if (!QFile::exists(repo_path) && !QFile::copy(QString(\":/repo_%1.iso\").arg(HOST_ARCH), repo_path))",
+      "file": "corpus/eval/eval_0057_cwe61.cpp",
+      "line": "42-43",
+      "code": "        if (!QFile::exists(repo_path)\n                && !QFile::copy(QString(\":/repo_%1.iso\").arg(HOST_ARCH), repo_path)) {",
+      "bug_class": "Time-of-check to time-of-use race (check-then-create in shared directory)",
+      "cwe": "CWE-367",
+      "severity": "medium",
+      "where_it_lives": "corpus/eval/eval_0057_cwe61.cpp",
+      "invariant": "Existence must not be tested separately from creation in a shared directory; create atomically (O_CREAT|O_EXCL|O_NOFOLLOW) and treat 'already exists' as a hard error, so no attacker can win the gap between the check and the write.",
+      "failure_mode": "Because '/tmp/.deepin-clone/repo.iso' is a name any local user can manipulate, the window between QFile::exists() returning false and QFile::copy() opening the destination lets the attacker create/replace repo_path (e.g. as a symlink) after the check, so the subsequent copy acts on the attacker's object. Combined with finding #1 this strengthens the symlink-write into a reliable race even when the target briefly exists.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm QFile::copy performs a non-atomic open of the destination that follows symlinks and does not use O_EXCL; confirm the directory is shared/world-writable at runtime."
+    },
+    {
+      "title": "Command/argument injection via string-built mount and chroot command lines",
+      "anchor": "Helper::processExec(QString(\"mount --bind -v --bind /dev %1/dev\").arg(mount_root)); process.start(QString(\"chroot %1 ./boot_fix.sh %2 %3 /deepin-clone\").arg(mount_root).arg(parent_device)...)",
+      "file": "corpus/eval/eval_0057_cwe61.cpp",
+      "line": "91-161",
+      "code": "            if (Helper::processExec(QString(\"mount --bind -v --bind /dev %1/dev\").arg(mount_root)) != 0) {",
+      "bug_class": "OS command / argument injection through unquoted string interpolation",
+      "cwe": "CWE-78",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided) - Helper::processExec / QProcess command parsing",
+      "invariant": "Commands must be built as explicit argv arrays with each argument passed separately (QProcess::start(program, QStringList)); untrusted values must never be concatenated into a command string that a shell or whitespace-splitter parses.",
+      "failure_mode": "mount_root, parent_device and part.filePath() are interpolated into command strings passed to Helper::processExec (lines 91,96,101,106,133) and QProcess::start (line 158). If processExec routes through a shell, any metacharacter yields arbitrary root command execution; even with QProcess whitespace splitting, a value containing spaces injects extra mount arguments/targets. This is latent - severity depends on the unshown processExec implementation and on whether these device/mount strings can carry attacker-influenced characters.",
+      "cve_analog": "",
+      "what_to_confirm": "Inspect Helper::processExec: does it use sh -c / system(), or split the QString? Determine whether mount_root/parent_device/part.filePath() can contain spaces or shell metacharacters under attacker influence."
+    },
+    {
+      "title": "Running as root inside an untrusted chroot executes attacker-controlled binaries",
+      "anchor": "process.start(QString(\"chroot %1 ./boot_fix.sh %2 %3 /deepin-clone\").arg(mount_root)...)",
+      "file": "corpus/eval/eval_0057_cwe61.cpp",
+      "line": "158-161",
+      "code": "                process.start(QString(\"chroot %1 ./boot_fix.sh %2 %3 /deepin-clone\")\n                              .arg(mount_root)\n                              .arg(parent_device)\n                              .arg(is_efi ? \"true\" : \"false\"));",
+      "bug_class": "Execution of functionality from an untrusted control sphere (untrusted chroot as root)",
+      "cwe": "CWE-829",
+      "severity": "medium",
+      "where_it_lives": "corpus/eval/eval_0057_cwe61.cpp",
+      "invariant": "A filesystem being repaired must be treated as hostile: do not execute its interpreter/binaries as root, invoke the repair script by an absolute validated path, and confine it in a strong sandbox (separate user/mount/pid namespaces, seccomp) rather than a bare chroot.",
+      "failure_mode": "chroot into mount_root then './boot_fix.sh' resolves the shell, dynamic loader and every command boot_fix.sh calls from the attacker-controlled target filesystem while the outer process is root and host /dev,/proc,/sys are bind-mounted in. A malicious image ships a trojaned /bin/sh (or a symlinked boot_fix.sh) and gains root code execution on the host kernel; chroot is not a security boundary. The relative './boot_fix.sh' further depends on chroot's cwd being the intended copied script.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm partDevice/mount_root can reference an attacker-prepared filesystem, and whether any isolation beyond chroot is applied; verify the script is resolved by an absolute in-mount path that cannot be a symlink."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm BootDoctor::fix runs with root privileges (mount/bind-mount/chroot/UUID reset all require it) - this is what turns every path issue into privilege escalation.",
+    "Replace the fixed '/tmp/.deepin-clone' + 'repo.iso' scheme with a per-run root-owned mode-0700 QTemporaryDir/mkdtemp, and open all writes with O_NOFOLLOW|O_EXCL.",
+    "Confine every path built from mount_root (etc/fstab, etc/crypttab, boot_fix.sh, boot/efi, deepin-clone) beneath the mount using openat2 RESOLVE_BENEATH or per-component O_NOFOLLOW so target-filesystem symlinks cannot escape.",
+    "Inspect Helper::processExec: does it use a shell? Convert all mount/umount/chroot invocations to argv-array form and stop interpolating mount_root/parent_device/part.filePath() into command strings.",
+    "Do not execute binaries from the untrusted chroot as root; run boot_fix.sh via an absolute validated path inside a real sandbox (user/mount/pid namespaces + seccomp), not a bare chroot.",
+    "Make the exists()/copy() on repo_path atomic (O_CREAT|O_EXCL) to close the TOCTOU window.",
+    "Check the return value of every umount/rmdir/remove in the cleanup block and refuse to report success or re-run while any bind mount remains under mount_root.",
+    "Verify whether partDevice can reference removable media or an attacker-prepared image, which is the precondition for the untrusted-mount findings."
+  ]
+}

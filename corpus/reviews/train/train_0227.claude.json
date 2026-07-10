@@ -1,0 +1,188 @@
+{
+  "subsystem": "VP9 video bitstream demux helper: ParseVP9SuperFrameIndex parses the trailing 'superframe index' of a VP9 frame. A VP9 superframe packs several coded sub-frames into one container frame and appends an index at the very end describing each sub-frame's byte length. This routine reads that index and produces a list of (offset, length) Ranges pointing into the frame payload, so a downstream decoder can split the container into individual sub-frames.",
+  "provenance": "Identified by the function name ParseVP9SuperFrameIndex and the VP9 superframe-index wire semantics encoded in the constants: kHasSuperFrameIndexMask=0xe0 / kSuperFrameMarker=0xc0 (the top-3-bits==110b marker in the last byte), kFrameCountMask=0x7 ((marker&7)+1 sub-frames), and the ((marker>>3)&0x3)+1 length-field-size — this is the exact VP9 superframe index layout from the VP9 bitstream spec / libvpx. The C++ types (std::uint8_t*, std::size_t, Ranges/Range, frame_ranges->push_back) and stderr diagnostics match the Chromium/WebM media stack rather than libvpx's C. The banner tag 'primevul_train_2670_fixed' marks this as the patched variant of a PrimeVul sample (file name train_0227_cwe125.cpp implies an out-of-bounds-read lineage).",
+  "trust_boundary": "The (frame, frame_length) buffer is attacker-controlled: it is a demuxed video packet originating from a file or network stream (WebM/MP4/RTP), so every byte — the trailing marker, the per-sub-frame length fields, and the frame count / length-field-size encoded in the marker — is hostile and may be crafted to force out-of-bounds reads or inconsistent Ranges. frame_ranges and error are caller-supplied output objects (trusted pointers, but their initialization state is a contract the caller must honor). The security question is whether the parser bounds every read of the index and every emitted Range strictly inside [frame, frame+frame_length).",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0227_cwe125.cpp",
+      "lines": "2-8",
+      "code": "bool ParseVP9SuperFrameIndex(const std::uint8_t* frame,\n                             std::size_t frame_length, Ranges* frame_ranges,\n                             bool* error) {\n  if (frame == nullptr || frame_length == 0 || frame_ranges == nullptr ||\n      error == nullptr) {\n    return false;\n  }",
+      "explanation": "Entry point. It takes a raw byte buffer `frame` with byte count `frame_length`, an output collection `frame_ranges` that will receive one Range per sub-frame, and an `error` out-parameter that signals a malformed-input failure distinct from the ordinary 'this is not a superframe' return. The guard rejects a null buffer, a null output pointer, a null error pointer, and importantly a zero-length frame. The frame_length==0 check is load-bearing because the very next thing the function does is read frame[frame_length-1]; without it that would underflow the index to SIZE_MAX and read wildly out of bounds. On any guard failure it returns false without touching *error."
+    },
+    {
+      "file": "corpus/train/train_0227_cwe125.cpp",
+      "lines": "10-14",
+      "code": "  bool parse_ok = false;\n  const std::uint8_t marker = frame[frame_length - 1];\n  const std::uint32_t kHasSuperFrameIndexMask = 0xe0;\n  const std::uint32_t kSuperFrameMarker = 0xc0;\n  const std::uint32_t kLengthFieldSizeMask = 0x3;",
+      "explanation": "parse_ok is the success flag returned at the end. `marker` is the last byte of the frame, which in the VP9 superframe format is the index marker byte (the index is written at the END of the container, and its first and last bytes are identical marker bytes). The three constants decode that marker: kHasSuperFrameIndexMask=0xe0 isolates the top three bits, kSuperFrameMarker=0xc0 is the required value (110b) that identifies a superframe index, and kLengthFieldSizeMask=0x3 will later isolate the two bits that encode how many bytes each sub-frame length occupies. Reading frame[frame_length-1] is safe here because frame_length!=0 was already established."
+    },
+    {
+      "file": "corpus/train/train_0227_cwe125.cpp",
+      "lines": "16-20",
+      "code": "  if ((marker & kHasSuperFrameIndexMask) == kSuperFrameMarker) {\n    const std::uint32_t kFrameCountMask = 0x7;\n    const int num_frames = (marker & kFrameCountMask) + 1;\n    const int length_field_size = ((marker >> 3) & kLengthFieldSizeMask) + 1;\n    const std::size_t index_length = 2 + length_field_size * num_frames;",
+      "explanation": "If the top three bits of the marker equal 110b this really is a superframe index, so the body decodes the index geometry entirely from that single attacker-supplied byte. num_frames = (marker&7)+1 gives 1..8 sub-frames. length_field_size = ((marker>>3)&3)+1 gives 1..4 bytes per length entry. index_length = 2 + length_field_size*num_frames is the total on-wire size of the index: two marker bytes (leading + trailing) plus num_frames length fields. Because num_frames<=8 and length_field_size<=4, index_length is bounded to [3, 34]; the multiply and add cannot overflow std::size_t. Every downstream bound is derived from this index_length, so its correctness is the crux of the parser."
+    },
+    {
+      "file": "corpus/train/train_0227_cwe125.cpp",
+      "lines": "22-27",
+      "code": "    if (frame_length < index_length) {\n      std::fprintf(stderr,\n                   \"VP9ParseSuperFrameIndex: Invalid superframe index size.\\n\");\n      *error = true;\n      return false;\n    }",
+      "explanation": "The primary short-input guard: if the whole frame is smaller than the index the marker claims, the frame is malformed. It logs, sets *error=true, and returns false. This is the check that makes the later unsigned subtraction frame_length - index_length safe (it guarantees frame_length >= index_length before subtracting), and it also guarantees that the index bytes the loop will read actually exist within the buffer. This is exactly the 'reject if too short BEFORE subtracting' guard the method calls for."
+    },
+    {
+      "file": "corpus/train/train_0227_cwe125.cpp",
+      "lines": "29-30",
+      "code": "    // Consume the super frame index. Note: it's at the end of the super frame.\n    const std::size_t length = frame_length - index_length;",
+      "explanation": "`length` is the size of the payload region that precedes the index (the concatenated sub-frame data). Because line 22 already ensured frame_length >= index_length, this unsigned subtraction cannot wrap. length is later used both as the base offset of the index (index bytes live at frame[length .. frame_length-1]) and as the upper bound that every sub-frame must fit inside."
+    },
+    {
+      "file": "corpus/train/train_0227_cwe125.cpp",
+      "lines": "32-37",
+      "code": "    if (length >= index_length &&\n        frame[frame_length - index_length] == marker) {\n      // Found a valid superframe index.\n      const std::uint8_t* byte = frame + length + 1;\n\n      std::size_t frame_offset = 0;",
+      "explanation": "A second validity gate. `frame[frame_length - index_length]` is the LEADING marker byte of the index (frame_length-index_length == length), and the format requires it to equal the trailing marker byte read earlier; comparing them cheaply rejects garbage. The additional `length >= index_length` conjunct further requires the payload to be at least as large as the index itself. `byte = frame + length + 1` positions the read cursor immediately after the leading marker byte, i.e. at the first per-sub-frame length field. frame_offset accumulates the running byte offset of each sub-frame within the payload and starts at 0. If this gate is false, control falls to the else branch at line 65."
+    },
+    {
+      "file": "corpus/train/train_0227_cwe125.cpp",
+      "lines": "39-44",
+      "code": "      for (int i = 0; i < num_frames; ++i) {\n        std::uint32_t child_frame_length = 0;\n\n        for (int j = 0; j < length_field_size; ++j) {\n          child_frame_length |= (*byte++) << (j * 8);\n        }",
+      "explanation": "Outer loop over the num_frames sub-frames. For each, the inner loop reads length_field_size bytes little-endian and assembles them into child_frame_length: byte j is shifted left by j*8 and OR-ed in. The cursor `byte` advances exactly length_field_size*num_frames = index_length-2 bytes over the whole run, starting at frame+length+1 and ending one byte before the trailing marker at frame_length-1 — so, given the line-22 guard, these reads stay inside the buffer. child_frame_length is the attacker-declared length of sub-frame i."
+    },
+    {
+      "file": "corpus/train/train_0227_cwe125.cpp",
+      "lines": "46-52",
+      "code": "        if (length - frame_offset < child_frame_length) {\n          std::fprintf(stderr,\n                       \"ParseVP9SuperFrameIndex: Invalid superframe, sub frame \"\n                       \"larger than entire frame.\\n\");\n          *error = true;\n          return false;\n        }",
+      "explanation": "The per-sub-frame bound: the remaining payload space `length - frame_offset` must be large enough to hold child_frame_length. This is the check that keeps the emitted Range inside the payload. The subtraction length - frame_offset cannot underflow because frame_offset only ever grows by amounts that already passed this check, maintaining the invariant frame_offset <= length. If a declared sub-frame length would exceed the remaining space it logs, sets *error, and bails."
+    },
+    {
+      "file": "corpus/train/train_0227_cwe125.cpp",
+      "lines": "54-56",
+      "code": "        frame_ranges->push_back(Range(frame_offset, child_frame_length));\n        frame_offset += child_frame_length;\n      }",
+      "explanation": "The validated (offset, length) pair is appended to the output as a Range, then frame_offset advances past this sub-frame. Because the line-46 check guaranteed frame_offset + child_frame_length <= length <= frame_length, every emitted Range refers to bytes strictly inside the frame payload, and the running offset stays within bounds for the next iteration."
+    },
+    {
+      "file": "corpus/train/train_0227_cwe125.cpp",
+      "lines": "58-71",
+      "code": "      if (static_cast<int>(frame_ranges->size()) != num_frames) {\n        std::fprintf(stderr, \"VP9Parse: superframe index parse failed.\\n\");\n        *error = true;\n        return false;\n      }\n\n      parse_ok = true;\n    } else {\n      std::fprintf(stderr, \"VP9Parse: Invalid superframe index.\\n\");\n      *error = true;\n    }\n  }\n  return parse_ok;\n}",
+      "explanation": "A final consistency check: the number of Ranges accumulated must equal num_frames. Since the loop pushes exactly num_frames entries (or returns early), this can only differ if frame_ranges was non-empty on entry — so it effectively asserts the caller passed an empty container. On success parse_ok becomes true. The else branch (line 65) handles the case where the leading/trailing marker bytes did not match: it logs and sets *error=true. The function returns parse_ok; note that returning false with *error still false is the legitimate 'this frame is simply not a superframe' outcome (the outer if at line 16 was not taken)."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0227_cwe125.cpp",
+      "lines": "42-44",
+      "code": "        for (int j = 0; j < length_field_size; ++j) {\n          child_frame_length |= (*byte++) << (j * 8);\n        }",
+      "explanation": "Undefined behavior from a signed left shift into the sign bit. `*byte` is a std::uint8_t which, per the usual arithmetic conversions, is promoted to a signed `int` before the shift. When length_field_size==4 the last iteration evaluates (*byte) << 24; if that byte is >= 0x80 the result (e.g. 0xFF << 24 = 4278190080) exceeds INT_MAX, which is undefined behavior for a signed left shift under C++17 and earlier. An attacker fully controls both length_field_size (bits 3-4 of the marker) and the byte value, so they can reliably trigger the shift into/over the sign bit. In practice compilers produce the expected two's-complement bits and the |= into the uint32_t recovers them, but this is UB: a sanitizer (UBSan) build aborts, and an optimizing compiler is entitled to assume it cannot happen, so it is a genuine latent defect. The invariant: cast the byte to std::uint32_t BEFORE shifting — static_cast<std::uint32_t>(*byte++) << (j * 8)."
+    },
+    {
+      "file": "corpus/train/train_0227_cwe125.cpp",
+      "lines": "2-8",
+      "code": "bool ParseVP9SuperFrameIndex(const std::uint8_t* frame,\n                             std::size_t frame_length, Ranges* frame_ranges,\n                             bool* error) {\n  if (frame == nullptr || frame_length == 0 || frame_ranges == nullptr ||\n      error == nullptr) {\n    return false;\n  }",
+      "explanation": "The *error out-parameter is never initialized to false on any path — it is only ever assigned true (lines 25, 50, 60, 67). On the two 'normal' outcomes — a non-superframe frame (marker top bits != 110b, so the line-16 body is skipped) and a fully successful parse (parse_ok=true) — *error is left with whatever value the caller's variable held before the call. A caller that reads *error without pre-initializing it will consume an indeterminate value (CWE-457 / CWE-908), potentially treating a good parse as an error or vice versa. The invariant the header contract must state (and the safe implementation should enforce) is: set *error = false once at function entry, so the out-parameter is always well-defined. This is a contract hazard latent in the callers, not an in-buffer memory-safety bug."
+    },
+    {
+      "file": "corpus/train/train_0227_cwe125.cpp",
+      "lines": "32-33",
+      "code": "    if (length >= index_length &&\n        frame[frame_length - index_length] == marker) {",
+      "explanation": "The `length >= index_length` conjunct is a stronger constraint than memory safety requires and can silently mis-classify valid input. length is the payload size (frame_length - index_length); this requires the payload to be at least as large as the index (i.e. frame_length >= 2*index_length). A legitimately small superframe whose payload is shorter than the index falls through to the else branch and is reported as 'Invalid superframe index' with *error=true, even though the frame[frame_length-index_length] marker check might have succeeded. This is a correctness/robustness issue (false rejection), not an out-of-bounds read — the frame[frame_length - index_length] access is itself in-bounds because line 22 guaranteed frame_length >= index_length. Worth confirming against the VP9 spec whether the intended guard was simply the marker-equality check, with length>=index_length being an over-strict or copy-paste artifact."
+    },
+    {
+      "file": "corpus/train/train_0227_cwe125.cpp",
+      "lines": "58-62",
+      "code": "      if (static_cast<int>(frame_ranges->size()) != num_frames) {\n        std::fprintf(stderr, \"VP9Parse: superframe index parse failed.\\n\");\n        *error = true;\n        return false;\n      }",
+      "explanation": "This post-loop check compares frame_ranges->size() against num_frames, which implicitly assumes the caller passed an EMPTY Ranges container. If frame_ranges already contained entries, the loop still appends exactly num_frames Ranges, so size() != num_frames and the parse is falsely reported as failed (with *error=true) — and the caller's pre-existing entries are now interleaved with this frame's ranges. The static_cast<int> is benign here (num_frames<=8 and size() is tiny), but a size() larger than INT_MAX would be implementation-defined; that cannot occur given the loop bound. Invariant: document/enforce that frame_ranges must be empty on entry (or clear it), so the size assertion means what it appears to mean."
+    },
+    {
+      "file": "corpus/train/train_0227_cwe125.cpp",
+      "lines": "22-33",
+      "code": "    if (frame_length < index_length) {\n      std::fprintf(stderr,\n                   \"VP9ParseSuperFrameIndex: Invalid superframe index size.\\n\");\n      *error = true;\n      return false;\n    }\n\n    // Consume the super frame index. Note: it's at the end of the super frame.\n    const std::size_t length = frame_length - index_length;\n\n    if (length >= index_length &&\n        frame[frame_length - index_length] == marker) {",
+      "explanation": "This is the memory-safety backbone and, per the 'reject before subtracting' rule, it holds: the line-22 guard is the necessary bound that makes both the frame_length - index_length subtraction and the subsequent index-byte reads (frame+length+1 through frame_length-2) in-range. The residual thing to verify is that no code path bypasses it — e.g. if a future refactor moved the subtraction above the guard, or changed index_length's derivation so it could be zero/overflowing. As written it is correct: index_length in [3,34] and the guard ensures frame_length >= index_length, so the classic VP9 superframe out-of-bounds-read (the unpatched lineage this sample derives from) is closed. This entry documents the guard as reviewed-and-sound rather than as an open defect."
+    }
+  ],
+  "summary": "This is the PATCHED VP9 superframe-index parser: the line-22 'frame_length < index_length' guard correctly bounds the unsigned subtraction and every index-byte read, and the per-sub-frame check at line 46 keeps all emitted Ranges inside the payload, so the classic out-of-bounds read this sample descends from is closed. Residual issues are minor and mostly latent: a signed-left-shift UB when assembling 4-byte length fields (child_frame_length |= (*byte) << 24), and an *error out-parameter that is never initialized to false, leaving callers exposed to an indeterminate read.",
+  "reviewed_anchors": [
+    {"anchor": "ParseVP9SuperFrameIndex(const std::uint8_t* frame, std::size_t frame_length, Ranges* frame_ranges, bool* error)", "disposition": "finding", "reason": "Entry/trust boundary; the *error out-parameter is never initialized to false on the success and non-superframe paths."},
+    {"anchor": "Null/zero guard, lines 5-8 (frame==nullptr || frame_length==0 || frame_ranges==nullptr || error==nullptr)", "disposition": "dismissed", "reason": "Correct defensive guard; the frame_length==0 clause specifically prevents the frame[frame_length-1] underflow."},
+    {"anchor": "marker = frame[frame_length - 1] (line 11)", "disposition": "dismissed", "reason": "In-bounds read; frame_length!=0 is guaranteed by the entry guard."},
+    {"anchor": "kHasSuperFrameIndexMask=0xe0 / kSuperFrameMarker=0xc0 / kLengthFieldSizeMask=0x3 / kFrameCountMask=0x7 (lines 12-14, 17)", "disposition": "dismissed", "reason": "Fixed mask constants that decode the marker; no memory contract of their own."},
+    {"anchor": "num_frames = (marker & kFrameCountMask) + 1 (line 18)", "disposition": "dismissed", "reason": "Bounded to [1,8]; bounds the loop count safely."},
+    {"anchor": "length_field_size = ((marker >> 3) & kLengthFieldSizeMask) + 1 (line 19)", "disposition": "dismissed", "reason": "Bounded to [1,4]; but note it feeds the signed-shift UB (see finding on line 43)."},
+    {"anchor": "index_length = 2 + length_field_size * num_frames (line 20)", "disposition": "dismissed", "reason": "Bounded to [3,34]; the multiply/add cannot overflow std::size_t."},
+    {"anchor": "frame_length < index_length guard (line 22)", "disposition": "dismissed", "reason": "Correct 'reject before subtracting' guard; makes the subtraction and index reads in-bounds — the fix that closes the OOB read."},
+    {"anchor": "length = frame_length - index_length (line 30)", "disposition": "dismissed", "reason": "Unsigned subtraction is safe because line 22 guarantees frame_length >= index_length."},
+    {"anchor": "length >= index_length && frame[frame_length - index_length] == marker (lines 32-33)", "disposition": "finding", "reason": "The frame[] access is in-bounds, but the length>=index_length conjunct is over-strict and can falsely reject valid small superframes (correctness/robustness)."},
+    {"anchor": "byte = frame + length + 1 (line 35)", "disposition": "dismissed", "reason": "Cursor positioned at first length field; the run of reads stays within the index region given the line-22 guard."},
+    {"anchor": "child_frame_length |= (*byte++) << (j * 8) (line 43)", "disposition": "finding", "reason": "Signed left shift of a promoted int into/over the sign bit (<<24 on a byte >=0x80) is undefined behavior; attacker-controlled."},
+    {"anchor": "length - frame_offset < child_frame_length guard (line 46)", "disposition": "dismissed", "reason": "Per-sub-frame bound; subtraction cannot underflow because the frame_offset <= length invariant is maintained by this very check."},
+    {"anchor": "frame_ranges->push_back(Range(frame_offset, child_frame_length)) (line 54)", "disposition": "dismissed", "reason": "Every emitted Range is validated to fit inside the payload before being pushed."},
+    {"anchor": "static_cast<int>(frame_ranges->size()) != num_frames (line 58)", "disposition": "finding", "reason": "Implicitly assumes frame_ranges is empty on entry; a non-empty container yields a false 'parse failed' and corrupts the caller's list."},
+    {"anchor": "*error assignments (lines 25, 50, 60, 67) and return parse_ok (line 70)", "disposition": "finding", "reason": "*error is only ever set to true; never initialized to false, so callers reading it after a success/non-superframe return consume an indeterminate value."}
+  ],
+  "findings": [
+    {
+      "title": "Undefined behavior: signed left shift into the sign bit when assembling sub-frame length",
+      "anchor": "child_frame_length |= (*byte++) << (j * 8)",
+      "file": "corpus/train/train_0227_cwe125.cpp",
+      "line": "43",
+      "code": "          child_frame_length |= (*byte++) << (j * 8);",
+      "bug_class": "Undefined behavior / integer overflow in signed left shift",
+      "cwe": "CWE-190",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0227_cwe125.cpp",
+      "invariant": "Bytes must be widened to an unsigned type of the target width before shifting: static_cast<std::uint32_t>(*byte) << (j * 8), so no shift moves a bit into or past the sign bit of a signed int.",
+      "failure_mode": "*byte (std::uint8_t) is promoted to signed int; with length_field_size==4 the j==3 iteration computes (*byte) << 24, and any byte value >= 0x80 makes the result exceed INT_MAX — undefined behavior for a signed left shift (C++17 and earlier). The attacker controls length_field_size (marker bits 3-4) and the byte, so this is trivially reachable. Impact is a UBSan abort and compiler-assumption-based miscompilation risk rather than a direct memory-safety break, since the |= into the uint32_t normally reconstructs the intended value.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm whether the production build enables -fsanitize=undefined or aggressive optimization; verify the fix casts each byte to std::uint32_t before shifting."
+    },
+    {
+      "title": "*error out-parameter never initialized to false (indeterminate read for callers)",
+      "anchor": "bool* error / *error assignments",
+      "file": "corpus/train/train_0227_cwe125.cpp",
+      "line": "4",
+      "code": "                             bool* error) {",
+      "bug_class": "Use of uninitialized / indeterminate output value",
+      "cwe": "CWE-457",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0227_cwe125.cpp",
+      "invariant": "The function must define *error on every non-early-return path — set *error = false once at entry (after the null-pointer guard) so the out-parameter is always well-defined regardless of outcome.",
+      "failure_mode": "*error is only ever assigned true (lines 25, 50, 60, 67). On a successful parse (parse_ok=true) and on the 'not a superframe' path (line-16 body skipped), *error is left untouched. A caller that does not pre-initialize its error variable and then branches on *error consumes an indeterminate value, which can turn a valid parse into a spurious error or mask a real one; under aggressive optimization reading an indeterminate bool is itself UB.",
+      "cve_analog": "",
+      "what_to_confirm": "Check every call site to see whether the error flag is initialized to false before the call; the safest fix is to initialize *error = false inside this function."
+    },
+    {
+      "title": "Post-loop size check assumes an empty output container",
+      "anchor": "static_cast<int>(frame_ranges->size()) != num_frames",
+      "file": "corpus/train/train_0227_cwe125.cpp",
+      "line": "58",
+      "code": "      if (static_cast<int>(frame_ranges->size()) != num_frames) {",
+      "bug_class": "Unstated precondition / incorrect result on non-empty output",
+      "cwe": "CWE-20",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0227_cwe125.cpp",
+      "invariant": "frame_ranges must be empty on entry (or be cleared at the start), so that size()==num_frames is an accurate success assertion and the caller's list is not silently extended.",
+      "failure_mode": "The loop always appends exactly num_frames Ranges, so this equality can only fail when frame_ranges was non-empty on entry — in which case a perfectly valid superframe is reported as 'parse failed' with *error=true, and the caller's pre-existing entries are now mixed with this frame's ranges. This is a robustness/contract bug; it does not cause out-of-bounds access.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm callers pass a fresh/empty Ranges, or add frame_ranges->clear() at function entry."
+    },
+    {
+      "title": "Over-strict length>=index_length gate can falsely reject valid superframes",
+      "anchor": "length >= index_length && frame[frame_length - index_length] == marker",
+      "file": "corpus/train/train_0227_cwe125.cpp",
+      "line": "32-33",
+      "code": "    if (length >= index_length &&\n        frame[frame_length - index_length] == marker) {",
+      "bug_class": "Incorrect validation predicate (false negative)",
+      "cwe": "CWE-20",
+      "severity": "info",
+      "where_it_lives": "corpus/train/train_0227_cwe125.cpp",
+      "invariant": "The index-validity gate should be exactly the marker-equality check (leading marker byte == trailing marker byte); it must not impose payload >= index_length unless the VP9 spec actually requires it.",
+      "failure_mode": "length = frame_length - index_length is the payload size; requiring length >= index_length demands frame_length >= 2*index_length. A legitimate superframe whose payload is smaller than its index is routed to the else branch and reported as invalid (*error=true) even when its marker bytes match. This rejects valid input; it is not a memory-safety defect because frame[frame_length - index_length] is already in-bounds via the line-22 guard.",
+      "cve_analog": "",
+      "what_to_confirm": "Compare against the VP9 bitstream spec / libvpx reference to determine whether the length>=index_length conjunct is intended or an over-strict artifact."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm the fix widens each length byte before shifting (static_cast<std::uint32_t>(*byte) << (j*8)) to eliminate the signed-left-shift UB at line 43.",
+    "Verify *error is initialized to false on all non-early-return paths (ideally once at entry), and audit call sites that read the flag without pre-initializing it.",
+    "Verify callers pass an empty Ranges container (or add a clear()) so the size()==num_frames assertion at line 58 is meaningful.",
+    "Re-derive the index-byte read range (frame+length+1 .. frame_length-2) against the line-22 guard to confirm no path reads outside [frame, frame+frame_length) — the core OOB-read fix.",
+    "Check the length>=index_length gate against the VP9 spec to confirm it does not falsely reject valid small superframes.",
+    "Confirm num_frames, length_field_size, and index_length ranges ([1,8], [1,4], [3,34]) hold and that index_length can never be zero or overflow before it bounds any read."
+  ]
+}

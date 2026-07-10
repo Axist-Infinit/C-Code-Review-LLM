@@ -1,0 +1,173 @@
+{
+  "subsystem": "TensorFlow FusedBatchNorm op-kernel Compute path. This is the ComputeWithReservedSpace method of a FusedBatchNorm[V2/V3/Ex] OpKernel: it validates the shapes of the batch-normalization input tensors (x, scale, offset, estimated_mean, estimated_variance, optional side_input), optionally reshapes a 5-D input down to 4-D, allocates the output tensors, and dispatches to the functor::FusedBatchNorm compute functor for either the training or inference path.",
+  "provenance": "Identified from the TensorFlow OpKernel idioms: OpKernelContext* context, context->input(N), the OP_REQUIRES / OP_REQUIRES_OK error-checking macros, errors::InvalidArgument, Tensor / TensorShape / TensorFormat (GetTensorDim, ShapeFromFormat), forward_input_or_allocate_output, allocate_output, and the functor::FusedBatchNorm<Device, T, U, IsTraining> template. The FbnActivationMode::kIdentity enum, cudnnBatchNormalizationForwardTrainingEx comment, and member fields (has_side_input_, is_training_, tensor_format_, activation_mode_, epsilon_, exponential_avg_factor_) confirm this is TensorFlow's fused batch-normalization kernel (core/kernels/fused_batch_norm_op). The header comment '/* sample: primevul_train_2126_fixed */' and the cwe703 file tag indicate this is the hardened/fixed variant emphasizing exceptional-condition handling.",
+  "trust_boundary": "The trust boundary is the op-kernel input interface: context->input(0..5) return tensors whose shapes, dtypes, element counts and contents are supplied by the computation graph. In any deployment that runs untrusted or partially-untrusted models/inputs (a served SavedModel, a model loaded from disk, or user-fed feed tensors), an attacker controls x.dims(), every dimension size, num_channels, the element counts of scale/offset/estimated_mean/estimated_variance, and whether side_input is present and its shape. All of these are therefore hostile: the OP_REQUIRES guards in this method are the primary and often only defense before the raw pointers reach the compute functor and, on GPU, cuDNN. A guard that is missing, or that is satisfied by a degenerate value (0, empty, or an integer-overflowed product), lets malformed shape metadata flow into the kernel.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0029_cwe703.cpp",
+      "lines": "2-9",
+      "code": "  virtual void ComputeWithReservedSpace(OpKernelContext* context,\n                                        bool use_reserved_space) {\n    Tensor x = context->input(0);\n    const Tensor& scale = context->input(1);\n    const Tensor& offset = context->input(2);\n    const Tensor& estimated_mean = context->input(3);\n    const Tensor& estimated_variance = context->input(4);\n    const Tensor* side_input = has_side_input_ ? &context->input(5) : nullptr;",
+      "explanation": "This is the kernel's compute entry point. It receives the OpKernelContext (the per-invocation environment that exposes the operation's input tensors and output-allocation API) and a bool use_reserved_space that selects whether cuDNN's reserved-space workspace is produced. It binds the six logical inputs of batch normalization: x is the data tensor (bound by value into a non-const local Tensor so it can be reshaped in place later), scale and offset are the affine parameters, estimated_mean and estimated_variance are the population statistics used in inference, and side_input is an optional additive tensor (fused residual add) that is only fetched from input slot 5 when the has_side_input_ member is set, otherwise left as nullptr. Every one of these tensors is graph-controlled data crossing into the kernel."
+    },
+    {
+      "file": "corpus/train/train_0029_cwe703.cpp",
+      "lines": "11-26",
+      "code": "    OP_REQUIRES(context, x.dims() == 4 || x.dims() == 5,\n                errors::InvalidArgument(\"input must be 4 or 5-dimensional\",\n                                        x.shape().DebugString()));\n    OP_REQUIRES(context, scale.dims() == 1,\n                errors::InvalidArgument(\"scale must be 1-dimensional\",\n                                        scale.shape().DebugString()));\n    OP_REQUIRES(context, offset.dims() == 1,\n                errors::InvalidArgument(\"offset must be 1-dimensional\",\n                                        offset.shape().DebugString()));\n    OP_REQUIRES(context, estimated_mean.dims() == 1,\n                errors::InvalidArgument(\"estimated_mean must be 1-dimensional\",\n                                        estimated_mean.shape().DebugString()));\n    OP_REQUIRES(\n        context, estimated_variance.dims() == 1,\n        errors::InvalidArgument(\"estimated_variance must be 1-dimensional\",\n                                estimated_variance.shape().DebugString()));",
+      "explanation": "This block enforces the rank (number of dimensions) contract for each input. OP_REQUIRES(context, cond, status) evaluates cond and, if false, records the InvalidArgument error on the context and returns from Compute — it is the kernel's structured way of rejecting malformed input rather than crashing. x must be rank 4 (NHWC/NCHW) or rank 5 (NDHWC/NCDHW, the 3-D convolution layout). scale, offset, estimated_mean and estimated_variance must each be rank 1 (a per-channel vector). These checks ensure the subsequent GetTensorDim and NumElements calls operate on tensors of the expected shape family; they constrain rank but not the individual dimension magnitudes."
+    },
+    {
+      "file": "corpus/train/train_0029_cwe703.cpp",
+      "lines": "27-40",
+      "code": "    bool use_reshape = (x.dims() == 5);\n    auto x_shape = x.shape();\n    TensorShape dest_shape;\n    if (use_reshape) {\n      const int64 in_batch = GetTensorDim(x, tensor_format_, 'N');\n      int64 in_planes = GetTensorDim(x, tensor_format_, '0');\n      int64 in_rows = GetTensorDim(x, tensor_format_, '1');\n      int64 in_cols = GetTensorDim(x, tensor_format_, '2');\n      const int64 in_depth = GetTensorDim(x, tensor_format_, 'C');\n      dest_shape = ShapeFromFormat(tensor_format_, in_batch,\n                                   {{in_planes, in_rows * in_cols}}, in_depth);\n      OP_REQUIRES(context, x.CopyFrom(x, dest_shape),\n                  errors::InvalidArgument(\"Error during tensor copy.\"));\n    }",
+      "explanation": "The batch-norm functor works on 4-D layouts, so a 5-D input is collapsed to 4-D before compute. use_reshape captures whether x was rank 5; x_shape saves the original shape so the output can be reshaped back at the end. When reshaping, the code pulls the five spatial/logical dimensions of x using GetTensorDim (which maps the format-relative axis labels 'N', '0', '1', '2', 'C' to concrete int64 sizes): batch, the three spatial extents (planes/rows/cols) and channels/depth. ShapeFromFormat then rebuilds a 4-D shape by folding the last two spatial extents into a single dimension of size in_rows * in_cols, producing dest_shape. x.CopyFrom(x, dest_shape) re-views the same buffer under the new (4-D) shape and returns false if the element counts are incompatible; OP_REQUIRES turns that false into a clean InvalidArgument error. Note the multiplication in_rows * in_cols is performed in int64 with no overflow guard."
+    },
+    {
+      "file": "corpus/train/train_0029_cwe703.cpp",
+      "lines": "42-52",
+      "code": "    const auto num_channels = GetTensorDim(x, tensor_format_, 'C');\n    OP_REQUIRES(\n        context, scale.NumElements() == num_channels,\n        errors::InvalidArgument(\"scale must have the same number of elements \"\n                                \"as the channels of x, got \",\n                                scale.NumElements(), \" and \", num_channels));\n    OP_REQUIRES(\n        context, offset.NumElements() == num_channels,\n        errors::InvalidArgument(\"offset must have the same number of elements \"\n                                \"as the channels of x, got \",\n                                offset.NumElements(), \" and \", num_channels));",
+      "explanation": "num_channels is the channel-axis size of x (int64). The kernel then requires that scale and offset each have exactly num_channels elements: batch norm applies one scale and one offset per channel, so the affine-parameter vectors must line up with the channel dimension of x. These equality checks are what prevent the functor from reading scale[c]/offset[c] for c beyond the end of the scale/offset buffers. Crucially, the check binds the parameter length to num_channels but does not itself require num_channels to be strictly positive."
+    },
+    {
+      "file": "corpus/train/train_0029_cwe703.cpp",
+      "lines": "53-66",
+      "code": "    if (estimated_mean.NumElements() != 0) {\n      OP_REQUIRES(context, estimated_mean.NumElements() == num_channels,\n                  errors::InvalidArgument(\n                      \"mean must be empty or have the same number of \"\n                      \"elements as the channels of x, got \",\n                      estimated_mean.NumElements(), \" and \", num_channels));\n    }\n    if (estimated_variance.NumElements() != 0) {\n      OP_REQUIRES(context, estimated_variance.NumElements() == num_channels,\n                  errors::InvalidArgument(\n                      \"variance must be empty or have the same number of \"\n                      \"elements as the channels of x, got \",\n                      estimated_variance.NumElements(), \" and \", num_channels));\n    }",
+      "explanation": "estimated_mean and estimated_variance carry the population statistics. In training mode these are typically unused (the mean/variance are computed from the batch), so the op permits them to be empty (0 elements); when they are non-empty, they are required to match num_channels exactly, again to keep per-channel indexing in bounds inside the functor. The guard is structured as 'empty is allowed, otherwise must equal num_channels' — it deliberately does not couple the empty-allowed relaxation to is_training_, so an empty mean/variance is accepted for every mode of the op, including the inference path that actually consumes those statistics."
+    },
+    {
+      "file": "corpus/train/train_0029_cwe703.cpp",
+      "lines": "68-74",
+      "code": "    if (has_side_input_) {\n      OP_REQUIRES(context, side_input->shape() == x.shape(),\n                  errors::InvalidArgument(\n                      \"side_input shape must be equal to input shape: \",\n                      side_input->shape().DebugString(),\n                      \" != \", x.shape().DebugString()));\n    }",
+      "explanation": "When the fused side-input (residual add) is enabled, the side_input tensor must have exactly the same shape as x, because the fused op adds it element-wise to the normalized activations before the activation function. The shape equality check guards the element-wise add against a mismatched-size buffer. Note that side_input was dereferenced here only under the same has_side_input_ predicate that populated it at line 9, so the pointer is non-null on this path; x.shape() here is the (possibly already reshaped) 4-D shape."
+    },
+    {
+      "file": "corpus/train/train_0029_cwe703.cpp",
+      "lines": "76-83",
+      "code": "    if (activation_mode_ != FbnActivationMode::kIdentity) {\n      // NOTE(ezhulenev): This requirement is coming from implementation\n      // details of cudnnBatchNormalizationForwardTrainingEx.\n      OP_REQUIRES(\n          context, !is_training_ || num_channels % 4 == 0,\n          errors::InvalidArgument(\"FusedBatchNorm with activation requires \"\n                                  \"channel dimension to be a multiple of 4.\"));\n    }",
+      "explanation": "When a fused activation (e.g. ReLU) is requested (activation_mode_ is not kIdentity), and the op is in training mode, cuDNN's cudnnBatchNormalizationForwardTrainingEx requires the channel count to be a multiple of 4. The guard '!is_training_ || num_channels % 4 == 0' enforces that constraint only in training mode (in inference the constraint does not apply). This is a correctness/ABI constraint imposed by the backend library, surfaced as an InvalidArgument rather than allowed to become undefined behavior inside cuDNN."
+    },
+    {
+      "file": "corpus/train/train_0029_cwe703.cpp",
+      "lines": "85-101",
+      "code": "    Tensor* y = nullptr;\n    auto alloc_shape = use_reshape ? dest_shape : x_shape;\n    OP_REQUIRES_OK(context, context->forward_input_or_allocate_output(\n                                {0}, 0, alloc_shape, &y));\n\n    Tensor* batch_mean = nullptr;\n    OP_REQUIRES_OK(context, context->forward_input_or_allocate_output(\n                                {3}, 1, scale.shape(), &batch_mean));\n    Tensor* batch_var = nullptr;\n    OP_REQUIRES_OK(context, context->forward_input_or_allocate_output(\n                                {4}, 2, scale.shape(), &batch_var));\n    Tensor* saved_mean = nullptr;\n    OP_REQUIRES_OK(context,\n                   context->allocate_output(3, scale.shape(), &saved_mean));\n    Tensor* saved_maybe_inv_var = nullptr;\n    OP_REQUIRES_OK(context, context->allocate_output(4, scale.shape(),\n                                                     &saved_maybe_inv_var));",
+      "explanation": "This block allocates the five outputs. y (the normalized output) is allocated with the compute-time shape (the reshaped 4-D dest_shape when reshaping, otherwise the original x_shape); forward_input_or_allocate_output({0}, 0, ...) allows it to alias input 0 in place to save memory. batch_mean and batch_var (outputs 1 and 2) are allocated with scale.shape() (a per-channel vector) and may forward inputs 3 and 4. saved_mean and saved_maybe_inv_var (outputs 3 and 4) are freshly allocated per-channel vectors used to pass intermediate reduction results to the gradient. OP_REQUIRES_OK propagates any allocation error (e.g. OOM or bad shape) as a Status and returns. All the per-channel outputs are sized from scale.shape(), which was already constrained to num_channels elements above."
+    },
+    {
+      "file": "corpus/train/train_0029_cwe703.cpp",
+      "lines": "103-115",
+      "code": "    if (is_training_) {\n      functor::FusedBatchNorm<Device, T, U, true>()(\n          context, x, scale, offset, estimated_mean, estimated_variance,\n          side_input, epsilon_, exponential_avg_factor_, activation_mode_, y,\n          batch_mean, batch_var, saved_mean, saved_maybe_inv_var,\n          tensor_format_, use_reserved_space);\n    } else {\n      functor::FusedBatchNorm<Device, T, U, false>()(\n          context, x, scale, offset, estimated_mean, estimated_variance,\n          side_input, epsilon_, exponential_avg_factor_, activation_mode_, y,\n          batch_mean, batch_var, saved_mean, saved_maybe_inv_var,\n          tensor_format_, use_reserved_space);\n    }",
+      "explanation": "Dispatch to the device-specific compute functor, template-specialized on the is_training_ member via the boolean template parameter (true / false). This is where the validated tensors and their raw data pointers are handed to the actual normalization math (on CPU an Eigen kernel, on GPU cuDNN). Every shape assumption baked into that functor — scale/offset/mean/variance lengths equal num_channels, side_input matching x, channel-multiple-of-4 for GPU activation — was established by the OP_REQUIRES guards above; the functor does not re-check them. The inference branch (false) reads estimated_mean/estimated_variance to normalize."
+    },
+    {
+      "file": "corpus/train/train_0029_cwe703.cpp",
+      "lines": "116-119",
+      "code": "    if (use_reshape) {\n      OP_REQUIRES(context, y->CopyFrom(*y, x_shape),\n                  errors::InvalidArgument(\"Error during tensor copy.\"));\n    }",
+      "explanation": "If the input was reshaped from 5-D to 4-D at the start, the output y is reshaped back to the original 5-D x_shape so the op's declared output shape is honored. y->CopyFrom(*y, x_shape) re-views y's buffer under x_shape and returns false on element-count mismatch, which OP_REQUIRES converts to a clean InvalidArgument. Because x_shape was the exact original shape and the total element count is preserved through the forward pass, this copy is expected to succeed in normal operation."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0029_cwe703.cpp",
+      "lines": "31-38",
+      "code": "      int64 in_rows = GetTensorDim(x, tensor_format_, '1');\n      int64 in_cols = GetTensorDim(x, tensor_format_, '2');\n      const int64 in_depth = GetTensorDim(x, tensor_format_, 'C');\n      dest_shape = ShapeFromFormat(tensor_format_, in_batch,\n                                   {{in_planes, in_rows * in_cols}}, in_depth);\n      OP_REQUIRES(context, x.CopyFrom(x, dest_shape),\n                  errors::InvalidArgument(\"Error during tensor copy.\"));",
+      "explanation": "in_rows and in_cols are attacker-controlled int64 dimension sizes read from a 5-D input tensor's shape. Their product in_rows * in_cols is computed in signed 64-bit arithmetic with no overflow check before being handed to ShapeFromFormat as a folded dimension. A model that declares very large spatial extents (each individually accepted as a valid dimension) can make the product exceed INT64_MAX and overflow, producing a negative or wrapped dimension. ShapeFromFormat / TensorShape validates dimensions with an internal CHECK (or by returning an error status that is not consulted here), so an overflowed/negative dimension either triggers a CHECK-fail abort (denial of service) or constructs a corrupt dest_shape whose declared element count no longer matches x's real buffer. The x.CopyFrom guard on line 38 only catches an element-count MISMATCH; it does not defend against the process-aborting CHECK inside shape construction that fires before CopyFrom is reached. The safe invariant is that in_rows * in_cols (and the resulting total element count) must be validated with a checked/overflow-aware multiply (e.g. MultiplyWithoutOverflow) and rejected via OP_REQUIRES before dest_shape is built. This is a latent integer-overflow bug living in the shape-construction path."
+    },
+    {
+      "file": "corpus/train/train_0029_cwe703.cpp",
+      "lines": "53-66",
+      "code": "    if (estimated_mean.NumElements() != 0) {\n      OP_REQUIRES(context, estimated_mean.NumElements() == num_channels,\n                  errors::InvalidArgument(\n                      \"mean must be empty or have the same number of \"\n                      \"elements as the channels of x, got \",\n                      estimated_mean.NumElements(), \" and \", num_channels));\n    }\n    if (estimated_variance.NumElements() != 0) {\n      OP_REQUIRES(context, estimated_variance.NumElements() == num_channels,\n                  errors::InvalidArgument(\n                      \"variance must be empty or have the same number of \"\n                      \"elements as the channels of x, got \",\n                      estimated_variance.NumElements(), \" and \", num_channels));\n    }",
+      "explanation": "The empty-allowed relaxation is unconditional: it is not gated on is_training_. An empty estimated_mean/estimated_variance is legitimate for the training path (where population statistics are recomputed), but the inference dispatch at line 110 (functor::FusedBatchNorm<..., false>) normalizes using estimated_mean and estimated_variance directly. If an attacker constructs a FusedBatchNorm node with is_training_ == false and passes empty (0-element) mean and variance tensors, both guards here are satisfied (the NumElements()!=0 predicate is false, so the equality check is skipped) and the empty statistics flow into the inference functor. Depending on the backend, the functor then reads per-channel mean/variance entries from a zero-length buffer (out-of-bounds read of a null/empty data pointer) or divides using absent variance. The invariant the implementation must uphold is that in inference mode mean and variance must be non-empty and equal to num_channels; the header-level guard as written does not enforce that coupling, so the check must be tightened (or the inference functor must itself reject empty statistics)."
+    },
+    {
+      "file": "corpus/train/train_0029_cwe703.cpp",
+      "lines": "42-44",
+      "code": "    const auto num_channels = GetTensorDim(x, tensor_format_, 'C');\n    OP_REQUIRES(\n        context, scale.NumElements() == num_channels,",
+      "explanation": "num_channels is taken directly from x's channel axis and is never required to be strictly positive. If the channel dimension is 0, num_channels == 0; then scale, offset (and empty mean/variance) all legally have 0 elements, the per-channel outputs are allocated with 0 elements, and control reaches the compute functor with a channel count of zero. Downstream the functor may divide or modulo by num_channels, or index a zero-length reduction, leading to a division-by-zero, a degenerate loop, or a CHECK-fail. Even the multiple-of-4 guard at line 80 is vacuously satisfied by 0. This is an exceptional-condition (CWE-703) gap: a robust implementation should reject a zero (or non-positive) channel count explicitly rather than relying on every downstream consumer to tolerate an empty channel axis. Impact is a likely denial of service rather than memory corruption, so it ranks below the two issues above."
+    },
+    {
+      "file": "corpus/train/train_0029_cwe703.cpp",
+      "lines": "4-4",
+      "code": "    Tensor x = context->input(0);",
+      "explanation": "x is bound by value (a non-const Tensor copy of input 0) specifically so that x.CopyFrom(x, dest_shape) at line 38 and the aliasing forward_input_or_allocate_output({0}, 0, ...) at line 87 can re-view the buffer in place. This is a correctness subtlety rather than a distinct memory-safety bug: because forward_input_or_allocate_output is allowed to forward input 0 into output 0, the compute functor may read x and write y over the same backing store. That in-place reuse is only safe if the functor is written to tolerate input/output aliasing; if it is not, an attacker who forces the forwarding (matching dtype/shape) could get partially-overwritten reads. It is called out for completeness — confirm the functor's aliasing contract — but on the standard FusedBatchNorm functor this reuse is intended and safe."
+    }
+  ],
+  "summary": "This is the hardened FusedBatchNorm compute path and it is, on the whole, well-guarded: rank, per-channel element counts, side-input shape, and the cuDNN channel-multiple-of-4 constraint are all checked with OP_REQUIRES before the compute functor runs. Two residual latent issues remain: an unchecked int64 multiplication in_rows * in_cols in the 5-D->4-D reshape can overflow and CHECK-fail (or corrupt the shape) during dest_shape construction (CWE-190/703), and the empty-allowed relaxation for estimated_mean/estimated_variance is not gated on is_training_, so empty statistics can reach the inference functor (CWE-20/125). A minor robustness gap is that num_channels is never required to be positive. Overall risk is moderate and DoS-leaning; no clear-cut heap overflow is present in the shown code.",
+  "reviewed_anchors": [
+    {"anchor": "ComputeWithReservedSpace(OpKernelContext* context, bool use_reserved_space)", "disposition": "dismissed", "reason": "Method signature; use_reserved_space is an internal bool selecting cuDNN workspace, not attacker-varied buffer data."},
+    {"anchor": "Tensor x = context->input(0)", "disposition": "finding", "reason": "Untrusted primary input; bound by value to enable in-place reshape/aliasing (see aliasing note)."},
+    {"anchor": "scale/offset/estimated_mean/estimated_variance = context->input(1..4)", "disposition": "dismissed", "reason": "Untrusted inputs, but their element counts are constrained to num_channels by explicit OP_REQUIRES below."},
+    {"anchor": "side_input = has_side_input_ ? &context->input(5) : nullptr", "disposition": "dismissed", "reason": "Dereferenced only under the same has_side_input_ predicate; shape-checked at line 69; pointer is non-null on that path."},
+    {"anchor": "OP_REQUIRES x.dims()==4||x.dims()==5", "disposition": "dismissed", "reason": "Rank guard; correctly rejects other ranks."},
+    {"anchor": "OP_REQUIRES scale/offset/mean/variance dims()==1", "disposition": "dismissed", "reason": "Rank guards on the per-channel vectors; correct."},
+    {"anchor": "use_reshape = (x.dims() == 5)", "disposition": "dismissed", "reason": "Boolean derived from validated rank; no direct hazard."},
+    {"anchor": "GetTensorDim(x, tensor_format_, 'N'/'0'/'1'/'2'/'C')", "disposition": "finding", "reason": "Returns attacker-controlled int64 dimension sizes fed into an unchecked multiply."},
+    {"anchor": "in_rows * in_cols (ShapeFromFormat folded dim)", "disposition": "finding", "reason": "Unchecked int64 multiplication can overflow before shape construction; central residual bug."},
+    {"anchor": "x.CopyFrom(x, dest_shape) guarded by OP_REQUIRES", "disposition": "dismissed", "reason": "Element-count mismatch is caught and turned into InvalidArgument; only fails to cover the pre-CopyFrom overflow CHECK."},
+    {"anchor": "num_channels = GetTensorDim(x, tensor_format_, 'C')", "disposition": "finding", "reason": "Never required to be positive; num_channels==0 can reach the functor (DoS/div-by-zero)."},
+    {"anchor": "OP_REQUIRES scale.NumElements()==num_channels", "disposition": "dismissed", "reason": "Correct per-channel length coupling for scale."},
+    {"anchor": "OP_REQUIRES offset.NumElements()==num_channels", "disposition": "dismissed", "reason": "Correct per-channel length coupling for offset."},
+    {"anchor": "estimated_mean empty-or-equal guard (lines 53-59)", "disposition": "finding", "reason": "Empty-allowed relaxation not gated on is_training_; empty mean reaches inference functor."},
+    {"anchor": "estimated_variance empty-or-equal guard (lines 60-66)", "disposition": "finding", "reason": "Same relaxation as mean; empty variance can reach inference normalization."},
+    {"anchor": "OP_REQUIRES side_input->shape()==x.shape()", "disposition": "dismissed", "reason": "Element-wise add operand shape is validated equal to x."},
+    {"anchor": "OP_REQUIRES !is_training_ || num_channels % 4 == 0", "disposition": "dismissed", "reason": "cuDNN backend constraint; correctly gated on training mode. (Vacuously true when num_channels==0 — captured by the num_channels finding.)"},
+    {"anchor": "forward_input_or_allocate_output({0},0,alloc_shape,&y)", "disposition": "dismissed", "reason": "Output allocation with aliasing of input 0; status checked by OP_REQUIRES_OK. Aliasing safety noted separately."},
+    {"anchor": "forward_input_or_allocate_output({3}/{4},...,scale.shape(),...)", "disposition": "dismissed", "reason": "batch_mean/batch_var sized from validated scale.shape(); status checked."},
+    {"anchor": "allocate_output(3/4, scale.shape(), ...)", "disposition": "dismissed", "reason": "saved_mean/saved_maybe_inv_var sized from validated per-channel shape; status checked."},
+    {"anchor": "functor::FusedBatchNorm<Device,T,U,true/false>()(...)", "disposition": "dismissed", "reason": "Dispatch to compute functor; the latent read/DoS risks are attributed to the specific input anchors above, not the call site itself."},
+    {"anchor": "y->CopyFrom(*y, x_shape) guarded by OP_REQUIRES", "disposition": "dismissed", "reason": "Reshape-back is element-count checked; x_shape preserves the original count."}
+  ],
+  "findings": [
+    {
+      "title": "Unchecked int64 multiplication in 5-D reshape can overflow / CHECK-fail",
+      "anchor": "dest_shape = ShapeFromFormat(tensor_format_, in_batch, {{in_planes, in_rows * in_cols}}, in_depth);",
+      "file": "corpus/train/train_0029_cwe703.cpp",
+      "line": "33-38",
+      "code": "      int64 in_rows = GetTensorDim(x, tensor_format_, '1');\n      int64 in_cols = GetTensorDim(x, tensor_format_, '2');\n      const int64 in_depth = GetTensorDim(x, tensor_format_, 'C');\n      dest_shape = ShapeFromFormat(tensor_format_, in_batch,\n                                   {{in_planes, in_rows * in_cols}}, in_depth);\n      OP_REQUIRES(context, x.CopyFrom(x, dest_shape),\n                  errors::InvalidArgument(\"Error during tensor copy.\"));",
+      "bug_class": "Integer overflow in shape arithmetic leading to CHECK-fail / corrupt TensorShape",
+      "cwe": "CWE-190",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "The folded spatial dimension in_rows * in_cols, and the resulting total element count, must be computed with an overflow-checked multiply and rejected via OP_REQUIRES before dest_shape is constructed; no dimension may be negative or exceed the tensor's real element count.",
+      "failure_mode": "A 5-D input with large but individually-valid spatial dims makes in_rows * in_cols overflow int64. ShapeFromFormat/TensorShape then either aborts the process via an internal CHECK on the negative/oversized dimension (denial of service for the whole server) or builds a corrupt dest_shape; the x.CopyFrom guard only catches an element-count mismatch, not the pre-construction abort. Attacker input is the tensor shape metadata of a FusedBatchNorm node.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether ShapeFromFormat/TensorShape here uses a checked multiply (e.g. MultiplyWithoutOverflow) and returns a Status the code inspects, or whether it CHECK-fails; and whether any OP_REQUIRES bounds in_rows*in_cols before line 37."
+    },
+    {
+      "title": "Empty estimated_mean/variance accepted regardless of inference mode",
+      "anchor": "if (estimated_mean.NumElements() != 0) { OP_REQUIRES(... == num_channels ...); }",
+      "file": "corpus/train/train_0029_cwe703.cpp",
+      "line": "53-66",
+      "code": "    if (estimated_mean.NumElements() != 0) {\n      OP_REQUIRES(context, estimated_mean.NumElements() == num_channels,\n                  errors::InvalidArgument(\n                      \"mean must be empty or have the same number of \"\n                      \"elements as the channels of x, got \",\n                      estimated_mean.NumElements(), \" and \", num_channels));\n    }\n    if (estimated_variance.NumElements() != 0) {\n      OP_REQUIRES(context, estimated_variance.NumElements() == num_channels,\n                  errors::InvalidArgument(\n                      \"variance must be empty or have the same number of \"\n                      \"elements as the channels of x, got \",\n                      estimated_variance.NumElements(), \" and \", num_channels));\n    }",
+      "bug_class": "Improper input validation / out-of-bounds read of empty statistics buffer",
+      "cwe": "CWE-20",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "In inference mode (is_training_ == false) estimated_mean and estimated_variance must be non-empty and have exactly num_channels elements; the empty-allowed relaxation must be restricted to the training path where the statistics are recomputed and unused.",
+      "failure_mode": "An attacker builds a FusedBatchNorm node with is_training_ == false and passes 0-element mean and variance. Both guards are skipped (the NumElements()!=0 predicate is false), and the empty statistics reach functor::FusedBatchNorm<...,false> at line 110, which reads per-channel mean/variance from a zero-length (null) data pointer or normalizes with absent variance — an out-of-bounds read or degenerate divide. The relaxation is unconditional and not coupled to is_training_.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether the inference functor tolerates empty estimated_mean/estimated_variance, or whether an is_training_-gated OP_REQUIRES that forces non-empty statistics in inference mode is present elsewhere in the kernel."
+    },
+    {
+      "title": "num_channels not required to be positive",
+      "anchor": "const auto num_channels = GetTensorDim(x, tensor_format_, 'C');",
+      "file": "corpus/train/train_0029_cwe703.cpp",
+      "line": "42",
+      "code": "    const auto num_channels = GetTensorDim(x, tensor_format_, 'C');",
+      "bug_class": "Improper handling of exceptional condition (zero channel count)",
+      "cwe": "CWE-703",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "The channel dimension used to size every per-channel vector and to drive the compute functor must be strictly positive; a zero (or non-positive) channel count should be rejected before allocation and dispatch.",
+      "failure_mode": "If x's channel axis is 0, num_channels == 0 passes all element-count and multiple-of-4 guards (each satisfied by empty/zero), the per-channel outputs are allocated empty, and the functor runs with a zero channel count, risking a division/modulo by zero, a degenerate reduction, or a CHECK-fail — a denial of service. Attacker input is the channel dimension of x.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether the compute functor or an earlier OP_REQUIRES rejects num_channels <= 0 before it is used to size allocations and drive per-channel loops."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm ShapeFromFormat/TensorShape uses an overflow-checked multiply for the folded {in_planes, in_rows*in_cols} dimension and surfaces overflow as a Status (not a process-aborting CHECK); add an explicit OP_REQUIRES bound before line 37.",
+    "Verify the inference path (functor::FusedBatchNorm<...,false>) either rejects or safely handles empty estimated_mean/estimated_variance; ideally gate the empty-allowed relaxation on is_training_.",
+    "Add/confirm a guard that num_channels > 0 before allocations and functor dispatch to avoid zero-channel division/degenerate loops.",
+    "Confirm the compute functor is safe under input/output aliasing introduced by forward_input_or_allocate_output({0}, 0, ...) forwarding input 0 into output 0.",
+    "Check that GetTensorDim never returns a negative sentinel for a malformed format/axis that could then feed the multiplication or allocation shapes.",
+    "Confirm side_input dtype (not just shape) is validated to match x before the fused element-wise add."
+  ]
+}

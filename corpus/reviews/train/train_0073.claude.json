@@ -1,0 +1,283 @@
+{
+  "subsystem": "TensorFlow checkpoint deserialization. This is TensorSliceReader::LoadShard, the per-shard loader inside TensorFlow's core checkpoint/tensor-slice reader (core/util/tensor_slice_reader.cc). Its job is to open one shard file of a saved checkpoint, read the serialized SavedTensorSlices protobuf metadata stored under a well-known key, verify the checkpoint version, and materialize the tensor-shape and tensor-slice metadata (dimensions, slice extents, dtype, name) into in-memory maps used to later restore tensor values. It is the first code that touches the on-disk checkpoint bytes.",
+  "provenance": "Identified by the fully-qualified method name TensorSliceReader::LoadShard (line 2), the SavedTensorSlices / SavedSliceMeta / TensorSliceProto protobuf types (lines 8, 31, 35), the checkpoint constants kSavedTensorSlicesKey, TF_CHECKPOINT_VERSION and TF_CHECKPOINT_VERSION_MIN_PRODUCER (lines 19, 27-28), the TensorShape::BuildTensorShapeBase / TensorSlice::BuildTensorSlice factory calls (lines 33, 37), and the tensorflow::errors::DataLoss / errors::Internal and Status idioms (lines 14, 21). These are all TensorFlow core symbols. The sample banner tag /* sample: primevul_train_2038_fixed */ (line 1) marks this as the post-fix revision.",
+  "trust_boundary": "The trust boundary is the checkpoint file on disk. fname (line 9) comes from fnames_ and is opened by open_function_ (line 12); the bytes returned by table->Get(kSavedTensorSlicesKey, &value) (line 19) and parsed by ParseProtoUnlimited(&sts, value) (line 20) are fully attacker-controlled whenever a model loads a checkpoint from an untrusted source (a downloaded model, a shared SavedModel, an attacker-supplied restore path). Every field decoded from sts is hostile: sts.meta().versions() (line 27), each ssm.shape() (line 33), ssm.type()/ssm.name() (line 39), and each tsp slice (line 37). TensorFlow's threat model explicitly treats checkpoints/SavedModels as CODE-equivalent untrusted input, and this function performs NO cryptographic authenticity check on those bytes.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0073_cwe345.cpp",
+      "lines": "2-6",
+      "code": "void TensorSliceReader::LoadShard(int shard) const {\n  CHECK_LT(shard, sss_.size());\n  if (sss_[shard] || !status_.ok()) {\n    return;  // Already loaded, or invalid.\n  }",
+      "explanation": "The method loads a single checkpoint shard identified by the integer index shard. It is const but mutates mutable member state (status_, sss_) via the const-correctness escape hatch typical of lazy loaders. CHECK_LT(shard, sss_.size()) asserts the index is within the shared-pointer-slot vector sss_; this is a hard abort, not a recoverable error. The guard on line 4 short-circuits: if sss_[shard] is already populated (this shard was loaded before) or the reader is already in an error state (!status_.ok()), it returns immediately, making the load idempotent and refusing to run further once any prior error was recorded."
+    },
+    {
+      "file": "corpus/train/train_0073_cwe345.cpp",
+      "lines": "7-9",
+      "code": "string value;\n  SavedTensorSlices sts;\n  const string fname = fnames_[shard];",
+      "explanation": "Local scratch is set up: value will receive the raw serialized metadata blob read from the table, and sts is the SavedTensorSlices protobuf message that ParseProtoUnlimited will populate. fname is pulled from the parallel vector fnames_ using the same shard index, i.e. sss_ and fnames_ are index-aligned per-shard vectors. fname is the path/handle for the shard's on-disk table."
+    },
+    {
+      "file": "corpus/train/train_0073_cwe345.cpp",
+      "lines": "10-17",
+      "code": "VLOG(1) << \"Reading meta data from file \" << fname << \"...\";\n  Table* table;\n  Status s = open_function_(fname, &table);\n  if (!s.ok()) {\n    status_ = errors::DataLoss(\"Unable to open table file \", fname, \": \",\n                               s.ToString());\n    return;\n  }",
+      "explanation": "A verbose log line records the file being read. open_function_ is an injected callable (a std::function-style open policy) that opens the shard and, on success, writes a raw Table* into the out-parameter table. If the open fails, the reader records a DataLoss status embedding fname and the underlying error string, then returns. Note that only s.ok() is checked here; the code proceeds assuming that an OK status implies a valid, non-null table pointer."
+    },
+    {
+      "file": "corpus/train/train_0073_cwe345.cpp",
+      "lines": "18",
+      "code": "sss_[shard].reset(table);",
+      "explanation": "Ownership of the freshly opened raw Table* is transferred into the shard's smart-pointer slot sss_[shard] via reset(table). From here on the Table's lifetime is managed by that slot, and populating the slot is also what makes the line-4 idempotence guard return early on subsequent calls."
+    },
+    {
+      "file": "corpus/train/train_0073_cwe345.cpp",
+      "lines": "19-26",
+      "code": "if (!(table->Get(kSavedTensorSlicesKey, &value) &&\n        ParseProtoUnlimited(&sts, value))) {\n    status_ = errors::Internal(\n        \"Failed to find the saved tensor slices at the beginning of the \"\n        \"checkpoint file: \",\n        fname);\n    return;\n  }",
+      "explanation": "This is the core untrusted-input read. table->Get(kSavedTensorSlicesKey, &value) looks up the well-known metadata key and copies its raw bytes into value. ParseProtoUnlimited(&sts, value) then deserializes those bytes into the SavedTensorSlices message sts with protobuf's size limits disabled (the 'Unlimited' variant removes the default ~2GB / recursion protections normally imposed by ParseFromString). The combined condition requires BOTH the key lookup and the parse to succeed; otherwise an Internal error naming fname is stored and the function returns. Everything in sts after this point is attacker-shaped structured data."
+    },
+    {
+      "file": "corpus/train/train_0073_cwe345.cpp",
+      "lines": "27-30",
+      "code": "status_ = CheckVersions(sts.meta().versions(), TF_CHECKPOINT_VERSION,\n                          TF_CHECKPOINT_VERSION_MIN_PRODUCER, \"Checkpoint\",\n                          \"checkpoint\");\n  if (!status_.ok()) return;",
+      "explanation": "The only explicit validation gate over the parsed metadata: CheckVersions compares the checkpoint's declared producer/consumer version numbers (sts.meta().versions(), attacker-controlled) against the compiled-in constants TF_CHECKPOINT_VERSION and TF_CHECKPOINT_VERSION_MIN_PRODUCER, with the label strings used for error messages. This is a compatibility/structural check (is this checkpoint format version something this binary understands), NOT an authenticity or integrity check. If it fails the reader stops; if it passes, the code trusts the remaining fields as well-formed."
+    },
+    {
+      "file": "corpus/train/train_0073_cwe345.cpp",
+      "lines": "31-34",
+      "code": "for (const SavedSliceMeta& ssm : sts.meta().tensor()) {\n    TensorShape ssm_shape;\n    status_ = TensorShape::BuildTensorShapeBase(ssm.shape(), &ssm_shape);\n    if (!status_.ok()) return;",
+      "explanation": "The code iterates over each tensor's metadata (SavedSliceMeta) declared in the checkpoint. For each, it builds a TensorShape from the attacker-supplied shape proto ssm.shape() using the fallible factory TensorShape::BuildTensorShapeBase, which returns a Status and writes into ssm_shape. This is the security-relevant hardening pattern: rather than constructing TensorShape directly from the proto (which historically would CHECK-fail or silently overflow on hostile dimensions), the Build*Base variant validates dimension counts, non-negativity, and total-element overflow and reports an error instead of crashing. On any validation failure the loop aborts safely."
+    },
+    {
+      "file": "corpus/train/train_0073_cwe345.cpp",
+      "lines": "35-42",
+      "code": "for (const TensorSliceProto& tsp : ssm.slice()) {\n      TensorSlice ss_slice;\n      status_ = TensorSlice::BuildTensorSlice(tsp, &ss_slice);\n      if (!status_.ok()) return;\n      status_ = RegisterTensorSlice(ssm.name(), ssm_shape, ssm.type(), fname,\n                                    ss_slice, &tensors_);\n      if (!status_.ok()) return;\n    }",
+      "explanation": "For each tensor, the code iterates its declared slices (TensorSliceProto). Each attacker-controlled slice proto tsp is converted through the fallible TensorSlice::BuildTensorSlice factory into ss_slice; like BuildTensorShapeBase this validates the slice extents (start/length per dimension, dimension count consistency) and returns a Status instead of aborting. The validated shape and slice, plus the attacker-controlled ssm.name() and ssm.type(), are then handed to RegisterTensorSlice, which records the tensor and its slice mapping into tensors_. Each step is gated on status_.ok(), so the first malformed shape/slice/registration stops the whole load and is surfaced as an error."
+    },
+    {
+      "file": "corpus/train/train_0073_cwe345.cpp",
+      "lines": "43-44",
+      "code": "}\n}",
+      "explanation": "Closing braces of the inner/outer loops and the function. If control reaches here, the shard's metadata was parsed, version-checked, and every shape/slice validated and registered; status_ remains OK and sss_[shard] holds the open table for subsequent value reads."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0073_cwe345.cpp",
+      "lines": "19-20",
+      "code": "if (!(table->Get(kSavedTensorSlicesKey, &value) &&\n        ParseProtoUnlimited(&sts, value))) {",
+      "explanation": "This is the central authenticity gap (CWE-345). The bytes in value come straight from an attacker-controlled checkpoint file and are deserialized with ParseProtoUnlimited, which deliberately removes protobuf's size and nesting guards. There is NO signature, MAC, or integrity/authenticity verification anywhere in this function before the parsed structure is trusted and acted upon. An attacker who can supply the checkpoint fully controls the shape/slice/type/name metadata; the entire safety of the restore then rests on the downstream validators (CheckVersions and the two Build* factories) being complete. Using the Unlimited parser additionally removes the default caps, so a crafted blob can drive very large allocations / deep recursion during parse. The invariant: checkpoint bytes must be treated as fully untrusted, and their provenance/integrity established out-of-band before load; nothing here does that."
+    },
+    {
+      "file": "corpus/train/train_0073_cwe345.cpp",
+      "lines": "33",
+      "code": "status_ = TensorShape::BuildTensorShapeBase(ssm.shape(), &ssm_shape);",
+      "explanation": "LATENT (fix is here, but the guarantee lives in the callee). ssm.shape() is an attacker-controlled TensorShapeProto: it can declare a huge number of dimensions, negative dimension sizes, or dimensions whose product overflows int64. The security of this line depends entirely on BuildTensorShapeBase actually rejecting all of those. This exact call site replaced the historical pattern TensorShape ssm_shape(ssm.shape()), whose constructor CHECK-failed (process abort / DoS) or overflowed the element count on hostile dimensions. If BuildTensorShapeBase's num-elements overflow / negative-dim checks are incomplete, a crafted shape yields an inconsistent TensorShape that later drives out-of-bounds indexing or an integer-overflow-derived undersized allocation (CWE-190/CWE-20). The invariant: BuildTensorShapeBase must return an error for every non-representable or overflowing shape and never populate ssm_shape on failure."
+    },
+    {
+      "file": "corpus/train/train_0073_cwe345.cpp",
+      "lines": "37",
+      "code": "status_ = TensorSlice::BuildTensorSlice(tsp, &ss_slice);",
+      "explanation": "LATENT (companion of the shape fix). tsp is an attacker-controlled TensorSliceProto. A malicious slice can declare a dimension count that disagrees with ssm_shape, or start/length extents that fall outside the tensor's bounds or overflow. BuildTensorSlice must validate the extent count and bound each start/length before ss_slice is used. If it does not, the resulting slice is inconsistent with ssm_shape and, when RegisterTensorSlice (and later value restoration) copies data according to that slice, produces an out-of-bounds read/write (CWE-125/CWE-787). This is the fallible replacement for the old direct TensorSlice(tsp) construction that could CHECK-fail. The invariant: BuildTensorSlice must reject any slice whose rank or extents are inconsistent or out of range, and the caller must additionally verify the slice fits within ssm_shape."
+    },
+    {
+      "file": "corpus/train/train_0073_cwe345.cpp",
+      "lines": "39-40",
+      "code": "status_ = RegisterTensorSlice(ssm.name(), ssm_shape, ssm.type(), fname,\n                                    ss_slice, &tensors_);",
+      "explanation": "LATENT downstream contract. Even with a validated ssm_shape and ss_slice, ssm.name() and ssm.type() are attacker-controlled. RegisterTensorSlice must: (1) confirm ss_slice is actually contained within ssm_shape (BuildTensorSlice alone does not know the parent shape), (2) reject an invalid/unknown DataType in ssm.type() rather than using it to size element strides, and (3) safely handle duplicate or conflicting registrations for the same name (a crafted checkpoint can register the same tensor with contradictory shapes/types). A gap in any of these turns metadata into a bad restore plan that later reads/writes tensor buffers out of bounds. The invariant: registration must cross-check slice-within-shape and validate dtype before the mapping is trusted by value restoration."
+    },
+    {
+      "file": "corpus/train/train_0073_cwe345.cpp",
+      "lines": "18-19",
+      "code": "sss_[shard].reset(table);\n  if (!(table->Get(kSavedTensorSlicesKey, &value) &&",
+      "explanation": "NULL-pointer contract on the open callback. open_function_ (line 12) is only checked via s.ok(); the code then does sss_[shard].reset(table) and immediately dereferences table->Get(...). If any open_function_ implementation can return an OK status while leaving table null (or leaves it uninitialized on a path that returns OK), line 18 stores a null and line 19 dereferences it, causing a NULL-pointer crash (CWE-476). The invariant the open policy must uphold: an OK status guarantees a non-null, valid Table*; otherwise this call site needs an explicit table != nullptr check before use."
+    },
+    {
+      "file": "corpus/train/train_0073_cwe345.cpp",
+      "lines": "3",
+      "code": "CHECK_LT(shard, sss_.size());",
+      "explanation": "Reachable abort / denial of service if the contract on shard is violated. CHECK_LT aborts the process (does not throw or return an error) when shard >= sss_.size(). shard is an internal index here, so this is defensive rather than directly attacker-driven, but any caller that derives shard from checkpoint-declared shard counts without bounding it against sss_.size() converts a malformed checkpoint into a hard crash (CWE-617). The invariant: shard must be validated against sss_.size() by the caller before entry; a recoverable error return would be safer than CHECK for input-derived indices."
+    }
+  ],
+  "summary": "Post-fix TensorFlow checkpoint shard loader. It deserializes fully attacker-controlled checkpoint metadata via ParseProtoUnlimited with no integrity/authenticity verification (CWE-345) and only a structural version check; safety now depends on the fallible BuildTensorShapeBase / BuildTensorSlice factories that replaced the old CHECK-failing direct constructors. Residual risk is latent in those validators and in RegisterTensorSlice (slice-within-shape and dtype checks), plus a NULL-table assumption on the open callback and a CHECK-abort on the shard index.",
+  "reviewed_anchors": [
+    {
+      "anchor": "void TensorSliceReader::LoadShard(int shard) const (line 2)",
+      "disposition": "finding",
+      "reason": "const method mutating mutable state; entry point that consumes the untrusted shard index and drives the whole untrusted parse."
+    },
+    {
+      "anchor": "CHECK_LT(shard, sss_.size()) (line 3)",
+      "disposition": "finding",
+      "reason": "Fatal abort on out-of-range index; DoS (CWE-617) if shard is ever input-derived and unbounded."
+    },
+    {
+      "anchor": "if (sss_[shard] || !status_.ok()) (line 4)",
+      "disposition": "dismissed",
+      "reason": "Idempotence / error-latch guard; sss_[shard] is already bounded by the line-3 CHECK. No independent security contract."
+    },
+    {
+      "anchor": "const string fname = fnames_[shard] (line 9)",
+      "disposition": "dismissed",
+      "reason": "Parallel-vector read at the same index already bounds-checked at line 3; fname is a file handle, not a size/length driving a copy."
+    },
+    {
+      "anchor": "Status s = open_function_(fname, &table) (line 12)",
+      "disposition": "finding",
+      "reason": "Injected open callback; only s.ok() is checked before table is dereferenced, creating a NULL-deref contract (CWE-476)."
+    },
+    {
+      "anchor": "sss_[shard].reset(table) (line 18)",
+      "disposition": "finding",
+      "reason": "Takes ownership of a raw pointer whose non-nullness is assumed rather than verified before the immediate dereference at line 19."
+    },
+    {
+      "anchor": "table->Get(kSavedTensorSlicesKey, &value) (line 19)",
+      "disposition": "finding",
+      "reason": "Reads attacker-controlled bytes; dereferences table which is assumed non-null."
+    },
+    {
+      "anchor": "ParseProtoUnlimited(&sts, value) (line 20)",
+      "disposition": "finding",
+      "reason": "Deserializes untrusted checkpoint bytes with size/recursion guards disabled; no authenticity check precedes it (CWE-345, resource exhaustion)."
+    },
+    {
+      "anchor": "kSavedTensorSlicesKey (line 19)",
+      "disposition": "dismissed",
+      "reason": "Fixed well-known lookup key constant; not attacker-controlled and carries no length/bound contract."
+    },
+    {
+      "anchor": "CheckVersions(sts.meta().versions(), TF_CHECKPOINT_VERSION, TF_CHECKPOINT_VERSION_MIN_PRODUCER, ...) (lines 27-29)",
+      "disposition": "finding",
+      "reason": "Only validation gate over parsed metadata; it is a structural/compatibility check, NOT integrity/authenticity, so it does not establish trust in the content (CWE-345)."
+    },
+    {
+      "anchor": "TF_CHECKPOINT_VERSION / TF_CHECKPOINT_VERSION_MIN_PRODUCER (lines 27-28)",
+      "disposition": "dismissed",
+      "reason": "Compiled-in version constants used only for comparison; not attacker-controlled."
+    },
+    {
+      "anchor": "for (const SavedSliceMeta& ssm : sts.meta().tensor()) (line 31)",
+      "disposition": "dismissed",
+      "reason": "Iteration over an attacker-controlled repeated field; unbounded count is a resource concern already covered by the ParseProtoUnlimited finding, not a distinct memory-safety contract at this line."
+    },
+    {
+      "anchor": "TensorShape::BuildTensorShapeBase(ssm.shape(), &ssm_shape) (line 33)",
+      "disposition": "finding",
+      "reason": "Fallible factory over attacker-controlled shape proto; the hardening replacing direct construction. Latent overflow/OOB if validation is incomplete (CWE-190/CWE-20)."
+    },
+    {
+      "anchor": "TensorSlice::BuildTensorSlice(tsp, &ss_slice) (line 37)",
+      "disposition": "finding",
+      "reason": "Fallible factory over attacker-controlled slice proto; latent OOB if extents/rank not fully bounded against the shape (CWE-125/CWE-787)."
+    },
+    {
+      "anchor": "RegisterTensorSlice(ssm.name(), ssm_shape, ssm.type(), fname, ss_slice, &tensors_) (lines 39-40)",
+      "disposition": "finding",
+      "reason": "Consumes attacker-controlled name/type plus the built shape/slice; downstream must verify slice-within-shape and validate dtype (latent CWE-20)."
+    },
+    {
+      "anchor": "TensorShape ssm_shape / TensorSlice ss_slice locals (lines 32, 36)",
+      "disposition": "dismissed",
+      "reason": "Default-constructed empty locals populated only by the checked Build* calls; no independent contract."
+    }
+  ],
+  "findings": [
+    {
+      "title": "Checkpoint metadata deserialized and trusted with no authenticity/integrity verification",
+      "anchor": "ParseProtoUnlimited(&sts, value) after table->Get(kSavedTensorSlicesKey, &value)",
+      "file": "corpus/train/train_0073_cwe345.cpp",
+      "line": "19-20",
+      "code": "if (!(table->Get(kSavedTensorSlicesKey, &value) &&\n        ParseProtoUnlimited(&sts, value))) {",
+      "bug_class": "Insufficient verification of data authenticity (untrusted deserialization)",
+      "cwe": "CWE-345",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0073_cwe345.cpp",
+      "invariant": "Checkpoint bytes must be treated as fully untrusted; their integrity/provenance must be established out-of-band before the decoded structure is trusted, and every decoded field must pass complete validation before use. The Unlimited parser must not be used on data whose size/nesting is attacker-controlled without an upstream cap.",
+      "failure_mode": "An attacker who supplies the checkpoint file controls value entirely. There is no signature/MAC/integrity check anywhere before sts is parsed and acted on, and ParseProtoUnlimited removes protobuf's default size/recursion limits, so a crafted blob can drive large allocations or deep recursion during parse, and hostile shape/slice/type/name fields flow directly into the shape/slice builders and RegisterTensorSlice. Impact ranges from DoS to memory corruption if any downstream validator has a gap. The only gate before this trust is a structural version comparison, which does not authenticate content.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm whether callers ever load checkpoints from untrusted sources without an out-of-band integrity check, and whether an upstream size cap bounds value before ParseProtoUnlimited."
+    },
+    {
+      "title": "Attacker-controlled TensorShape proto: safety depends entirely on BuildTensorShapeBase overflow/negative-dim validation",
+      "anchor": "TensorShape::BuildTensorShapeBase(ssm.shape(), &ssm_shape)",
+      "file": "corpus/train/train_0073_cwe345.cpp",
+      "line": "33",
+      "code": "status_ = TensorShape::BuildTensorShapeBase(ssm.shape(), &ssm_shape);",
+      "bug_class": "Integer overflow / missing input validation in shape construction (latent)",
+      "cwe": "CWE-190",
+      "severity": "high",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "BuildTensorShapeBase must return an error status (and not populate ssm_shape) for any shape proto with negative dimensions, an unrepresentable dimension count, or a total-element product that overflows int64; the caller must stop on that error (which it does at line 34).",
+      "failure_mode": "ssm.shape() is attacker-controlled. This call site is the fix that replaced the historical TensorShape ssm_shape(ssm.shape()) direct constructor, which aborted via CHECK (DoS) or overflowed num_elements on hostile dimensions. If BuildTensorShapeBase's validation is incomplete, a crafted shape produces an inconsistent TensorShape whose element count wraps, later yielding an undersized allocation and out-of-bounds access during restore, or still a CHECK abort. The visible caller is correct; the risk is latent in the validator.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify BuildTensorShapeBase rejects negative dims, excessive rank, and num-elements overflow, and never writes a partially-valid shape on the error path."
+    },
+    {
+      "title": "Attacker-controlled TensorSlice proto: slice extents must be bounded against the tensor shape",
+      "anchor": "TensorSlice::BuildTensorSlice(tsp, &ss_slice)",
+      "file": "corpus/train/train_0073_cwe345.cpp",
+      "line": "37",
+      "code": "status_ = TensorSlice::BuildTensorSlice(tsp, &ss_slice);",
+      "bug_class": "Out-of-bounds access from unvalidated slice extents (latent)",
+      "cwe": "CWE-125",
+      "severity": "high",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "BuildTensorSlice must validate that the slice's rank matches and each start/length extent is non-negative and representable; and RegisterTensorSlice/restoration must additionally verify each extent lies within ssm_shape before any data is copied per the slice.",
+      "failure_mode": "tsp is attacker-controlled. A malicious slice can declare a rank inconsistent with ssm_shape or start/length extents outside the tensor bounds. BuildTensorSlice alone does not know the parent shape, so if it (and the downstream containment check) are incomplete, the resulting ss_slice drives an out-of-bounds read or write when tensor values are later restored according to it. This is the companion of the old direct TensorSlice(tsp) construction that CHECK-failed.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify BuildTensorSlice bounds every extent and that slice-within-shape containment is enforced (here or in RegisterTensorSlice) before any per-slice copy."
+    },
+    {
+      "title": "RegisterTensorSlice trusts attacker-controlled name/type and slice-vs-shape consistency",
+      "anchor": "RegisterTensorSlice(ssm.name(), ssm_shape, ssm.type(), fname, ss_slice, &tensors_)",
+      "file": "corpus/train/train_0073_cwe345.cpp",
+      "line": "39-40",
+      "code": "status_ = RegisterTensorSlice(ssm.name(), ssm_shape, ssm.type(), fname,\n                                    ss_slice, &tensors_);",
+      "bug_class": "Missing validation of dtype / slice containment / duplicate registration (latent)",
+      "cwe": "CWE-20",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "RegisterTensorSlice must reject an invalid/unknown DataType in ssm.type(), enforce that ss_slice is fully contained within ssm_shape, and handle conflicting/duplicate registrations for the same name without producing an inconsistent restore plan.",
+      "failure_mode": "ssm.name() and ssm.type() are attacker-controlled and ss_slice/ssm_shape were validated independently of each other. If registration does not cross-check slice-within-shape, does not validate the dtype before it is used to compute element strides, or lets a second entry silently overwrite/conflict with a first for the same name, later value restoration operates on an inconsistent (shape, slice, dtype) triple and reads/writes tensor buffers out of bounds.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify RegisterTensorSlice validates DataType, enforces slice containment in the shape, and rejects contradictory duplicate registrations."
+    },
+    {
+      "title": "Table pointer dereferenced assuming an OK open status implies non-null",
+      "anchor": "sss_[shard].reset(table); ... table->Get(...)",
+      "file": "corpus/train/train_0073_cwe345.cpp",
+      "line": "18-19",
+      "code": "sss_[shard].reset(table);\n  if (!(table->Get(kSavedTensorSlicesKey, &value) &&",
+      "bug_class": "NULL pointer dereference",
+      "cwe": "CWE-476",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "open_function_ must guarantee that whenever it returns an OK status, table is a valid non-null pointer; alternatively this call site must check table != nullptr before line 18/19.",
+      "failure_mode": "Only s.ok() is checked (line 13). If any open_function_ implementation returns OK while leaving table null or uninitialized, sss_[shard].reset(table) stores null and table->Get(...) dereferences it, crashing the process (DoS). table is also never initialized to nullptr at declaration (line 11), so an OK-returning path that forgets to set it dereferences garbage.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm every open_function_ implementation sets a non-null table on OK, or add an explicit null check before line 18."
+    },
+    {
+      "title": "CHECK_LT on shard index aborts the process on out-of-range input",
+      "anchor": "CHECK_LT(shard, sss_.size())",
+      "file": "corpus/train/train_0073_cwe345.cpp",
+      "line": "3",
+      "code": "CHECK_LT(shard, sss_.size());",
+      "bug_class": "Reachable assertion / abort (denial of service)",
+      "cwe": "CWE-617",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0073_cwe345.cpp",
+      "invariant": "shard must be validated against sss_.size() by the caller before LoadShard is entered; for input-derived indices a recoverable error is preferable to a CHECK abort.",
+      "failure_mode": "CHECK_LT aborts (SIGABRT) rather than returning an error when shard >= sss_.size(). shard is internal here, so exploitation requires a caller that derives it from checkpoint-declared shard counts without bounding it; in that case a malformed checkpoint becomes a hard process crash.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm all callers bound shard against sss_.size() and that shard is never derived directly from untrusted metadata."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm there is any integrity/authenticity check (signature/hash) on checkpoint files before LoadShard trusts them, or that the load path is documented as trusted-input-only.",
+    "Confirm BuildTensorShapeBase rejects negative dimensions, excessive rank, and num-elements int64 overflow, and leaves ssm_shape unpopulated on error.",
+    "Confirm BuildTensorSlice bounds every start/length extent and enforces rank consistency; confirm slice-within-ssm_shape containment is enforced before any per-slice copy.",
+    "Confirm RegisterTensorSlice validates ssm.type() (DataType), cross-checks ss_slice against ssm_shape, and handles duplicate/conflicting names for the same tensor.",
+    "Confirm open_function_ never returns OK with a null table, or add an explicit table!=nullptr check before sss_[shard].reset(table) and table->Get(...); initialize table to nullptr at declaration.",
+    "Confirm value is size-bounded before ParseProtoUnlimited, or justify why the Unlimited (guard-disabled) parser is acceptable on attacker-controlled bytes.",
+    "Confirm all callers bound shard against sss_.size() so CHECK_LT cannot be driven to abort by untrusted metadata."
+  ]
+}

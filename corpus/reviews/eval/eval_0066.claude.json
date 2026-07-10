@@ -1,0 +1,208 @@
+{
+  "subsystem": "GLib GIO socket client connection state machine. This is g_socket_client_connected_callback, the GAsyncReadyCallback that fires when one of the (possibly several, happy-eyeballs style) parallel TCP connection attempts started by GSocketClient finishes connecting. It decides whether the attempt succeeded, tears down the other in-flight attempts, emits progress signals, and then dispatches to TLS handshake or proxy negotiation. The file name tag 'cwe754' points at Improper Check for Unusual or Exceptional Conditions, and the sample id 'primevul_c_test_0379_fixed' marks this as the post-fix revision.",
+  "provenance": "Identified from the GLib/GIO naming conventions and symbols: the function name g_socket_client_connected_callback, the types GSocketClientAsyncConnectData / ConnectionAttempt / GProxy / GSocketConnection, the GObject async idioms (g_task_get_cancellable, g_steal_pointer, g_clear_pointer, g_object_unref), the GLib signal helper g_socket_client_emit_event with enum values G_SOCKET_CLIENT_CONNECTED / G_SOCKET_CLIENT_PROXY_NEGOTIATING, the g_critical logging macro, and the gettext _() marker. This is gsocketclient.c from GLib's gio/ tree. The banner header /* sample: primevul_c_test_0379_fixed */ (line 1) confirms provenance as a PrimeVul C sample, the 'fixed' variant.",
+  "trust_boundary": "The direct inputs (source GObject, GAsyncResult, user_data) are not attacker-wire-controlled: they are produced by GIO's own async machinery. The genuine hostile surface is (1) the network peer/proxy the socket connects to, which controls timing and connect success/failure and therefore which branches run and in what order, and (2) re-entrancy through the signal handlers invoked by g_socket_client_emit_event (line 60, line 95): those handlers are application code that runs synchronously in the middle of this function and can mutate or destroy the objects (data, data->client, data->connection) the rest of the function keeps using. The proxy 'protocol' string (line 71) is derived from data->proxy_addr, which originates from address enumeration and can be influenced by DNS/proxy configuration. The central safety concern for this file class is object lifetime / callback re-entrancy, not buffer parsing.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/eval/eval_0066_cwe754.c",
+      "lines": "2-5",
+      "code": "g_socket_client_connected_callback (GObject      *source,\n\t\t\t\t    GAsyncResult *result,\n\t\t\t\t    gpointer      user_data)\n{",
+      "explanation": "This is the completion callback for an asynchronous socket connect operation, matching the GAsyncReadyCallback contract. 'source' is the GObject that started the async op (here a GSocketConnection), 'result' carries the async result to be finished with g_socket_connection_connect_finish, and 'user_data' is the opaque closure pointer GIO threads back to the callback. The function returns void; it communicates outcome only through side effects on the closure state and by scheduling further async work."
+    },
+    {
+      "file": "corpus/eval/eval_0066_cwe754.c",
+      "lines": "6-11",
+      "code": "ConnectionAttempt *attempt = user_data;\n  GSocketClientAsyncConnectData *data = attempt->data;\n  GSList *l;\n  GError *error = NULL;\n  GProxy *proxy;\n  const gchar *protocol;",
+      "explanation": "The closure is recovered by casting user_data to ConnectionAttempt* (line 6), then the shared per-connect operation state is fetched via attempt->data (line 7). ConnectionAttempt models one of the parallel connect attempts; GSocketClientAsyncConnectData (data) is the operation-wide state shared by all attempts and owns the GTask, the client, the connectable/proxy address, and the list of attempts. 'l' iterates the attempt list, 'error' collects a failure, 'proxy' and 'protocol' are used only in the proxy path. Both dereferences (user_data and attempt->data) are done unconditionally with no NULL check, relying on GIO's internal invariant that the callback is always dispatched with a live attempt whose ->data is set."
+    },
+    {
+      "file": "corpus/eval/eval_0066_cwe754.c",
+      "lines": "13-18",
+      "code": "if (g_cancellable_is_cancelled (attempt->cancellable) || task_completed_or_cancelled (data->task))\n    {\n      g_object_unref (data->task);\n      connection_attempt_unref (attempt);\n      return;\n    }",
+      "explanation": "This is the key exceptional-condition guard and the essence of the 'fixed' revision. Because several attempts run concurrently, one attempt can succeed and COMPLETE the shared data->task before another attempt's callback fires. This guard bails out early if this attempt's cancellable was cancelled OR if the shared task has already been completed/cancelled by a sibling attempt. On that path it drops this callback's reference on the task (g_object_unref) and on the attempt (connection_attempt_unref) and returns without touching the already-finished operation state, preventing double-completion and use-after-free of data. Without this check the rest of the function would operate on a task that another attempt already finished."
+    },
+    {
+      "file": "corpus/eval/eval_0066_cwe754.c",
+      "lines": "20-24",
+      "code": "if (attempt->timeout_source)\n    {\n      g_source_destroy (attempt->timeout_source);\n      g_clear_pointer (&attempt->timeout_source, g_source_unref);\n    }",
+      "explanation": "Each attempt may arm a per-attempt timeout GSource so a hung connect eventually gives up. Since the connect has now returned, the timeout is cancelled: g_source_destroy detaches it from the main context, and g_clear_pointer both unrefs the source and NULLs the field so it cannot be destroyed or fired twice. This is correct lifetime hygiene for the timeout."
+    },
+    {
+      "file": "corpus/eval/eval_0066_cwe754.c",
+      "lines": "26-44",
+      "code": "if (!g_socket_connection_connect_finish (G_SOCKET_CONNECTION (source),\n\t\t\t\t\t   result, &error))\n    {\n      if (!g_cancellable_is_cancelled (attempt->cancellable))\n        {\n          clarify_connect_error (error, data->connectable, attempt->address);\n          set_last_error (data, error);\n          connection_attempt_remove (attempt);\n          enumerator_next_async (data, FALSE);\n        }\n      else\n        {\n          g_clear_error (&error);\n          g_object_unref (data->task);\n          connection_attempt_unref (attempt);\n        }\n\n      return;\n    }",
+      "explanation": "The async result is finished and its success checked (line 26) — this IS the CWE-754 return-value check the file is named for, and it is present. On failure the code splits: if this attempt was not itself cancelled (line 29) it annotates the error with clarify_connect_error, records it as data's last error via set_last_error, removes this attempt from the list (connection_attempt_remove, which also drops the list reference), and asks the enumerator for the next address to try (enumerator_next_async). If instead the attempt was cancelled (line 36) it just clears the transient error and releases this callback's task and attempt references. Either way it returns, so the success path below only runs when connect actually succeeded. Note the ownership asymmetry: the non-cancelled branch hands data/task lifetime to enumerator_next_async, while the cancelled branch unrefs the task here."
+    },
+    {
+      "file": "corpus/eval/eval_0066_cwe754.c",
+      "lines": "46-47",
+      "code": "data->socket = g_steal_pointer (&attempt->socket);\n  data->connection = g_steal_pointer (&attempt->connection);",
+      "explanation": "The winning attempt's socket and connection objects are transferred to the operation-wide state. g_steal_pointer returns the pointer and NULLs the source field in one step, so ownership moves from attempt to data and the objects survive the imminent unref of attempt. After this, data->socket and data->connection are the authoritative live objects for the rest of the function."
+    },
+    {
+      "file": "corpus/eval/eval_0066_cwe754.c",
+      "lines": "49-57",
+      "code": "for (l = data->connection_attempts; l; l = g_slist_next (l))\n    {\n      ConnectionAttempt *attempt_entry = l->data;\n      g_cancellable_cancel (attempt_entry->cancellable);\n      connection_attempt_unref (attempt_entry);\n    }\n  g_slist_free (data->connection_attempts);\n  data->connection_attempts = NULL;\n  connection_attempt_unref (attempt);",
+      "explanation": "Now that one attempt won, all remaining parallel attempts are torn down: the loop cancels each attempt's cancellable (so their in-flight connects abort and their callbacks hit the guard at line 13) and drops the LIST's reference on each entry via connection_attempt_unref. The list itself is freed and NULLed (lines 55-56). Finally line 57 drops THIS callback's reference on the current attempt. Reference accounting is balanced: the loop releases the list-held reference of every entry including the current attempt, while line 57 releases the separate callback-held reference — two references, two unrefs, so the current attempt is freed exactly once here (its socket/connection already stolen at lines 46-47, so they persist)."
+    },
+    {
+      "file": "corpus/eval/eval_0066_cwe754.c",
+      "lines": "59-63",
+      "code": "g_socket_connection_set_cached_remote_address ((GSocketConnection*)data->connection, NULL);\n  g_socket_client_emit_event (data->client, G_SOCKET_CLIENT_CONNECTED, data->connectable, data->connection);\n\n  /* wrong, but backward compatible */\n  g_socket_set_blocking (data->socket, TRUE);",
+      "explanation": "The cached remote address is cleared (line 59), then a G_SOCKET_CLIENT_CONNECTED progress event is emitted to the client (line 60). g_socket_client_emit_event synchronously invokes any application-registered 'event' signal handlers — arbitrary re-entrant application code — before returning. After that, line 63 puts the socket back into blocking mode (the comment concedes this is semantically 'wrong, but backward compatible'). Crucially, lines 63 onward keep dereferencing data->socket, data->connection, data->client, and data->proxy_addr after the re-entrant emission."
+    },
+    {
+      "file": "corpus/eval/eval_0066_cwe754.c",
+      "lines": "65-69",
+      "code": "if (!data->proxy_addr)\n    {\n      g_socket_client_tls_handshake (data);\n      return;\n    }",
+      "explanation": "If no proxy address is configured for this operation, the connection is direct: control goes straight to g_socket_client_tls_handshake (which will complete the task or continue the TLS state machine) and the callback returns. This is the common non-proxy completion path."
+    },
+    {
+      "file": "corpus/eval/eval_0066_cwe754.c",
+      "lines": "71-71",
+      "code": "protocol = g_proxy_address_get_protocol (data->proxy_addr);",
+      "explanation": "Reached only when data->proxy_addr is non-NULL. It extracts the proxy protocol string (e.g. 'socks5', 'http') from the proxy address; this string is used both to look up an application-provided proxy and to pick a default GProxy implementation, and is echoed into an error message on the unsupported path (line 110)."
+    },
+    {
+      "file": "corpus/eval/eval_0066_cwe754.c",
+      "lines": "76-86",
+      "code": "if (!G_IS_TCP_CONNECTION (data->connection))\n    {\n      g_critical (\"Trying to proxy over non-TCP connection, this is \"\n          \"most likely a bug in GLib IO library.\");\n\n      g_set_error_literal (&data->last_error,\n          G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,\n          _(\"Proxying over a non-TCP connection is not supported.\"));\n\n      enumerator_next_async (data, FALSE);\n    }",
+      "explanation": "First branch of the proxy dispatch. Proxying is only meaningful over TCP, so a defensive type check guards it (the comment at lines 73-75 frames it as a safety guard against an internal bug). If the connection is not a TCP connection it logs a g_critical, records a G_IO_ERROR_NOT_SUPPORTED last error, and advances the address enumerator to try the next candidate. It does not return, but this is the first arm of an if/else-if chain (lines 76/87/93/104), so falling through simply reaches the end of the function at line 114."
+    },
+    {
+      "file": "corpus/eval/eval_0066_cwe754.c",
+      "lines": "87-92",
+      "code": "else if (g_hash_table_contains (data->client->priv->app_proxies, protocol))\n    {\n      /* Simply complete the connection, we don't want to do TLS handshake\n       * as the application proxy handling may need proxy handshake first */\n      g_socket_client_async_connect_complete (data);\n    }",
+      "explanation": "Second branch: if the application registered its own handler for this proxy protocol (looked up in client->priv->app_proxies by the protocol string), the operation is completed immediately without a TLS handshake, deferring proxy negotiation to the application. g_socket_client_async_connect_complete finishes data->task."
+    },
+    {
+      "file": "corpus/eval/eval_0066_cwe754.c",
+      "lines": "93-103",
+      "code": "else if ((proxy = g_proxy_get_default_for_protocol (protocol)))\n    {\n      g_socket_client_emit_event (data->client, G_SOCKET_CLIENT_PROXY_NEGOTIATING, data->connectable, data->connection);\n      g_proxy_connect_async (proxy,\n                             data->connection,\n                             data->proxy_addr,\n                             g_task_get_cancellable (data->task),\n                             g_socket_client_proxy_connect_callback,\n                             data);\n      g_object_unref (proxy);\n    }",
+      "explanation": "Third branch: if a built-in GProxy implementation exists for the protocol, emit a PROXY_NEGOTIATING event (again re-entrant application code) and start proxy negotiation asynchronously with g_proxy_connect_async, passing data as the closure and g_socket_client_proxy_connect_callback as the continuation. The proxy's reference obtained from g_proxy_get_default_for_protocol is released with g_object_unref after the async call is armed (the async op holds its own ref)."
+    },
+    {
+      "file": "corpus/eval/eval_0066_cwe754.c",
+      "lines": "104-113",
+      "code": "else\n    {\n      g_clear_error (&data->last_error);\n\n      g_set_error (&data->last_error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,\n          _(\"Proxy protocol “%s” is not supported.\"),\n          protocol);\n\n      enumerator_next_async (data, FALSE);\n    }",
+      "explanation": "Final branch: the protocol is neither app-handled nor backed by a built-in proxy, so it is unsupported. Any prior last_error is cleared and a G_IO_ERROR_NOT_SUPPORTED error is formatted with the offending protocol string interpolated via _(\"Proxy protocol “%s” is not supported.\"), then the enumerator is advanced to try the next address. protocol is a GLib-owned string from g_proxy_address_get_protocol, so the %s format is well-typed."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/eval/eval_0066_cwe754.c",
+      "lines": "59-63",
+      "code": "g_socket_connection_set_cached_remote_address ((GSocketConnection*)data->connection, NULL);\n  g_socket_client_emit_event (data->client, G_SOCKET_CLIENT_CONNECTED, data->connectable, data->connection);\n\n  /* wrong, but backward compatible */\n  g_socket_set_blocking (data->socket, TRUE);",
+      "explanation": "g_socket_client_emit_event (line 60, and again at line 95) synchronously runs application-registered 'event' signal handlers in the middle of this callback. Those handlers are arbitrary re-entrant code. The function then continues to dereference data->socket (line 63), data->proxy_addr (line 65), data->connection (line 76), and data->client (line 87) with no re-validation. The invariant the implementation must uphold is that an 'event' handler cannot synchronously finalize the operation and free 'data' (for example by dropping the last reference to the GSocketClient or by driving the task to completion and cleanup). If a handler can cause data or its owned objects to be freed, the subsequent accesses are a use-after-free. This is the classic object-lifetime/callback-reentrancy hazard for this function class; it is latent in the implementation of the signal handlers and the completion path, not visible in this excerpt."
+    },
+    {
+      "file": "corpus/eval/eval_0066_cwe754.c",
+      "lines": "13-18",
+      "code": "if (g_cancellable_is_cancelled (attempt->cancellable) || task_completed_or_cancelled (data->task))\n    {\n      g_object_unref (data->task);\n      connection_attempt_unref (attempt);\n      return;\n    }",
+      "explanation": "This guard is the mitigation for the concurrent-attempt use-after-free (CWE-416/CWE-754): with several attempts racing, one can complete data->task before another's callback runs. The residual risk to confirm is that the guard is only checked ONCE, at entry. The success path below re-enters application code via g_socket_client_emit_event (lines 60, 95) and then calls completion/continuation routines (g_socket_client_tls_handshake, g_socket_client_async_connect_complete, enumerator_next_async, g_proxy_connect_async) with no second task_completed_or_cancelled check. If any of those re-entrant callouts can complete or cancel the task, the code following them would act on an already-finished operation. The invariant is that between line 13 and the terminal dispatch, nothing re-entrant may complete data->task; that must be verified in the implementation."
+    },
+    {
+      "file": "corpus/eval/eval_0066_cwe754.c",
+      "lines": "46-63",
+      "code": "data->socket = g_steal_pointer (&attempt->socket);\n  data->connection = g_steal_pointer (&attempt->connection);",
+      "explanation": "The success path assumes that when g_socket_connection_connect_finish returned TRUE (line 26), the winning attempt necessarily holds a non-NULL socket and connection. If that exceptional-condition assumption is ever violated (a finish that reports success but leaves attempt->socket NULL), g_steal_pointer stores NULL into data->socket, and g_socket_set_blocking (data->socket, TRUE) at line 63 — plus the G_SOCKET_CONNECTION cast/use of data->connection at line 59 — dereferences NULL, yielding a crash. The invariant is: connect_finish success implies both attempt->socket and attempt->connection are live. There is no explicit NULL check here; confirm connect_finish's contract guarantees it, otherwise this is a NULL-pointer dereference (CWE-476)."
+    },
+    {
+      "file": "corpus/eval/eval_0066_cwe754.c",
+      "lines": "6-7",
+      "code": "ConnectionAttempt *attempt = user_data;\n  GSocketClientAsyncConnectData *data = attempt->data;",
+      "explanation": "Both dereferences are unconditional: attempt is taken straight from user_data and attempt->data is read with no NULL guard before the first use at line 13. This is safe only under GIO's internal invariant that the callback is always scheduled with a valid, non-NULL attempt whose ->data points at a live operation. Because these inputs are produced by trusted GIO machinery rather than the network peer, the exposure is low, but it is the assumption on which every later dereference rests; if the closure could ever be torn down before the callback runs, this would be a NULL/dangling read (CWE-476/CWE-416)."
+    }
+  ],
+  "summary": "This is the post-fix revision of GLib's g_socket_client_connected_callback and, on its face, it handles the exceptional conditions the CWE-754 tag targets: the async result IS checked (line 26) and a task_completed_or_cancelled guard (line 13) prevents a losing parallel attempt from operating on an already-finished task, which is the core use-after-free fix. The residual, latent risks are object-lifetime/re-entrancy driven: g_socket_client_emit_event (lines 60, 95) runs application signal handlers synchronously and the code keeps using data afterward, and the entry guard is not re-checked across those re-entrant callouts. No buffer/parsing memory-safety issues exist in this excerpt.",
+  "reviewed_anchors": [
+    {"anchor": "g_socket_client_connected_callback(GObject*, GAsyncResult*, gpointer) signature (lines 2-4)", "disposition": "dismissed", "reason": "Standard GAsyncReadyCallback; inputs are GIO-produced, not attacker wire data."},
+    {"anchor": "attempt = user_data (line 6)", "disposition": "finding", "reason": "Unconditional cast/deref of the closure; underpins every later access (NULL/lifetime assumption)."},
+    {"anchor": "data = attempt->data (line 7)", "disposition": "finding", "reason": "Unchecked dereference feeding all subsequent data-> uses."},
+    {"anchor": "guard: g_cancellable_is_cancelled(attempt->cancellable) || task_completed_or_cancelled(data->task) (line 13)", "disposition": "finding", "reason": "The CWE-754 exceptional-condition/UAF mitigation; checked only once at entry, not re-checked across re-entrant callouts."},
+    {"anchor": "g_object_unref(data->task); connection_attempt_unref(attempt) early-exit (lines 15-16)", "disposition": "dismissed", "reason": "Balanced reference release on the bail-out path."},
+    {"anchor": "timeout_source teardown: g_source_destroy + g_clear_pointer (lines 20-24)", "disposition": "dismissed", "reason": "Correct source lifetime handling; guarded by NULL check and cleared to prevent reuse."},
+    {"anchor": "g_socket_connection_connect_finish(...) return check (lines 26-27)", "disposition": "dismissed", "reason": "The async return value IS checked; this is the exceptional-condition check present and correct."},
+    {"anchor": "failure dispatch: clarify_connect_error/set_last_error/connection_attempt_remove/enumerator_next_async (lines 31-40)", "disposition": "dismissed", "reason": "Branches on cancellation with balanced ownership handoff; no visible defect."},
+    {"anchor": "data->socket / data->connection = g_steal_pointer(&attempt->...) (lines 46-47)", "disposition": "finding", "reason": "Assumes connect_finish success implies non-NULL socket/connection; feeds an unguarded deref at line 63."},
+    {"anchor": "attempt-teardown loop + connection_attempt_unref(attempt) (lines 49-57)", "disposition": "dismissed", "reason": "Reference accounting is balanced (list ref freed in loop, callback ref freed at line 57); no double-free."},
+    {"anchor": "g_socket_client_emit_event(... G_SOCKET_CLIENT_CONNECTED ...) (line 60)", "disposition": "finding", "reason": "Synchronous re-entry into application handlers before continued use of data — UAF surface."},
+    {"anchor": "g_socket_set_blocking(data->socket, TRUE) (line 63)", "disposition": "finding", "reason": "Dereferences data->socket after re-entrant emission and assumes it is non-NULL."},
+    {"anchor": "if (!data->proxy_addr) -> g_socket_client_tls_handshake (lines 65-69)", "disposition": "dismissed", "reason": "Guarded non-proxy completion path; no defect."},
+    {"anchor": "protocol = g_proxy_address_get_protocol(data->proxy_addr) (line 71)", "disposition": "dismissed", "reason": "Reached only when proxy_addr non-NULL; returns a GLib-owned string, no bound/format hazard."},
+    {"anchor": "if (!G_IS_TCP_CONNECTION(data->connection)) g_critical(...) (lines 76-86)", "disposition": "dismissed", "reason": "Defensive type guard; g_critical takes a static literal, no NULL-handle deref."},
+    {"anchor": "g_hash_table_contains(data->client->priv->app_proxies, protocol) (line 87)", "disposition": "dismissed", "reason": "Hash lookup by GLib-owned protocol string; no memory-safety contract violated."},
+    {"anchor": "g_proxy_get_default_for_protocol / g_proxy_connect_async / g_object_unref(proxy) (lines 93-103)", "disposition": "dismissed", "reason": "Proxy ref correctly released after async op takes its own reference; emit_event reentrancy covered by the line 60 finding."},
+    {"anchor": "unsupported-protocol else: g_set_error(... _(\"Proxy protocol “%s” ...\"), protocol) (lines 104-113)", "disposition": "dismissed", "reason": "%s fed a GLib-owned string; format is well-typed, no injection or overflow."}
+  ],
+  "findings": [
+    {
+      "title": "Use-after-free via synchronous signal emission (event handler re-entrancy)",
+      "anchor": "g_socket_client_emit_event(data->client, G_SOCKET_CLIENT_CONNECTED, data->connectable, data->connection)",
+      "file": "corpus/eval/eval_0066_cwe754.c",
+      "line": "60",
+      "code": "g_socket_client_emit_event (data->client, G_SOCKET_CLIENT_CONNECTED, data->connectable, data->connection);",
+      "bug_class": "Use-after-free via callback re-entrancy (object lifetime)",
+      "cwe": "CWE-416",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "An application 'event' signal handler invoked synchronously by g_socket_client_emit_event (lines 60 and 95) must not be able to finalize/free 'data', its GTask, its GSocketClient, its GSocketConnection, or its socket before this function's subsequent accesses (lines 63, 65, 76, 87, 96-99) complete.",
+      "failure_mode": "The 'event' signal runs arbitrary application code in the middle of the callback. If a handler drives the operation to completion/cleanup or drops the last reference on data->client/data->connection, the following dereferences (g_socket_set_blocking on data->socket at line 63, data->proxy_addr at line 65, G_IS_TCP_CONNECTION on data->connection at line 76, data->client->priv at line 87) read freed memory, giving a crash or exploitable UAF. Impact is elevated because the same emit-then-use pattern repeats at line 95 before g_proxy_connect_async.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether any registered 'event' handler path can synchronously free data or complete the task; if so, either cache needed pointers before emitting and re-check task_completed_or_cancelled(data->task) after each emit, or take a strong ref on data for the duration of the callback."
+    },
+    {
+      "title": "Entry-only exceptional-condition guard not re-checked across re-entrant continuations",
+      "anchor": "if (g_cancellable_is_cancelled (attempt->cancellable) || task_completed_or_cancelled (data->task))",
+      "file": "corpus/eval/eval_0066_cwe754.c",
+      "line": "13",
+      "code": "if (g_cancellable_is_cancelled (attempt->cancellable) || task_completed_or_cancelled (data->task))",
+      "bug_class": "Improper check for exceptional condition / stale-task use-after-free",
+      "cwe": "CWE-754",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "Between the single task-completion check at line 13 and the terminal dispatch to tls_handshake / async_connect_complete / enumerator_next_async / g_proxy_connect_async, nothing re-entrant (notably the emit_event callouts) may complete or cancel data->task; otherwise the completion routines act on an already-finished operation.",
+      "failure_mode": "The guard correctly prevents a losing parallel attempt from processing a task another attempt already completed, but it is evaluated only once at function entry. The success path afterwards re-enters application code (lines 60, 95) and then calls completion/continuation functions without re-testing task_completed_or_cancelled. If a re-entrant callout completes the task, the later dispatch double-completes or operates on freed operation state.",
+      "cve_analog": "",
+      "what_to_confirm": "That none of g_socket_client_emit_event, g_socket_client_tls_handshake, g_socket_client_async_connect_complete, or enumerator_next_async can synchronously complete/cancel data->task, or add a re-check of task_completed_or_cancelled after the emit points."
+    },
+    {
+      "title": "Unchecked assumption that connect success yields non-NULL socket/connection",
+      "anchor": "data->socket = g_steal_pointer (&attempt->socket); ... g_socket_set_blocking (data->socket, TRUE)",
+      "file": "corpus/eval/eval_0066_cwe754.c",
+      "line": "46-63",
+      "code": "data->socket = g_steal_pointer (&attempt->socket);\n  data->connection = g_steal_pointer (&attempt->connection);",
+      "bug_class": "NULL-pointer dereference from unvalidated success assumption",
+      "cwe": "CWE-476",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "A TRUE return from g_socket_connection_connect_finish (line 26) must guarantee that attempt->socket and attempt->connection are both non-NULL live objects before they are stolen into data and used at lines 59 and 63.",
+      "failure_mode": "If connect_finish ever reports success while attempt->socket is NULL, g_steal_pointer stores NULL into data->socket and g_socket_set_blocking(data->socket, TRUE) at line 63 (and the GSocketConnection use at line 59) dereferences NULL, crashing the process. There is no explicit non-NULL check on the stolen pointers here.",
+      "cve_analog": "",
+      "what_to_confirm": "That connect_finish's documented contract guarantees a live socket/connection on success, or add a NULL guard before line 59/63."
+    },
+    {
+      "title": "Unvalidated closure dereference (user_data -> attempt -> data)",
+      "anchor": "ConnectionAttempt *attempt = user_data; GSocketClientAsyncConnectData *data = attempt->data;",
+      "file": "corpus/eval/eval_0066_cwe754.c",
+      "line": "6-7",
+      "code": "ConnectionAttempt *attempt = user_data;\n  GSocketClientAsyncConnectData *data = attempt->data;",
+      "bug_class": "Unchecked pointer dereference (internal-invariant dependent)",
+      "cwe": "CWE-476",
+      "severity": "info",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "GIO must always dispatch this callback with a non-NULL user_data pointing at a live ConnectionAttempt whose ->data is a live GSocketClientAsyncConnectData.",
+      "failure_mode": "attempt->data is read with no NULL check before its first use at line 13; if the async op could be finalized and the closure freed before the callback is delivered, this is a NULL or dangling dereference. Exposure is low because user_data is set by trusted GIO code, not by the network peer.",
+      "cve_analog": "",
+      "what_to_confirm": "That the attempt closure is guaranteed live for the duration of the callback dispatch and cannot be torn down between scheduling and invocation."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm no application 'event' signal handler reachable from g_socket_client_emit_event (lines 60, 95) can synchronously free data, data->client, data->connection, data->socket, or complete data->task; if any can, cache pointers and re-check task state after each emit or hold a ref on data.",
+    "Verify task_completed_or_cancelled(data->task) (line 13) is a sufficient race guard given parallel connection attempts, and that no re-entrant continuation between line 13 and the terminal dispatch can complete the task without a re-check.",
+    "Confirm g_socket_connection_connect_finish returning TRUE guarantees attempt->socket and attempt->connection are non-NULL before lines 46-47/59/63; otherwise add NULL guards.",
+    "Trace reference counting for ConnectionAttempt: the loop (lines 49-57) releases each entry's list reference and line 57 releases the callback reference — confirm the current attempt is not additionally still owned by the list to rule out a double-free.",
+    "Verify ownership handoff of data->task across the failure branch (lines 31-40 vs 38-40) and the four proxy branches so the task is completed/unreffed exactly once on every path.",
+    "Confirm the protocol string from g_proxy_address_get_protocol (line 71) remains valid GLib-owned memory when interpolated with %s at line 110 and used as a hash key at line 87."
+  ]
+}

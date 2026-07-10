@@ -1,0 +1,139 @@
+{
+  "subsystem": "Privilege-dropping / process-credential management for a server process. Capability::ChangeUnixUser() is the routine that lowers a root-launched daemon down to an unprivileged Unix user/group identity after startup, gated by capability-management helpers (setInitialCapabilities / setMinimalCapabilities). It processes a target uid_t and the passwd database entry it maps to.",
+  "provenance": "Identified from naming and library idioms: the Capability class, setInitialCapabilities()/setMinimalCapabilities() helpers, the Logger::Error(...) logging facade, and folly::errnoStr(errno) all point to Facebook/Meta's HHVM runtime, which uses the folly library. The sample banner /* sample: primevul_train_2093_vuln */ and the file name corpus/train/train_0324_cwe264.cpp classify it under CWE-264 (Permissions, Privileges, and Access Controls). The function uses the POSIX credential API: getpwuid(3), setgid(2), setuid(2).",
+  "trust_boundary": "The trust boundary is the transition from a privileged (root/EUID 0) context to an unprivileged one. The caller supplies the target uid; the passwd database (getpwuid) supplies the paired pw_gid. The security-critical concern is not parsing hostile bytes but COMPLETELY and CORRECTLY shedding privilege before untrusted work begins: any credential the process still holds after this function returns true is exposed to whatever attacker can influence the now-'unprivileged' server. Incomplete credential drop leaves a privilege-escalation primitive.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0324_cwe264.cpp",
+      "lines": "2-3",
+      "code": "bool Capability::ChangeUnixUser(uid_t uid) {\n  if (setInitialCapabilities()) {",
+      "explanation": "The entry point takes a single uid_t uid — the numeric user id the process wants to become. It returns bool to signal success/failure to the caller, which presumably aborts startup on false. The whole body is guarded by setInitialCapabilities(): only if that helper succeeds in establishing the pre-drop capability state does the code proceed to lower credentials. If setInitialCapabilities() returns false the function falls through to the final return false (line 30), so the caller is told the change did not happen."
+    },
+    {
+      "file": "corpus/train/train_0324_cwe264.cpp",
+      "lines": "4-10",
+      "code": "struct passwd *pw;\n\n    if ((pw = getpwuid(uid)) == nullptr) {\n      Logger::Error(\"unable to getpwuid(%d): %s\", uid,\n                    folly::errnoStr(errno).c_str());\n      return false;\n    }",
+      "explanation": "It resolves the target uid to a passwd database entry with getpwuid(uid), storing the result in pw. getpwuid returns a pointer into a shared static buffer (or nullptr on error / no such user). The nullptr case is handled: it logs the errno via folly::errnoStr(errno).c_str() and returns false, refusing to continue if the account cannot be resolved. The pw entry is needed only to obtain the primary group id (pw->pw_gid) used in the next block; the user's login name (pw->pw_name) is available here but is not used."
+    },
+    {
+      "file": "corpus/train/train_0324_cwe264.cpp",
+      "lines": "12-16",
+      "code": "if (pw->pw_gid == 0 || setgid(pw->pw_gid) < 0) {\n      Logger::Error(\"unable to drop gid privs: %s\",\n                    folly::errnoStr(errno).c_str());\n      return false;\n    }",
+      "explanation": "First privilege step: drop the group id. The short-circuit condition is defensive — pw->pw_gid == 0 is rejected outright so the process never re-affirms membership in the root group gid 0, and only if the target gid is non-zero is setgid(pw->pw_gid) actually invoked. The return value is checked with < 0, so a failed setgid causes an error log and return false rather than silently continuing with elevated group privilege. Critically, group id is dropped BEFORE the user id (next block) — the correct order, because once setuid drops root you can no longer call setgid to a different group."
+    },
+    {
+      "file": "corpus/train/train_0324_cwe264.cpp",
+      "lines": "18-22",
+      "code": "if (uid == 0 || setuid(uid) < 0) {\n      Logger::Error(\"unable to drop uid privs: %s\",\n                    folly::errnoStr(errno).c_str());\n      return false;\n    }",
+      "explanation": "Second privilege step: drop the user id with the same defensive pattern. uid == 0 is rejected so the routine refuses to 'drop' to root itself, and setuid(uid) is only called for a non-zero target. Because the process is still privileged (EUID 0) at this point, a successful setuid(uid) to a non-zero uid sets the real, effective, AND saved-set-user-ids all to uid on Linux, which is what makes the drop permanent (no re-escalation via the saved uid). The < 0 return check turns a failed drop into return false."
+    },
+    {
+      "file": "corpus/train/train_0324_cwe264.cpp",
+      "lines": "24-27",
+      "code": "if (!setMinimalCapabilities()) {\n      Logger::Error(\"unable to set minimal server capabiltiies\");\n      return false;\n    }",
+      "explanation": "After the uid/gid drop, setMinimalCapabilities() reduces the process's Linux capability set to the minimum the server needs, logging (note the 'capabiltiies' typo) and returning false on failure. This is the capability-bounding counterpart to the earlier setInitialCapabilities() gate; it exists to strip lingering CAP_* bits that survive a uid change (e.g. via file capabilities or an ambient/inheritable set), which a bare setuid does not clear."
+    },
+    {
+      "file": "corpus/train/train_0324_cwe264.cpp",
+      "lines": "28-31",
+      "code": "return true;\n  }\n  return false;\n}",
+      "explanation": "If all four steps succeed the function returns true, signalling a complete drop to the unprivileged identity. The trailing return false is reached both when setInitialCapabilities() failed (the outer if was not entered) and is the single exit for that path. The boolean contract puts the burden on the caller to abort/refuse to serve if false is returned — continuing to run as root after a false return would defeat the whole routine."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0324_cwe264.cpp",
+      "lines": "12-22",
+      "code": "if (pw->pw_gid == 0 || setgid(pw->pw_gid) < 0) {\n      Logger::Error(\"unable to drop gid privs: %s\",\n                    folly::errnoStr(errno).c_str());\n      return false;\n    }\n\n    if (uid == 0 || setuid(uid) < 0) {",
+      "explanation": "PRIMARY DEFECT — supplementary groups are never dropped. The routine sets the primary group with setgid(pw->pw_gid) and the user with setuid(uid), but it never calls setgroups(0, nullptr) (or, better, initgroups(pw->pw_name, pw->pw_gid)) to reset the process's SUPPLEMENTARY group list. A process launched as root inherits root's supplementary groups (commonly including privileged groups such as 0/root, wheel, disk, shadow, docker, etc.). setuid/setgid do NOT touch the supplementary group set, so after this function returns true the 'unprivileged' process still holds every supplementary group root had. Any subsequent access-control decision (file opens, group-owned sockets/devices, credential checks over IPC) is evaluated against those retained group memberships, giving an attacker who compromises the server code the access rights of those groups — a privilege-escalation primitive. The invariant: before setuid drops root, while still privileged, the code MUST call setgroups()/initgroups() to install exactly the target user's group set; only setgroups can clear supplementary groups and it requires the privilege you are about to give up, so its omission here is order-fatal, not just incomplete."
+    },
+    {
+      "file": "corpus/train/train_0324_cwe264.cpp",
+      "lines": "18-22",
+      "code": "if (uid == 0 || setuid(uid) < 0) {\n      Logger::Error(\"unable to drop uid privs: %s\",\n                    folly::errnoStr(errno).c_str());\n      return false;\n    }",
+      "explanation": "Drop is not verified. setuid()'s return value is checked (< 0), which catches an outright failure, but the code never confirms the resulting credential state with getuid()/geteuid()/getresuid() (and getgroups()) afterward. On the mainstream Linux path a privileged setuid to a non-zero uid is atomic and sets all three uids, so this is a secondary/defense-in-depth concern rather than an independent bug here — but on non-Linux or seteuid-based platforms a 'successful' return can leave the saved-set-uid at 0, permitting re-escalation. The invariant: after the drop, the process must be unable to regain uid 0; a post-drop assertion that getresuid() shows no 0 anywhere (and that setuid(0) fails) is the robust confirmation. Combined with the missing setgroups above, the overall credential state is under-verified."
+    },
+    {
+      "file": "corpus/train/train_0324_cwe264.cpp",
+      "lines": "7-8",
+      "code": "Logger::Error(\"unable to getpwuid(%d): %s\", uid,\n                    folly::errnoStr(errno).c_str());",
+      "explanation": "Considered-and-cleared: the .c_str() on a temporary is NOT a use-after-free here. folly::errnoStr(errno) returns a std::string temporary and .c_str() yields a pointer into that temporary's buffer. Per C++ full-expression rules the temporary is destroyed only at the terminating semicolon, i.e. AFTER the entire Logger::Error(...) call has returned and consumed the pointer. So the char* is valid for the whole duration of the logging call (same reasoning for lines 13-14 and 19-20). This differs from the dangerous pattern of storing/returning such a pointer or building it from (a+b).c_str() and using it later. Only if Logger::Error retained the pointer beyond the call (e.g. stored it asynchronously) would this become CWE-416; nothing shown does that. Recorded as dismissed to avoid a false positive."
+    },
+    {
+      "file": "corpus/train/train_0324_cwe264.cpp",
+      "lines": "6-9",
+      "code": "if ((pw = getpwuid(uid)) == nullptr) {\n      Logger::Error(\"unable to getpwuid(%d): %s\", uid,\n                    folly::errnoStr(errno).c_str());\n      return false;",
+      "explanation": "getpwuid() is non-reentrant and returns a pointer into a shared static buffer that a concurrent getpwuid/getpwnam call on another thread can overwrite. pw is dereferenced immediately (pw->pw_gid at line 12) with no intervening NSS calls in this function, so within this code path it is safe; the latent hazard is that this static buffer is easy to misuse if the routine is later extended or the pw pointer is cached. The failure-mode is a torn/incorrect passwd entry driving setgid to the wrong group. Preferred fix is the reentrant getpwuid_r() with a caller-owned buffer. Low severity given the current single-use pattern."
+    }
+  ],
+  "summary": "A privilege-dropping routine that lowers a root server to an unprivileged uid/gid but never resets the SUPPLEMENTARY group list (no setgroups()/initgroups()), so the process retains root's extra group memberships after the drop — a real privilege-escalation weakness (CWE-264 family). The uid/gid drops themselves are ordered correctly and return-checked, and the .c_str()-on-temporary logging calls are safe because the temporaries outlive the logging call.",
+  "reviewed_anchors": [
+    {"anchor": "bool Capability::ChangeUnixUser(uid_t uid) (signature, line 2)", "disposition": "finding", "reason": "The privilege-drop entry point; its contract is to fully shed root, which it does incompletely (supplementary groups)."},
+    {"anchor": "setInitialCapabilities() gate (line 3)", "disposition": "dismissed", "reason": "Opaque helper with no signature/body shown; used only as a boolean gate, no attacker-controlled input crosses it here."},
+    {"anchor": "getpwuid(uid) (line 6)", "disposition": "finding", "reason": "Non-reentrant static-buffer lookup; low-severity thread-safety/latent-misuse note."},
+    {"anchor": "pw / struct passwd* and pw->pw_gid (lines 4,12)", "disposition": "finding", "reason": "pw->pw_gid drives setgid; the passwd entry also carries pw_name which SHOULD have fed initgroups but is unused — central to the supplementary-groups defect."},
+    {"anchor": "pw->pw_gid == 0 guard (line 12)", "disposition": "dismissed", "reason": "Correct defensive check that refuses to set the root group; no weakness."},
+    {"anchor": "setgid(pw->pw_gid) < 0 (line 12)", "disposition": "finding", "reason": "Drops primary gid but is paired with the missing setgroups() call; correctly ordered before setuid and return-checked."},
+    {"anchor": "uid == 0 guard (line 18)", "disposition": "dismissed", "reason": "Correct defensive check that refuses to 'drop' to root; no weakness."},
+    {"anchor": "setuid(uid) < 0 (line 18)", "disposition": "finding", "reason": "Return-checked but the resulting credential state is not verified (getresuid/getgroups); secondary defense-in-depth."},
+    {"anchor": "setMinimalCapabilities() (line 24)", "disposition": "dismissed", "reason": "Opaque helper, return-checked; strips Linux capabilities but does not address supplementary groups (which are not capabilities)."},
+    {"anchor": "folly::errnoStr(errno).c_str() (lines 8,14,20)", "disposition": "dismissed", "reason": "Temporary std::string lives until end of the full expression, i.e. past the Logger::Error call that consumes the pointer — not a use-after-free."},
+    {"anchor": "return true / return false paths (lines 9,15,21,26,28,30)", "disposition": "dismissed", "reason": "Fail-closed: every error path returns false; caller is responsible for aborting on false. No weakness in the returns themselves."}
+  ],
+  "findings": [
+    {
+      "title": "Supplementary groups never dropped during privilege lowering (setgroups/initgroups missing)",
+      "anchor": "setgid(pw->pw_gid) / setuid(uid) with no setgroups() or initgroups()",
+      "file": "corpus/train/train_0324_cwe264.cpp",
+      "line": "12-22",
+      "code": "if (pw->pw_gid == 0 || setgid(pw->pw_gid) < 0) {\n      Logger::Error(\"unable to drop gid privs: %s\",\n                    folly::errnoStr(errno).c_str());\n      return false;\n    }\n\n    if (uid == 0 || setuid(uid) < 0) {\n      Logger::Error(\"unable to drop uid privs: %s\",\n                    folly::errnoStr(errno).c_str());\n      return false;\n    }",
+      "bug_class": "Incomplete privilege drop — retained supplementary group memberships",
+      "cwe": "CWE-271",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0324_cwe264.cpp",
+      "invariant": "Before setuid() relinquishes root, while still privileged, the process MUST reset its supplementary group list to exactly the target user's groups via initgroups(pw->pw_name, pw->pw_gid) (or setgroups(0, nullptr) to clear them), because setuid/setgid do not modify the supplementary group set and only a privileged process may call setgroups.",
+      "failure_mode": "A daemon started as root inherits root's supplementary groups (e.g. 0/root, wheel, disk, shadow, docker). After ChangeUnixUser returns true the process runs with the target uid/gid but STILL belongs to all those groups, so kernel access checks on group-owned files, devices, and sockets grant the extra privileges. An attacker who compromises the now-'unprivileged' server (e.g. via a memory-safety or logic bug elsewhere) can read/write resources belonging to those privileged groups, escalating beyond the intended sandbox.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm there is NO initgroups()/setgroups() call anywhere between setInitialCapabilities() and setuid() (including inside setInitialCapabilities), and that getgroups() after the drop returns only the target user's groups rather than root's set."
+    },
+    {
+      "title": "Credential state not verified after setuid/setgid drop",
+      "anchor": "setuid(uid) < 0 (return checked but resulting uids not asserted)",
+      "file": "corpus/train/train_0324_cwe264.cpp",
+      "line": "18-22",
+      "code": "if (uid == 0 || setuid(uid) < 0) {\n      Logger::Error(\"unable to drop uid privs: %s\",\n                    folly::errnoStr(errno).c_str());\n      return false;\n    }",
+      "bug_class": "Unverified privilege drop (no post-drop credential assertion)",
+      "cwe": "CWE-273",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0324_cwe264.cpp",
+      "invariant": "After dropping, the process must be provably unable to regain uid/gid 0: real, effective, and saved-set ids should all equal the target, verifiable via getresuid()/getresgid(), and setuid(0) should fail.",
+      "failure_mode": "The code trusts setuid()'s <0 return as sufficient. On the Linux privileged path this is atomic, but on platforms/paths where a seteuid-style drop leaves the saved-set-user-id at 0 (or where a partial failure occurs), a 'successful' return can leave a re-escalation route intact; because the drop is never reconfirmed, this would go unnoticed and the server would run with a latent path back to root.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify whether the platform's setuid drops the saved-set-uid, and whether any post-drop getresuid()/getresgid() assertion exists; add one if not."
+    },
+    {
+      "title": "Non-reentrant getpwuid() returning a shared static buffer",
+      "anchor": "(pw = getpwuid(uid)) == nullptr",
+      "file": "corpus/train/train_0324_cwe264.cpp",
+      "line": "6",
+      "code": "if ((pw = getpwuid(uid)) == nullptr) {",
+      "bug_class": "Use of non-reentrant API / static-buffer aliasing",
+      "cwe": "CWE-676",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0324_cwe264.cpp",
+      "invariant": "The passwd entry must not be overwritten by a concurrent NSS lookup between retrieval and use of pw->pw_gid (and pw->pw_name if used).",
+      "failure_mode": "getpwuid returns a pointer into a process-wide static buffer; a concurrent getpwuid/getpwnam on another thread can overwrite it, so pw->pw_gid could reflect a different user, causing setgid to the wrong group. In the shown single-use path pw is consumed immediately with no intervening NSS call, so exploitability is minimal, but the pattern is fragile if the routine is extended.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm no other thread performs passwd/group NSS lookups during startup, or switch to getpwuid_r() with a caller-owned buffer."
+    }
+  ],
+  "audit_checklist": [
+    "Grep the drop path (and setInitialCapabilities) for initgroups()/setgroups(); if absent, the process retains root's supplementary groups — add initgroups(pw->pw_name, pw->pw_gid) before setuid().",
+    "Confirm ordering: supplementary-group reset and setgid MUST occur before setuid drops root, since setgroups/setgid require privilege.",
+    "Add a post-drop assertion using getresuid()/getresgid()/getgroups() to prove no 0 remains in any uid/gid slot and that setuid(0) fails.",
+    "Verify setMinimalCapabilities() actually clears Linux capabilities (CAP_SETUID/CAP_SETGID/CAP_DAC_OVERRIDE etc.) and does not itself re-add ambient/inheritable caps.",
+    "Confirm every caller treats a false return as fatal and does not proceed to serve requests as root.",
+    "Consider getpwuid_r() to avoid the shared static passwd buffer if any concurrent NSS lookups are possible at startup.",
+    "Confirm Logger::Error does not retain the char* from folly::errnoStr(errno).c_str() beyond the call (async/deferred logging would turn these into use-after-free)."
+  ]
+}

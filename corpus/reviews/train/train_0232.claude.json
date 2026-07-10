@@ -1,0 +1,182 @@
+{
+  "subsystem": "TensorFlow CPU/GPU op kernel: the Compute() method of the Dequantize OpKernel, which converts a quantized integer tensor back to floating point using per-tensor or per-axis (per-slice) min/max range values. It processes graph inputs supplied at runtime by whatever builds and runs the TensorFlow graph (e.g. tf.raw_ops.Dequantize).",
+  "provenance": "Identified by TensorFlow-specific types and idioms: OpKernelContext* ctx, ctx->input(n), Tensor, ctx->allocate_output, OP_REQUIRES / OP_REQUIRES_OK, errors::Unimplemented, tensorflow::Tensor(DT_FLOAT, ...), Eigen tensor accessors flat<T>(), vec<float>(), bit_casted_shaped<T,3>(), flat_inner_outer_dims<float,3>(), chip<1>(i), and ctx->eigen_device<Device>(). The helper names DequantizeTensor/DequantizeSlice and the QUANTIZE_MODE_MIN_FIRST enum and axis_/mode_/need_cast_ attributes place this squarely in tensorflow/core/kernels/dequantize_op.cc. The sample banner (primevul_validation_0017_vuln) confirms it is a PrimeVul C++ vulnerability sample.",
+  "trust_boundary": "This is a TensorFlow op kernel: all three inputs (input at index 0, input_min_tensor at index 1, input_max_tensor at index 2) and the node attributes (axis_, mode_, need_cast_) are attacker-controllable. A hostile GraphDef / SavedModel or a direct tf.raw_ops.Dequantize call can set arbitrary tensor shapes, dtypes, and element counts, and an arbitrary axis_ attribute. Nothing here validates that the min/max range tensors have the number of elements the per-axis loop will index, nor that they are non-empty in the scalar path, nor that axis_ is within input.dims(). The shapes of input, input_min_tensor and input_max_tensor are the hostile fields.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0232_cwe20.cpp",
+      "lines": "2-5",
+      "code": "  void Compute(OpKernelContext* ctx) override {\n    const Tensor& input = ctx->input(0);\n    const Tensor& input_min_tensor = ctx->input(1);\n    const Tensor& input_max_tensor = ctx->input(2);",
+      "explanation": "Compute() is the per-invocation entry point of the Dequantize kernel; OpKernelContext* ctx carries the op's runtime inputs, allocator, and error-reporting channel. The method binds three input tensors by const reference: input (index 0) is the quantized data of element type T, and input_min_tensor / input_max_tensor (indices 1 and 2) carry the floating-point min and max of the value range used to reconstruct the real values. Because ctx->input(n) returns whatever the graph supplied, the shapes, dtypes, and element counts of all three are fully caller-controlled data, not trusted constants."
+    },
+    {
+      "file": "corpus/train/train_0232_cwe20.cpp",
+      "lines": "7-10",
+      "code": "    int num_slices = 1;\n    if (axis_ > -1) {\n      num_slices = input.dim_size(axis_);\n    }",
+      "explanation": "num_slices selects between per-tensor dequantization (one shared min/max) and per-axis dequantization (a distinct min/max per slice along a chosen axis). It defaults to 1. axis_ is a node attribute; when it is non-negative the code sets num_slices to the size of that dimension of the input, input.dim_size(axis_). This value is later used both as the middle dimension of the reshaped input and as the loop bound that indexes the min/max range vectors, so num_slices is derived directly from an attacker-chosen dimension of an attacker-shaped tensor."
+    },
+    {
+      "file": "corpus/train/train_0232_cwe20.cpp",
+      "lines": "12-15",
+      "code": "    Tensor* output = nullptr;\n    OP_REQUIRES_OK(ctx, ctx->allocate_output(0, input.shape(), &output));\n    Tensor float_output =\n        need_cast_ ? tensorflow::Tensor(DT_FLOAT, input.shape()) : *output;",
+      "explanation": "The kernel allocates its output tensor with the same shape as the input (allocate_output(0, input.shape(), &output)); OP_REQUIRES_OK aborts the op if allocation fails. float_output is the working buffer in which floating-point results are produced. When need_cast_ is true (the final dtype S is not float, e.g. bfloat16), a temporary DT_FLOAT tensor is allocated to hold intermediate float results that will later be cast into output; otherwise float_output aliases the real output tensor (*output). This means downstream writes target either a temporary or the true output depending on need_cast_."
+    },
+    {
+      "file": "corpus/train/train_0232_cwe20.cpp",
+      "lines": "16-19",
+      "code": "    if (num_slices == 1) {\n      const float min_range = input_min_tensor.flat<float>()(0);\n      const float max_range = input_max_tensor.flat<float>()(0);\n      DequantizeTensor(ctx, input, min_range, max_range, &float_output);",
+      "explanation": "The per-tensor path: a single min_range and max_range are read as element 0 of the min/max tensors via flat<float>()(0), then handed to DequantizeTensor to convert the whole input at once. flat<float>() reinterprets the tensor as a 1-D float array and (0) subscripts its first element. There is no check here that input_min_tensor / input_max_tensor actually contain at least one element or are of float dtype; the code simply assumes element 0 exists."
+    },
+    {
+      "file": "corpus/train/train_0232_cwe20.cpp",
+      "lines": "20-23",
+      "code": "    } else {\n      OP_REQUIRES(ctx, mode_ != QUANTIZE_MODE_MIN_FIRST,\n                  errors::Unimplemented(\"MIN_FIRST mode is not implemented for \"\n                                        \"Dequantize with axis != -1.\"));",
+      "explanation": "The per-axis path (num_slices != 1). Before doing per-slice work it enforces that the quantization mode_ is not QUANTIZE_MODE_MIN_FIRST, because that combination is unimplemented; OP_REQUIRES raises an Unimplemented error and returns from the kernel if the predicate is false. This is a mode-compatibility gate, not a bounds check on the range tensors."
+    },
+    {
+      "file": "corpus/train/train_0232_cwe20.cpp",
+      "lines": "25-31",
+      "code": "      int64 pre_dim = 1, post_dim = 1;\n      for (int i = 0; i < axis_; ++i) {\n        pre_dim *= float_output.dim_size(i);\n      }\n      for (int i = axis_ + 1; i < float_output.dims(); ++i) {\n        post_dim *= float_output.dim_size(i);\n      }",
+      "explanation": "This computes the flattened dimensions surrounding the quantization axis: pre_dim is the product of all dimension sizes before axis_, and post_dim is the product of all dimensions after axis_. Together with num_slices (the size of axis_ itself) these reshape the logically N-D tensor into a canonical 3-D [pre_dim, num_slices, post_dim] view so each of the num_slices slices can be dequantized with its own range. The loops iterate over float_output.dims(); they assume axis_ is a valid index into the tensor's dimensions."
+    },
+    {
+      "file": "corpus/train/train_0232_cwe20.cpp",
+      "lines": "32-35",
+      "code": "      auto input_tensor = input.template bit_casted_shaped<T, 3>(\n          {pre_dim, num_slices, post_dim});\n      auto output_tensor =\n          float_output.flat_inner_outer_dims<float, 3>(axis_ - 1);",
+      "explanation": "input_tensor is a rank-3 Eigen view of the quantized input, bit-cast to element type T and reshaped to {pre_dim, num_slices, post_dim}. output_tensor is the corresponding rank-3 float view of float_output, produced via flat_inner_outer_dims<float,3>(axis_ - 1), which groups the dimensions around axis_ into a 3-D [outer, axis, inner] layout. The two views are set up so that slice i along the middle (axis) dimension of the input maps to slice i of the output."
+    },
+    {
+      "file": "corpus/train/train_0232_cwe20.cpp",
+      "lines": "36-37",
+      "code": "      auto min_ranges = input_min_tensor.vec<float>();\n      auto max_ranges = input_max_tensor.vec<float>();",
+      "explanation": "In the per-axis path the min/max tensors are treated as 1-D vectors of floats (vec<float>()), one range value per slice. min_ranges(i) and max_ranges(i) are expected to hold exactly num_slices entries. The size of these vectors is whatever the caller supplied for inputs 1 and 2; the code establishes the views but does not compare their lengths to num_slices."
+    },
+    {
+      "file": "corpus/train/train_0232_cwe20.cpp",
+      "lines": "38-43",
+      "code": "      for (int i = 0; i < num_slices; ++i) {\n        DequantizeSlice(ctx->eigen_device<Device>(), ctx,\n                        input_tensor.template chip<1>(i), min_ranges(i),\n                        max_ranges(i), output_tensor.template chip<1>(i));\n      }\n    }",
+      "explanation": "The core per-axis loop: for each of num_slices slices it selects slice i of the input along dimension 1 (chip<1>(i)), passes the matching min_ranges(i) and max_ranges(i) scalar range values, and writes into slice i of the output. The loop bound num_slices comes from the input's axis dimension (line 9), whereas min_ranges(i)/max_ranges(i) index the separate min/max input tensors — two independently sized, attacker-controlled tensors indexed by the same counter with no equality check between them."
+    },
+    {
+      "file": "corpus/train/train_0232_cwe20.cpp",
+      "lines": "44-50",
+      "code": "    if (need_cast_) {\n      S* out_ptr = output->flat<S>().data();\n      float* in_ptr = float_output.flat<float>().data();\n      for (int64 i = 0; i < float_output.NumElements(); ++i) {\n        out_ptr[i] = static_cast<S>(in_ptr[i]);\n      }\n    }",
+      "explanation": "The final cast step, taken only when need_cast_ is true. It obtains raw pointers to the true output buffer (typed S) and to the temporary float buffer, then copies every element of float_output into output with a static_cast<S>. The loop count is float_output.NumElements(); because output and float_output were both allocated from input.shape() (lines 13-15) they have matching element counts, so this elementwise copy is internally consistent. out_ptr[i] writes the reconstructed, down-cast values into the op's real output."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0232_cwe20.cpp",
+      "lines": "38-42",
+      "code": "      for (int i = 0; i < num_slices; ++i) {\n        DequantizeSlice(ctx->eigen_device<Device>(), ctx,\n                        input_tensor.template chip<1>(i), min_ranges(i),\n                        max_ranges(i), output_tensor.template chip<1>(i));\n      }",
+      "explanation": "This is the primary heap out-of-bounds read. num_slices is set from input.dim_size(axis_) (line 9), i.e. the size of the input's quantization axis, while min_ranges/max_ranges are separate caller-supplied tensors (inputs 1 and 2). The loop indexes min_ranges(i) and max_ranges(i) for i in [0, num_slices) but nothing ever checks that input_min_tensor.NumElements() == num_slices (or even that input_min_tensor is 1-D with num_slices entries). An attacker builds a Dequantize node with axis set so num_slices is large (e.g. input axis dimension of 1024) but passes a min/max tensor with only one element; every access min_ranges(i)/max_ranges(i) for i>=size reads past the end of the range tensor's heap buffer. Impact: heap out-of-bounds read that either leaks adjacent heap memory into the dequantized output or crashes the process (DoS). The invariant the implementation must enforce (and does not here) is that input_min_tensor and input_max_tensor are 1-D and each contain exactly num_slices elements before the loop — the fixed real code adds OP_REQUIRES checks that the min/max shapes match num_slices."
+    },
+    {
+      "file": "corpus/train/train_0232_cwe20.cpp",
+      "lines": "17-18",
+      "code": "      const float min_range = input_min_tensor.flat<float>()(0);\n      const float max_range = input_max_tensor.flat<float>()(0);",
+      "explanation": "In the per-tensor path the code reads element 0 of the min and max tensors without first verifying they are non-empty. A caller can pass an empty tensor (shape [0], zero elements) for input 1 or 2; flat<float>()(0) then dereferences index 0 of a zero-length buffer, an out-of-bounds read of a fresh/uninitialized heap allocation. The impact is a leak of adjacent memory into min_range/max_range (which then skews the whole dequantization) or a crash. The implementation must validate that input_min_tensor and input_max_tensor are scalars (or at least NumElements() >= 1) before subscripting element 0."
+    },
+    {
+      "file": "corpus/train/train_0232_cwe20.cpp",
+      "lines": "8-9",
+      "code": "    if (axis_ > -1) {\n      num_slices = input.dim_size(axis_);",
+      "explanation": "axis_ is an attacker-controlled attribute. There is no check here that axis_ < input.dims(). If axis_ is set to a value >= input.dims(), input.dim_size(axis_) indexes the shape's dimension array out of bounds; TensorShape::dim_size typically CHECK-fails, aborting the process (a denial of service), and in a build with checks disabled it would read a bogus dimension that propagates into num_slices and the reshape math. The implementation must validate -1 <= axis_ < input.dims() before using axis_ as a dimension index. This is a latent contract the shown code does not enforce."
+    },
+    {
+      "file": "corpus/train/train_0232_cwe20.cpp",
+      "lines": "34-35",
+      "code": "      auto output_tensor =\n          float_output.flat_inner_outer_dims<float, 3>(axis_ - 1);",
+      "explanation": "The per-axis path is entered whenever num_slices != 1, and num_slices came from input.dim_size(axis_) with axis_ >= 0. If axis_ == 0, then axis_ - 1 == -1 is passed to flat_inner_outer_dims<float,3>, which expects a non-negative starting dimension; a negative dimension index produces an invalid reshape (CHECK-fail or a malformed view leading to out-of-bounds slice access in the loop). An attacker can reach this by setting axis_=0 on an input whose dimension 0 has size != 1. The implementation must constrain axis_ (typically axis_ >= 1 for the per-axis reshape, or validate the reshape) rather than assuming axis_ - 1 is valid."
+    }
+  ],
+  "summary": "This is TensorFlow's Dequantize Compute() kernel operating on fully attacker-controlled graph inputs. The dominant flaw is a per-axis heap out-of-bounds read (CWE-125/CWE-20): the loop bound num_slices is derived from the input tensor's axis dimension but is used to index the independently sized input_min_tensor/input_max_tensor range vectors with no check that they contain num_slices elements. A secondary unchecked element-0 read on the scalar path and unvalidated axis_ (dimension index and axis_-1 reshape) add further OOB/abort hazards. All stem from missing input validation.",
+  "reviewed_anchors": [
+    {"anchor": "void Compute(OpKernelContext* ctx) override (line 2)", "disposition": "dismissed", "reason": "Method entry point; carries no bound of its own, risk lives in the inputs it reads."},
+    {"anchor": "input = ctx->input(0) (line 3)", "disposition": "dismissed", "reason": "Quantized data tensor; its shape drives num_slices but the OOB is on the min/max tensors, covered by the axis_ finding."},
+    {"anchor": "input_min_tensor = ctx->input(1) (line 4)", "disposition": "finding", "reason": "Attacker-sized range tensor indexed by num_slices without a length check (per-axis OOB) and by element 0 without a non-empty check (scalar OOB)."},
+    {"anchor": "input_max_tensor = ctx->input(2) (line 5)", "disposition": "finding", "reason": "Same as input_min_tensor: indexed at (i) and (0) with no bound check versus its own element count."},
+    {"anchor": "axis_ attribute / if (axis_ > -1) (line 8)", "disposition": "finding", "reason": "Used as a dimension index (dim_size(axis_)) and as axis_-1 in reshape with no range validation."},
+    {"anchor": "num_slices = input.dim_size(axis_) (line 9)", "disposition": "finding", "reason": "Loop bound derived from the input axis; drives min_ranges(i)/max_ranges(i) indexing that is not validated against the range tensors."},
+    {"anchor": "ctx->allocate_output(0, input.shape(), &output) (line 13)", "disposition": "dismissed", "reason": "Return status is checked via OP_REQUIRES_OK; output shape equals input shape, internally consistent."},
+    {"anchor": "float_output / need_cast_ ternary (lines 14-15)", "disposition": "dismissed", "reason": "Selects temporary vs real output buffer; both allocated from input.shape(), no size mismatch."},
+    {"anchor": "input_min_tensor.flat<float>()(0) / input_max_tensor.flat<float>()(0) (lines 17-18)", "disposition": "finding", "reason": "Reads element 0 with no check that the tensor is non-empty; OOB read on an empty range tensor."},
+    {"anchor": "OP_REQUIRES(ctx, mode_ != QUANTIZE_MODE_MIN_FIRST, ...) (lines 21-23)", "disposition": "dismissed", "reason": "Correct guard that rejects the unimplemented MIN_FIRST+axis combination; no security contract violated."},
+    {"anchor": "pre_dim/post_dim reshape loops (lines 25-31)", "disposition": "dismissed", "reason": "Products of dimension sizes; safe once axis_ is validated, which is covered by the axis_ finding."},
+    {"anchor": "input.bit_casted_shaped<T,3>({pre_dim, num_slices, post_dim}) (lines 32-33)", "disposition": "dismissed", "reason": "Reshape view whose element count equals the input's; the hazard is num_slices/range mismatch, tracked in the primary finding."},
+    {"anchor": "float_output.flat_inner_outer_dims<float,3>(axis_ - 1) (lines 34-35)", "disposition": "finding", "reason": "axis_-1 becomes -1 when axis_==0 in the per-axis path, an invalid reshape dimension index."},
+    {"anchor": "min_ranges = input_min_tensor.vec<float>() / max_ranges = ...vec<float>() (lines 36-37)", "disposition": "finding", "reason": "1-D range views whose length is never compared to num_slices before indexing; root of the per-axis OOB."},
+    {"anchor": "for (i<num_slices) DequantizeSlice(... min_ranges(i), max_ranges(i) ...) (lines 38-42)", "disposition": "finding", "reason": "Primary heap OOB read: indexes the range vectors by an input-derived count with no length check."},
+    {"anchor": "need_cast_ cast loop: out_ptr[i]=static_cast<S>(in_ptr[i]) for i<NumElements() (lines 44-50)", "disposition": "dismissed", "reason": "output and float_output share input.shape(), so element counts match; the elementwise copy is in-bounds."}
+  ],
+  "findings": [
+    {
+      "title": "Heap out-of-bounds read: per-axis min/max range vectors indexed by input-derived num_slices without a length check",
+      "anchor": "for (int i = 0; i < num_slices; ++i) { ... min_ranges(i), max_ranges(i) ... }",
+      "file": "corpus/train/train_0232_cwe20.cpp",
+      "line": "38-42",
+      "code": "      for (int i = 0; i < num_slices; ++i) {\n        DequantizeSlice(ctx->eigen_device<Device>(), ctx,\n                        input_tensor.template chip<1>(i), min_ranges(i),\n                        max_ranges(i), output_tensor.template chip<1>(i));\n      }",
+      "bug_class": "Heap out-of-bounds read (unvalidated count vs separate tensor length)",
+      "cwe": "CWE-125",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0232_cwe20.cpp (Compute), with the range views established at lines 36-37 and the count at line 9",
+      "invariant": "Before the per-axis loop, the implementation must verify that input_min_tensor and input_max_tensor are 1-D and each contain exactly num_slices (= input.dim_size(axis_)) elements; otherwise reject with an InvalidArgument error.",
+      "failure_mode": "An attacker constructs a Dequantize node with axis set so num_slices (input.dim_size(axis_)) is large but supplies a small (e.g. single-element) input_min_tensor/input_max_tensor. The loop then evaluates min_ranges(i)/max_ranges(i) for i beyond the range tensor's element count, reading past its heap buffer. Result: leakage of adjacent heap memory into the dequantized output, or a crash (denial of service).",
+      "cve_analog": "CVE-2021-29582",
+      "what_to_confirm": "Confirm there is no OP_REQUIRES checking input_min_tensor.NumElements() == num_slices (and likewise for max) prior to line 36; the vulnerable variant omits it while the patched Dequantize adds these shape checks."
+    },
+    {
+      "title": "Out-of-bounds read of element 0 from possibly-empty min/max range tensors (scalar path)",
+      "anchor": "input_min_tensor.flat<float>()(0) / input_max_tensor.flat<float>()(0)",
+      "file": "corpus/train/train_0232_cwe20.cpp",
+      "line": "17-18",
+      "code": "      const float min_range = input_min_tensor.flat<float>()(0);\n      const float max_range = input_max_tensor.flat<float>()(0);",
+      "bug_class": "Out-of-bounds read (missing non-empty validation)",
+      "cwe": "CWE-125",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0232_cwe20.cpp (Compute, num_slices == 1 branch)",
+      "invariant": "The implementation must ensure input_min_tensor and input_max_tensor each have at least one element (ideally are scalars) before subscripting element 0.",
+      "failure_mode": "With num_slices == 1, a caller passes an empty tensor (0 elements) for input 1 or 2; flat<float>()(0) dereferences index 0 of a zero-length buffer, reading uninitialized/out-of-bounds heap memory into min_range/max_range and corrupting the dequantization, or crashing.",
+      "cve_analog": "",
+      "what_to_confirm": "Check whether the op registration or an earlier OP_REQUIRES enforces scalar/non-empty min and max tensors; if not, element-0 access is unguarded."
+    },
+    {
+      "title": "Unvalidated axis_ used as a dimension index",
+      "anchor": "num_slices = input.dim_size(axis_)",
+      "file": "corpus/train/train_0232_cwe20.cpp",
+      "line": "8-9",
+      "code": "    if (axis_ > -1) {\n      num_slices = input.dim_size(axis_);",
+      "bug_class": "Improper input validation / out-of-bounds dimension access",
+      "cwe": "CWE-20",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0232_cwe20.cpp (Compute)",
+      "invariant": "The implementation must validate -1 <= axis_ < input.dims() before using axis_ to index the shape (dim_size) or the reshape helpers.",
+      "failure_mode": "An attacker sets axis_ >= input.dims(); input.dim_size(axis_) indexes the shape's dimension array out of bounds, typically triggering a CHECK-fail and process abort (DoS), or in a checks-disabled build a garbage num_slices that propagates into the reshape and per-slice loop.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm whether axis_ is range-validated at op construction (OP_REQUIRES on axis_ < input.dims()); the vulnerable sample relies on it being in range."
+    },
+    {
+      "title": "Negative reshape dimension when axis_ == 0 (flat_inner_outer_dims(axis_ - 1))",
+      "anchor": "float_output.flat_inner_outer_dims<float, 3>(axis_ - 1)",
+      "file": "corpus/train/train_0232_cwe20.cpp",
+      "line": "34-35",
+      "code": "      auto output_tensor =\n          float_output.flat_inner_outer_dims<float, 3>(axis_ - 1);",
+      "bug_class": "Improper input validation (negative dimension index into reshape)",
+      "cwe": "CWE-20",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0232_cwe20.cpp (Compute, per-axis branch)",
+      "invariant": "In the per-axis path axis_ must be >= 1 (or the reshape must otherwise tolerate axis_ == 0) so that axis_ - 1 is a valid non-negative starting dimension for flat_inner_outer_dims.",
+      "failure_mode": "The per-axis branch runs whenever num_slices != 1 with axis_ >= 0. When axis_ == 0 (and input dim 0 != 1), axis_ - 1 == -1 is passed as the dimension index, producing an invalid reshape/CHECK-fail or a malformed output view that the subsequent chip<1>(i) writes then access incorrectly.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm whether axis_ == 0 is excluded or specially handled before reaching flat_inner_outer_dims(axis_ - 1)."
+    }
+  ],
+  "audit_checklist": [
+    "Verify an OP_REQUIRES enforces input_min_tensor and input_max_tensor are 1-D with exactly num_slices (= input.dim_size(axis_)) elements before the per-axis loop at lines 38-42.",
+    "Verify the scalar path (lines 17-18) checks input_min_tensor / input_max_tensor are non-empty (scalar) before reading element 0.",
+    "Verify axis_ is validated to satisfy -1 <= axis_ < input.dims() before dim_size(axis_) (line 9) and before the reshape loops.",
+    "Verify axis_ == 0 is handled so flat_inner_outer_dims<float,3>(axis_ - 1) never receives a negative dimension (line 35).",
+    "Confirm input_min_tensor / input_max_tensor dtype is actually float before flat<float>()/vec<float>() interpret their bytes.",
+    "Confirm output and float_output element counts always match so the need_cast_ copy loop (lines 47-48) stays in bounds under all shapes."
+  ]
+}

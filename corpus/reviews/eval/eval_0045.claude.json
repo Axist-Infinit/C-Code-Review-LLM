@@ -1,0 +1,237 @@
+{
+  "subsystem": "virtiofsd — the QEMU virtio-fs vhost-user file-system daemon. This is the program's main() entry point (the passthrough_ll.c 'lo' / 'lo_data' variant). Its job is to parse operator command-line options, build the inode/fd bookkeeping maps, open a FUSE low-level session, drop privileges and enter a sandbox, and then run virtio_loop() to serve FUSE requests coming from an untrusted guest over a vhost-user/virtio transport.",
+  "provenance": "Identified from QEMU virtiofsd naming and API surface: 'struct fuse_args', 'FUSE_ARGS_INIT', 'struct fuse_session', 'struct fuse_cmdline_opts', 'fuse_parse_cmdline', 'fuse_opt_parse', 'fuse_session_new', 'fuse_session_mount', 'fuse_lowlevel_help/version' are libfuse low-level API; 'struct lo_data', 'struct lo_map_elem', 'lo_map_init', 'lo_map_reserve', 'FUSE_ROOT_ID', 'SANDBOX_NAMESPACE', 'setup_capng', 'setup_sandbox', 'drop_supplementary_groups', 'qemu_init_exec_dir', 'qemu_version', 'print_capabilities', 'virtio_loop', openlog(\"virtiofsd\", ...) are all QEMU tools/virtiofsd (passthrough_ll.c) symbols. The sample banner 'primevul_c_train_2695_fixed' and file tag 'cwe273' point at Improper Check for Dropped Privileges (CWE-273).",
+  "trust_boundary": "Two boundaries. (1) argv/argc and the parsed options (opts, lo_opts) come from the host operator / management layer (libvirt, QEMU) and are semi-trusted configuration. (2) The real hostile party is the GUEST VM: once virtio_loop(se) runs, the guest drives FUSE operations across the vhost-user socket against the shared directory tree (lo.source). Therefore every privilege-reduction and sandbox step (drop_supplementary_groups, setup_capng, setup_sandbox, umask policy) MUST be fully and correctly in force BEFORE virtio_loop() begins serving the guest; a silently-failed drop leaves the daemon serving guest requests with more authority than intended. This main() itself does not touch guest wire bytes, but it establishes the privilege and confinement state that guards them.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/eval/eval_0045_cwe273.c",
+      "lines": "2-19",
+      "code": "int main(int argc, char *argv[])\n{\n    struct fuse_args args = FUSE_ARGS_INIT(argc, argv);\n    struct fuse_session *se;\n    struct fuse_cmdline_opts opts;\n    struct lo_data lo = {\n        .sandbox = SANDBOX_NAMESPACE,\n        .debug = 0,\n        .writeback = 0,\n        .posix_lock = 0,\n        .allow_direct_io = 0,\n        .proc_self_fd = -1,\n        .user_killpriv_v2 = -1,\n        .user_posix_acl = -1,\n    };\n    struct lo_map_elem *root_elem;\n    struct lo_map_elem *reserve_elem;\n    int ret = -1;",
+      "explanation": "main() wraps argv/argc into a 'struct fuse_args' via FUSE_ARGS_INIT so libfuse can consume and rewrite the argument vector. 'se' will hold the FUSE session, 'opts' the generic parsed cmdline options. 'struct lo_data lo' is the daemon-wide state object, initialized with security-relevant defaults: .sandbox = SANDBOX_NAMESPACE selects the mount/pid/net-namespace confinement mode; the tri-state feature flags .proc_self_fd, .user_killpriv_v2 and .user_posix_acl are set to -1 to mean 'auto/unset' so later logic can distinguish 'operator explicitly chose' from 'not chosen'. root_elem/reserve_elem are handles into the inode map filled in below. ret is preset to -1 so any early 'goto err_out1' returns a failure exit code.",
+      "file_note": ""
+    },
+    {
+      "file": "corpus/eval/eval_0045_cwe273.c",
+      "lines": "21-35",
+      "code": "/* Initialize time conversion information for localtime_r(). */\n    tzset();\n\n    /* Don't mask creation mode, kernel already did that */\n    umask(0);\n\n    qemu_init_exec_dir(argv[0]);\n\n    drop_supplementary_groups();\n\n    pthread_mutex_init(&lo.mutex, NULL);\n    lo.inodes = g_hash_table_new(lo_key_hash, lo_key_equal);\n    lo.root.fd = -1;\n    lo.root.fuse_ino = FUSE_ROOT_ID;\n    lo.cache = CACHE_AUTO;",
+      "explanation": "tzset() primes libc timezone data so later localtime_r() calls are thread-safe. umask(0) clears the process file-creation mask so that when the daemon creates files on behalf of guest requests the requested mode is applied verbatim (the comment asserts the FUSE kernel side already applied the caller's umask). qemu_init_exec_dir(argv[0]) records the binary's directory for later relative lookups. drop_supplementary_groups() is the first privilege-reduction step: it removes any supplementary group memberships the daemon inherited so guest-driven file access cannot be authorized via a stray group. Then the shared state is initialized: a mutex, a GHashTable of inodes keyed by (lo_key_hash/lo_key_equal), the root inode fd set to -1 (not yet opened), the root's FUSE inode number to the well-known FUSE_ROOT_ID, and the default cache policy to CACHE_AUTO.",
+      "file_note": ""
+    },
+    {
+      "file": "corpus/eval/eval_0045_cwe273.c",
+      "lines": "37-57",
+      "code": "/*\n     * Set up the ino map like this:\n     * [0] Reserved (will not be used)\n     * [1] Root inode\n     */\n    lo_map_init(&lo.ino_map);\n    reserve_elem = lo_map_reserve(&lo.ino_map, 0);\n    if (!reserve_elem) {\n        fuse_log(FUSE_LOG_ERR, \"failed to alloc reserve_elem.\\n\");\n        goto err_out1;\n    }\n    reserve_elem->in_use = false;\n    root_elem = lo_map_reserve(&lo.ino_map, lo.root.fuse_ino);\n    if (!root_elem) {\n        fuse_log(FUSE_LOG_ERR, \"failed to alloc root_elem.\\n\");\n        goto err_out1;\n    }\n    root_elem->inode = &lo.root;\n\n    lo_map_init(&lo.dirp_map);\n    lo_map_init(&lo.fd_map);",
+      "explanation": "The inode map (ino_map) is initialized and slot 0 is reserved and marked in_use=false so index 0 is never a valid handle (a sentinel to catch stale/zero handles from the guest). Slot 1 (FUSE_ROOT_ID) is reserved for the root inode and wired to &lo.root. Both lo_map_reserve() calls are correctly NULL-checked and branch to err_out1 on allocation failure, so allocation errors are handled. Two further maps are initialized: dirp_map (open directory handles) and fd_map (open file descriptors). These maps are the indirection layer that translates guest-supplied 64-bit handles into real kernel fds/pointers.",
+      "file_note": ""
+    },
+    {
+      "file": "corpus/eval/eval_0045_cwe273.c",
+      "lines": "59-66",
+      "code": "if (fuse_parse_cmdline(&args, &opts) != 0) {\n        goto err_out1;\n    }\n    fuse_set_log_func(log_func);\n    use_syslog = opts.syslog;\n    if (use_syslog) {\n        openlog(\"virtiofsd\", LOG_PID, LOG_DAEMON);\n    }",
+      "explanation": "fuse_parse_cmdline() parses the generic FUSE options (help/version/foreground/syslog/log_level/rlimit_nofile etc.) into opts; a non-zero result aborts. The daemon installs its own log callback (log_func) via fuse_set_log_func, records the global use_syslog flag from opts.syslog, and if syslog is requested opens the syslog channel tagged 'virtiofsd'. From here on log output can be routed to syslog.",
+      "file_note": ""
+    },
+    {
+      "file": "corpus/eval/eval_0045_cwe273.c",
+      "lines": "68-84",
+      "code": "if (opts.show_help) {\n        printf(\"usage: %s [options]\\n\\n\", argv[0]);\n        fuse_cmdline_help();\n        printf(\"    -o source=PATH             shared directory tree\\n\");\n        fuse_lowlevel_help();\n        ret = 0;\n        goto err_out1;\n    } else if (opts.show_version) {\n        qemu_version();\n        fuse_lowlevel_version();\n        ret = 0;\n        goto err_out1;\n    } else if (opts.print_capabilities) {\n        print_capabilities();\n        ret = 0;\n        goto err_out1;\n    }",
+      "explanation": "These three informational modes short-circuit startup. show_help prints usage plus the FUSE cmdline/low-level help; show_version prints the QEMU and FUSE low-level versions; print_capabilities emits the machine-readable capability set used by libvirt to negotiate features. Each sets ret = 0 (success) and jumps to err_out1, which only frees args and lo — no session, sandbox, or guest serving happens in these modes, which is correct.",
+      "file_note": ""
+    },
+    {
+      "file": "corpus/eval/eval_0045_cwe273.c",
+      "lines": "86-99",
+      "code": "if (fuse_opt_parse(&args, &lo, lo_opts, NULL) == -1) {\n        goto err_out1;\n    }\n\n    if (opts.log_level != 0) {\n        current_log_level = opts.log_level;\n    } else {\n        /* default log level is INFO */\n        current_log_level = FUSE_LOG_INFO;\n    }\n    lo.debug = opts.debug;\n    if (lo.debug) {\n        current_log_level = FUSE_LOG_DEBUG;\n    }",
+      "explanation": "fuse_opt_parse() applies the virtiofsd-specific option table (lo_opts) into the lo_data struct — this is where operator options like source=, cache=, xattrmap, sandbox mode, killpriv, posix_acl, timeout get parsed. A -1 result aborts. The log level is then resolved: explicit opts.log_level wins, otherwise INFO, and debug forces DEBUG. lo.debug is copied from opts.debug so the rest of the daemon can gate verbose behavior.",
+      "file_note": ""
+    },
+    {
+      "file": "corpus/eval/eval_0045_cwe273.c",
+      "lines": "100-120",
+      "code": "if (lo.source) {\n        struct stat stat;\n        int res;\n\n        res = lstat(lo.source, &stat);\n        if (res == -1) {\n            fuse_log(FUSE_LOG_ERR, \"failed to stat source (\\\"%s\\\"): %m\\n\",\n                     lo.source);\n            exit(1);\n        }\n        if (!S_ISDIR(stat.st_mode)) {\n            fuse_log(FUSE_LOG_ERR, \"source is not a directory\\n\");\n            exit(1);\n        }\n    } else {\n        lo.source = strdup(\"/\");\n        if (!lo.source) {\n            fuse_log(FUSE_LOG_ERR, \"failed to strdup source\\n\");\n            goto err_out1;\n        }\n    }",
+      "explanation": "The shared root path (lo.source) is validated. If provided, lstat() must succeed and the target must be a directory (S_ISDIR), else the daemon exits(1). If no source was given, it defaults to '/' via strdup, with a NULL-check on the allocation. This path becomes the root of the exported tree the guest can traverse. Note lstat (not stat) is used, so a symlink named as source is not followed at this check.",
+      "file_note": ""
+    },
+    {
+      "file": "corpus/eval/eval_0045_cwe273.c",
+      "lines": "122-150",
+      "code": "if (lo.xattrmap) {\n        lo.xattr = 1;\n        parse_xattrmap(&lo);\n    }\n\n    if (!lo.timeout_set) {\n        switch (lo.cache) {\n        case CACHE_NONE:\n            lo.timeout = 0.0;\n            break;\n\n        case CACHE_AUTO:\n            lo.timeout = 1.0;\n            break;\n\n        case CACHE_ALWAYS:\n            lo.timeout = 86400.0;\n            break;\n        }\n    } else if (lo.timeout < 0) {\n        fuse_log(FUSE_LOG_ERR, \"timeout is negative (%lf)\\n\", lo.timeout);\n        exit(1);\n    }\n\n    if (lo.user_posix_acl == 1 && !lo.xattr) {\n        fuse_log(FUSE_LOG_ERR, \"Can't enable posix ACLs. xattrs are disabled.\"\n                 \"\\n\");\n        exit(1);\n    }",
+      "explanation": "If an xattrmap rule string was supplied, xattr support is force-enabled and parse_xattrmap() compiles the mapping rules that rewrite extended-attribute names between guest and host. The attribute-cache timeout is then resolved: when not explicitly set it is derived from the cache mode (0s for none, 1s for auto, 86400s for always); when explicitly set, a negative value is rejected via exit(1). Finally a consistency gate: requesting POSIX ACLs while xattrs are disabled is rejected. These are configuration-validation steps that constrain later guest-facing behavior.",
+      "file_note": ""
+    },
+    {
+      "file": "corpus/eval/eval_0045_cwe273.c",
+      "lines": "152-165",
+      "code": "lo.use_statx = true;\n\n    se = fuse_session_new(&args, &lo_oper, sizeof(lo_oper), &lo);\n    if (se == NULL) {\n        goto err_out1;\n    }\n\n    if (fuse_set_signal_handlers(se) != 0) {\n        goto err_out2;\n    }\n\n    if (fuse_session_mount(se) != 0) {\n        goto err_out3;\n    }",
+      "explanation": "use_statx is enabled so the daemon uses statx() for richer file metadata. fuse_session_new() creates the low-level FUSE session, binding the operation table lo_oper (the callbacks the guest will invoke) with sizeof(lo_oper) for ABI versioning, and stashes &lo as user data; failure goes to err_out1. fuse_set_signal_handlers() installs SIGINT/SIGTERM/SIGHUP handling for clean shutdown; failure jumps to err_out2 which will destroy the session. fuse_session_mount() connects the vhost-user/virtio transport so requests can flow; failure jumps to err_out3 which also removes the signal handlers. The err label ladder ensures partial initialization is unwound in reverse order.",
+      "file_note": ""
+    },
+    {
+      "file": "corpus/eval/eval_0045_cwe273.c",
+      "lines": "167-178",
+      "code": "fuse_daemonize(opts.foreground);\n\n    setup_nofile_rlimit(opts.rlimit_nofile);\n\n    /* Must be before sandbox since it wants /proc */\n    setup_capng();\n\n    setup_sandbox(&lo, se, opts.syslog);\n\n    setup_root(&lo, &lo.root);\n    /* Block until ctrl+c or fusermount -u */\n    ret = virtio_loop(se);",
+      "explanation": "This is the privilege-and-confinement finalization block, executed just before serving the guest. fuse_daemonize(opts.foreground) backgrounds the process unless foreground was requested. setup_nofile_rlimit() raises/sets the open-file rlimit from opts.rlimit_nofile because a passthrough fs needs many fds. setup_capng() drops Linux capabilities down to the minimal set virtiofsd needs; the comment notes it must run before the sandbox because it reads /proc. setup_sandbox() then enters the confinement selected by lo.sandbox (namespace or chroot), pivoting the view of the filesystem to the shared tree and dropping the rest. setup_root() opens the root inode fd inside the sandbox. Only then does virtio_loop(se) run, blocking and dispatching guest FUSE requests until unmount/signal. Everything guarding the guest must be fully established before this line.",
+      "file_note": ""
+    },
+    {
+      "file": "corpus/eval/eval_0045_cwe273.c",
+      "lines": "180-192",
+      "code": "fuse_session_unmount(se);\n    cleanup_capng();\nerr_out3:\n    fuse_remove_signal_handlers(se);\nerr_out2:\n    fuse_session_destroy(se);\nerr_out1:\n    fuse_opt_free_args(&args);\n\n    fuse_lo_data_cleanup(&lo);\n\n    return ret ? 1 : 0;\n}",
+      "explanation": "After virtio_loop returns, the normal path unmounts the session and undoes the capng state, then falls through the err_out ladder: err_out3 removes signal handlers, err_out2 destroys the session, err_out1 frees the parsed args. fuse_lo_data_cleanup(&lo) releases the maps, inode hash table, source string, and mutex. The exit code is normalized: any non-zero ret (including the initial -1) becomes 1, success becomes 0. The goto ladder means each early failure runs exactly the cleanup appropriate to how far initialization progressed.",
+      "file_note": ""
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/eval/eval_0045_cwe273.c",
+      "lines": "29",
+      "code": "drop_supplementary_groups();",
+      "explanation": "This is the sample's central contract (CWE-273, Improper Check for Dropped Privileges). drop_supplementary_groups() is called for its side effect only — its return status is never inspected here. The underlying operation (setgroups(0, NULL) / getgroups) can fail (e.g. EPERM if a required capability was already dropped, or an unexpected errno), and if the failure is not turned into a hard abort, main() continues past line 29 and eventually reaches virtio_loop() at line 178 still holding inherited supplementary group memberships. Because virtiofsd authorizes guest-driven file access using the daemon's own credentials, a lingering supplementary group can grant the guest read/write to host files owned by that group that it should not reach. The invariant the implementation MUST uphold: drop_supplementary_groups() either succeeds completely or terminates the process — it must never silently return on failure. This is latent: the abort could live inside the helper (file not provided), so the exact check must be confirmed there.",
+      "file_note": ""
+    },
+    {
+      "file": "corpus/eval/eval_0045_cwe273.c",
+      "lines": "172-174",
+      "code": "setup_capng();\n\n    setup_sandbox(&lo, se, opts.syslog);",
+      "explanation": "Same CWE-273 pattern for the two remaining privilege/confinement steps. setup_capng() (capability drop) and setup_sandbox() (namespace/chroot confinement) are both invoked with their return values discarded. If setup_capng() fails to drop a capability, or setup_sandbox() fails to enter the mount/pid/net namespace or to pivot_root/chroot into lo.source, and the helper returns instead of aborting, the daemon proceeds to virtio_loop() at line 178 and serves the untrusted guest with FULL host capabilities and/or an un-confined view of the host filesystem — a direct host-compromise primitive. The invariant: every one of these must be fail-closed (abort on any error) and must complete BEFORE virtio_loop. The ordering here is correct (capng, then sandbox, then serve), but the success of each must be verified in the implementation, which is not shown.",
+      "file_note": ""
+    },
+    {
+      "file": "corpus/eval/eval_0045_cwe273.c",
+      "lines": "25",
+      "code": "umask(0);",
+      "explanation": "Setting the process umask to 0 removes all default mode masking, so files/directories the daemon creates on behalf of the guest are created with exactly the mode bits the request carries — including group/other write bits and, critically, setuid/setgid bits. On a passthrough export this is intentional (the comment says the kernel already applied the caller umask), but it means the guest's requested mode is trusted verbatim by the host side. If the compensating controls (killpriv / setuid-setgid stripping / the sandbox uid mapping) are not fully in force, a guest could create a host-visible setuid-root or setgid file in the shared tree, i.e. a privilege-escalation staging point (CWE-732, incorrect permission assignment). The invariant: killpriv/setgid-clearing on the create path must neutralize dangerous mode bits since umask no longer does.",
+      "file_note": ""
+    },
+    {
+      "file": "corpus/eval/eval_0045_cwe273.c",
+      "lines": "167-174",
+      "code": "fuse_daemonize(opts.foreground);\n\n    setup_nofile_rlimit(opts.rlimit_nofile);\n\n    /* Must be before sandbox since it wants /proc */\n    setup_capng();\n\n    setup_sandbox(&lo, se, opts.syslog);",
+      "explanation": "Ordering/lifetime hazard around daemonization. fuse_daemonize() may fork; the confinement (setup_capng/setup_sandbox) runs AFTER it, so the parent that forks must exit and only the confined child must reach virtio_loop — otherwise a less-privileged or differently-namespaced process could linger. Additionally the in-code comment couples an ordering constraint (capng before sandbox because capng reads /proc); if a future change reorders these, setup_capng() would run after /proc is namespaced away and could fail or mis-drop capabilities. The invariant: the process that ultimately calls virtio_loop is the one that has passed through BOTH setup_capng and setup_sandbox successfully, and the capng-before-sandbox order is preserved. Confirm in fuse_daemonize/setup_sandbox (not provided).",
+      "file_note": ""
+    },
+    {
+      "file": "corpus/eval/eval_0045_cwe273.c",
+      "lines": "114-119",
+      "code": "} else {\n        lo.source = strdup(\"/\");\n        if (!lo.source) {\n            fuse_log(FUSE_LOG_ERR, \"failed to strdup source\\n\");\n            goto err_out1;\n        }\n    }",
+      "explanation": "When no source= is supplied, the export defaults to the host root '/'. If the daemon is ever started without an explicit source (a misconfiguration, or a management-layer bug), the entire host filesystem becomes the tree the guest can traverse, bounded only by whatever the sandbox subsequently restricts. This is a dangerous default (CWE-668, exposure of resource): the safety of the whole daemon then rests entirely on setup_sandbox() correctly confining '/'. The invariant: the sandbox must always narrow the guest-visible root regardless of the source default, and operators should be required to pass an explicit source. Worth flagging even though it is intended behavior, because it maximizes blast radius if any downstream confinement check is weak.",
+      "file_note": ""
+    },
+    {
+      "file": "corpus/eval/eval_0045_cwe273.c",
+      "lines": "122-125",
+      "code": "if (lo.xattrmap) {\n        lo.xattr = 1;\n        parse_xattrmap(&lo);\n    }",
+      "explanation": "parse_xattrmap(&lo) parses an operator-supplied xattr mapping rule string and its return value is not checked. If a malformed rule string yields a partially-built or empty mapping and the helper returns instead of aborting, the daemon could run with an xattr policy that differs from what the operator intended — e.g. failing to prefix/hide 'trusted.'/'security.' namespace attributes, which could let a guest read or set security-sensitive xattrs on host files. The invariant: parse_xattrmap must fail-closed on any malformed rule and must fully install the mapping before any guest xattr operation is served. Confirm the error handling inside parse_xattrmap (not provided).",
+      "file_note": ""
+    }
+  ],
+  "summary": "This is virtiofsd's main() startup path. It contains no direct guest-wire parsing, but it establishes every privilege-reduction and sandbox control that guards the untrusted guest served later by virtio_loop(). The dominant risk is CWE-273: drop_supplementary_groups(), setup_capng(), and setup_sandbox() are all invoked with their return values discarded, so any of these must be verified to be fail-closed (abort on error) — a silent failure would leave the daemon serving the guest with excess group membership, capabilities, or an un-confined filesystem view. Secondary concerns are umask(0) trusting guest-requested create modes (setuid/setgid) and the '/' default export widening blast radius.",
+  "reviewed_anchors": [
+    {"anchor": "main(int argc, char *argv[]) signature (line 2)", "disposition": "dismissed", "reason": "Standard entry point; argv is operator/management-supplied config, not the primary hostile channel (the guest is)."},
+    {"anchor": "FUSE_ARGS_INIT(argc, argv) (line 4)", "disposition": "dismissed", "reason": "libfuse arg-vector wrapper macro; no length/buffer contract of its own here."},
+    {"anchor": "struct lo_data lo initializer, .sandbox = SANDBOX_NAMESPACE (line 8)", "disposition": "finding", "reason": "Selects confinement mode consumed by setup_sandbox at line 174; safety of guest serving depends on it — covered under the setup_sandbox privilege-drop finding."},
+    {"anchor": ".proc_self_fd/.user_killpriv_v2/.user_posix_acl = -1 tri-state (lines 13-15)", "disposition": "dismissed", "reason": "'unset' sentinels correctly distinguishing default from explicit; validated later (posix_acl gate line 146). No overflow/priv contract broken here."},
+    {"anchor": "tzset() (line 22)", "disposition": "dismissed", "reason": "Timezone init for thread-safe localtime_r; no untrusted input, no security contract."},
+    {"anchor": "umask(0) (line 25)", "disposition": "finding", "reason": "Disables mode masking so guest-requested create modes (incl. setuid/setgid) are applied verbatim — CWE-732 unless killpriv/setgid stripping compensates."},
+    {"anchor": "qemu_init_exec_dir(argv[0]) (line 27)", "disposition": "dismissed", "reason": "Records executable directory; no attacker-controlled parsing of security consequence in this frame."},
+    {"anchor": "drop_supplementary_groups() (line 29)", "disposition": "finding", "reason": "Privilege-drop with return value discarded — central CWE-273 contract; must be fail-closed before virtio_loop."},
+    {"anchor": "pthread_mutex_init(&lo.mutex, NULL) (line 31)", "disposition": "dismissed", "reason": "Local mutex init; not attacker-influenced."},
+    {"anchor": "lo.inodes = g_hash_table_new(lo_key_hash, lo_key_equal) (line 32)", "disposition": "dismissed", "reason": "Inode hash-table setup; return not checked but glib aborts on OOM by default and this is not a privilege/parse contract."},
+    {"anchor": "lo.root.fuse_ino = FUSE_ROOT_ID (line 34)", "disposition": "dismissed", "reason": "Well-known root inode constant; correctly reserved in the ino_map below."},
+    {"anchor": "lo_map_init/lo_map_reserve ino_map slots 0 and root (lines 42-54)", "disposition": "dismissed", "reason": "Both reserve calls are NULL-checked with goto err_out1; slot 0 reserved as sentinel — handled correctly."},
+    {"anchor": "lo_map_init(&lo.dirp_map)/lo_map_init(&lo.fd_map) (lines 56-57)", "disposition": "dismissed", "reason": "Handle-map init; the guest-handle validation risk lives in the lookup callbacks (lo_oper), not shown here."},
+    {"anchor": "fuse_parse_cmdline(&args, &opts) (line 59)", "disposition": "dismissed", "reason": "Return checked (!= 0 aborts); parses semi-trusted operator options."},
+    {"anchor": "use_syslog = opts.syslog; openlog(\"virtiofsd\", ...) (lines 63-66)", "disposition": "dismissed", "reason": "Logging setup from operator flag; no untrusted format string (fixed tag)."},
+    {"anchor": "show_help/show_version/print_capabilities branches (lines 68-84)", "disposition": "dismissed", "reason": "Informational modes; each sets ret=0 and goto err_out1 without starting a session or serving the guest — safe."},
+    {"anchor": "fuse_opt_parse(&args, &lo, lo_opts, NULL) (line 86)", "disposition": "dismissed", "reason": "Return checked (== -1 aborts); populates lo from operator options."},
+    {"anchor": "log level / lo.debug resolution (lines 90-99)", "disposition": "dismissed", "reason": "Sets global verbosity; no memory or privilege contract."},
+    {"anchor": "lo.source lstat + S_ISDIR validation (lines 100-113)", "disposition": "dismissed", "reason": "lstat failure and non-directory both exit(1); source path is validated before use."},
+    {"anchor": "lo.source = strdup(\"/\") default (lines 114-120)", "disposition": "finding", "reason": "Defaults the export to host root, maximizing guest blast radius if confinement is weak — CWE-668."},
+    {"anchor": "parse_xattrmap(&lo) (lines 122-125)", "disposition": "finding", "reason": "Return value discarded; a malformed xattr map that fails open could weaken security-namespace xattr filtering."},
+    {"anchor": "timeout resolution / negative-timeout exit (lines 127-144)", "disposition": "dismissed", "reason": "Negative timeout rejected via exit(1); cache-derived defaults are bounded constants."},
+    {"anchor": "user_posix_acl==1 && !xattr gate (lines 146-150)", "disposition": "dismissed", "reason": "Consistency check that aborts an impossible config; correct fail-closed behavior."},
+    {"anchor": "lo.use_statx = true (line 152)", "disposition": "dismissed", "reason": "Enables statx metadata path; no untrusted-input contract here."},
+    {"anchor": "fuse_session_new(&args, &lo_oper, sizeof(lo_oper), &lo) (line 154)", "disposition": "dismissed", "reason": "NULL-checked; binds the guest-facing op table but the callbacks themselves are not in this file."},
+    {"anchor": "fuse_set_signal_handlers(se) (line 159)", "disposition": "dismissed", "reason": "Return checked with goto err_out2; clean-shutdown wiring only."},
+    {"anchor": "fuse_session_mount(se) (line 163)", "disposition": "dismissed", "reason": "Return checked with goto err_out3; connects transport."},
+    {"anchor": "fuse_daemonize(opts.foreground) (line 167)", "disposition": "finding", "reason": "Fork-then-confine ordering: the process reaching virtio_loop must be the fully-confined one — covered in the ordering finding."},
+    {"anchor": "setup_nofile_rlimit(opts.rlimit_nofile) (line 169)", "disposition": "dismissed", "reason": "Sets fd rlimit from operator value; return not checked but a failed rlimit is availability-only, not a privilege bypass."},
+    {"anchor": "setup_capng() (line 172)", "disposition": "finding", "reason": "Capability drop with return value discarded — CWE-273; must abort on failure before serving guest."},
+    {"anchor": "setup_sandbox(&lo, se, opts.syslog) (line 174)", "disposition": "finding", "reason": "Namespace/chroot confinement with return value discarded — CWE-273; a silent failure leaves the host filesystem exposed to the guest."},
+    {"anchor": "setup_root(&lo, &lo.root) (line 176)", "disposition": "dismissed", "reason": "Opens root fd inside the sandbox; return not checked but its safety depends on the sandbox already being in force (covered by setup_sandbox finding)."},
+    {"anchor": "ret = virtio_loop(se) (line 178)", "disposition": "dismissed", "reason": "The guest-serving loop; it is the point ALL prior privilege drops must precede — the contract, not a separate defect, and its body is not shown."},
+    {"anchor": "err_out ladder + fuse_lo_data_cleanup + return ret?1:0 (lines 180-191)", "disposition": "dismissed", "reason": "Cleanup unwinds in correct reverse order matched to init progress; exit code normalized. No double-free or leak visible."}
+  ],
+  "findings": [
+    {
+      "title": "Privilege/confinement drops invoked without checking success (improper check for dropped privileges)",
+      "anchor": "drop_supplementary_groups(); setup_capng(); setup_sandbox(&lo, se, opts.syslog);",
+      "file": "corpus/eval/eval_0045_cwe273.c",
+      "line": "29,172,174",
+      "code": "drop_supplementary_groups();\n...\n    setup_capng();\n\n    setup_sandbox(&lo, se, opts.syslog);",
+      "bug_class": "Improper check for dropped privileges (unverified privilege reduction before serving untrusted input)",
+      "cwe": "CWE-273",
+      "severity": "high",
+      "where_it_lives": "This file (main, lines 29/172/174) for the call sites; the fail-closed guarantee lives in the helpers drop_supplementary_groups()/setup_capng()/setup_sandbox() — implementation (file not provided).",
+      "invariant": "Each privilege-reduction and confinement step must be fail-closed: on ANY error it must terminate the process, and all three must fully complete BEFORE virtio_loop() at line 178 begins serving the guest. main() must not proceed past a failed drop.",
+      "failure_mode": "If drop_supplementary_groups() (setgroups), setup_capng() (capability drop), or setup_sandbox() (namespace/pivot_root/chroot) fails and the helper returns instead of aborting, execution reaches virtio_loop() with excess supplementary groups, full host capabilities, or an un-confined view of the host filesystem. The untrusted guest is then served by an over-privileged daemon, enabling host file access beyond the shared tree or full host compromise.",
+      "cve_analog": "",
+      "what_to_confirm": "Open drop_supplementary_groups(), setup_capng(), and setup_sandbox() and confirm each exits/aborts (not just logs and returns) on every error path, including partial failures (e.g. setgroups EPERM, capng_apply failure, unshare/mount/pivot_root failure), so no code path continues to virtio_loop() with residual privilege."
+    },
+    {
+      "title": "umask(0) trusts guest-requested create modes, including setuid/setgid bits",
+      "anchor": "umask(0);",
+      "file": "corpus/eval/eval_0045_cwe273.c",
+      "line": "25",
+      "code": "umask(0);",
+      "bug_class": "Incorrect permission assignment on guest-created files (setuid/setgid preservation)",
+      "cwe": "CWE-732",
+      "severity": "medium",
+      "where_it_lives": "This file (line 25) for the policy; the compensating stripping logic lives on the create/setattr path in the lo_oper callbacks — implementation (file not provided).",
+      "invariant": "With umask disabled, the create/mknod/setattr paths must themselves neutralize dangerous mode bits (setuid/setgid) from guest requests unless the operator explicitly and safely permits them (killpriv semantics), so a guest cannot plant a host-visible setuid/setgid file.",
+      "failure_mode": "umask(0) means the mode the guest supplies is applied verbatim on the host. If setuid/setgid stripping (killpriv) is not enforced on the create path, a guest can create a setuid-root or setgid file inside the shared directory that is visible/executable on the host, providing a privilege-escalation staging artifact.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify the file-creation and chmod/setattr callbacks in lo_oper strip S_ISUID/S_ISGID (or otherwise enforce killpriv) so that clearing the umask here cannot let a guest persist dangerous mode bits on host-visible files."
+    },
+    {
+      "title": "Default export is the host root '/' when no source is given",
+      "anchor": "lo.source = strdup(\"/\");",
+      "file": "corpus/eval/eval_0045_cwe273.c",
+      "line": "114-119",
+      "code": "} else {\n        lo.source = strdup(\"/\");\n        if (!lo.source) {\n            fuse_log(FUSE_LOG_ERR, \"failed to strdup source\\n\");\n            goto err_out1;\n        }\n    }",
+      "bug_class": "Exposure of resource to wrong sphere via unsafe default (whole-filesystem export)",
+      "cwe": "CWE-668",
+      "severity": "low",
+      "where_it_lives": "This file (lines 114-119); the mitigating confinement lives in setup_sandbox() — implementation (file not provided).",
+      "invariant": "The guest-visible root must always be narrowed by setup_sandbox() regardless of the source default; ideally an explicit source should be required rather than silently defaulting to '/'.",
+      "failure_mode": "If virtiofsd is started without an explicit source= (operator or management-layer error), the exported tree is the entire host filesystem. Any weakness or misconfiguration in the subsequent sandbox then exposes the whole host to the guest, maximizing blast radius. Even with a working sandbox, defaulting to '/' is a fragile choice that removes a defense-in-depth boundary.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm setup_sandbox() unconditionally confines the guest view (pivot_root/chroot into lo.source) even when lo.source is '/', and consider whether the daemon should refuse to start without an explicit source."
+    },
+    {
+      "title": "parse_xattrmap() return value discarded — xattr policy may fail open",
+      "anchor": "parse_xattrmap(&lo);",
+      "file": "corpus/eval/eval_0045_cwe273.c",
+      "line": "122-125",
+      "code": "if (lo.xattrmap) {\n        lo.xattr = 1;\n        parse_xattrmap(&lo);\n    }",
+      "bug_class": "Improper input validation / security-policy load without status check",
+      "cwe": "CWE-20",
+      "severity": "low",
+      "where_it_lives": "This file (lines 122-125) for the call site; the parsing and fail-closed behavior live in parse_xattrmap() — implementation (file not provided).",
+      "invariant": "parse_xattrmap() must fail-closed on any malformed rule (abort startup) and must fully install a well-formed mapping before any guest xattr operation is served; a partial/empty map must never be silently accepted.",
+      "failure_mode": "The return value is not inspected. If a malformed xattrmap rule string leaves an incomplete or empty mapping and the helper returns instead of aborting, the daemon serves guest xattr operations with a policy weaker than intended — potentially exposing or allowing writes to 'security.'/'trusted.' namespace attributes on host files.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm parse_xattrmap() aborts the process (does not merely log) on any rule-syntax error, and that xattr operations are gated on a fully-installed mapping."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm drop_supplementary_groups(), setup_capng(), and setup_sandbox() each abort the process on ANY failure (fail-closed) rather than returning, so line 178 virtio_loop() is never reached with residual privilege (primary CWE-273 concern).",
+    "Confirm the capng-before-sandbox ordering (comment at line 171) is preserved and that setup_capng() truly reduces to the minimal capability set virtiofsd needs.",
+    "Confirm fuse_daemonize() (line 167) fork behavior leaves only the fully-confined child running virtio_loop, and the parent exits.",
+    "Verify the create/mknod/chmod/setattr callbacks strip S_ISUID/S_ISGID (killpriv) so umask(0) at line 25 cannot let a guest persist setuid/setgid files on host-visible paths.",
+    "Confirm setup_sandbox() unconditionally confines the guest to lo.source even when it defaults to '/' (lines 114-119).",
+    "Confirm parse_xattrmap() (line 124) fails closed on malformed rules and correctly filters security/trusted xattr namespaces.",
+    "Confirm setup_root() (line 176) opens the root fd only inside the established sandbox and validates the result.",
+    "Confirm the goto err_out ladder (lines 182-189) matches each early-exit point to exactly the resources initialized so far, with no leak or double-free."
+  ]
+}

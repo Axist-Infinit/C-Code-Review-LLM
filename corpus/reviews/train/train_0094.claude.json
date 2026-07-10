@@ -1,0 +1,216 @@
+{
+  "subsystem": "Memory-region split helper for the Unicorn Engine CPU emulator (a QEMU-derived framework). `split_region()` carves an existing guest MemoryRegion `mr` around the caller-supplied range [address, address+size): it locates the backing RAMBlock, snapshots the region's contents, unmaps the whole region, then re-maps up to three sub-regions (left / middle / right) and restores their bytes from the snapshot. It is invoked on the memory-map/unmap/protect path so an emulated program's memory operations can partially overlap an existing mapping.",
+  "provenance": "Identified from Unicorn/QEMU-specific types and helpers: `struct uc_struct *uc`, `MemoryRegion *mr` with `->addr`/`->end`/`->perms`/`->size`, `RAMBlock` with `->offset`/`->used_length`/`->host`/`->flags`, `uc->ram_list.blocks`, the `QLIST_FOREACH(... , next)` macro, `int128_get64(mr->size)`, and the `uc_mem_map`/`uc_mem_unmap`/`uc_mem_map_ptr`/`uc_mem_write` API returning `UC_ERR_OK`. The `RAM_PREALLOC` comment and `RAMBlock`/`ram_list` naming are QEMU lineage carried into Unicorn. The leading comment `/* sample: primevul_c_train_2042_vuln */` marks it as a PrimeVul C sample; no SPDX or copyright header is present.",
+  "trust_boundary": "`address` and `size` are the caller-driven range of a map/unmap/protect operation; in Unicorn these can be reached from the embedding harness or from hooks/instrumentation invoked while emulating untrusted guest code, so their values (including boundary/overflow values) are attacker-influenced. `mr->addr`, `mr->end`, `mr->size` describe an existing mapping. The `RAMBlock` list (`block->offset`, `block->used_length`, `block->host`, `block->flags`) is internal allocator state that MUST correctly correspond to `mr`; the loop at lines 30-36 is the join that decides which host buffer backs the region, so a wrong match there turns internal state into an out-of-bounds primitive. The `backup` snapshot pointer is derived from that match and is then used as the source of every restore write.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0094_cwe697.c",
+      "lines": "1-10",
+      "code": "/* sample: primevul_c_train_2042_vuln */\nstatic bool split_region(struct uc_struct *uc, MemoryRegion *mr,\n                         uint64_t address, size_t size, bool do_delete)\n{\n    uint8_t *backup;\n    uint32_t perms;\n    uint64_t begin, end, chunk_end;\n    size_t l_size, m_size, r_size;\n    RAMBlock *block = NULL;\n    bool prealloc = false;",
+      "explanation": "`split_region` takes the emulator context `uc`, the target region `mr`, a 64-bit guest `address`, a `size_t size`, and a `do_delete` flag that selects whether the overlapping middle sub-region is dropped rather than re-created. Locals: `backup` is the byte pointer that will hold (or alias) the region's saved contents; `perms` snapshots the region permissions; `begin`/`end`/`chunk_end` hold guest addresses as `uint64_t`; `l_size`/`m_size`/`r_size` are the computed sizes of the left, middle, and right sub-regions as `size_t`; `block` is the RAMBlock backing the region (initialised NULL); `prealloc` records whether the block is pre-allocated (host memory owned elsewhere and must not be freed)."
+    },
+    {
+      "file": "corpus/train/train_0094_cwe697.c",
+      "lines": "12-18",
+      "code": "    chunk_end = address + size;\n\n    // if this region belongs to area [address, address+size],\n    // then there is no work to do.\n    if (address <= mr->addr && chunk_end >= mr->end) {\n        return true;\n    }",
+      "explanation": "`chunk_end` is computed as the exclusive end of the caller's range by adding `size` to `address` in 64-bit arithmetic. The first guard is a full-containment check: if the region `[mr->addr, mr->end)` lies entirely inside `[address, chunk_end)`, the whole region is covered by the request and there is nothing to split, so the function succeeds early. This comparison is the primary consumer of `chunk_end`, so the correctness of the `address + size` computation directly gates the split logic."
+    },
+    {
+      "file": "corpus/train/train_0094_cwe697.c",
+      "lines": "20-28",
+      "code": "    if (size == 0) {\n        // trivial case\n        return true;\n    }\n\n    if (address >= mr->end || chunk_end <= mr->addr) {\n        // impossible case\n        return false;\n    }",
+      "explanation": "A zero-length request is treated as a no-op success. The second guard rejects a request that cannot overlap the region: if the request starts at or after the region's end, or ends at or before the region's start, there is no intersection and the function returns false. After these two guards, the intended invariant is that `[address, chunk_end)` and `[mr->addr, mr->end)` genuinely overlap and `size > 0`, which the later size arithmetic relies on to stay non-negative."
+    },
+    {
+      "file": "corpus/train/train_0094_cwe697.c",
+      "lines": "30-40",
+      "code": "    QLIST_FOREACH(block, &uc->ram_list.blocks, next)\n    {\n        if (block->offset <= mr->addr &&\n            block->used_length >= (mr->end - mr->addr)) {\n            break;\n        }\n    }\n\n    if (block == NULL) {\n        return false;\n    }",
+      "explanation": "The loop walks the emulator's RAMBlock list to find the block that backs `mr`. The match test requires the block's `offset` to be at or below the region start AND the block's `used_length` to be at least the region's byte length `mr->end - mr->addr`. On the first block that satisfies both it breaks with `block` pointing at that block; if the loop exhausts the list `block` is NULL and the function fails. This block, and specifically its `host` pointer and `offset`, is what the rest of the routine treats as authoritative for the region's storage."
+    },
+    {
+      "file": "corpus/train/train_0094_cwe697.c",
+      "lines": "42-53",
+      "code": "    // RAM_PREALLOC is not defined outside exec.c and I didn't feel like\n    // moving it\n    prealloc = !!(block->flags & 1);\n\n    if (block->flags & 1) {\n        backup = block->host;\n    } else {\n        backup = copy_region(uc, mr);\n        if (backup == NULL) {\n            return false;\n        }\n    }",
+      "explanation": "`prealloc` is derived by masking `block->flags & 1`, an open-coded stand-in for the `RAM_PREALLOC` flag (the comment admits the real macro is not in scope). If the block is pre-allocated, `backup` is set to alias the live host buffer `block->host` directly (no copy, and it must not be freed later). Otherwise `copy_region(uc, mr)` allocates and fills a fresh snapshot of the region's bytes, and a NULL return aborts. From here `backup` is treated as the base of a buffer whose byte [0] corresponds to the region's first byte (`mr->addr`)."
+    },
+    {
+      "file": "corpus/train/train_0094_cwe697.c",
+      "lines": "55-65",
+      "code": "    // save the essential information required for the split before mr gets\n    // deleted\n    perms = mr->perms;\n    begin = mr->addr;\n    end = mr->end;\n\n    // unmap this region first, then do split it later\n    if (uc_mem_unmap(uc, mr->addr, (size_t)int128_get64(mr->size)) !=\n        UC_ERR_OK) {\n        goto error;\n    }",
+      "explanation": "Because unmapping will destroy `mr`, its permissions and bounds are snapshotted into `perms`, `begin`, and `end` first. `uc_mem_unmap` then tears down the entire region, using `int128_get64(mr->size)` truncated to `size_t` for the length. After this call the region no longer exists and `mr` is a dangling reference that must not be read again; the code correctly reads only the saved `begin`/`end`/`perms` afterward. On unmap failure it jumps to the error epilogue."
+    },
+    {
+      "file": "corpus/train/train_0094_cwe697.c",
+      "lines": "74-85",
+      "code": "    // adjust some things\n    if (address < begin) {\n        address = begin;\n    }\n    if (chunk_end > end) {\n        chunk_end = end;\n    }\n\n    // compute sub region sizes\n    l_size = (size_t)(address - begin);\n    r_size = (size_t)(end - chunk_end);\n    m_size = (size_t)(chunk_end - address);",
+      "explanation": "The request range is clamped to the region: `address` is raised to `begin` if it started earlier, and `chunk_end` is lowered to `end` if it ended later, so `[address, chunk_end)` becomes the intersection. The three sub-region sizes are then unsigned differences: `l_size` is the left slice `[begin, address)`, `r_size` is the right slice `[chunk_end, end)`, and `m_size` is the overlapping middle `[address, chunk_end)`. By construction `l_size + m_size + r_size == end - begin`, i.e. exactly the region length, which is the assumed size of the `backup` buffer and the basis for the restore offsets `backup`, `backup + l_size`, `backup + l_size + m_size`."
+    },
+    {
+      "file": "corpus/train/train_0094_cwe697.c",
+      "lines": "91-104",
+      "code": "    if (l_size > 0) {\n        if (!prealloc) {\n            if (uc_mem_map(uc, begin, l_size, perms) != UC_ERR_OK) {\n                goto error;\n            }\n            if (uc_mem_write(uc, begin, backup, l_size) != UC_ERR_OK) {\n                goto error;\n            }\n        } else {\n            if (uc_mem_map_ptr(uc, begin, l_size, perms, backup) != UC_ERR_OK) {\n                goto error;\n            }\n        }\n    }",
+      "explanation": "If a non-empty left slice exists, it is re-created at `begin` with the saved permissions. In the non-prealloc case a fresh mapping is created and the first `l_size` bytes of the snapshot (`backup`) are written into it. In the prealloc case `uc_mem_map_ptr` maps the existing host buffer `backup` directly at `begin`, aliasing it in place. Any failure jumps to the error epilogue, leaving the original region already unmapped (unrecoverable per the code's own comment)."
+    },
+    {
+      "file": "corpus/train/train_0094_cwe697.c",
+      "lines": "106-121",
+      "code": "    if (m_size > 0 && !do_delete) {\n        if (!prealloc) {\n            if (uc_mem_map(uc, address, m_size, perms) != UC_ERR_OK) {\n                goto error;\n            }\n            if (uc_mem_write(uc, address, backup + l_size, m_size) !=\n                UC_ERR_OK) {\n                goto error;\n            }\n        } else {\n            if (uc_mem_map_ptr(uc, address, m_size, perms, backup + l_size) !=\n                UC_ERR_OK) {\n                goto error;\n            }\n        }\n    }",
+      "explanation": "The middle slice is re-created only when `do_delete` is false (when deleting, the overlapping middle is intentionally dropped). It is mapped at `address` with size `m_size`, and its bytes are restored from `backup + l_size` — i.e. skipping the left slice's bytes in the snapshot. The prealloc branch aliases `backup + l_size` directly via `uc_mem_map_ptr`. This is the first read that indexes into the snapshot with a computed offset (`l_size`), so it depends entirely on `l_size` and the buffer size being consistent."
+    },
+    {
+      "file": "corpus/train/train_0094_cwe697.c",
+      "lines": "123-138",
+      "code": "    if (r_size > 0) {\n        if (!prealloc) {\n            if (uc_mem_map(uc, chunk_end, r_size, perms) != UC_ERR_OK) {\n                goto error;\n            }\n            if (uc_mem_write(uc, chunk_end, backup + l_size + m_size, r_size) !=\n                UC_ERR_OK) {\n                goto error;\n            }\n        } else {\n            if (uc_mem_map_ptr(uc, chunk_end, r_size, perms,\n                               backup + l_size + m_size) != UC_ERR_OK) {\n                goto error;\n            }\n        }\n    }",
+      "explanation": "The right slice is re-created at `chunk_end` with size `r_size`, restoring bytes from `backup + l_size + m_size` (past both the left and middle slices in the snapshot). The prealloc branch aliases `backup + l_size + m_size` directly. This is the deepest offset into `backup`; its highest byte accessed is at index `l_size + m_size + r_size - 1 == (end - begin) - 1`, exactly the last byte of a correctly sized region snapshot — so it is in-bounds only if the size arithmetic and the assumed backup length both hold."
+    },
+    {
+      "file": "corpus/train/train_0094_cwe697.c",
+      "lines": "140-150",
+      "code": "    if (!prealloc) {\n        free(backup);\n    }\n    return true;\n\nerror:\n    if (!prealloc) {\n        free(backup);\n    }\n    return false;\n}",
+      "explanation": "On success the heap snapshot from `copy_region` is freed (only when not prealloc; a prealloc `backup` aliases live host memory and must not be freed) and the function returns true. The `error` epilogue is symmetric: it frees the non-prealloc `backup` and returns false. Both free sites are guarded by `!prealloc`, so a prealloc block's `host` is never freed here and there is no double free between the two paths (a given call reaches exactly one)."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0094_cwe697.c",
+      "lines": "30-36",
+      "code": "    QLIST_FOREACH(block, &uc->ram_list.blocks, next)\n    {\n        if (block->offset <= mr->addr &&\n            block->used_length >= (mr->end - mr->addr)) {\n            break;\n        }\n    }",
+      "explanation": "This is an incorrect-comparison bug (CWE-697). The intent is to find the RAMBlock whose extent `[block->offset, block->offset + block->used_length)` actually contains the region `[mr->addr, mr->end)`. The upper-bound test the code uses, `block->used_length >= (mr->end - mr->addr)`, compares the block length against the region's SIZE, not against the region's END relative to the block's `offset`. The correct predicate is `block->offset + block->used_length >= mr->end`. As written, any block with `offset <= mr->addr` and a length at least equal to the region size matches — even one whose storage ends well before `mr->end`. When such a wrong/short block is chosen, `block->host` (used as `backup` in the prealloc path) points at storage that does not span the region, and the subsequent `uc_mem_write` reads and `uc_mem_map_ptr` aliases read/expose bytes past the end of that block: an out-of-bounds read and, via `uc_mem_map_ptr`, an out-of-bounds region aliased into the guest. The implementation MUST match on the block that fully contains the region (offset AND end), not merely one large enough."
+    },
+    {
+      "file": "corpus/train/train_0094_cwe697.c",
+      "lines": "46-49",
+      "code": "    if (block->flags & 1) {\n        backup = block->host;\n    } else {\n        backup = copy_region(uc, mr);",
+      "explanation": "In the prealloc branch `backup = block->host` is used as if byte [0] of the host buffer corresponds to the region's first byte (`begin == mr->addr`). But the block-match at line 32 only requires `block->offset <= mr->addr`, so the region can begin at a strictly positive offset inside the block. The restore code then reads `backup + l_size`, `backup + l_size + m_size` where the offsets are measured from `begin`, ignoring the intra-block displacement `(mr->addr - block->offset)`. The correct source pointer is `block->host + (mr->addr - block->offset)`. With `block->offset < mr->addr`, every prealloc `uc_mem_map_ptr` aliases the wrong host bytes: the left slice at `begin` is mapped from `block->host` (bytes that belong to an earlier region), and the middle/right slices are shifted by the same error — corrupting the guest view and potentially exposing adjacent region contents (CWE-125 / CWE-787). The implementation MUST offset `backup` by the region's displacement within the block."
+    },
+    {
+      "file": "corpus/train/train_0094_cwe697.c",
+      "lines": "12-16",
+      "code": "    chunk_end = address + size;\n\n    // if this region belongs to area [address, address+size],\n    // then there is no work to do.\n    if (address <= mr->addr && chunk_end >= mr->end) {",
+      "explanation": "`chunk_end = address + size` is an unchecked 64-bit addition (CWE-190). If a caller passes an `address`/`size` pair whose sum overflows `uint64_t`, `chunk_end` wraps to a small value. That wrapped value then drives every subsequent range decision: the containment check at line 16 (`chunk_end >= mr->end` becomes false), the overlap check at line 25 (`chunk_end <= mr->addr` can spuriously return the 'impossible' path), and the clamp at line 78. The impact is misclassification of the split geometry — either failing a legitimate operation or, combined with the clamp, producing a middle/right slice whose end pointer does not match reality. The implementation MUST reject `address + size` overflow (e.g. `size == 0 || address > UINT64_MAX - size`) before using `chunk_end`."
+    },
+    {
+      "file": "corpus/train/train_0094_cwe697.c",
+      "lines": "126-134",
+      "code": "            if (uc_mem_write(uc, chunk_end, backup + l_size + m_size, r_size) !=\n                UC_ERR_OK) {\n                goto error;\n            }\n        } else {\n            if (uc_mem_map_ptr(uc, chunk_end, r_size, perms,\n                               backup + l_size + m_size) != UC_ERR_OK) {",
+      "explanation": "The restore offsets `backup + l_size` and `backup + l_size + m_size` assume the `backup` buffer is exactly `end - begin` bytes long (the snapshot returned by `copy_region`, or the block-backed region). This holds only if the snapshot size and the size arithmetic agree. If `copy_region` sizes the snapshot from anything other than `mr->end - mr->addr`, or if the wrong block was selected at line 32 (making the effective backing shorter than `l_size + m_size + r_size`), these reads run off the end of `backup` — an out-of-bounds read of up to `r_size` bytes (CWE-125), with the leaked bytes written into a live guest mapping via `uc_mem_write`/`uc_mem_map_ptr`. The implementation MUST guarantee `sizeof(backup) >= l_size + m_size + r_size == end - begin`."
+    },
+    {
+      "file": "corpus/train/train_0094_cwe697.c",
+      "lines": "61-65",
+      "code": "    // unmap this region first, then do split it later\n    if (uc_mem_unmap(uc, mr->addr, (size_t)int128_get64(mr->size)) !=\n        UC_ERR_OK) {\n        goto error;\n    }",
+      "explanation": "The routine unmaps the whole region before it has successfully created any replacement mapping. If any later `uc_mem_map`/`uc_mem_map_ptr`/`uc_mem_write` fails, control goes to `error`, which frees `backup` and returns false while leaving the original region unmapped and only partially recreated — the code's own comment (lines 87-90) admits it cannot recover. This is a non-atomic destructive operation: an attacker who can make a sub-map fail (e.g. by exhausting host memory or forcing an odd geometry) can leave the emulator's memory map in an inconsistent, permanently damaged state (availability / integrity, roughly CWE-460/CWE-667 class). The implementation SHOULD stage the new mappings before tearing down the original, or provide a rollback."
+    }
+  ],
+  "summary": "The central defect is an incorrect-comparison block lookup (CWE-697) at lines 32-33 that matches a RAMBlock merely large enough rather than one that actually spans the region, so the derived `backup`/`host` pointer can be wrong or short and drive out-of-bounds reads and aliased mappings during restore. Compounding it, the prealloc path (line 47) ignores the region's displacement inside the block, and `chunk_end = address + size` (line 12) is an unchecked 64-bit add; the unmap-before-remap ordering also leaves the memory map unrecoverable on partial failure. Realistic impact ranges from information disclosure and guest-memory corruption to denial of service.",
+  "reviewed_anchors": [
+    {"anchor": "split_region(struct uc_struct *uc, MemoryRegion *mr, uint64_t address, size_t size, bool do_delete) signature (lines 2-3)", "disposition": "finding", "reason": "`address`/`size` are caller/attacker-influenced range inputs whose arithmetic feeds every geometry decision"},
+    {"anchor": "uint8_t *backup (line 5)", "disposition": "finding", "reason": "source pointer for all restore writes; derived from block match and used with computed offsets"},
+    {"anchor": "uint64_t begin, end, chunk_end (line 7)", "disposition": "finding", "reason": "chunk_end is an unchecked sum (line 12); begin/end bound the size arithmetic"},
+    {"anchor": "size_t l_size, m_size, r_size (line 8)", "disposition": "finding", "reason": "unsigned slice sizes indexing into backup; must sum to region length"},
+    {"anchor": "RAMBlock *block (line 9)", "disposition": "finding", "reason": "selected by the incorrect comparison at lines 32-33"},
+    {"anchor": "chunk_end = address + size (line 12)", "disposition": "finding", "reason": "unchecked uint64 addition can overflow (CWE-190)"},
+    {"anchor": "containment check address <= mr->addr && chunk_end >= mr->end (line 16)", "disposition": "dismissed", "reason": "correct early-out for full coverage; only unsafe via the upstream chunk_end overflow already flagged"},
+    {"anchor": "size == 0 guard (line 20)", "disposition": "dismissed", "reason": "correct trivial-case handling, no contract violated"},
+    {"anchor": "impossible-case guard address >= mr->end || chunk_end <= mr->addr (line 25)", "disposition": "dismissed", "reason": "correct non-overlap rejection; its only weakness is the shared chunk_end overflow flagged separately"},
+    {"anchor": "block match block->offset <= mr->addr && block->used_length >= (mr->end - mr->addr) (lines 32-33)", "disposition": "finding", "reason": "incorrect comparison (CWE-697): tests block size vs region size, not block end vs region end"},
+    {"anchor": "block == NULL check (line 38)", "disposition": "dismissed", "reason": "correct null guard preventing deref of an unmatched block"},
+    {"anchor": "prealloc = !!(block->flags & 1) (line 44)", "disposition": "dismissed", "reason": "flag extraction is correct; the derived free-guard is sound"},
+    {"anchor": "backup = block->host (line 47)", "disposition": "finding", "reason": "aliases host base without adding the region's intra-block offset, wrong source bytes"},
+    {"anchor": "backup = copy_region(uc, mr) (line 49) + NULL check (line 50)", "disposition": "finding", "reason": "snapshot size assumption underpins the restore-offset bounds; latent if copy_region size != region length"},
+    {"anchor": "perms/begin/end snapshot (lines 57-59)", "disposition": "dismissed", "reason": "correctly caches mr fields before unmap so no use-after-free of mr occurs"},
+    {"anchor": "uc_mem_unmap(uc, mr->addr, (size_t)int128_get64(mr->size)) (lines 62-63)", "disposition": "finding", "reason": "destroys region before replacements exist; non-atomic on partial failure"},
+    {"anchor": "address/chunk_end clamp (lines 75-80)", "disposition": "dismissed", "reason": "clamps to region; keeps slice subtractions non-negative given valid (non-overflowing) inputs"},
+    {"anchor": "l_size/r_size/m_size subtractions (lines 83-85)", "disposition": "dismissed", "reason": "non-negative after the clamp and overlap guards; risk is inherited from chunk_end overflow, flagged at line 12"},
+    {"anchor": "left slice map/write, backup (lines 91-104)", "disposition": "dismissed", "reason": "reads backup[0..l_size); in-bounds if backup is region-sized, covered by the block-match and snapshot-size findings"},
+    {"anchor": "middle slice map/write, backup + l_size, do_delete gate (lines 106-121)", "disposition": "dismissed", "reason": "offset read covered by the same backup-size invariant; do_delete gate is intentional"},
+    {"anchor": "right slice map/write, backup + l_size + m_size (lines 123-138)", "disposition": "finding", "reason": "deepest offset into backup; over-reads if backup shorter than end-begin"},
+    {"anchor": "free(backup) success and error epilogues guarded by !prealloc (lines 140-150)", "disposition": "dismissed", "reason": "prealloc host is never freed and only one epilogue runs per call, so no double free or free-of-aliased-host"}
+  ],
+  "findings": [
+    {
+      "title": "Incorrect RAMBlock selection compares block length to region size, not block end to region end",
+      "anchor": "block->offset <= mr->addr && block->used_length >= (mr->end - mr->addr)",
+      "file": "corpus/train/train_0094_cwe697.c",
+      "line": "32-33",
+      "code": "        if (block->offset <= mr->addr &&\n            block->used_length >= (mr->end - mr->addr)) {",
+      "bug_class": "Incorrect comparison selecting wrong backing buffer -> out-of-bounds read / bad aliasing",
+      "cwe": "CWE-697",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0094_cwe697.c (and copy_region/uc_mem_* implementation, file not provided)",
+      "invariant": "The chosen block must fully contain the region: block->offset <= mr->addr AND block->offset + block->used_length >= mr->end.",
+      "failure_mode": "Because the upper bound tests `used_length >= region size` instead of `offset + used_length >= mr->end`, a block that starts at/below mr->addr but ends before mr->end (or an unrelated large block at offset 0) is accepted. Its `host`/`backup` does not span the region, so the restore `uc_mem_write`/`uc_mem_map_ptr` calls at lines 96/111/128/133 read past the end of that block and alias out-of-region host memory into guest mappings — information disclosure and memory corruption.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether callers ever create a region whose end exceeds block->offset + block->used_length while offset <= mr->addr, and whether copy_region/host indexing assumes the block spans the region."
+    },
+    {
+      "title": "Prealloc restore uses block->host base without adding the region's offset inside the block",
+      "anchor": "backup = block->host;",
+      "file": "corpus/train/train_0094_cwe697.c",
+      "line": "47",
+      "code": "        backup = block->host;",
+      "bug_class": "Out-of-bounds / wrong-offset read from host buffer",
+      "cwe": "CWE-125",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0094_cwe697.c",
+      "invariant": "For a prealloc block, the byte backing region address `begin` is block->host + (mr->addr - block->offset); backup must be offset by that displacement.",
+      "failure_mode": "The match at line 32 permits block->offset < mr->addr, but line 47 sets backup = block->host, and the restore offsets (backup, backup + l_size, backup + l_size + m_size) are measured from `begin`. When the region sits at a nonzero offset within the block, every prealloc `uc_mem_map_ptr` aliases the wrong host bytes — the left slice at `begin` gets an earlier region's data, and the middle/right slices are shifted identically, corrupting guest memory and exposing adjacent region contents. If the displacement pushes the tail past block end it is also an over-read.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether prealloc regions can begin at block->offset strictly less than mr->addr, and whether the real code adds (mr->addr - block->offset) elsewhere before this call."
+    },
+    {
+      "title": "Unchecked 64-bit addition chunk_end = address + size can overflow",
+      "anchor": "chunk_end = address + size;",
+      "file": "corpus/train/train_0094_cwe697.c",
+      "line": "12",
+      "code": "    chunk_end = address + size;",
+      "bug_class": "Integer overflow leading to wrong range classification",
+      "cwe": "CWE-190",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0094_cwe697.c",
+      "invariant": "address + size must not exceed UINT64_MAX; reject (or saturate) before computing chunk_end.",
+      "failure_mode": "A caller-supplied `address`/`size` whose 64-bit sum wraps makes `chunk_end` small. The containment check (line 16), the overlap/impossible check (line 25), and the clamp (line 78) then classify the geometry incorrectly — either aborting a valid split or producing slices whose `chunk_end` end pointer does not match the intended range, feeding wrong sizes/offsets into the map/write calls.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether address/size reach this function from untrusted/emulated map operations without a prior overflow check on address+size."
+    },
+    {
+      "title": "Restore reads assume backup is exactly region-sized (end - begin)",
+      "anchor": "uc_mem_write(uc, chunk_end, backup + l_size + m_size, r_size)",
+      "file": "corpus/train/train_0094_cwe697.c",
+      "line": "128",
+      "code": "            if (uc_mem_write(uc, chunk_end, backup + l_size + m_size, r_size) !=",
+      "bug_class": "Out-of-bounds read (buffer-size assumption)",
+      "cwe": "CWE-125",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0094_cwe697.c (copy_region implementation, file not provided)",
+      "invariant": "The backup buffer must be at least l_size + m_size + r_size == end - begin bytes.",
+      "failure_mode": "The deepest access is backup[l_size + m_size + r_size - 1]. If copy_region sizes the snapshot from anything other than the region length, or the wrong/short block was matched at line 32, these offset reads run past the end of backup and copy up to r_size stale/adjacent bytes into a live guest mapping via uc_mem_write/uc_mem_map_ptr — a latent over-read disclosure.",
+      "cve_analog": "",
+      "what_to_confirm": "The exact allocation size returned by copy_region and that it always equals mr->end - mr->addr."
+    },
+    {
+      "title": "Region unmapped before replacements are created; partial failure is unrecoverable",
+      "anchor": "uc_mem_unmap(uc, mr->addr, (size_t)int128_get64(mr->size))",
+      "file": "corpus/train/train_0094_cwe697.c",
+      "line": "62-65",
+      "code": "    if (uc_mem_unmap(uc, mr->addr, (size_t)int128_get64(mr->size)) !=\n        UC_ERR_OK) {\n        goto error;\n    }",
+      "bug_class": "Non-atomic destructive operation / improper recovery",
+      "cwe": "CWE-460",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0094_cwe697.c",
+      "invariant": "A failed split must leave the original mapping intact, or roll back to a consistent memory map.",
+      "failure_mode": "The whole region is torn down first; if any subsequent uc_mem_map/uc_mem_map_ptr/uc_mem_write fails, the error path frees backup and returns false while leaving the region unmapped and only partially rebuilt (acknowledged as unrecoverable in the comment). An attacker able to force a sub-operation to fail (memory pressure, awkward geometry) can leave the emulator's address space permanently inconsistent — denial of service.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether any caller retries or depends on the region surviving a failed split, and whether staging maps before unmap is feasible."
+    }
+  ],
+  "audit_checklist": [
+    "Fix the block match to require block->offset + block->used_length >= mr->end (containment), not used_length >= region size.",
+    "In the prealloc branch, set backup = block->host + (mr->addr - block->offset) so restore offsets are measured from the correct host byte.",
+    "Add an overflow guard on chunk_end = address + size (reject when address > UINT64_MAX - size) before using chunk_end in any comparison.",
+    "Confirm copy_region always returns a buffer of exactly mr->end - mr->addr bytes, so backup + l_size + m_size + r_size stays in bounds.",
+    "Verify l_size + m_size + r_size == end - begin under all clamp paths, including do_delete, and that none of the subtractions can underflow.",
+    "Reorder or add rollback so a failed sub-map does not leave the original region unmapped and unrecoverable.",
+    "Confirm prealloc backup (block->host) is never passed to free() on either the success or error epilogue."
+  ]
+}

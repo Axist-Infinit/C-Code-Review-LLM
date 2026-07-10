@@ -1,0 +1,204 @@
+{
+  "subsystem": "Linux kernel TCP output path — tcp_fragment(), the routine that splits a queued transmit sk_buff into two segments at byte offset `len`. It is invoked both when the stack fragments outgoing data to honor MSS/TSO and, critically, on the retransmit (RTX) queue during inbound SACK processing to carve out selectively-acknowledged ranges. It manipulates skb truesize/wmem accounting, TCP sequence numbers, TCP control-block flags, and TSO segment counts, then links the new skb into the write or RTX queue.",
+  "provenance": "Identified by the exact Linux-kernel signature and internal API surface: `struct sock *sk`, `enum tcp_queue tcp_queue`, `struct sk_buff *skb`, `struct tcp_sock *tp = tcp_sk(sk)`, `TCP_SKB_CB()`, `sk_stream_alloc_skb()`, `skb_split()`, `tcp_set_skb_tso_segs()`, `tcp_insert_write_queue_after()`, `TCP_FRAG_IN_RTX_QUEUE`, and `__skb_header_release()`. This is `tcp_fragment()` from net/ipv4/tcp_output.c. The sample id `primevul_c_train_3367_vuln` and the cwe400 tag mark it as the pre-fix (vulnerable) revision.",
+  "trust_boundary": "The trigger surface is remote and unauthenticated. On an established TCP connection, a peer's inbound ACK/SACK packets drive tcp_ack() -> tcp_sacktag_write_queue(), which calls tcp_fragment(sk, TCP_FRAG_IN_RTX_QUEUE, ...) to split retransmit-queue skbs at attacker-chosen SACK boundaries. The attacker therefore controls (a) how many times this function runs per received segment and (b) the split offset `len`, indirectly via advertised MSS and SACK block layout. skb->len and the queue contents are locally trusted, but the RATE and MULTIPLICITY of fragmentation are driven by hostile wire input.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0316_cwe400.c",
+      "lines": "2-10",
+      "code": "int tcp_fragment(struct sock *sk, enum tcp_queue tcp_queue,\n\t\t struct sk_buff *skb, u32 len,\n\t\t unsigned int mss_now, gfp_t gfp)\n{\n\tstruct tcp_sock *tp = tcp_sk(sk);\n\tstruct sk_buff *buff;\n\tint nsize, old_factor;\n\tint nlen;\n\tu8 flags;",
+      "explanation": "Entry point and local declarations. `sk` is the socket; `tcp_queue` selects which queue (write vs RTX) the second half is linked into; `skb` is the buffer to be split; `len` is the byte offset within `skb` at which the split occurs; `mss_now` is the current maximum segment size used to recompute TSO segment counts; `gfp` is the allocation flag. `tp = tcp_sk(sk)` obtains the TCP-specific socket state. `nsize`/`nlen`/`old_factor` are signed ints holding the head-copy size, the new-skb data length, and the pre-split TSO factor; `flags` will hold the copied TCP header flags. Note `len` is a 32-bit unsigned quantity ultimately derived from SACK/MSS negotiation, so its magnitude is not fully under local control."
+    },
+    {
+      "file": "corpus/train/train_0316_cwe400.c",
+      "lines": "12-17",
+      "code": "\tif (WARN_ON(len > skb->len))\n\t\treturn -EINVAL;\n\n\tnsize = skb_headlen(skb) - len;\n\tif (nsize < 0)\n\t\tnsize = 0;",
+      "explanation": "The only up-front sanity gate: if the split offset exceeds the buffer's total length, emit a warning and bail with -EINVAL, so the subsequent arithmetic can assume `len <= skb->len`. `nsize` is the number of bytes of linear (head) data that must be relocated into the new skb: `skb_headlen(skb) - len`. Because `skb_headlen` can be smaller than `len` (the split point lies in the paged/fragment area), this subtraction is done in signed `int` and clamped to 0 when negative — a deliberate guard against a negative head-copy size. This clamp is why `nsize` cannot underflow into a huge allocation request."
+    },
+    {
+      "file": "corpus/train/train_0316_cwe400.c",
+      "lines": "19-25",
+      "code": "\tif (skb_unclone(skb, gfp))\n\t\treturn -ENOMEM;\n\n\t/* Get a new skb... force flag on. */\n\tbuff = sk_stream_alloc_skb(sk, nsize, gfp, true);\n\tif (!buff)\n\t\treturn -ENOMEM; /* We'll just try again later. */",
+      "explanation": "First `skb_unclone` ensures the original skb is not shared before it is mutated; failure returns -ENOMEM. Then a brand-new skb `buff` is allocated with `nsize` bytes of head room to receive the second half of the payload. Critically, `sk_stream_alloc_skb(..., true)` is called with force_schedule=true, meaning the allocation bypasses the normal send-buffer memory scheduling check and succeeds even when the socket is over its memory budget. Each call therefore commits new kernel memory. On failure the function returns -ENOMEM to retry later; on success it proceeds to charge the socket."
+    },
+    {
+      "file": "corpus/train/train_0316_cwe400.c",
+      "lines": "27-31",
+      "code": "\tsk->sk_wmem_queued += buff->truesize;\n\tsk_mem_charge(sk, buff->truesize);\n\tnlen = skb->len - len - nsize;\n\tbuff->truesize += nlen;\n\tskb->truesize -= nlen;",
+      "explanation": "Memory accounting for the new segment. `sk->sk_wmem_queued` (total bytes queued for this socket) is increased by the new skb's truesize, and `sk_mem_charge` books that memory against the socket. `nlen = skb->len - len - nsize` computes the payload length moving into `buff` beyond the copied head bytes; since `len <= skb->len` (enforced at line 12) and `nsize` was clamped, this stays sane. The two skbs' truesizes are then rebalanced so total accounting is conserved. The key observation: every successful split monotonically raises `sk_wmem_queued`, and nothing in this function bounds that growth."
+    },
+    {
+      "file": "corpus/train/train_0316_cwe400.c",
+      "lines": "33-43",
+      "code": "\t/* Correct the sequence numbers. */\n\tTCP_SKB_CB(buff)->seq = TCP_SKB_CB(skb)->seq + len;\n\tTCP_SKB_CB(buff)->end_seq = TCP_SKB_CB(skb)->end_seq;\n\tTCP_SKB_CB(skb)->end_seq = TCP_SKB_CB(buff)->seq;\n\n\t/* PSH and FIN should only be set in the second packet. */\n\tflags = TCP_SKB_CB(skb)->tcp_flags;\n\tTCP_SKB_CB(skb)->tcp_flags = flags & ~(TCPHDR_FIN | TCPHDR_PSH);\n\tTCP_SKB_CB(buff)->tcp_flags = flags;\n\tTCP_SKB_CB(buff)->sacked = TCP_SKB_CB(skb)->sacked;\n\ttcp_skb_fragment_eor(skb, buff);",
+      "explanation": "Sequence-number and flag fix-up on the two halves. `buff`'s starting sequence becomes `skb->seq + len` (the split boundary), and it inherits the original end sequence, while the original skb's end sequence is truncated to the boundary — so the two skbs now cover adjacent, non-overlapping byte ranges. The TCP flags are split: FIN and PSH are cleared on the first (earlier) segment and preserved only on the trailing `buff`, matching TCP semantics that these belong to the last byte. The SACK bitmap is copied, and `tcp_skb_fragment_eor` propagates end-of-record markers. This is bookkeeping, not a memory-safety operation."
+    },
+    {
+      "file": "corpus/train/train_0316_cwe400.c",
+      "lines": "45-50",
+      "code": "\tskb_split(skb, buff, len);\n\n\tbuff->ip_summed = CHECKSUM_PARTIAL;\n\n\tbuff->tstamp = skb->tstamp;\n\ttcp_fragment_tstamp(skb, buff);",
+      "explanation": "`skb_split(skb, buff, len)` performs the actual data move: bytes at offset >= len (linear and paged) are transferred from `skb` into `buff`. `buff->ip_summed = CHECKSUM_PARTIAL` marks the new skb for hardware checksum offload. The timestamps are copied so the fragment retains its original transmit timing for RTT/retransmit accounting. All of this depends on the earlier arithmetic (`len`, `nsize`, `nlen`) being consistent; skb_split itself trusts `len <= skb->len`."
+    },
+    {
+      "file": "corpus/train/train_0316_cwe400.c",
+      "lines": "52-70",
+      "code": "\told_factor = tcp_skb_pcount(skb);\n\n\t/* Fix up tso_factor for both original and new SKB.  */\n\ttcp_set_skb_tso_segs(skb, mss_now);\n\ttcp_set_skb_tso_segs(buff, mss_now);\n\n\t/* Update delivered info for the new segment */\n\tTCP_SKB_CB(buff)->tx = TCP_SKB_CB(skb)->tx;\n\n\t/* If this packet has been sent out already, we must\n\t * adjust the various packet counters.\n\t */\n\tif (!before(tp->snd_nxt, TCP_SKB_CB(buff)->end_seq)) {\n\t\tint diff = old_factor - tcp_skb_pcount(skb) -\n\t\t\ttcp_skb_pcount(buff);\n\n\t\tif (diff)\n\t\t\ttcp_adjust_pcount(sk, skb, diff);\n\t}",
+      "explanation": "`old_factor` snapshots the original TSO segment count. `tcp_set_skb_tso_segs(..., mss_now)` recomputes each skb's segment count as roughly ceil(payload/mss_now) and stores it in the skb's GSO fields (a 16-bit tcp_gso_segs). If the segment was already transmitted (`!before(snd_nxt, buff->end_seq)`), the difference between old and new segment counts is folded back into the socket's global `packets_out`/lost/retrans counters via tcp_adjust_pcount, keeping congestion-control state consistent. The correctness of these counters depends on `mss_now` being non-trivially small; an extremely small MSS inflates the per-skb segment count."
+    },
+    {
+      "file": "corpus/train/train_0316_cwe400.c",
+      "lines": "72-78",
+      "code": "\t/* Link BUFF into the send queue. */\n\t__skb_header_release(buff);\n\ttcp_insert_write_queue_after(skb, buff, sk, tcp_queue);\n\tif (tcp_queue == TCP_FRAG_IN_RTX_QUEUE)\n\t\tlist_add(&buff->tcp_tsorted_anchor, &skb->tcp_tsorted_anchor);\n\n\treturn 0;",
+      "explanation": "The new skb is released for the header path and spliced into the selected queue immediately after `skb`. When the caller is SACK processing on the retransmit queue (`tcp_queue == TCP_FRAG_IN_RTX_QUEUE`), `buff` is also linked into the time-sorted RTX anchor list. The function returns 0 on success. This is the point at which each fragmentation permanently grows the retransmit queue by one skb — the queue whose unbounded growth is the resource-exhaustion vector."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0316_cwe400.c",
+      "lines": "22-31",
+      "code": "\t/* Get a new skb... force flag on. */\n\tbuff = sk_stream_alloc_skb(sk, nsize, gfp, true);\n\tif (!buff)\n\t\treturn -ENOMEM; /* We'll just try again later. */\n\n\tsk->sk_wmem_queued += buff->truesize;\n\tsk_mem_charge(sk, buff->truesize);\n\tnlen = skb->len - len - nsize;\n\tbuff->truesize += nlen;\n\tskb->truesize -= nlen;",
+      "explanation": "PRIMARY DEFECT (CWE-400, CVE-2019-11478 'SACK Slowness / TCP SACK panic' family). This function contains no upper bound on how far the retransmit queue may grow. When a remote peer sends a stream of crafted SACK options that repeatedly select tiny, non-contiguous byte ranges, tcp_sacktag_write_queue calls tcp_fragment(..., TCP_FRAG_IN_RTX_QUEUE, ...) once per range, each call allocating a fresh skb via sk_stream_alloc_skb with force_schedule=true (line 23) and unconditionally charging it to sk_wmem_queued (line 27). Because the allocation is forced and no `sk_wmem_queued` vs `sk_sndbuf` guard exists here, an attacker can drive the RTX queue to hold a very large number of small skbs, consuming excessive kernel memory AND making subsequent linear walks of the queue O(n) expensive — degrading the whole host. The invariant the fixed implementation must uphold is exactly the guard the upstream patch added: reject the fragmentation with -ENOMEM (and bump LINUX_MIB_TCPWQUEUETOOBIG) when `(sk->sk_wmem_queued >> 1) > sk->sk_sndbuf` and the target is not the write queue, BEFORE allocating."
+    },
+    {
+      "file": "corpus/train/train_0316_cwe400.c",
+      "lines": "54-56",
+      "code": "\t/* Fix up tso_factor for both original and new SKB.  */\n\ttcp_set_skb_tso_segs(skb, mss_now);\n\ttcp_set_skb_tso_segs(buff, mss_now);",
+      "explanation": "LATENT related hazard (CWE-190, CVE-2019-11477 'SACK integer overflow' and CVE-2019-11479 'low MSS'). `tcp_set_skb_tso_segs` derives the per-skb GSO segment count as payload/mss_now and stores it in a 16-bit field. A peer that advertises a pathologically small MSS (e.g. down to a few dozen bytes) forces a large number of tiny segments per skb; combined with repeated fragmentation this both amplifies the memory/CPU cost above and, in the unpatched SACK path, can overflow the 16-bit tcp_gso_segs accumulation used elsewhere, corrupting packets_out accounting. The invariant: the stack must clamp the minimum acceptable MSS (tcp_min_snd_mss) and guard the segment-count arithmetic against 16-bit overflow. The bug lives in the tso-segs and SACK-merge implementation (files not provided), but this call site is where the tiny-MSS segment counts are (re)computed."
+    },
+    {
+      "file": "corpus/train/train_0316_cwe400.c",
+      "lines": "12-17",
+      "code": "\tif (WARN_ON(len > skb->len))\n\t\treturn -EINVAL;\n\n\tnsize = skb_headlen(skb) - len;\n\tif (nsize < 0)\n\t\tnsize = 0;",
+      "explanation": "Defensive-but-noisy guard, not itself a memory bug. The sole precondition check is WARN_ON(len > skb->len); it is well-placed and prevents the downstream subtractions `nsize = skb_headlen(skb) - len` and `nlen = skb->len - len - nsize` from underflowing, and the explicit `if (nsize < 0) nsize = 0` clamp neutralizes the case where the split lands in paged data. The residual concern is only that WARN_ON on an attacker-influenceable condition can, if such a code path were reachable, spam the kernel log; here `len` is bounded by construction in the callers, so this is low risk. Worth confirming that no caller can pass `len > skb->len` under crafted SACK input to weaponize the WARN as a log-flood."
+    },
+    {
+      "file": "corpus/train/train_0316_cwe400.c",
+      "lines": "64-69",
+      "code": "\tif (!before(tp->snd_nxt, TCP_SKB_CB(buff)->end_seq)) {\n\t\tint diff = old_factor - tcp_skb_pcount(skb) -\n\t\t\ttcp_skb_pcount(buff);\n\n\t\tif (diff)\n\t\t\ttcp_adjust_pcount(sk, skb, diff);",
+      "explanation": "Congestion-state accounting correctness. `diff` folds the change in TSO segment counts back into the socket's global packets_out/sacked_out/lost_out counters. If the tso-segs recomputation is wrong (e.g. because of the tiny-MSS inflation above) or if fragmentation is attempted after the segment has already been (partially) accounted, these counters can be driven out of sync, which historically manifested as retransmit-loop stalls and mis-estimated in-flight data. This is a downstream consequence of the same attacker-controlled fragmentation rate rather than an independent memory-safety flaw; the invariant is that segment-count deltas stay consistent so packets_out never underflows."
+    }
+  ],
+  "summary": "This is the pre-fix Linux tcp_fragment(). Its dominant flaw is the absence of any memory/queue-size bound before force-allocating and charging a new retransmit-queue skb, letting a remote peer's crafted SACK stream drive unbounded RTX-queue growth and CPU cost (CWE-400, CVE-2019-11478). A closely related tiny-MSS segment-count amplification/overflow (CVE-2019-11477/11479) lives in the tso-segs and SACK-merge implementation this function feeds. The pure buffer arithmetic (nsize/nlen) is correctly guarded and not itself unsafe.",
+  "reviewed_anchors": [
+    {
+      "anchor": "tcp_fragment(struct sock *sk, enum tcp_queue tcp_queue, struct sk_buff *skb, u32 len, unsigned int mss_now, gfp_t gfp) — signature",
+      "disposition": "finding",
+      "reason": "Remotely reachable via SACK processing; the function performs an unbounded, force-committed allocation with no queue-size guard."
+    },
+    {
+      "anchor": "u32 len (split offset parameter)",
+      "disposition": "finding",
+      "reason": "Attacker-influenced via SACK block boundaries; drives per-call allocation and the number of fragmentation calls."
+    },
+    {
+      "anchor": "unsigned int mss_now parameter",
+      "disposition": "finding",
+      "reason": "A hostilely small MSS inflates per-skb TSO segment counts feeding the CVE-2019-11477/11479 overflow class."
+    },
+    {
+      "anchor": "if (WARN_ON(len > skb->len)) return -EINVAL; (line 12-13)",
+      "disposition": "dismissed",
+      "reason": "Correctly-placed precondition guard; bounds len so downstream subtractions cannot underflow. Minor log-flood note only."
+    },
+    {
+      "anchor": "nsize = skb_headlen(skb) - len; if (nsize < 0) nsize = 0; (line 15-17)",
+      "disposition": "dismissed",
+      "reason": "Signed subtraction explicitly clamped to 0; cannot produce an oversized or negative allocation."
+    },
+    {
+      "anchor": "sk_stream_alloc_skb(sk, nsize, gfp, true) (line 23)",
+      "disposition": "finding",
+      "reason": "force_schedule=true bypasses send-buffer memory scheduling, so allocation succeeds even when the socket is over budget — the core of the resource-exhaustion path."
+    },
+    {
+      "anchor": "sk->sk_wmem_queued += buff->truesize; sk_mem_charge (line 27-28)",
+      "disposition": "finding",
+      "reason": "Monotonically grows queued memory with no bound checked in this function; the quantity the missing guard should test."
+    },
+    {
+      "anchor": "nlen = skb->len - len - nsize; (line 29)",
+      "disposition": "dismissed",
+      "reason": "Bounded by the line-12 check and the nsize clamp; conserves total truesize, no underflow."
+    },
+    {
+      "anchor": "sequence-number/flags fix-up (TCP_SKB_CB, lines 34-42)",
+      "disposition": "dismissed",
+      "reason": "Pure control-block bookkeeping over already-validated ranges; no attacker-controlled length or buffer."
+    },
+    {
+      "anchor": "skb_split(skb, buff, len) (line 45)",
+      "disposition": "dismissed",
+      "reason": "Data move bounded by len <= skb->len already enforced; not an independent overflow site."
+    },
+    {
+      "anchor": "tcp_set_skb_tso_segs(skb/buff, mss_now) (lines 55-56)",
+      "disposition": "finding",
+      "reason": "Recomputes 16-bit segment counts from mss_now; tiny-MSS input is the amplification/overflow vector (latent, CVE-2019-11477/11479)."
+    },
+    {
+      "anchor": "pcount adjust block (old_factor / diff / tcp_adjust_pcount, lines 52-70)",
+      "disposition": "finding",
+      "reason": "Segment-count delta accounting can be desynchronized by the same attacker-controlled fragmentation; downstream congestion-state hazard."
+    },
+    {
+      "anchor": "tcp_insert_write_queue_after / list_add on TCP_FRAG_IN_RTX_QUEUE (lines 74-76)",
+      "disposition": "dismissed",
+      "reason": "Linkage into the queue is correct; the danger is the growth rate, already captured by the primary finding, not the insertion itself."
+    }
+  ],
+  "findings": [
+    {
+      "title": "Unbounded retransmit-queue growth in tcp_fragment (no send-buffer guard before forced skb allocation)",
+      "anchor": "sk_stream_alloc_skb(sk, nsize, gfp, true); ... sk->sk_wmem_queued += buff->truesize;",
+      "file": "corpus/train/train_0316_cwe400.c",
+      "line": "23-28",
+      "code": "\tbuff = sk_stream_alloc_skb(sk, nsize, gfp, true);\n\tif (!buff)\n\t\treturn -ENOMEM; /* We'll just try again later. */\n\n\tsk->sk_wmem_queued += buff->truesize;\n\tsk_mem_charge(sk, buff->truesize);",
+      "bug_class": "Uncontrolled resource consumption (remote memory/CPU exhaustion via SACK-driven fragmentation)",
+      "cwe": "CWE-400",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0316_cwe400.c (net/ipv4/tcp_output.c tcp_fragment); triggered from net/ipv4/tcp_input.c tcp_sacktag_write_queue (file not provided)",
+      "invariant": "Before allocating and charging a new fragment on the retransmit queue, the function must reject the split when the socket's queued write memory is already excessive — i.e. `if ((sk->sk_wmem_queued >> 1) > sk->sk_sndbuf && tcp_queue != TCP_FRAG_IN_WRITE_QUEUE) { NET_INC_STATS(..., LINUX_MIB_TCPWQUEUETOOBIG); return -ENOMEM; }`.",
+      "failure_mode": "A remote peer sends a sustained stream of crafted SACK options selecting many small, non-contiguous ranges. Each range forces one tcp_fragment call on TCP_FRAG_IN_RTX_QUEUE, and because sk_stream_alloc_skb is called with force_schedule=true and sk_wmem_queued is incremented unconditionally, the retransmit queue grows without bound. This exhausts kernel memory and makes every later linear walk of the queue O(n), degrading or hanging the host (denial of service).",
+      "cve_analog": "CVE-2019-11478",
+      "what_to_confirm": "Confirm the shown revision lacks the `(sk->sk_wmem_queued >> 1) > sk->sk_sndbuf` / LINUX_MIB_TCPWQUEUETOOBIG guard at function entry and that TCP_FRAG_IN_RTX_QUEUE callers can invoke it repeatedly per received SACK block."
+    },
+    {
+      "title": "Tiny-MSS TSO segment-count amplification / 16-bit overflow feeding SACK merge accounting",
+      "anchor": "tcp_set_skb_tso_segs(skb, mss_now); tcp_set_skb_tso_segs(buff, mss_now);",
+      "file": "corpus/train/train_0316_cwe400.c",
+      "line": "55-56",
+      "code": "\ttcp_set_skb_tso_segs(skb, mss_now);\n\ttcp_set_skb_tso_segs(buff, mss_now);",
+      "bug_class": "Integer overflow / amplification from attacker-minimized MSS",
+      "cwe": "CWE-190",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided) — tcp_set_skb_tso_segs / tcp_skb_pcount and the SACK-merge path in net/ipv4/tcp_input.c",
+      "invariant": "The stack must enforce a minimum sender MSS (tcp_min_snd_mss) and guard tcp_gso_segs (16-bit) arithmetic so that recomputed segment counts cannot overflow or make per-fragment work unboundedly large.",
+      "failure_mode": "A peer advertises a pathologically small MSS so each skb's recomputed segment count (payload/mss_now) becomes very large; repeated fragmentation then multiplies CPU cost and, in the unpatched SACK path, can overflow the 16-bit segment counter, corrupting packets_out/tcp_gso_segs accounting and enabling further DoS.",
+      "cve_analog": "CVE-2019-11479",
+      "what_to_confirm": "Verify whether mss_now can be driven below tcp_min_snd_mss for this socket and whether tcp_skb_pcount accumulation downstream is guarded against 16-bit overflow."
+    },
+    {
+      "title": "Segment-count delta accounting can desynchronize congestion counters",
+      "anchor": "int diff = old_factor - tcp_skb_pcount(skb) - tcp_skb_pcount(buff); if (diff) tcp_adjust_pcount(sk, skb, diff);",
+      "file": "corpus/train/train_0316_cwe400.c",
+      "line": "64-69",
+      "code": "\tif (!before(tp->snd_nxt, TCP_SKB_CB(buff)->end_seq)) {\n\t\tint diff = old_factor - tcp_skb_pcount(skb) -\n\t\t\ttcp_skb_pcount(buff);\n\n\t\tif (diff)\n\t\t\ttcp_adjust_pcount(sk, skb, diff);",
+      "bug_class": "State desynchronization of in-flight packet counters",
+      "cwe": "CWE-682",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided) — tcp_adjust_pcount in net/ipv4/tcp_input.c",
+      "invariant": "The segment-count delta must remain consistent so packets_out/sacked_out/lost_out never underflow or overcount as a result of repeated or post-transmit fragmentation.",
+      "failure_mode": "If tso-segs are inflated by a tiny MSS or the segment has already been accounted, `diff` folds an incorrect value into the socket counters, which historically produced retransmit stalls and mis-estimated in-flight data; it is a downstream symptom of the same attacker-controlled fragmentation rate rather than a standalone memory bug.",
+      "cve_analog": "",
+      "what_to_confirm": "Check that tcp_adjust_pcount cannot drive tp->packets_out below zero when fragmentation is repeated on already-transmitted, tiny-MSS segments."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm the entry of tcp_fragment adds the `(sk->sk_wmem_queued >> 1) > sk->sk_sndbuf && tcp_queue != TCP_FRAG_IN_WRITE_QUEUE` guard returning -ENOMEM with LINUX_MIB_TCPWQUEUETOOBIG BEFORE sk_stream_alloc_skb (fixes CVE-2019-11478).",
+    "Verify a sender-side minimum MSS (tcp_min_snd_mss) is enforced so mss_now passed here cannot be driven pathologically small (CVE-2019-11479).",
+    "Verify tcp_skb_pcount / tcp_gso_segs accumulation in the SACK-merge path is guarded against 16-bit integer overflow (CVE-2019-11477).",
+    "Confirm every TCP_FRAG_IN_RTX_QUEUE caller is rate/quantity-limited so a single received packet cannot induce unbounded fragmentation calls.",
+    "Confirm callers cannot pass `len > skb->len` under crafted SACK input, which would only trip WARN_ON but could be used to flood the kernel log.",
+    "Confirm tcp_adjust_pcount cannot underflow tp->packets_out when fragmentation repeats on already-transmitted segments."
+  ]
+}

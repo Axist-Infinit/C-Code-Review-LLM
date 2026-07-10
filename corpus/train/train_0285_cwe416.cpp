@@ -1,0 +1,7 @@
+/* sample: primevul_train_2154_fixed */
+	SilenceMessage(const std::string& mask, const std::string& flags)
+		: ClientProtocol::Message("SILENCE")
+	{
+		PushParam(mask);
+		PushParam(flags);
+	}

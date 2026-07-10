@@ -1,0 +1,213 @@
+{
+  "subsystem": "TensorFlow GPU linear-algebra op kernel: the ComputeAsync() method of a batched MatrixSolve OpKernel (solves op(A) X = B on the GPU). It reshapes the two input tensors into batches of square matrices, performs a partially-pivoted LU factorization via cuBLAS/cuSolver (GetrfBatched / Getrf), then a triangular solve (GetrsBatched / Getrs), and transposes the result back into the output tensor. The class is templated on Scalar and driven by the runtime through OpKernelContext.",
+  "provenance": "Identified from TensorFlow-specific API surface: OpKernelContext* context / DoneCallback done, context->input(0/1) returning const Tensor&, Tensor / TensorShape / dim_size / NumElements / flat<Scalar>() / flat_inner_dims<Scalar,3>(), the OP_REQUIRES_ASYNC / OP_REQUIRES_OK_ASYNC macros, errors::InvalidArgument, DataTypeToEnum<Scalar>::value, GPUDevice / eigen_device, and the CudaSolver wrapper (GetrfBatched/GetrsBatched/Getrf/Getrs, DeviceLapackInfo, GetScratchSpace, CheckLapackInfoAndDeleteSolverAsync). The banner names corpus/train/train_0075_cwe354.cpp and the header comment '/* sample: primevul_test_0087_vuln */' marks it as a PrimeVul-derived sample; the code matches tensorflow/core/kernels/linalg/matrix_solve_op.cc (GpuMatrixSolveOp).",
+  "trust_boundary": "The two input Tensors (context->input(0) = A, context->input(1) = B/rhs) are fully attacker-controllable: a caller of the TensorFlow runtime (a saved model, a GraphDef, an RPC to a serving endpoint, or a Python front-end) chooses their dtype, rank, and every dimension size, including the batch (leading) dimensions and the trailing matrix dimensions. The op's OP_REQUIRES_ASYNC guards are the ONLY validation gate before this data is fed to raw device memcpy and cuBLAS/cuSolver pointer arithmetic. Any shape relationship that the guards fail to enforce is a hostile degree of freedom. Tensor element *values* are also attacker-controlled but are not the primary hazard here; the shapes are.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0075_cwe354.cpp",
+      "lines": "2-7",
+      "code": "  void ComputeAsync(OpKernelContext* context, DoneCallback done) final {\n    const Tensor& input = context->input(0);\n    const Tensor& rhs = context->input(1);\n    const int ndims = input.dims();\n    const int64 n = input.dim_size(ndims - 1);\n    const int64 nrhs = rhs.dim_size(ndims - 1);",
+      "explanation": "Entry point of an asynchronous op kernel. It grabs the two operand tensors: `input` (the coefficient matrix/matrices A) and `rhs` (the right-hand-side B). `ndims` is the rank of A. `n` is A's last dimension (the matrix column count, expected to equal the row count for a square system), and `nrhs` is rhs's last dimension (number of right-hand-side columns). Crucially, `n` and `nrhs` are computed by indexing dimension `ndims - 1` on BOTH tensors using A's rank, and this happens before any of the validation macros below run."
+    },
+    {
+      "file": "corpus/train/train_0075_cwe354.cpp",
+      "lines": "8-28",
+      "code": "    // Validate inputs.\n    OP_REQUIRES_ASYNC(\n        context, ndims >= 2,\n        errors::InvalidArgument(\"Input must have rank >= 2, got \", ndims),\n        done);\n    OP_REQUIRES_ASYNC(context, rhs.dims() == ndims,\n                      errors::InvalidArgument(\n                          \"Input and right-hand side must have same rank, got \",\n                          ndims, \" != \", rhs.dims()),\n                      done);\n    OP_REQUIRES_ASYNC(\n        context, input.dim_size(ndims - 2) == n,\n        errors::InvalidArgument(\"Input matrices must be squares, got\",\n                                input.dim_size(ndims - 2), \" != \", n),\n        done);\n    OP_REQUIRES_ASYNC(context, rhs.dim_size(ndims - 2) == n,\n                      errors::InvalidArgument(\n                          \"Input matrix and right-hand side must have the \"\n                          \"same number of rows, got\",\n                          n, \" != \", rhs.dim_size(ndims - 2)),\n                      done);",
+      "explanation": "The validation gate. OP_REQUIRES_ASYNC evaluates the boolean condition; on failure it reports the InvalidArgument error, invokes `done`, and returns. Four contracts are enforced: (1) A has rank >= 2; (2) rhs has the same rank as A; (3) A is square, i.e. its second-to-last dimension equals its last dimension `n`; (4) rhs has `n` rows (its second-to-last dimension equals `n`). Note what is NOT checked: the LEADING batch dimensions (all dims except the last two) of A and rhs are never compared for equality. The gate constrains only the trailing 2-D matrix shape and the total rank, not the batch counts."
+    },
+    {
+      "file": "corpus/train/train_0075_cwe354.cpp",
+      "lines": "30-42",
+      "code": "    // Allocate output.\n    Tensor* output;\n    OP_REQUIRES_OK_ASYNC(\n        context,\n        context->forward_input_or_allocate_output({1}, 0, rhs.shape(), &output),\n        done);\n\n    // To be consistent with the MatrixInverse op, we define the solution for\n    // an empty set of equations as the empty matrix.\n    if (input.NumElements() == 0 || rhs.NumElements() == 0) {\n      done();\n      return;\n    }",
+      "explanation": "The output tensor is allocated (or forwarded from input index 1) with the SHAPE OF rhs — the solution X has the same shape as B. Then an early-out: if either operand has zero elements, the op declares the empty-system solution and finishes. Because the output shape is taken from rhs while later the batch loop count is taken from `input`, any mismatch between the two operands' batch sizes produces a downstream index/size divergence."
+    },
+    {
+      "file": "corpus/train/train_0075_cwe354.cpp",
+      "lines": "44-45",
+      "code": "    // TODO(rmlarsen): Convert to std::make_unique when available.\n    std::unique_ptr<CudaSolver> solver(new CudaSolver(context));",
+      "explanation": "Creates a CudaSolver, a TensorFlow RAII wrapper around cuSolver/cuBLAS handles and scoped scratch allocations bound to this OpKernelContext. It is held in a unique_ptr so ownership can later be transferred into the async completion machinery via std::move."
+    },
+    {
+      "file": "corpus/train/train_0075_cwe354.cpp",
+      "lines": "47-72",
+      "code": "    // Make a copy of the input for the factorization step, or, if adjoint_ is\n    // false, try to reuse the input buffer if this op owns it exclusively.\n    Tensor input_copy;\n    const GPUDevice& device = context->eigen_device<GPUDevice>();\n    if (adjoint_) {\n      // For the adjoint case, it is simpler to always make a transposed copy up\n      // front.\n      OP_REQUIRES_OK_ASYNC(\n          context,\n          solver->allocate_scoped_tensor(DataTypeToEnum<Scalar>::value,\n                                         input.shape(), &input_copy),\n          done);\n      OP_REQUIRES_OK_ASYNC(context,\n                           DoMatrixTranspose(device, input, &input_copy), done);\n    } else {\n      OP_REQUIRES_OK_ASYNC(\n          context,\n          solver->forward_input_or_allocate_scoped_tensor(\n              {0}, DataTypeToEnum<Scalar>::value, input.shape(), &input_copy),\n          done);\n      if (!input.SharesBufferWith(input_copy)) {\n        device.memcpy(input_copy.flat<Scalar>().data(),\n                      input.flat<Scalar>().data(),\n                      input.NumElements() * sizeof(Scalar));\n      }\n    }",
+      "explanation": "LAPACK factorization mutates its matrix in place, so the op needs a writable copy of A. If `adjoint_` (a member set by the op attribute), it allocates a scoped tensor shaped like A and fills it with a device transpose of A. Otherwise it tries to forward/reuse input 0's buffer in place; if the returned copy does not alias the original, it does a raw device memcpy of `input.NumElements() * sizeof(Scalar)` bytes from A into the copy. The memcpy length is derived from A's own element count, so it is self-consistent for A."
+    },
+    {
+      "file": "corpus/train/train_0075_cwe354.cpp",
+      "lines": "73-83",
+      "code": "    auto input_copy_reshaped = input_copy.template flat_inner_dims<Scalar, 3>();\n    const int64 batch_size = input_copy_reshaped.dimension(0);\n\n    // Allocate pivots on the device.\n    Tensor pivots;\n    OP_REQUIRES_OK_ASYNC(\n        context,\n        solver->allocate_scoped_tensor(DataTypeToEnum<int>::value,\n                                       TensorShape{batch_size, n}, &pivots),\n        done);\n    auto pivots_mat = pivots.template matrix<int>();",
+      "explanation": "The input copy is viewed as a 3-D tensor whose first dimension collapses all of A's leading (batch) dimensions and whose last two dimensions are the n x n matrix. `batch_size` is that collapsed count — the number of independent matrices to factor, derived ENTIRELY FROM A. A pivots tensor of shape [batch_size, n] is allocated on the device; `pivots_mat` is a 2-D int view of it. From here on, `batch_size` is A's batch count and is used to size scratch, iterate loops, and index BOTH the A-derived and the rhs-derived reshaped tensors."
+    },
+    {
+      "file": "corpus/train/train_0075_cwe354.cpp",
+      "lines": "85-108",
+      "code": "    // 1. Compute the partially pivoted LU factorization(s) of the\n    // matrix/matrices.\n    std::vector<DeviceLapackInfo> dev_info;\n    auto input_copy_ptrs = solver->GetScratchSpace<uint8>(\n        sizeof(Scalar*) * batch_size, \"input_copt_ptrs\",\n        /* on_host */ true);\n    const int kMaxMatrixSizeToBatchSizeRatio = 128;\n    const bool use_batched_solver =\n        n <= kMaxMatrixSizeToBatchSizeRatio * batch_size;\n    if (use_batched_solver) {\n      // For small matrices or large batch sizes, we use the batched interface\n      // from cuBlas.\n      const Scalar** input_copy_ptrs_base =\n          reinterpret_cast<const Scalar**>(input_copy_ptrs.mutable_data());\n      for (int batch = 0; batch < batch_size; ++batch) {\n        input_copy_ptrs_base[batch] = &input_copy_reshaped(batch, 0, 0);\n      }\n      dev_info.push_back(\n          solver->GetDeviceLapackInfo(batch_size, \"getrfBatched\"));\n      OP_REQUIRES_OK_ASYNC(\n          context,\n          solver->GetrfBatched(n, input_copy_ptrs_base, n, pivots_mat.data(),\n                               &dev_info.back(), batch_size),\n          done);",
+      "explanation": "Step 1 factorizes A. It allocates a host scratch buffer of `sizeof(Scalar*) * batch_size` bytes as raw uint8, then reinterpret_casts it to an array of `const Scalar*` pointers. A heuristic (`n <= 128 * batch_size`) picks the batched cuBLAS path for many-small-matrices. In the batched branch it fills the pointer array with the device address of each matrix's (batch,0,0) element via input_copy_reshaped, records a DeviceLapackInfo of length batch_size, and calls GetrfBatched over `batch_size` matrices. All indices here are bounded by A's own batch_size, so this block is internally consistent."
+    },
+    {
+      "file": "corpus/train/train_0075_cwe354.cpp",
+      "lines": "109-120",
+      "code": "    } else {\n      // For small batch sizes or large matrices, we use the non-batched\n      // interface from cuSolver, which is much faster for large matrices.\n      dev_info.push_back(solver->GetDeviceLapackInfo(batch_size, \"getrf\"));\n      for (int batch = 0; batch < batch_size; ++batch) {\n        OP_REQUIRES_OK_ASYNC(\n            context,\n            solver->Getrf(n, n, &input_copy_reshaped(batch, 0, 0), n,\n                          &pivots_mat(batch, 0), &dev_info.back()(batch)),\n            done);\n      }\n    }",
+      "explanation": "The non-batched alternative for few-large-matrices: it iterates each batch and calls cuSolver Getrf on that single n x n matrix, writing pivots into pivots_mat(batch,0). The loop counter `batch` is a plain `int` iterating up to the int64 `batch_size`. Again indices only touch A-derived structures (input_copy_reshaped, pivots_mat), so this is internally consistent with batch_size."
+    },
+    {
+      "file": "corpus/train/train_0075_cwe354.cpp",
+      "lines": "122-142",
+      "code": "    // 2. Make a transposed copy of the right-hand sides. This is necessary\n    // because cuBLAS assumes column-major storage while TensorFlow TF uses\n    // row-major.\n    TensorShape transposed_rhs_shape(rhs.shape());\n    transposed_rhs_shape.RemoveLastDims(2);\n    transposed_rhs_shape.AddDim(nrhs);\n    transposed_rhs_shape.AddDim(n);\n    Tensor transposed_rhs;\n    OP_REQUIRES_OK_ASYNC(\n        context,\n        solver->allocate_scoped_tensor(DataTypeToEnum<Scalar>::value,\n                                       transposed_rhs_shape, &transposed_rhs),\n        done);\n    if (nrhs > 1) {\n      OP_REQUIRES_OK_ASYNC(\n          context, DoMatrixTranspose(device, rhs, &transposed_rhs), done);\n    } else {\n      device.memcpy(transposed_rhs.flat<Scalar>().data(),\n                    rhs.flat<Scalar>().data(),\n                    rhs.NumElements() * sizeof(Scalar));\n    }",
+      "explanation": "Step 2 builds a column-major transposed copy of B. The transposed shape starts from rhs.shape(), drops the last two dims (rhs's OWN batch dims survive here), and appends [nrhs, n]. So transposed_rhs's batch count equals RHS's batch product, NOT A's. It is filled by a device transpose (nrhs>1) or a straight memcpy sized by rhs.NumElements(). This is the pivotal divergence: transposed_rhs is sized/laid-out from rhs, but the solve loops below index it with A's batch_size."
+    },
+    {
+      "file": "corpus/train/train_0075_cwe354.cpp",
+      "lines": "144-182",
+      "code": "    auto input_copy_ptr_array = solver->GetScratchSpace<uint8>(\n        sizeof(Scalar*) * batch_size, \"input_copy_ptr_array\",\n        /* on_host */ true);\n    auto transposed_rhs_ptr_array = solver->GetScratchSpace<uint8>(\n        sizeof(Scalar*) * batch_size, \"transposed_rhs_ptr_array\",\n        /* on_host */ true);\n    auto transposed_rhs_reshaped =\n        transposed_rhs.template flat_inner_dims<Scalar, 3>();\n    if (use_batched_solver) {\n      const Scalar** input_copy_ptrs_base =\n          reinterpret_cast<const Scalar**>(input_copy_ptr_array.mutable_data());\n      const Scalar** transposed_rhs_ptrs_base =\n          reinterpret_cast<const Scalar**>(\n              transposed_rhs_ptr_array.mutable_data());\n      for (int batch = 0; batch < batch_size; ++batch) {\n        input_copy_ptrs_base[batch] = &input_copy_reshaped(batch, 0, 0);\n        transposed_rhs_ptrs_base[batch] = &transposed_rhs_reshaped(batch, 0, 0);\n      }\n      int host_info = 0;\n      OP_REQUIRES_OK_ASYNC(\n          context,\n          solver->GetrsBatched(adjoint_ ? CUBLAS_OP_C : CUBLAS_OP_T, n, nrhs,\n                               input_copy_ptrs_base, n, pivots_mat.data(),\n                               transposed_rhs_ptrs_base, n, &host_info,\n                               batch_size),\n          done);\n      OP_REQUIRES_ASYNC(\n          context, host_info == 0,\n          errors::InvalidArgument(\"The \", -host_info,\n                                  \"'th argument to cublas*getrsBatched had \"\n                                  \"an illegal value.\"),\n          done);",
+      "explanation": "Step 3 (batched) solves the triangular systems. It reshapes transposed_rhs to 3-D (transposed_rhs_reshaped, first dim = rhs's batch product) and builds two host pointer arrays. The loop runs `batch` from 0 to A's `batch_size` and dereferences transposed_rhs_reshaped(batch,0,0) — indexing the rhs-derived tensor with A's batch count. GetrsBatched then reads/writes each of `batch_size` right-hand-side matrices in place. host_info is checked afterward for an illegal-argument return from cuBLAS."
+    },
+    {
+      "file": "corpus/train/train_0075_cwe354.cpp",
+      "lines": "183-205",
+      "code": "    } else {\n      dev_info.push_back(solver->GetDeviceLapackInfo(batch_size, \"getrs\"));\n      for (int batch = 0; batch < batch_size; ++batch) {\n        OP_REQUIRES_OK_ASYNC(\n            context,\n            solver->Getrs(adjoint_ ? CUBLAS_OP_C : CUBLAS_OP_T, n, nrhs,\n                          &input_copy_reshaped(batch, 0, 0), n,\n                          &pivots_mat(batch, 0),\n                          &transposed_rhs_reshaped(batch, 0, 0), n,\n                          &dev_info.back()(batch)),\n            done);\n      }\n    }\n\n    // 4. Transpose X to get the final result in row-major form.\n    if (nrhs > 1) {\n      OP_REQUIRES_OK_ASYNC(\n          context, DoMatrixTranspose(device, transposed_rhs, output), done);\n    } else {\n      device.memcpy(output->flat<Scalar>().data(),\n                    transposed_rhs.flat<Scalar>().data(),\n                    transposed_rhs.NumElements() * sizeof(Scalar));\n    }",
+      "explanation": "The non-batched solve loops each batch and calls cuSolver Getrs, again indexing transposed_rhs_reshaped(batch,0,0) with A's batch_size. Step 4 transposes the solved column-major X back into the row-major `output` (device transpose for nrhs>1, else a memcpy sized by transposed_rhs.NumElements()). Because `output` was sized from rhs.shape() and transposed_rhs from rhs.shape(), the final memcpy is rhs-consistent, but the solve just wrote into transposed_rhs at up to `batch_size` (A-derived) batch indices."
+    },
+    {
+      "file": "corpus/train/train_0075_cwe354.cpp",
+      "lines": "207-227",
+      "code": "    // Callback for checking info after kernels finish. Also capture the\n    // temporary Tensors/ScratchSpace so they don't get deallocated before the\n    // kernels run. TODO(rmlarsen): Use move capture once C++14 becomes\n    // available.\n    auto info_checker = [context, done, dev_info](\n                            const Status& status,\n                            const std::vector<HostLapackInfo>& host_infos) {\n      if (!status.ok() && errors::IsInvalidArgument(status) &&\n          !host_infos.empty()) {\n        for (int i = 0; i < host_infos[0].size(); ++i) {\n          // Match the CPU error message for singular matrices. Otherwise\n          // just print the original error message from the status below.\n          OP_REQUIRES_ASYNC(context, host_infos[0].data()[i] <= 0,\n                            errors::InvalidArgument(kErrMsg), done);\n        }\n      }\n      OP_REQUIRES_OK_ASYNC(context, status, done);\n      done();\n    };\n    CudaSolver::CheckLapackInfoAndDeleteSolverAsync(std::move(solver), dev_info,\n                                                    std::move(info_checker));",
+      "explanation": "A completion callback captures context, done, and the dev_info vector by value (so the LapackInfo tensors outlive the async GPU work). When the kernels finish it inspects host_infos[0]: a positive info entry means a singular matrix, reported as InvalidArgument; otherwise it propagates status and calls done(). Finally CheckLapackInfoAndDeleteSolverAsync takes ownership of the solver via std::move and schedules the callback. The moved-from `solver` is not read afterward, so there is no use-after-move here."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0075_cwe354.cpp",
+      "lines": "13-28",
+      "code": "    OP_REQUIRES_ASYNC(context, rhs.dims() == ndims,\n                      errors::InvalidArgument(\n                          \"Input and right-hand side must have same rank, got \",\n                          ndims, \" != \", rhs.dims()),\n                      done);\n    OP_REQUIRES_ASYNC(\n        context, input.dim_size(ndims - 2) == n,\n        errors::InvalidArgument(\"Input matrices must be squares, got\",\n                                input.dim_size(ndims - 2), \" != \", n),\n        done);\n    OP_REQUIRES_ASYNC(context, rhs.dim_size(ndims - 2) == n,\n                      errors::InvalidArgument(\n                          \"Input matrix and right-hand side must have the \"\n                          \"same number of rows, got\",\n                          n, \" != \", rhs.dim_size(ndims - 2)),\n                      done);",
+      "explanation": "This validation block checks rank equality, A squareness, and that rhs has n rows, but it NEVER checks that A and rhs share the same leading (batch) dimensions. An attacker can supply, e.g., A of shape [1000, n, n] and B of shape [1, n, nrhs]: same rank, A square, B has n rows — all guards pass. Then `batch_size` (line 74) is A's batch product (1000), while `transposed_rhs` (lines 125-128) and its 3-D view `transposed_rhs_reshaped` have RHS's batch product (1). The solve loops (lines 165-168 batched, 185-194 non-batched) iterate `batch` up to A's batch_size and dereference `&transposed_rhs_reshaped(batch, 0, 0)`, walking far past the end of the small transposed_rhs allocation. GetrsBatched/Getrs then read and write those out-of-range device addresses as right-hand-side matrices. Impact: out-of-bounds device read and WRITE (heap/GPU memory corruption), reachable by any caller who controls the two tensor shapes — a remotely triggerable memory-safety bug and at minimum a crash/DoS. The implementation MUST require that input's and rhs's batch dimensions are identical (all dims except the last two equal) before deriving a single batch_size and indexing both tensors with it. The reverse mismatch (rhs batch > A batch) leaves rhs matrices unsolved and the final output likewise diverges."
+    },
+    {
+      "file": "corpus/train/train_0075_cwe354.cpp",
+      "lines": "5-7",
+      "code": "    const int ndims = input.dims();\n    const int64 n = input.dim_size(ndims - 1);\n    const int64 nrhs = rhs.dim_size(ndims - 1);",
+      "explanation": "`n` and `nrhs` are computed by indexing dimension `ndims - 1` BEFORE the rank guards run. Two hazards: (1) if A is a scalar or 1-D tensor, `ndims` is 0 or 1, so `ndims - 1` is -1 or the index is out of range — `input.dim_size(-1)` is evaluated before the `ndims >= 2` check on line 10. (2) `rhs.dim_size(ndims - 1)` on line 7 indexes rhs using A's rank, before the `rhs.dims() == ndims` check on line 13; if rhs has fewer dims than A, this reads an out-of-range dimension index on rhs. TensorShape::dim_size validates the index with an internal CHECK/DCHECK — in a checked build this aborts the process (DoS via CHECK-fail), and in a build with DCHECKs disabled it is an out-of-bounds read of the shape's dimension storage. The implementation MUST validate ndims >= 2 and rhs.dims() == ndims BEFORE using ndims-1/ndims-2 to index either tensor."
+    },
+    {
+      "file": "corpus/train/train_0075_cwe354.cpp",
+      "lines": "99-101",
+      "code": "      for (int batch = 0; batch < batch_size; ++batch) {\n        input_copy_ptrs_base[batch] = &input_copy_reshaped(batch, 0, 0);\n      }",
+      "explanation": "`batch_size` is an int64 (line 74) derived from an attacker-controllable product of batch dimensions, but every batch loop (lines 99, 113, 165, 185) uses a plain `int batch` counter. If batch_size exceeds INT_MAX (a tensor whose leading dims multiply past 2^31, feasible for a maliciously shaped tensor), the comparison `batch < batch_size` and the increment overflow/never terminate as intended: signed int overflow is undefined behavior and can produce an effectively infinite loop that writes `input_copy_ptrs_base[batch]` past the `sizeof(Scalar*) * batch_size` host scratch (out-of-bounds write) as `batch` wraps negative. The scratch itself is sized with the int64 batch_size, so the pointer index and the allocation size disagree once truncation occurs. The implementation should use int64 loop counters and/or reject batch_size > INT_MAX before this loop."
+    },
+    {
+      "file": "corpus/train/train_0075_cwe354.cpp",
+      "lines": "97-98",
+      "code": "      const Scalar** input_copy_ptrs_base =\n          reinterpret_cast<const Scalar**>(input_copy_ptrs.mutable_data());",
+      "explanation": "The scratch space is requested as `GetScratchSpace<uint8>` (a byte buffer) and reinterpret_cast to `const Scalar**` (lines 97-98, 160-164). reinterpret_cast performs no layout or alignment check; if the byte scratch is not aligned to alignof(Scalar*) (8 bytes on 64-bit), storing pointers through this cast is undefined behavior on strict-alignment targets and violates strict aliasing. The size request `sizeof(Scalar*) * batch_size` is correct so there is no overflow of the allocation itself, and TF scratch is normally suitably aligned, which is why this is a lower-severity, latent concern rather than an active overflow. The implementation must guarantee the scratch allocator returns memory aligned for pointer storage."
+    }
+  ],
+  "summary": "A GPU batched MatrixSolve kernel whose input-validation gate constrains only rank and the trailing 2-D matrix shape but never checks that the coefficient tensor A and the right-hand-side tensor B share the same batch dimensions. Because the batch loop count is taken from A while the right-hand-side buffer is sized from B, an attacker-chosen shape mismatch drives out-of-bounds device reads and writes through cuBLAS/cuSolver — the central, high-severity issue. A secondary ordering flaw indexes tensor dimensions before validating rank (crash/OOB read), plus latent int64-to-int truncation and reinterpret_cast alignment concerns.",
+  "reviewed_anchors": [
+    {"anchor": "ComputeAsync(OpKernelContext*, DoneCallback) final (line 2)", "disposition": "dismissed", "reason": "Async op-kernel entry signature; the DoneCallback contract is honored on every early return, no issue in the signature itself."},
+    {"anchor": "const Tensor& input / rhs = context->input(0/1) (lines 3-4)", "disposition": "dismissed", "reason": "Standard operand fetch; both are the attacker-controlled trust boundary but carry no bug at the fetch site."},
+    {"anchor": "const int ndims = input.dims() (line 5)", "disposition": "dismissed", "reason": "Rank read; safe by itself."},
+    {"anchor": "const int64 n = input.dim_size(ndims - 1) (line 6)", "disposition": "finding", "reason": "Indexes ndims-1 before the ndims>=2 guard; part of the ordering finding."},
+    {"anchor": "const int64 nrhs = rhs.dim_size(ndims - 1) (line 7)", "disposition": "finding", "reason": "Indexes rhs with A's rank before the rhs.dims()==ndims guard; part of the ordering finding."},
+    {"anchor": "OP_REQUIRES_ASYNC ndims >= 2 (lines 9-12)", "disposition": "dismissed", "reason": "Correct rank check, but runs after the dim_size reads on lines 6-7 (captured by the ordering finding)."},
+    {"anchor": "OP_REQUIRES_ASYNC rhs.dims() == ndims (lines 13-17)", "disposition": "finding", "reason": "Validates rank equality but the block it belongs to omits the batch-dimension equality check (primary finding)."},
+    {"anchor": "OP_REQUIRES_ASYNC input square: dim_size(ndims-2) == n (lines 18-22)", "disposition": "dismissed", "reason": "Correctly enforces A squareness."},
+    {"anchor": "OP_REQUIRES_ASYNC rhs rows == n (lines 23-28)", "disposition": "finding", "reason": "Checks trailing rows only; leading batch dims of A vs rhs remain unchecked (primary finding)."},
+    {"anchor": "forward_input_or_allocate_output({1}, 0, rhs.shape(), &output) (lines 32-35)", "disposition": "dismissed", "reason": "Output sized from rhs; contributes to the batch-mismatch divergence but is not itself a bug."},
+    {"anchor": "empty-system early return (lines 39-42)", "disposition": "dismissed", "reason": "Correct zero-element guard that also prevents later zero-size arithmetic."},
+    {"anchor": "std::unique_ptr<CudaSolver> solver (line 45)", "disposition": "dismissed", "reason": "RAII handle; ownership cleanly transferred via std::move at the end, no leak or double-free."},
+    {"anchor": "adjoint transpose branch: allocate_scoped_tensor + DoMatrixTranspose (lines 51-60)", "disposition": "dismissed", "reason": "Allocates copy shaped like A and transposes A into it; self-consistent."},
+    {"anchor": "forward_input_or_allocate_scoped_tensor + device.memcpy (lines 62-71)", "disposition": "dismissed", "reason": "memcpy length input.NumElements()*sizeof(Scalar) matches both source and destination (both shaped from A)."},
+    {"anchor": "input_copy_reshaped = flat_inner_dims<Scalar,3>() (line 73)", "disposition": "dismissed", "reason": "3-D view of A; index domain equals batch_size."},
+    {"anchor": "const int64 batch_size = input_copy_reshaped.dimension(0) (line 74)", "disposition": "finding", "reason": "A-derived batch count later used to index rhs-derived tensors and as an int loop bound (primary + truncation findings)."},
+    {"anchor": "pivots allocate TensorShape{batch_size, n} (lines 78-82)", "disposition": "dismissed", "reason": "Pivots sized from batch_size and n; consistent with the A-side loops that index it."},
+    {"anchor": "GetScratchSpace<uint8>(sizeof(Scalar*)*batch_size, ...) input_copt_ptrs (lines 88-90)", "disposition": "dismissed", "reason": "Correctly sized byte scratch; the cast that consumes it is the reinterpret_cast finding."},
+    {"anchor": "kMaxMatrixSizeToBatchSizeRatio / use_batched_solver (lines 91-93)", "disposition": "dismissed", "reason": "128 is int, batch_size int64 so 128*batch_size is computed in int64; heuristic only selects a code path, no overflow of concern."},
+    {"anchor": "reinterpret_cast<const Scalar**>(...mutable_data()) (lines 97-98, 160-164)", "disposition": "finding", "reason": "Type/alignment reinterpretation of a uint8 scratch buffer to a pointer array (CWE-704 latent finding)."},
+    {"anchor": "for (int batch = 0; batch < batch_size; ++batch) loops (lines 99, 113, 165, 185)", "disposition": "finding", "reason": "int counter against an int64 attacker-influenced bound (truncation/overflow finding)."},
+    {"anchor": "GetrfBatched(n, input_copy_ptrs_base, n, pivots_mat.data(), ..., batch_size) (lines 104-108)", "disposition": "dismissed", "reason": "Operates only on A-derived pointers/pivots bounded by batch_size; consistent."},
+    {"anchor": "Getrf loop (lines 112-119)", "disposition": "dismissed", "reason": "Per-batch factorization on A-derived data; consistent with batch_size."},
+    {"anchor": "transposed_rhs_shape from rhs.shape() + AddDim(nrhs)/AddDim(n) (lines 125-128)", "disposition": "finding", "reason": "Retains rhs batch dims, so transposed_rhs batch count differs from batch_size — the sink of the primary mismatch finding."},
+    {"anchor": "allocate_scoped_tensor transposed_rhs (lines 129-134)", "disposition": "dismissed", "reason": "Allocation is correct for its own shape; the hazard is that A's batch_size later indexes it."},
+    {"anchor": "DoMatrixTranspose / device.memcpy of rhs (lines 135-142)", "disposition": "dismissed", "reason": "Fills transposed_rhs from rhs with rhs.NumElements() length; self-consistent for rhs."},
+    {"anchor": "GetScratchSpace ptr arrays (lines 151-156)", "disposition": "dismissed", "reason": "Both sized sizeof(Scalar*)*batch_size correctly; consumed by the reinterpret_cast/loop findings."},
+    {"anchor": "transposed_rhs_reshaped = flat_inner_dims<Scalar,3>() (lines 157-158)", "disposition": "finding", "reason": "rhs-derived 3-D view indexed with A's batch_size in the solve loops (primary finding sink)."},
+    {"anchor": "for-loop setting input_copy_ptrs_base/transposed_rhs_ptrs_base (lines 165-168)", "disposition": "finding", "reason": "Dereferences transposed_rhs_reshaped(batch,0,0) up to A's batch_size — OOB when rhs batch < A batch (primary finding)."},
+    {"anchor": "GetrsBatched(...) + host_info check (lines 169-182)", "disposition": "dismissed", "reason": "host_info illegal-argument check is present and correct; the OOB risk lives in the pointer array it consumes, already captured."},
+    {"anchor": "Getrs loop indexing transposed_rhs_reshaped(batch,0,0) (lines 184-194)", "disposition": "finding", "reason": "Non-batched sink of the same OOB read/write when batches mismatch (primary finding)."},
+    {"anchor": "DoMatrixTranspose / memcpy X to output (lines 198-205)", "disposition": "dismissed", "reason": "output and transposed_rhs both rhs-shaped, so this copy is self-consistent; the corruption already happened in the solve."},
+    {"anchor": "info_checker lambda capturing [context, done, dev_info] (lines 211-225)", "disposition": "dismissed", "reason": "Captures LapackInfo by value to keep it alive across async work; singular-matrix reporting is correct, no lifetime bug."},
+    {"anchor": "CheckLapackInfoAndDeleteSolverAsync(std::move(solver), ...) (lines 226-227)", "disposition": "dismissed", "reason": "std::move(solver) is the last use; not read afterward, so no use-after-move."}
+  ],
+  "findings": [
+    {
+      "title": "Missing batch-dimension equality check between coefficient and RHS tensors causes out-of-bounds device read/write in the solve loops",
+      "anchor": "Validation block (rank/square/rows) with no batch-dim check; batch_size from input vs transposed_rhs from rhs",
+      "file": "corpus/train/train_0075_cwe354.cpp",
+      "line": "13-28",
+      "code": "    OP_REQUIRES_ASYNC(context, rhs.dims() == ndims,\n                      errors::InvalidArgument(\n                          \"Input and right-hand side must have same rank, got \",\n                          ndims, \" != \", rhs.dims()),\n                      done);\n    OP_REQUIRES_ASYNC(\n        context, input.dim_size(ndims - 2) == n,\n        errors::InvalidArgument(\"Input matrices must be squares, got\",\n                                input.dim_size(ndims - 2), \" != \", n),\n        done);\n    OP_REQUIRES_ASYNC(context, rhs.dim_size(ndims - 2) == n,\n                      errors::InvalidArgument(\n                          \"Input matrix and right-hand side must have the \"\n                          \"same number of rows, got\",\n                          n, \" != \", rhs.dim_size(ndims - 2)),\n                      done);",
+      "bug_class": "Out-of-bounds read/write from unvalidated shape relationship (missing input validation)",
+      "cwe": "CWE-787",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0075_cwe354.cpp (this kernel) and the CudaSolver::GetrsBatched/Getrs implementation (file not provided)",
+      "invariant": "Before deriving a single batch_size from `input` and using it to index tensors derived from `rhs`, the op must require that `input` and `rhs` have identical leading (batch) dimensions — i.e. every dimension except the trailing two must be equal.",
+      "failure_mode": "An attacker supplies A of shape [B_a, n, n] and B of shape [B_b, n, nrhs] with B_a != B_b (same rank, A square, B has n rows — all four guards pass). batch_size (line 74) becomes A's B_a. transposed_rhs and transposed_rhs_reshaped (lines 125-128, 157-158) have rhs's B_b batches. The solve loops (lines 165-168, 185-194) iterate batch up to B_a and dereference &transposed_rhs_reshaped(batch,0,0); when B_a > B_b this indexes past the transposed_rhs allocation, and GetrsBatched/Getrs then read and WRITE those out-of-range device addresses. Result: GPU heap out-of-bounds read and write (memory corruption) or a crash, triggerable by any caller controlling the two tensor shapes.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm there is no batch-dimension equality check anywhere before line 74, and that transposed_rhs is allocated from rhs.shape() while the solve loops are bounded by input-derived batch_size; verify GetrsBatched/Getrs perform no internal bound re-check on the pointer arrays."
+    },
+    {
+      "title": "Dimension indices used before rank validation (dim_size(ndims-1/ndims-2) with unchecked ndims and mismatched rhs rank)",
+      "anchor": "const int64 n = input.dim_size(ndims - 1); const int64 nrhs = rhs.dim_size(ndims - 1);",
+      "file": "corpus/train/train_0075_cwe354.cpp",
+      "line": "5-7",
+      "code": "    const int ndims = input.dims();\n    const int64 n = input.dim_size(ndims - 1);\n    const int64 nrhs = rhs.dim_size(ndims - 1);",
+      "bug_class": "Improper input validation / out-of-bounds shape index (validation ordering)",
+      "cwe": "CWE-20",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0075_cwe354.cpp (this kernel); TensorShape::dim_size implementation (file not provided)",
+      "invariant": "ndims >= 2 and rhs.dims() == ndims must be established BEFORE any tensor is indexed at ndims-1 or ndims-2.",
+      "failure_mode": "If A is a scalar or vector, ndims is 0 or 1 and line 6 computes input.dim_size(ndims-1) = dim_size(-1)/dim_size(0-out-of-range) before the ndims>=2 guard on line 10. Line 7 indexes rhs at A's rank before the rhs.dims()==ndims guard on line 13, so a rhs of lower rank is indexed out of range. TensorShape::dim_size CHECK-fails (process abort / DoS) in a checked build, or reads out of bounds of the dimension array where DCHECKs are compiled out. Attacker only needs to submit a low-rank or rank-mismatched pair of tensors.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm dim_size is called on lines 6-7 before the OP_REQUIRES_ASYNC guards on lines 9-17, and check whether TensorShape::dim_size uses CHECK (abort) or DCHECK (OOB) for an out-of-range or negative index in the shipped build."
+    },
+    {
+      "title": "int64 batch_size truncated to int loop counter (batch-count overflow)",
+      "anchor": "for (int batch = 0; batch < batch_size; ++batch) with const int64 batch_size",
+      "file": "corpus/train/train_0075_cwe354.cpp",
+      "line": "99-101",
+      "code": "      for (int batch = 0; batch < batch_size; ++batch) {\n        input_copy_ptrs_base[batch] = &input_copy_reshaped(batch, 0, 0);\n      }",
+      "bug_class": "Integer overflow / signed truncation of a size-like value",
+      "cwe": "CWE-190",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0075_cwe354.cpp (this kernel); loops at lines 99, 113, 165, 185",
+      "invariant": "The batch loop counter must be able to represent the full int64 batch_size, or batch_size must be rejected when it exceeds INT_MAX before any int-indexed loop.",
+      "failure_mode": "batch_size is an int64 product of attacker-controlled leading dimensions. Every batch loop uses a plain int counter (lines 99, 113, 165, 185). If batch_size > INT_MAX, the signed int comparison/increment overflows (undefined behavior): the loop can run past intended bounds and write input_copy_ptrs_base[batch] beyond the sizeof(Scalar*)*batch_size scratch as batch wraps negative, and/or never terminate. Requires an extremely large tensor, so exploitability is limited (hence low), but it is a real correctness/safety gap.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the loop counters remain int while batch_size is int64, and that no earlier code caps batch_size to <= INT_MAX."
+    },
+    {
+      "title": "reinterpret_cast of uint8 scratch buffer to const Scalar** pointer array (alignment / type confusion)",
+      "anchor": "reinterpret_cast<const Scalar**>(input_copy_ptrs.mutable_data())",
+      "file": "corpus/train/train_0075_cwe354.cpp",
+      "line": "97-98",
+      "code": "      const Scalar** input_copy_ptrs_base =\n          reinterpret_cast<const Scalar**>(input_copy_ptrs.mutable_data());",
+      "bug_class": "Incorrect type conversion / alignment reinterpretation (reinterpret_cast)",
+      "cwe": "CWE-704",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0075_cwe354.cpp (this kernel); also lines 160-164; CudaSolver::GetScratchSpace implementation (file not provided)",
+      "invariant": "Memory reinterpreted as an array of pointers must be at least alignof(Scalar*) aligned and dedicated to that pointer type; reinterpret_cast performs no such check.",
+      "failure_mode": "The scratch is allocated as GetScratchSpace<uint8> and reinterpret_cast to const Scalar** (lines 97-98, 160-164). The byte size sizeof(Scalar*)*batch_size is correct, so there is no overflow, but if the scratch allocator does not return pointer-aligned memory, storing pointers through the cast is undefined behavior on strict-alignment targets and violates strict aliasing. Normal TF scratch is suitably aligned, so this is a latent hygiene issue rather than an active exploit.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm GetScratchSpace<uint8> returns memory aligned for pointer storage (alignof(void*)); otherwise request the scratch as Scalar* (or a pointer-typed) buffer instead of uint8."
+    }
+  ],
+  "audit_checklist": [
+    "Add an explicit guard that input and rhs share identical batch dimensions (all dims except the trailing two) before line 74, and confirm no path lets A's batch_size index rhs-derived tensors (transposed_rhs_reshaped) when the batch counts differ.",
+    "Move the ndims>=2 and rhs.dims()==ndims checks ahead of the dim_size(ndims-1)/dim_size(ndims-2) reads on lines 6-7, and verify TensorShape::dim_size behavior (CHECK vs DCHECK) for out-of-range/negative indices in the shipped build.",
+    "Change the batch loop counters (lines 99, 113, 165, 185) to int64 or reject batch_size > INT_MAX, since batch_size is an attacker-influenced int64.",
+    "Verify that GetrfBatched/GetrsBatched/Getrf/Getrs perform no independent bounds validation on the caller-supplied pointer arrays and matrix dimensions n/nrhs — they trust the kernel's arithmetic entirely.",
+    "Confirm the uint8 GetScratchSpace buffers are aligned for pointer storage before the reinterpret_cast to const Scalar** (lines 97-98, 160-164).",
+    "Confirm the memcpy lengths on lines 68-70, 139-141, and 202-204 always match both source and destination element counts once batch dimensions are validated equal.",
+    "Confirm std::move(solver) on line 226 is the final use and the info_checker lambda does not reference the moved-from solver."
+  ]
+}

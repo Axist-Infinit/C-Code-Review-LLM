@@ -1,0 +1,239 @@
+{
+  "subsystem": "ImageMagick raster image decoder — ReadCALSImage(), the reader for the CALS Type 1 (MIL-STD-1840, US DoD) raster/fax image format. It parses a sequence of 128-byte ASCII CALS header records to recover density, pixel count (width/height), orientation and type, then copies the raw compressed bitstream into a temporary file and delegates the actual pixel decode to the Group 4 (CCITT T.6 fax) coder via ReadImage on a 'group4:<file>' spec.",
+  "provenance": "Identified from the ImageMagick coder API surface: the signature 'static Image *ReadCALSImage(const ImageInfo *image_info, ExceptionInfo *exception)' matches ImageMagick's Read<Format>Image coder convention; the use of MaxTextExtent, MagickCoreSignature, MagickBooleanType, AcquireImage, OpenBlob/ReadBlob/ReadBlobByte/CloseBlob, AcquireUniqueFileResource, FormatLocaleString, CloneImageInfo, ConstantString and ReadImage are all ImageMagick MagickCore symbols. The CALS field keywords 'rdensty:', 'rpelcnt:', 'rorient:', 'rtype:' and the group4 delegation are specific to coders/cals.c. The banner tag 'primevul_c_train_2502_vuln' and 'cwe252' in the filename indicate the intended issue class is Unchecked Return Value.",
+  "trust_boundary": "The entire 128-byte-per-record header stream and the trailing bitstream come from the input blob opened by OpenBlob (a file or an in-memory blob supplied by the caller/network). Everything read via ReadBlob/ReadBlobByte is attacker-controlled: the ASCII header records, the numeric operands parsed by sscanf ('rdensty:', 'rpelcnt:' width/height, 'rorient:' pel_path/direction, 'rtype:'), and the raw Group 4 payload. The parsed width/height/density/orientation cross the trust boundary a second time when they are formatted into read_info and handed to the delegated group4 decoder. header[129] is the only stack buffer that touches raw input directly.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0051_cwe252.c",
+      "lines": "2-3",
+      "code": "static Image *ReadCALSImage(const ImageInfo *image_info,\n  ExceptionInfo *exception)",
+      "explanation": "Entry point for the CALS decoder. It follows the standard ImageMagick coder contract: it takes a read-only ImageInfo describing the source (filename, blob, flags) and an ExceptionInfo out-parameter for error reporting, and returns a newly allocated Image* (or NULL on failure). All bytes it will process arrive through the blob referenced by image_info, so this function is an untrusted-input parser."
+    },
+    {
+      "file": "corpus/train/train_0051_cwe252.c",
+      "lines": "5-8",
+      "code": "char\n    filename[MaxTextExtent],\n    header[129],\n    message[MaxTextExtent];",
+      "explanation": "Three fixed-size stack buffers. filename[MaxTextExtent] holds the path of a temporary file that the raw bitstream is spilled into. message[MaxTextExtent] is a scratch buffer used to format the size/density strings for the delegated reader. header[129] is the critical one: it receives each 128-byte CALS header record. Its size is deliberately one byte larger than the 128 bytes read, so that a guaranteed NUL terminator can sit at index 128 and the record can be treated as a C string by the string/sscanf calls below."
+    },
+    {
+      "file": "corpus/train/train_0051_cwe252.c",
+      "lines": "29-36",
+      "code": "unsigned long\n    density,\n    direction,\n    height,\n    orientation,\n    pel_path,\n    type,\n    width;",
+      "explanation": "The seven metadata values recovered from the header records, all unsigned long. density is the CALS raster density, width/height are the pixel dimensions, pel_path and direction combine to produce orientation, and type is the CALS document type. These are the sole outputs of the header-parse phase; width/height and density flow to the delegated group4 reader, so they are security-relevant attacker-controlled scalars."
+    },
+    {
+      "file": "corpus/train/train_0051_cwe252.c",
+      "lines": "41-54",
+      "code": "assert(image_info != (const ImageInfo *) NULL);\n  assert(image_info->signature == MagickCoreSignature);\n  if (image_info->debug != MagickFalse)\n    (void) LogMagickEvent(TraceEvent,GetMagickModule(),\"%s\",\n      image_info->filename);\n  assert(exception != (ExceptionInfo *) NULL);\n  assert(exception->signature == MagickCoreSignature);\n  image=AcquireImage(image_info);\n  status=OpenBlob(image_info,image,ReadBinaryBlobMode,exception);\n  if (status == MagickFalse)\n    {\n      image=DestroyImageList(image);\n      return((Image *) NULL);\n    }",
+      "explanation": "Preamble and blob open. The asserts validate the caller-supplied handles and their MagickCoreSignature (debug/assert builds only). AcquireImage allocates the working Image structure; its return value is used immediately without a NULL check. OpenBlob opens the input in binary read mode and its MagickBooleanType return IS checked: on MagickFalse the image list is destroyed and NULL is returned. This is the one return value in the function that is handled correctly."
+    },
+    {
+      "file": "corpus/train/train_0051_cwe252.c",
+      "lines": "58-65",
+      "code": "(void) memset(header,0,sizeof(header));\n  density=0;\n  direction=0;\n  orientation=1;\n  pel_path=0;\n  type=1;\n  width=0;\n  height=0;",
+      "explanation": "Initialization. The whole 129-byte header buffer is zeroed once, which is what guarantees header[128] stays NUL even after subsequent 128-byte reads overwrite indices 0..127 — this is the invariant that makes treating header as a string safe. Every metadata variable is given a safe default (orientation=1, type=1, everything else 0). This pre-initialization is what limits the blast radius of the unchecked sscanf calls below: a parse failure leaves the default in place rather than an uninitialized value."
+    },
+    {
+      "file": "corpus/train/train_0051_cwe252.c",
+      "lines": "66-70",
+      "code": "for (i=0; i < 16; i++)\n  {\n    if (ReadBlob(image,128,(unsigned char *) header) != 128)\n      break;\n    switch (*header)",
+      "explanation": "The header-record loop, capped at 16 records (16 * 128 = 2048 bytes of header maximum). Each iteration reads exactly 128 bytes into header; the ReadBlob return is checked against 128 and the loop breaks on a short read, so a truncated stream cannot leave stale/partial data being parsed as a full record. The first byte of the record (*header) is used as a cheap dispatch to decide whether the record could be one of the recognized 'r...' keywords."
+    },
+    {
+      "file": "corpus/train/train_0051_cwe252.c",
+      "lines": "72-79",
+      "code": "case 'R':\n      case 'r':\n      {\n        if (LocaleNCompare(header,\"rdensty:\",8) == 0)\n          {\n            (void) sscanf(header+8,\"%lu\",&density);\n            break;\n          }",
+      "explanation": "Records beginning with 'R'/'r' are matched against the known keywords with LocaleNCompare over a fixed 8-byte prefix (safe: the record always has 128 valid bytes plus the NUL). For 'rdensty:' the operand after the 8-byte prefix is parsed as an unsigned long into density with sscanf. The sscanf return value is explicitly discarded via the (void) cast — if the operand is non-numeric, density silently retains its default of 0."
+    },
+    {
+      "file": "corpus/train/train_0051_cwe252.c",
+      "lines": "80-84",
+      "code": "if (LocaleNCompare(header,\"rpelcnt:\",8) == 0)\n          {\n            (void) sscanf(header+8,\"%lu,%lu\",&width,&height);\n            break;\n          }",
+      "explanation": "The 'rpelcnt:' record carries the pixel count as 'width,height'. sscanf parses two unsigned longs into width and height. Again the return (which would tell you whether 0, 1, or 2 conversions succeeded) is discarded. Because both are pre-initialized to 0, a partial or failed parse leaves one or both at 0, but there is no validation that either is non-zero or within a sane range — and these are exactly the values later handed to the group4 delegate as the image geometry."
+    },
+    {
+      "file": "corpus/train/train_0051_cwe252.c",
+      "lines": "85-99",
+      "code": "if (LocaleNCompare(header,\"rorient:\",8) == 0)\n          {\n            (void) sscanf(header+8,\"%lu,%lu\",&pel_path,&direction);\n            if (pel_path == 90)\n              orientation=5;\n            else\n              if (pel_path == 180)\n                orientation=3;\n              else\n                if (pel_path == 270)\n                  orientation=7;\n            if (direction == 90)\n              orientation++;\n            break;\n          }",
+      "explanation": "The 'rorient:' record supplies pel_path and direction (again via an unchecked two-operand sscanf). pel_path selects a base orientation (5/3/7 for 90/180/270; otherwise the default 1), and a direction of 90 increments it. The resulting orientation is later cast to OrientationType. Values are bounded to the small set {1,3,5,7,8,2,4,6} by construction, so this arithmetic is not itself dangerous, but the sscanf return is still ignored."
+    },
+    {
+      "file": "corpus/train/train_0051_cwe252.c",
+      "lines": "100-107",
+      "code": "if (LocaleNCompare(header,\"rtype:\",6) == 0)\n          {\n            (void) sscanf(header+6,\"%lu\",&type);\n            break;\n          }\n        break;\n      }\n    }",
+      "explanation": "The 'rtype:' record (note the 6-byte prefix, not 8) parses the CALS document type into type via another unchecked sscanf. type is otherwise unused downstream in this function. The trailing break statements fall out of the switch; unrecognized records are simply ignored and the loop continues to the next 128-byte record."
+    },
+    {
+      "file": "corpus/train/train_0051_cwe252.c",
+      "lines": "112-117",
+      "code": "file=(FILE *) NULL;\n  unique_file=AcquireUniqueFileResource(filename);\n  if (unique_file != -1)\n    file=fdopen(unique_file,\"wb\");\n  if ((unique_file == -1) || (file == (FILE *) NULL))\n    ThrowImageException(FileOpenError,\"UnableToCreateTemporaryFile\");",
+      "explanation": "A unique temporary file is acquired (its name written into filename) and wrapped in a stdio FILE* via fdopen. Both failure modes are handled: AcquireUniqueFileResource returning -1 and fdopen returning NULL both lead to ThrowImageException. This return-value handling is correct."
+    },
+    {
+      "file": "corpus/train/train_0051_cwe252.c",
+      "lines": "118-122",
+      "code": "while ((c=ReadBlobByte(image)) != EOF)\n    (void) fputc(c,file);\n  (void) fclose(file);\n  (void) CloseBlob(image);\n  image=DestroyImage(image);",
+      "explanation": "The remainder of the input blob (everything after the consumed header records) is copied byte-by-byte into the temporary file — this is the raw Group 4 fax bitstream. fputc's return is discarded (a write failure / full disk goes undetected), and fclose's return is also discarded via (void), so a deferred write error surfacing at close is lost. The source blob is then closed and the interim Image destroyed."
+    },
+    {
+      "file": "corpus/train/train_0051_cwe252.c",
+      "lines": "123-132",
+      "code": "read_info=CloneImageInfo(image_info);\n  SetImageInfoBlob(read_info,(void *) NULL,0);\n  (void) FormatLocaleString(read_info->filename,MaxTextExtent,\"group4:%s\",\n    filename);\n  (void) FormatLocaleString(message,MaxTextExtent,\"%lux%lu\",width,height);\n  read_info->size=ConstantString(message);\n  (void) FormatLocaleString(message,MaxTextExtent,\"%lu\",density);\n  read_info->density=ConstantString(message);\n  read_info->orientation=(OrientationType) orientation;\n  image=ReadImage(read_info,exception);",
+      "explanation": "The delegation phase. A cloned ImageInfo is built to read the temp file through the group4 coder ('group4:<filename>'). The attacker-controlled width and height are formatted into 'WxH' and stored as read_info->size, density into read_info->density, and orientation is cast into read_info->orientation. ReadImage then invokes the Group 4 decoder with that geometry. FormatLocaleString is bounded by MaxTextExtent, so the string building itself is safe, but the semantic values (dimensions) are passed through unvalidated."
+    },
+    {
+      "file": "corpus/train/train_0051_cwe252.c",
+      "lines": "133-143",
+      "code": "if (image != (Image *) NULL)\n    {\n      (void) CopyMagickString(image->filename,image_info->filename,\n        MaxTextExtent);\n      (void) CopyMagickString(image->magick_filename,image_info->filename,\n        MaxTextExtent);\n      (void) CopyMagickString(image->magick,\"CALS\",MaxTextExtent);\n    }\n  read_info=DestroyImageInfo(read_info);\n  (void) RelinquishUniqueFileResource(filename);\n  return(image);",
+      "explanation": "If the delegate produced an image, its filename/magick_filename/magick fields are set with size-bounded CopyMagickString calls (safe). The read_info is destroyed, the temporary file resource is released, and the decoded image (or NULL) is returned. Note the returned image may be NULL if the group4 decode failed — that NULL propagates correctly to the caller."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0051_cwe252.c",
+      "lines": "80-84",
+      "code": "if (LocaleNCompare(header,\"rpelcnt:\",8) == 0)\n          {\n            (void) sscanf(header+8,\"%lu,%lu\",&width,&height);\n            break;\n          }",
+      "explanation": "The primary risk: width and height are fully attacker-controlled unsigned longs taken from the ASCII header and are NOT validated for range before being handed to the Group 4 delegate (lines 127-132). An attacker can specify 'rpelcnt: 4294967295,4294967295' (or any enormous value). Nothing here checks width/height against MagickMax dimension limits, against the amount of pixel data actually present in the temp file, or that they are non-zero. When ReadImage runs the group4 coder with read_info->size set to that geometry, the downstream decoder may attempt a huge allocation or produce a geometry/data mismatch, i.e. a denial-of-service / resource-exhaustion primitive (CWE-20 / CWE-789). The invariant the implementation must uphold is: reject or clamp CALS dimensions to sane bounds before delegating."
+    },
+    {
+      "file": "corpus/train/train_0051_cwe252.c",
+      "lines": "82",
+      "code": "(void) sscanf(header+8,\"%lu,%lu\",&width,&height);",
+      "explanation": "The tagged CWE-252 issue: every sscanf here discards its return value (lines 77, 82, 87, 102). sscanf returns the number of successful conversions; discarding it means the code cannot distinguish 'rpelcnt: 640,480' from 'rpelcnt: garbage' or 'rpelcnt: 640' (only one operand). In this specific function the impact is bounded because density/width/height/pel_path/direction/type are all pre-initialized (lines 59-65) to safe defaults, so a failed conversion yields a default (0 or 1) rather than an uninitialized read. The failure mode is therefore silent acceptance of malformed metadata (wrong dimensions/density) rather than memory corruption. The invariant: check that sscanf returned the expected conversion count and reject the record otherwise. Had any of these variables not been pre-initialized, the same pattern would be an uninitialized-value use (CWE-457) feeding the allocator."
+    },
+    {
+      "file": "corpus/train/train_0051_cwe252.c",
+      "lines": "48",
+      "code": "image=AcquireImage(image_info);",
+      "explanation": "AcquireImage's return value is used on the very next line (OpenBlob(image_info,image,...)) with no NULL check. Under memory pressure AcquireImage can return NULL; OpenBlob and the subsequent DestroyImageList would then dereference a NULL Image handle (CWE-476/CWE-252). This is a latent robustness defect — the contract in ImageMagick is that callers should verify AcquireImage before use — with impact limited to a NULL-deref crash rather than exploitable corruption. The invariant: verify AcquireImage != NULL before passing it to OpenBlob."
+    },
+    {
+      "file": "corpus/train/train_0051_cwe252.c",
+      "lines": "119-120",
+      "code": "(void) fputc(c,file);\n  (void) fclose(file);",
+      "explanation": "The bitstream spill ignores both fputc's return (per-byte write error, e.g. ENOSPC) and fclose's return (deferred flush error). If writes to the temporary file silently fail or truncate, the group4 delegate later reads a corrupt/short bitstream and may misbehave, and the caller is told nothing went wrong (CWE-252). Impact is low (data-integrity / robustness), not memory safety, but it is another instance of the unchecked-return pattern. The invariant: detect write/close failure and raise an exception instead of proceeding to decode a possibly-truncated temp file."
+    },
+    {
+      "file": "corpus/train/train_0051_cwe252.c",
+      "lines": "58-69",
+      "code": "(void) memset(header,0,sizeof(header));\n...\n    if (ReadBlob(image,128,(unsigned char *) header) != 128)\n      break;",
+      "explanation": "Worth confirming rather than a live bug: header is 129 bytes, ReadBlob writes exactly 128 (indices 0..127), and the one-time memset leaves header[128]=0 permanently, so the record is always NUL-terminated before LocaleNCompare/sscanf treat it as a string — no out-of-bounds read (CWE-125) occurs. This is only safe as long as (a) the read width stays at 128 < sizeof(header) and (b) the memset is never removed or moved inside a path that lets a later 128-byte read reach index 128. If a future edit raised the ReadBlob length to 129 or dropped the memset, sscanf/LocaleNCompare would run off an unterminated buffer. Flag it so the invariant (read length strictly less than buffer size, terminator preserved) is documented."
+    }
+  ],
+  "summary": "This is ImageMagick's CALS Type 1 reader (ReadCALSImage). It is largely memory-safe: the 129-byte header buffer is correctly over-sized-and-NUL-terminated against a fixed 128-byte read, string prefixes are compared with bounded lengths, and all output-string formatting is length-capped. The real weaknesses are the tagged CWE-252 pattern (every sscanf and the fputc/fclose discard their return values) and, more importantly, the absence of any range validation on the attacker-controlled width/height before they are passed as the geometry to the delegated Group 4 decoder. The CWE-252 impact is mitigated here by pre-initialization of all target variables, making this an honest low-to-medium-risk review.",
+  "reviewed_anchors": [
+    { "anchor": "ReadCALSImage(const ImageInfo *image_info, ExceptionInfo *exception) — signature (lines 2-3)", "disposition": "dismissed", "reason": "Standard coder entry; parameters are handles, not buffers. Risk lives in what it parses, captured by the field/call anchors below." },
+    { "anchor": "filename[MaxTextExtent] (line 6)", "disposition": "dismissed", "reason": "Written only by AcquireUniqueFileResource and read by size-bounded FormatLocaleString('group4:%s'); no unbounded copy." },
+    { "anchor": "header[129] (line 7)", "disposition": "finding", "reason": "Sole raw-input stack buffer; safety depends on the 128<129 read width plus the one-time memset terminator — flagged as an invariant to confirm." },
+    { "anchor": "message[MaxTextExtent] (line 8)", "disposition": "dismissed", "reason": "Only written by MaxTextExtent-bounded FormatLocaleString calls; no overflow path." },
+    { "anchor": "unsigned long density/direction/height/orientation/pel_path/type/width (lines 29-36)", "disposition": "finding", "reason": "Attacker-controlled scalars; width/height/density cross into the group4 delegate unvalidated." },
+    { "anchor": "assert(image_info->signature == MagickCoreSignature) etc. (lines 41-47)", "disposition": "dismissed", "reason": "Debug/assert-build sanity checks on caller handles; not attacker-reachable data and compiled out in release." },
+    { "anchor": "image=AcquireImage(image_info) (line 48)", "disposition": "finding", "reason": "Return not NULL-checked before OpenBlob; latent NULL dereference." },
+    { "anchor": "status=OpenBlob(...) + if (status == MagickFalse) (lines 49-54)", "disposition": "dismissed", "reason": "Return value correctly checked and error path returns NULL after DestroyImageList." },
+    { "anchor": "memset(header,0,sizeof(header)) (line 58)", "disposition": "finding", "reason": "This is the terminator guarantee for header[128]; covered under the header[129] invariant." },
+    { "anchor": "variable initializers density=0..height=0 (lines 59-65)", "disposition": "dismissed", "reason": "Safe defaults; these mitigate the unchecked-sscanf impact rather than create risk." },
+    { "anchor": "for (i=0; i<16; i++) header-record loop (line 66)", "disposition": "dismissed", "reason": "Fixed 16-iteration cap bounds header consumption to 2048 bytes; no unbounded loop." },
+    { "anchor": "if (ReadBlob(image,128,...) != 128) break (line 68)", "disposition": "dismissed", "reason": "Return value checked; short read breaks the loop, preventing stale-record parsing." },
+    { "anchor": "switch (*header) (line 70)", "disposition": "dismissed", "reason": "Single-byte dispatch into a valid 128-byte record; no bounds concern." },
+    { "anchor": "LocaleNCompare(header,\"rdensty:\"/\"rpelcnt:\"/\"rorient:\",8) and \"rtype:\",6 (lines 75,80,85,100)", "disposition": "dismissed", "reason": "Fixed-length prefix compares over a buffer with >=128 valid bytes plus NUL; no OOB." },
+    { "anchor": "(void) sscanf(header+8,\"%lu\",&density) (line 77)", "disposition": "finding", "reason": "Unchecked return value (CWE-252); folded into the sscanf finding." },
+    { "anchor": "(void) sscanf(header+8,\"%lu,%lu\",&width,&height) (line 82)", "disposition": "finding", "reason": "Unchecked return AND unvalidated dimensions handed to delegate; two findings anchor here." },
+    { "anchor": "(void) sscanf(header+8,\"%lu,%lu\",&pel_path,&direction) (line 87)", "disposition": "finding", "reason": "Unchecked return value (CWE-252); folded into the sscanf finding." },
+    { "anchor": "rorient orientation arithmetic (lines 88-97)", "disposition": "dismissed", "reason": "Result bounded to a small orientation set; benign even with hostile pel_path/direction." },
+    { "anchor": "(void) sscanf(header+6,\"%lu\",&type) (line 102)", "disposition": "finding", "reason": "Unchecked return (CWE-252); type is otherwise unused. Folded into the sscanf finding." },
+    { "anchor": "unique_file=AcquireUniqueFileResource(filename) + check (lines 113-114)", "disposition": "dismissed", "reason": "Return checked against -1." },
+    { "anchor": "file=fdopen(unique_file,\"wb\") + NULL check (lines 115-117)", "disposition": "dismissed", "reason": "Both -1 and NULL failure paths raise ThrowImageException; handled correctly." },
+    { "anchor": "while ((c=ReadBlobByte(image)) != EOF) (void) fputc(c,file) (lines 118-119)", "disposition": "finding", "reason": "fputc return discarded (CWE-252); folded into the write/close finding." },
+    { "anchor": "(void) fclose(file) (line 120)", "disposition": "finding", "reason": "fclose return discarded, losing deferred write errors; folded into the write/close finding." },
+    { "anchor": "FormatLocaleString(read_info->filename,MaxTextExtent,\"group4:%s\",filename) (line 125)", "disposition": "dismissed", "reason": "Length-bounded formatting; delegate target string is safe." },
+    { "anchor": "FormatLocaleString(message,MaxTextExtent,\"%lux%lu\",width,height) + read_info->size (lines 127-128)", "disposition": "finding", "reason": "Bounded formatting, but propagates unvalidated attacker dimensions into the group4 read; part of the dimension-validation finding." },
+    { "anchor": "read_info->orientation=(OrientationType) orientation (line 131)", "disposition": "dismissed", "reason": "orientation is bounded to a small valid set by the rorient logic; benign cast." },
+    { "anchor": "image=ReadImage(read_info,exception) (line 132)", "disposition": "dismissed", "reason": "Delegation call itself is correct; the risk is the unvalidated inputs it receives, captured by the dimension finding. Its NULL return is handled at line 133." },
+    { "anchor": "CopyMagickString(image->filename/magick_filename/magick,...,MaxTextExtent) (lines 135-139)", "disposition": "dismissed", "reason": "Size-bounded string copies into MaxTextExtent buffers; no overflow." }
+  ],
+  "findings": [
+    {
+      "title": "Attacker-controlled CALS width/height passed to Group 4 decoder without range validation",
+      "anchor": "(void) sscanf(header+8,\"%lu,%lu\",&width,&height); ... FormatLocaleString(message,MaxTextExtent,\"%lux%lu\",width,height); read_info->size=ConstantString(message);",
+      "file": "corpus/train/train_0051_cwe252.c",
+      "line": "82, 127-132",
+      "code": "(void) sscanf(header+8,\"%lu,%lu\",&width,&height);\n...\n(void) FormatLocaleString(message,MaxTextExtent,\"%lux%lu\",width,height);\n  read_info->size=ConstantString(message);\n...\n  image=ReadImage(read_info,exception);",
+      "bug_class": "Missing input validation of image dimensions before delegation (resource exhaustion / DoS)",
+      "cwe": "CWE-20",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided) — the risk realizes in the delegated Group 4 / TIFF fax coder invoked by ReadImage",
+      "invariant": "The 'rpelcnt:' width and height must be validated (non-zero, within MagickMax / configured resource limits, and consistent with the amount of bitstream data actually written to the temp file) before being set as read_info->size and handed to the group4 decoder.",
+      "failure_mode": "A CALS file with 'rpelcnt: 4294967295,4294967295' (or any oversized pair) sets read_info->size to a huge geometry. ReadImage runs the Group 4 coder with that geometry, which can drive an enormous pixel-buffer allocation or a geometry/data mismatch, yielding memory exhaustion / denial of service. No bound is checked anywhere in this function.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether the group4/TIFF fax delegate clamps or rejects out-of-range image dimensions, or whether ReadCALSImage should validate width/height against MagickResourceLimits before setting read_info->size."
+    },
+    {
+      "title": "Unchecked sscanf return values when parsing CALS header numeric fields (CWE-252)",
+      "anchor": "(void) sscanf(header+8,\"%lu\",&density); (void) sscanf(header+8,\"%lu,%lu\",&width,&height); (void) sscanf(header+8,\"%lu,%lu\",&pel_path,&direction); (void) sscanf(header+6,\"%lu\",&type);",
+      "file": "corpus/train/train_0051_cwe252.c",
+      "line": "77, 82, 87, 102",
+      "code": "(void) sscanf(header+8,\"%lu\",&density);\n...\n(void) sscanf(header+8,\"%lu,%lu\",&width,&height);\n...\n(void) sscanf(header+8,\"%lu,%lu\",&pel_path,&direction);\n...\n(void) sscanf(header+6,\"%lu\",&type);",
+      "bug_class": "Unchecked return value (silent acceptance of malformed metadata)",
+      "cwe": "CWE-252",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0051_cwe252.c",
+      "invariant": "Each sscanf must have its conversion count checked against the expected number of operands; a record whose numeric field fails to parse should be rejected or explicitly defaulted, not silently accepted.",
+      "failure_mode": "A malformed record ('rpelcnt: abc', 'rpelcnt: 640' with a missing second operand, etc.) leaves the affected variable at its pre-initialized default, and the code proceeds as if the field were valid. Impact is bounded to using wrong/default dimensions or density because all targets are initialized at lines 59-65; there is no uninitialized read here. Had the pre-initialization been absent, the same pattern would feed uninitialized values (CWE-457) into the downstream allocation.",
+      "cve_analog": "",
+      "what_to_confirm": "That the hardened version checks sscanf() == expected-count (e.g. '== 2' for rpelcnt/rorient) and rejects records that do not fully parse."
+    },
+    {
+      "title": "AcquireImage return value used without NULL check",
+      "anchor": "image=AcquireImage(image_info); status=OpenBlob(image_info,image,ReadBinaryBlobMode,exception);",
+      "file": "corpus/train/train_0051_cwe252.c",
+      "line": "48-49",
+      "code": "image=AcquireImage(image_info);\n  status=OpenBlob(image_info,image,ReadBinaryBlobMode,exception);",
+      "bug_class": "NULL pointer dereference from unchecked allocation return",
+      "cwe": "CWE-476",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0051_cwe252.c",
+      "invariant": "AcquireImage's return must be checked for NULL before it is passed to OpenBlob and DestroyImageList.",
+      "failure_mode": "Under memory pressure AcquireImage may return NULL; the immediate OpenBlob call (and DestroyImageList on the error path) would dereference the NULL Image handle, crashing the process. Not memory-corruption-exploitable, but a robustness/DoS defect.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether AcquireImage can return NULL in this build and whether callers elsewhere guard it; add a NULL check if not guaranteed non-NULL."
+    },
+    {
+      "title": "Discarded fputc/fclose return values while spilling the bitstream to a temp file",
+      "anchor": "while ((c=ReadBlobByte(image)) != EOF) (void) fputc(c,file); (void) fclose(file);",
+      "file": "corpus/train/train_0051_cwe252.c",
+      "line": "118-120",
+      "code": "while ((c=ReadBlobByte(image)) != EOF)\n    (void) fputc(c,file);\n  (void) fclose(file);",
+      "bug_class": "Unchecked return value on write/close (silent data truncation)",
+      "cwe": "CWE-252",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0051_cwe252.c",
+      "invariant": "Write and close failures on the temporary file must be detected and surfaced as an exception before the file is fed to the group4 delegate.",
+      "failure_mode": "If fputc fails (e.g. ENOSPC) or fclose reports a deferred flush error, the temp file is silently truncated/corrupt. The group4 decoder then reads short/garbled input and may misbehave, with no error propagated to the caller. Impact is data-integrity/robustness rather than memory safety.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether the hardened implementation checks fputc/fclose (or uses a checked write helper) and aborts on write failure."
+    },
+    {
+      "title": "header[129] string-termination invariant depends on fixed 128-byte read plus one-time memset",
+      "anchor": "char header[129]; (void) memset(header,0,sizeof(header)); if (ReadBlob(image,128,(unsigned char *) header) != 128) break;",
+      "file": "corpus/train/train_0051_cwe252.c",
+      "line": "7, 58, 68",
+      "code": "header[129],\n...\n(void) memset(header,0,sizeof(header));\n...\n    if (ReadBlob(image,128,(unsigned char *) header) != 128)\n      break;",
+      "bug_class": "Fragile buffer-termination contract (potential out-of-bounds read if invariant is broken)",
+      "cwe": "CWE-125",
+      "severity": "info",
+      "where_it_lives": "corpus/train/train_0051_cwe252.c",
+      "invariant": "The ReadBlob length must stay strictly less than sizeof(header) and the whole-buffer memset must remain, so that header[128] is always NUL before LocaleNCompare/sscanf treat the record as a C string.",
+      "failure_mode": "As written this is SAFE: 128 bytes fill indices 0..127 and header[128] stays 0 from the memset, so no OOB read occurs. It becomes a bug only if a future edit raises the read length to 129, removes/relocates the memset, or lets a short read leave stale bytes with no terminator — then LocaleNCompare/sscanf could read past the buffer. Documented so the invariant is preserved.",
+      "cve_analog": "",
+      "what_to_confirm": "That no code path reads more than 128 bytes into header and that the terminator at header[128] is always present before string operations."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm the group4/TIFF fax delegate (or ReadCALSImage) clamps or rejects out-of-range 'rpelcnt:' width/height against MagickResourceLimits before allocation.",
+    "Check that each sscanf's conversion count is validated (== expected operands) so malformed CALS records are rejected rather than silently defaulted.",
+    "Verify AcquireImage (line 48) return is NULL-checked before OpenBlob/DestroyImageList in the intended build.",
+    "Verify fputc/fclose (and ideally the whole temp-file spill) detect and propagate write/close errors before the group4 decode runs.",
+    "Confirm header[128] is always NUL (memset preserved, ReadBlob length stays 128 < 129) so LocaleNCompare/sscanf never read past the record.",
+    "Confirm width/height/density parsed here are consistent with the actual bitstream size written to the temp file, to avoid geometry/data mismatch in the delegate."
+  ]
+}

@@ -1,0 +1,252 @@
+{
+  "subsystem": "Linux kernel hfi1 InfiniBand/OPA host-fabric driver — Send DMA (SDMA) engine bring-up. sdma_init() allocates and initializes the array of per-engine sdma_engine objects, their descriptor FIFOs (descq), software transmit rings (tx_ring), the DMA head-write-back region, a pad buffer, and a resizable hashtable (sdma_rht) used to map connections to engines. It runs once at device probe/port init time.",
+  "provenance": "Identified from the sample banner '/* sample: primevul_c_train_3056_fixed */' and the function/type names: struct hfi1_devdata, struct hfi1_pportdata, struct sdma_engine, chip_sdma_engines/chip_sdma_mem_size, HFI1_CAP_IS_KSET(SDMA), TXE_NUM_SDMA_ENGINES, SD(TAIL), get_kctxt_csr_addr, sdma_map_init, sdma_rht_params. These are the exact symbols of drivers/infiniband/hw/hfi1/sdma.c in the mainline Linux kernel. The 'cwe401' tag in the filename (train_0235_cwe401.c) and the '_fixed' suffix indicate this is the patched revision of a memory-leak-classed sample.",
+  "trust_boundary": "This is device/port initialization code, not a network wire parser, so there is no remote attacker on the primary data path. The inputs are: (1) hardware-derived quantities returned by chip_sdma_engines(dd), chip_sdma_mem_size(dd), sdma_get_descq_cnt() — trusted-but-fallible (a mis-programmed or emulated/pass-through device could report degenerate values such as 0); (2) module parameters mod_num_sdma, sdma_idle_cnt, sdma_desct_intr — root/admin controlled at load time, not unprivileged; (3) the caller-supplied u8 port used as an index into dd->pport. Nothing here decodes untrusted packet bytes, so the realistic risk surface is robustness of the init/error paths (division by degenerate hardware counts, and correct memory unwinding on failure) rather than remote memory corruption.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0235_cwe401.c",
+      "lines": "2-13",
+      "code": "int sdma_init(struct hfi1_devdata *dd, u8 port)\n{\n\tunsigned this_idx;\n\tstruct sdma_engine *sde;\n\tstruct rhashtable *tmp_sdma_rht;\n\tu16 descq_cnt;\n\tvoid *curr_head;\n\tstruct hfi1_pportdata *ppd = dd->pport + port;\n\tu32 per_sdma_credits;\n\tuint idle_cnt = sdma_idle_cnt;\n\tsize_t num_engines = chip_sdma_engines(dd);\n\tint ret = -ENOMEM;",
+      "explanation": "The entry point takes the per-device context dd and a u8 port number and returns an int status (0 on success, negative errno otherwise, defaulted to -ENOMEM at line 13). Local state is declared up front: this_idx is the engine loop index; sde is a working pointer to the current engine; tmp_sdma_rht is a scratch pointer for the hashtable (its name and locality are the signature of the memory-leak fix this sample encodes); descq_cnt is a u16 descriptor-FIFO depth; curr_head walks the head-writeback DMA region; ppd is computed immediately as dd->pport + port (pointer arithmetic indexed by the caller's port); per_sdma_credits is a computed credit budget; idle_cnt is seeded from the sdma_idle_cnt module parameter; and num_engines is seeded from the hardware via chip_sdma_engines(dd) as a size_t. num_engines is the master count that drives every subsequent allocation and both loops."
+    },
+    {
+      "file": "corpus/train/train_0235_cwe401.c",
+      "lines": "15-18",
+      "code": "\tif (!HFI1_CAP_IS_KSET(SDMA)) {\n\t\tHFI1_CAP_CLEAR(SDMA_AHG);\n\t\treturn 0;\n\t}",
+      "explanation": "A capability gate: if the SDMA feature is not enabled in the kernel capability set, the routine clears the dependent SDMA_AHG capability and returns success (0) without allocating anything. This is a clean early-out that leaves dd->per_sdma NULL, which callers and teardown must tolerate."
+    },
+    {
+      "file": "corpus/train/train_0235_cwe401.c",
+      "lines": "19-24",
+      "code": "\tif (mod_num_sdma &&\n\t    /* can't exceed chip support */\n\t    mod_num_sdma <= chip_sdma_engines(dd) &&\n\t    /* count must be >= vls */\n\t    mod_num_sdma >= num_vls)\n\t\tnum_engines = mod_num_sdma;",
+      "explanation": "The mod_num_sdma module parameter can override the hardware-derived engine count, but only if it is non-zero, does not exceed the chip's engine count, and is at least the number of virtual lanes (num_vls). This is an admin-tunable override with sane clamping — it cannot force num_engines above what the chip reports, and it cannot go below num_vls. Note it can still be exactly num_vls (>=1 in practice) but the clamp does not itself defend a downstream divide-by-count."
+    },
+    {
+      "file": "corpus/train/train_0235_cwe401.c",
+      "lines": "26-32",
+      "code": "\tdd_dev_info(dd, \"SDMA mod_num_sdma: %u\\n\", mod_num_sdma);\n\tdd_dev_info(dd, \"SDMA chip_sdma_engines: %u\\n\", chip_sdma_engines(dd));\n\tdd_dev_info(dd, \"SDMA chip_sdma_mem_size: %u\\n\",\n\t\t    chip_sdma_mem_size(dd));\n\n\tper_sdma_credits =\n\t\tchip_sdma_mem_size(dd) / (num_engines * SDMA_BLOCK_SIZE);",
+      "explanation": "After logging the resolved counts, per_sdma_credits is computed as the chip's total SDMA memory size divided by (num_engines * SDMA_BLOCK_SIZE). This apportions the on-chip SDMA memory evenly across the engines. The divisor is a product of num_engines (from hardware or the clamped module param) and the fixed SDMA_BLOCK_SIZE macro; the result is a u32 credit budget later handed to init_sdma_regs. This is the one arithmetic statement whose safety depends on num_engines being non-zero."
+    },
+    {
+      "file": "corpus/train/train_0235_cwe401.c",
+      "lines": "34-40",
+      "code": "\t/* set up freeze waitqueue */\n\tinit_waitqueue_head(&dd->sdma_unfreeze_wq);\n\tatomic_set(&dd->sdma_unfreeze_count, 0);\n\n\tdescq_cnt = sdma_get_descq_cnt();\n\tdd_dev_info(dd, \"SDMA engines %zu descq_cnt %u\\n\",\n\t\t    num_engines, descq_cnt);",
+      "explanation": "The freeze/unfreeze synchronization primitives are initialized (a waitqueue and an atomic counter used when the device is quiesced). descq_cnt is then obtained from sdma_get_descq_cnt() into a u16 — this is the per-engine descriptor FIFO depth and is expected to be a power of two (it is later fed to ilog2 and used to build a mask). The counts are logged for diagnostics."
+    },
+    {
+      "file": "corpus/train/train_0235_cwe401.c",
+      "lines": "42-46",
+      "code": "\t/* alloc memory for array of send engines */\n\tdd->per_sdma = kcalloc_node(num_engines, sizeof(*dd->per_sdma),\n\t\t\t\t    GFP_KERNEL, dd->node);\n\tif (!dd->per_sdma)\n\t\treturn ret;",
+      "explanation": "The array of num_engines sdma_engine structures is allocated with kcalloc_node (zeroing, NUMA-node-local, overflow-checked internally by kcalloc). On failure it returns -ENOMEM directly. Because this is the first allocation, an early failure here needs no cleanup, so returning without goto bail is correct. dd->per_sdma is the backing store both loops index."
+    },
+    {
+      "file": "corpus/train/train_0235_cwe401.c",
+      "lines": "48-57",
+      "code": "\tidle_cnt = ns_to_cclock(dd, idle_cnt);\n\tif (idle_cnt)\n\t\tdd->default_desc1 =\n\t\t\tSDMA_DESC1_HEAD_TO_HOST_FLAG;\n\telse\n\t\tdd->default_desc1 =\n\t\t\tSDMA_DESC1_INT_REQ_FLAG;\n\n\tif (!sdma_desct_intr)\n\t\tsdma_desct_intr = SDMA_DESC_INTR;",
+      "explanation": "idle_cnt (from the sdma_idle_cnt module param) is converted from nanoseconds to core-clock ticks. If non-zero, the default descriptor-1 template is set to request head-writeback-to-host (interrupt coalescing by idle timeout); otherwise it requests a completion interrupt per descriptor. sdma_desct_intr, if left at zero, is defaulted to SDMA_DESC_INTR. These configure interrupt/coalescing policy for the engines."
+    },
+    {
+      "file": "corpus/train/train_0235_cwe401.c",
+      "lines": "60-79",
+      "code": "\tfor (this_idx = 0; this_idx < num_engines; ++this_idx) {\n\t\tsde = &dd->per_sdma[this_idx];\n\t\tsde->dd = dd;\n\t\tsde->ppd = ppd;\n\t\tsde->this_idx = this_idx;\n\t\tsde->descq_cnt = descq_cnt;\n\t\tsde->desc_avail = sdma_descq_freecnt(sde);\n\t\tsde->sdma_shift = ilog2(descq_cnt);\n\t\tsde->sdma_mask = (1 << sde->sdma_shift) - 1;\n\n\t\t/* Create a mask specifically for each interrupt source */\n\t\tsde->int_mask = (u64)1 << (0 * TXE_NUM_SDMA_ENGINES +\n\t\t\t\t\t   this_idx);\n\t\tsde->progress_mask = (u64)1 << (1 * TXE_NUM_SDMA_ENGINES +\n\t\t\t\t\t\tthis_idx);\n\t\tsde->idle_mask = (u64)1 << (2 * TXE_NUM_SDMA_ENGINES +\n\t\t\t\t\t    this_idx);\n\t\t/* Create a combined mask to cover all 3 interrupt sources */\n\t\tsde->imask = sde->int_mask | sde->progress_mask |\n\t\t\t     sde->idle_mask;",
+      "explanation": "The main per-engine initialization loop. For each engine index it wires back-pointers (dd, ppd, this_idx), records descq_cnt, and seeds desc_avail from sdma_descq_freecnt(sde). It derives sdma_shift = ilog2(descq_cnt) and sdma_mask = (1 << sdma_shift) - 1, i.e. a ring-index mask assuming descq_cnt is a power of two. It then builds three per-source interrupt bit masks (int/progress/idle) by shifting 1 into position this_idx within stride TXE_NUM_SDMA_ENGINES, and ORs them into a combined imask. These masks assume this_idx stays below TXE_NUM_SDMA_ENGINES so the three sources do not collide."
+    },
+    {
+      "file": "corpus/train/train_0235_cwe401.c",
+      "lines": "81-112",
+      "code": "\t\tspin_lock_init(&sde->tail_lock);\n\t\tseqlock_init(&sde->head_lock);\n\t\tspin_lock_init(&sde->senddmactrl_lock);\n\t\tspin_lock_init(&sde->flushlist_lock);\n\t\tseqlock_init(&sde->waitlock);\n\t\t/* insure there is always a zero bit */\n\t\tsde->ahg_bits = 0xfffffffe00000000ULL;\n\n\t\tsdma_set_state(sde, sdma_state_s00_hw_down);\n\n\t\t/* set up reference counting */\n\t\tkref_init(&sde->state.kref);\n\t\tinit_completion(&sde->state.comp);\n\n\t\tINIT_LIST_HEAD(&sde->flushlist);\n\t\tINIT_LIST_HEAD(&sde->dmawait);\n\n\t\tsde->tail_csr =\n\t\t\tget_kctxt_csr_addr(dd, this_idx, SD(TAIL));\n\n\t\ttasklet_init(&sde->sdma_hw_clean_up_task, sdma_hw_clean_up_task,\n\t\t\t     (unsigned long)sde);\n\n\t\ttasklet_init(&sde->sdma_sw_clean_up_task, sdma_sw_clean_up_task,\n\t\t\t     (unsigned long)sde);\n\t\tINIT_WORK(&sde->err_halt_worker, sdma_err_halt_wait);\n\t\tINIT_WORK(&sde->flush_worker, sdma_field_flush);\n\n\t\tsde->progress_check_head = 0;\n\n\t\ttimer_setup(&sde->err_progress_check_timer,\n\t\t\t    sdma_err_progress_check, 0);",
+      "explanation": "The engine's concurrency and lifecycle objects are initialized: five locks (tail/head/senddmactrl/flushlist/waitlock, a mix of spinlocks and seqlocks), the AHG-bits accumulator preset so a zero bit always exists, and the state machine set to s00_hw_down. Reference counting is established via kref_init and a completion. The flushlist and dmawait list heads are initialized. tail_csr is resolved to this engine's TAIL CSR MMIO address. Two tasklets (hardware and software cleanup) and two workqueue items (err_halt, flush) are registered, and an error-progress-check timer is armed via timer_setup. This is where the engine acquires callable state — kref and the tasklets/workers are the lifetime machinery the teardown path must unwind."
+    },
+    {
+      "file": "corpus/train/train_0235_cwe401.c",
+      "lines": "114-125",
+      "code": "\t\tsde->descq = dma_alloc_coherent(&dd->pcidev->dev,\n\t\t\t\t\t\tdescq_cnt * sizeof(u64[2]),\n\t\t\t\t\t\t&sde->descq_phys, GFP_KERNEL);\n\t\tif (!sde->descq)\n\t\t\tgoto bail;\n\t\tsde->tx_ring =\n\t\t\tkvzalloc_node(array_size(descq_cnt,\n\t\t\t\t\t sizeof(struct sdma_txreq *)),\n\t\t\t\t      GFP_KERNEL, dd->node);\n\t\tif (!sde->tx_ring)\n\t\t\tgoto bail;\n\t}",
+      "explanation": "Each engine gets two heap objects. descq is a coherent DMA buffer of descq_cnt * sizeof(u64[2]) bytes (each hardware descriptor is two u64 words) with its bus address stored in descq_phys. tx_ring is a software array of descq_cnt sdma_txreq pointers, allocated with kvzalloc_node using array_size() (the overflow-saturating multiply helper). Any allocation failure jumps to bail, which is the shared cleanup label; note that at that point earlier engines and the current engine's already-allocated descq are live and must be reclaimed by sdma_clean. There is a deliberate asymmetry: tx_ring's size uses the overflow-safe array_size() while descq's size uses a plain multiply."
+    },
+    {
+      "file": "corpus/train/train_0235_cwe401.c",
+      "lines": "127-144",
+      "code": "\tdd->sdma_heads_size = L1_CACHE_BYTES * num_engines;\n\t/* Allocate memory for DMA of head registers to memory */\n\tdd->sdma_heads_dma = dma_alloc_coherent(&dd->pcidev->dev,\n\t\t\t\t\t\tdd->sdma_heads_size,\n\t\t\t\t\t\t&dd->sdma_heads_phys,\n\t\t\t\t\t\tGFP_KERNEL);\n\tif (!dd->sdma_heads_dma) {\n\t\tdd_dev_err(dd, \"failed to allocate SendDMA head memory\\n\");\n\t\tgoto bail;\n\t}\n\n\t/* Allocate memory for pad */\n\tdd->sdma_pad_dma = dma_alloc_coherent(&dd->pcidev->dev, sizeof(u32),\n\t\t\t\t\t      &dd->sdma_pad_phys, GFP_KERNEL);\n\tif (!dd->sdma_pad_dma) {\n\t\tdd_dev_err(dd, \"failed to allocate SendDMA pad memory\\n\");\n\t\tgoto bail;\n\t}",
+      "explanation": "After the engines, a single coherent DMA region of L1_CACHE_BYTES * num_engines bytes is allocated to hold hardware head-register writebacks (one cacheline per engine so engines do not false-share). sdma_heads_size records that size for later teardown. A small 4-byte pad DMA buffer is also allocated. Both failures jump to bail. sdma_heads_size is stored on dd, so teardown can free exactly this region."
+    },
+    {
+      "file": "corpus/train/train_0235_cwe401.c",
+      "lines": "146-159",
+      "code": "\t/* assign each engine to different cacheline and init registers */\n\tcurr_head = (void *)dd->sdma_heads_dma;\n\tfor (this_idx = 0; this_idx < num_engines; ++this_idx) {\n\t\tunsigned long phys_offset;\n\n\t\tsde = &dd->per_sdma[this_idx];\n\n\t\tsde->head_dma = curr_head;\n\t\tcurr_head += L1_CACHE_BYTES;\n\t\tphys_offset = (unsigned long)sde->head_dma -\n\t\t\t      (unsigned long)dd->sdma_heads_dma;\n\t\tsde->head_phys = dd->sdma_heads_phys + phys_offset;\n\t\tinit_sdma_regs(sde, per_sdma_credits, idle_cnt);\n\t}",
+      "explanation": "The second loop carves the head-writeback region into per-engine cachelines: curr_head starts at the region base and advances by L1_CACHE_BYTES each iteration, giving each engine its own head_dma virtual pointer and corresponding head_phys bus address (base bus address plus the same byte offset). It then programs the engine's hardware registers via init_sdma_regs with the previously computed per_sdma_credits and idle_cnt. Because it walks exactly num_engines cachelines and the region was sized as L1_CACHE_BYTES * num_engines, curr_head stays within the allocation."
+    },
+    {
+      "file": "corpus/train/train_0235_cwe401.c",
+      "lines": "160-182",
+      "code": "\tdd->flags |= HFI1_HAS_SEND_DMA;\n\tdd->flags |= idle_cnt ? HFI1_HAS_SDMA_TIMEOUT : 0;\n\tdd->num_sdma = num_engines;\n\tret = sdma_map_init(dd, port, ppd->vls_operational, NULL);\n\tif (ret < 0)\n\t\tgoto bail;\n\n\ttmp_sdma_rht = kzalloc(sizeof(*tmp_sdma_rht), GFP_KERNEL);\n\tif (!tmp_sdma_rht) {\n\t\tret = -ENOMEM;\n\t\tgoto bail;\n\t}\n\n\tret = rhashtable_init(tmp_sdma_rht, &sdma_rht_params);\n\tif (ret < 0) {\n\t\tkfree(tmp_sdma_rht);\n\t\tgoto bail;\n\t}\n\n\tdd->sdma_rht = tmp_sdma_rht;\n\n\tdd_dev_info(dd, \"SDMA num_sdma: %u\\n\", dd->num_sdma);\n\treturn 0;",
+      "explanation": "Device flags are set to advertise SendDMA (and the timeout variant if idle_cnt is non-zero), and dd->num_sdma records the engine count. sdma_map_init builds the VL-to-engine routing map; on failure it bails. The final resource is the sdma_rht hashtable: it is allocated into the LOCAL tmp_sdma_rht, then rhashtable_init is attempted. Crucially, if kzalloc fails or rhashtable_init returns an error, tmp_sdma_rht is kfree'd before bailing, and dd->sdma_rht is only published (line 179) AFTER rhashtable_init succeeds. This is exactly the memory-leak fix the sample name encodes: the previous buggy form assigned dd->sdma_rht up front (or failed to free the allocation), leaking the rhashtable object when init failed. On full success it returns 0."
+    },
+    {
+      "file": "corpus/train/train_0235_cwe401.c",
+      "lines": "184-187",
+      "code": "bail:\n\tsdma_clean(dd, num_engines);\n\treturn ret;\n}",
+      "explanation": "The single error-cleanup label calls sdma_clean(dd, num_engines) and returns the saved errno. sdma_clean is expected to iterate all num_engines entries and free whatever was allocated (descq DMA buffers, tx_ring arrays, the head/pad DMA regions, the per_sdma array, kill tasklets/timers, drop krefs). The correctness of every goto bail above depends on sdma_clean tolerating partially-initialized engines (e.g. an engine whose descq succeeded but whose tx_ring was NULL) without double-freeing or dereferencing NULL."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0235_cwe401.c",
+      "lines": "31-32",
+      "code": "\tper_sdma_credits =\n\t\tchip_sdma_mem_size(dd) / (num_engines * SDMA_BLOCK_SIZE);",
+      "explanation": "This division is unguarded against num_engines == 0. num_engines is set from chip_sdma_engines(dd) (line 12) or from the clamped mod_num_sdma (line 24). Nothing between line 12 and line 32 rejects a zero engine count: the mod_num_sdma clamp only applies when mod_num_sdma is non-zero, so if the chip reports zero engines num_engines stays 0. A zero divisor here is an integer divide-by-zero, which on most architectures raises a fault and panics the kernel (CWE-369). The safe invariant is that num_engines must be validated as >= 1 (ideally >= num_vls) before this division; the module-parameter path enforces a lower bound but the hardware path does not. Realistic trigger requires degenerate/mis-programmed or emulated hardware, so severity is bounded, but it is the sharpest latent defect in the shown code."
+    },
+    {
+      "file": "corpus/train/train_0235_cwe401.c",
+      "lines": "67-68",
+      "code": "\t\tsde->sdma_shift = ilog2(descq_cnt);\n\t\tsde->sdma_mask = (1 << sde->sdma_shift) - 1;",
+      "explanation": "descq_cnt comes from sdma_get_descq_cnt() (line 38) and is assumed to be a non-zero power of two. If it were 0, ilog2(0) is undefined (the kernel ilog2 of a runtime 0 yields an undefined/garbage shift), and (1 << shift) - 1 would produce a bogus ring mask; if it were not a power of two, sdma_mask would not correspond to descq_cnt and ring index wrapping (index & sdma_mask) could exceed the descq/tx_ring bounds (CWE-682 / potential CWE-125/787 in the fast path that uses the mask). The implementation must guarantee descq_cnt is a non-zero power of two before this point. This is a contract on sdma_get_descq_cnt(), not on attacker input, so it is latent/low."
+    },
+    {
+      "file": "corpus/train/train_0235_cwe401.c",
+      "lines": "167-179",
+      "code": "\ttmp_sdma_rht = kzalloc(sizeof(*tmp_sdma_rht), GFP_KERNEL);\n\tif (!tmp_sdma_rht) {\n\t\tret = -ENOMEM;\n\t\tgoto bail;\n\t}\n\n\tret = rhashtable_init(tmp_sdma_rht, &sdma_rht_params);\n\tif (ret < 0) {\n\t\tkfree(tmp_sdma_rht);\n\t\tgoto bail;\n\t}\n\n\tdd->sdma_rht = tmp_sdma_rht;",
+      "explanation": "This is the memory-leak (CWE-401) contract that names the sample. In this FIXED form the object is held in a local (tmp_sdma_rht) and freed with kfree on the rhashtable_init failure path before goto bail, and dd->sdma_rht is only published after success — so no leak occurs. The historical/buggy pattern this replaces assigned dd->sdma_rht = kzalloc(...) directly and, when rhashtable_init failed, jumped to bail without freeing it (and sdma_clean did not free sdma_rht), permanently leaking the allocation on every probe failure. What to confirm in the implementation: that sdma_clean does NOT also try to free/destroy dd->sdma_rht (which is still NULL on this path) — otherwise the fix would introduce a NULL destroy — and that the teardown that runs on later device removal calls rhashtable_free_and_destroy on the now-published dd->sdma_rht exactly once."
+    },
+    {
+      "file": "corpus/train/train_0235_cwe401.c",
+      "lines": "184-185",
+      "code": "bail:\n\tsdma_clean(dd, num_engines);",
+      "explanation": "Every failure between the first per-engine allocation and the end funnels here with a partially-initialized engine array: e.g. an engine whose dma_alloc_coherent(descq) succeeded but whose tx_ring kvzalloc failed (lines 114-124), or a mid-loop failure leaving engines [0..k] fully built and engine k+1 half-built. sdma_clean(dd, num_engines) is called with the FULL num_engines, not the number actually initialized, so it must be written to tolerate NULL descq/tx_ring/head_dma and un-run tasklets/timers on the not-yet-reached engines without double-free, NULL-deref (CWE-476), or freeing DMA buffers that were never allocated. This is a latent contract in sdma_clean (file not provided): the loop bound passed here makes correct NULL-guarding in the cleanup function mandatory."
+    },
+    {
+      "file": "corpus/train/train_0235_cwe401.c",
+      "lines": "114-116",
+      "code": "\t\tsde->descq = dma_alloc_coherent(&dd->pcidev->dev,\n\t\t\t\t\t\tdescq_cnt * sizeof(u64[2]),\n\t\t\t\t\t\t&sde->descq_phys, GFP_KERNEL);",
+      "explanation": "The descq allocation size is computed with a plain multiply, descq_cnt * sizeof(u64[2]), whereas the very next allocation (tx_ring, line 120) deliberately uses the overflow-saturating array_size() helper. With descq_cnt a u16 (max 65535) times 16 bytes the product tops out around 1 MiB and cannot overflow size_t, so there is no live overflow (CWE-190) here — but the inconsistency is a latent hazard: if a future change widened descq_cnt or the element size, the descq path would silently wrap while tx_ring stayed safe. Low severity; worth normalizing to array_size for defense in depth."
+    },
+    {
+      "file": "corpus/train/train_0235_cwe401.c",
+      "lines": "9",
+      "code": "\tstruct hfi1_pportdata *ppd = dd->pport + port;",
+      "explanation": "The caller-supplied u8 port is used directly as an index (pointer offset) into dd->pport with no bound check in this function. If port ever exceeds dd->num_pports - 1, ppd points outside the port array and later uses (sde->ppd = ppd at line 63, ppd->vls_operational at line 163) are out-of-bounds reads/writes (CWE-125/787). In practice sdma_init is called from the driver's own probe path with a validated port, so this is a caller contract rather than an exploitable bug here; the invariant to confirm is that every caller passes port < dd->num_pports."
+    }
+  ],
+  "summary": "This is the FIXED revision of hfi1 sdma_init(); it is device/port bring-up code with no untrusted remote input path, so the residual risk is robustness, not remote memory corruption. The named issue (CWE-401 rhashtable leak) is correctly repaired by holding the object in a local, freeing it on rhashtable_init failure, and publishing dd->sdma_rht only on success. The remaining observations are latent and low: an unguarded divide-by-num_engines (CWE-369) if the chip reports zero engines, an ilog2/power-of-two assumption on descq_cnt, and the requirement that sdma_clean safely unwind partially-initialized engines.",
+  "reviewed_anchors": [
+    {"anchor": "int sdma_init(struct hfi1_devdata *dd, u8 port) (line 2)", "disposition": "dismissed", "reason": "Init-time signature; dd is trusted device context and port is a driver-supplied index — no untrusted data crosses here (see port anchor)."},
+    {"anchor": "struct hfi1_pportdata *ppd = dd->pport + port (line 9)", "disposition": "finding", "reason": "u8 port used as unchecked pointer index into dd->pport; caller contract that could cause OOB access if violated."},
+    {"anchor": "size_t num_engines = chip_sdma_engines(dd) (line 12)", "disposition": "finding", "reason": "Master count; if 0 it drives a divide-by-zero at line 32 — enumerated under the per_sdma_credits finding."},
+    {"anchor": "u16 descq_cnt / sdma_get_descq_cnt() (lines 7,38)", "disposition": "finding", "reason": "Assumed non-zero power of two; ilog2(descq_cnt) and the derived sdma_mask break otherwise."},
+    {"anchor": "HFI1_CAP_IS_KSET(SDMA) early return (lines 15-18)", "disposition": "dismissed", "reason": "Clean capability gate returning 0 with nothing allocated; leaves per_sdma NULL which teardown must already tolerate — no contract violated here."},
+    {"anchor": "mod_num_sdma clamp (lines 19-24)", "disposition": "dismissed", "reason": "Root-only module param with upper (<= chip engines) and lower (>= num_vls) bounds; cannot exceed hardware. It does not, however, guard the zero case when the hardware count is used."},
+    {"anchor": "per_sdma_credits = chip_sdma_mem_size(dd) / (num_engines * SDMA_BLOCK_SIZE) (lines 31-32)", "disposition": "finding", "reason": "Unguarded division by num_engines — divide-by-zero if engine count is 0."},
+    {"anchor": "dd->per_sdma = kcalloc_node(num_engines, sizeof(*dd->per_sdma), ...) (lines 43-46)", "disposition": "dismissed", "reason": "kcalloc is internally overflow-checked and the immediate NULL check returns before any cleanup is needed; correct."},
+    {"anchor": "idle_cnt/default_desc1/sdma_desct_intr defaulting (lines 48-57)", "disposition": "dismissed", "reason": "Pure policy configuration from a root module param; no memory-safety contract."},
+    {"anchor": "sde->sdma_shift = ilog2(descq_cnt); sde->sdma_mask = (1 << sde->sdma_shift) - 1 (lines 67-68)", "disposition": "finding", "reason": "Ring-mask derivation assumes descq_cnt is a non-zero power of two; undefined/incorrect mask otherwise."},
+    {"anchor": "int/progress/idle interrupt masks with this_idx and TXE_NUM_SDMA_ENGINES (lines 71-79)", "disposition": "dismissed", "reason": "Bit positions are correct as long as this_idx < TXE_NUM_SDMA_ENGINES, which is enforced by the mod_num_sdma <= chip engines clamp; no attacker input."},
+    {"anchor": "sde->ahg_bits = 0xfffffffe00000000ULL (line 87)", "disposition": "dismissed", "reason": "Constant AHG-bit accumulator preset; no external input, no contract."},
+    {"anchor": "kref_init(&sde->state.kref) / tasklets / timer_setup (lines 92-112)", "disposition": "dismissed", "reason": "Lifecycle objects; their teardown correctness is captured by the sdma_clean partial-init finding rather than as a separate issue."},
+    {"anchor": "sde->descq = dma_alloc_coherent(..., descq_cnt * sizeof(u64[2]), ...) (lines 114-116)", "disposition": "finding", "reason": "Plain multiply for allocation size (no array_size) — no live overflow because descq_cnt is u16, but flagged as an inconsistency/latent hazard."},
+    {"anchor": "sde->tx_ring = kvzalloc_node(array_size(descq_cnt, sizeof(struct sdma_txreq *)), ...) (lines 119-124)", "disposition": "dismissed", "reason": "Uses overflow-saturating array_size(); the goto bail on failure is handled by the sdma_clean partial-init contract."},
+    {"anchor": "dd->sdma_heads_size = L1_CACHE_BYTES * num_engines and second head-carving loop (lines 127-159)", "disposition": "dismissed", "reason": "Region sized exactly L1_CACHE_BYTES * num_engines and the loop advances curr_head num_engines times; stays in bounds. Product cannot overflow for realistic num_engines."},
+    {"anchor": "sdma_map_init(dd, port, ppd->vls_operational, NULL) (line 163)", "disposition": "dismissed", "reason": "Return value checked and bails on error; ppd->vls_operational safety depends on the port anchor already flagged."},
+    {"anchor": "tmp_sdma_rht kzalloc + rhashtable_init + kfree-on-failure (lines 167-179)", "disposition": "finding", "reason": "The central CWE-401 leak contract; correctly handled in this fixed revision, documented with what to confirm in teardown."},
+    {"anchor": "bail: sdma_clean(dd, num_engines) (lines 184-185)", "disposition": "finding", "reason": "Shared cleanup called with full num_engines against a possibly partially-initialized array — imposes a NULL-tolerance/no-double-free contract on sdma_clean."}
+  ],
+  "findings": [
+    {
+      "title": "rhashtable (sdma_rht) memory-leak contract — correctly fixed via local + kfree-on-failure",
+      "anchor": "tmp_sdma_rht = kzalloc(...); if (rhashtable_init(...) < 0) kfree(tmp_sdma_rht); dd->sdma_rht = tmp_sdma_rht;",
+      "file": "corpus/train/train_0235_cwe401.c",
+      "line": "167-179",
+      "code": "\ttmp_sdma_rht = kzalloc(sizeof(*tmp_sdma_rht), GFP_KERNEL);\n\tif (!tmp_sdma_rht) {\n\t\tret = -ENOMEM;\n\t\tgoto bail;\n\t}\n\n\tret = rhashtable_init(tmp_sdma_rht, &sdma_rht_params);\n\tif (ret < 0) {\n\t\tkfree(tmp_sdma_rht);\n\t\tgoto bail;\n\t}\n\n\tdd->sdma_rht = tmp_sdma_rht;",
+      "bug_class": "Memory leak on error path (missing kfree of allocated hashtable)",
+      "cwe": "CWE-401",
+      "severity": "info",
+      "where_it_lives": "corpus/train/train_0235_cwe401.c (this is the fixed revision); teardown counterpart in implementation (file not provided)",
+      "invariant": "The rhashtable object allocated by kzalloc must be freed on every failure path before it is published to dd->sdma_rht, and dd->sdma_rht must only be set after rhashtable_init succeeds so that later teardown frees it exactly once and never frees an un-published NULL.",
+      "failure_mode": "In the pre-fix form, dd->sdma_rht was assigned the allocation up front (or the kzalloc'd object was not freed) and a rhashtable_init failure jumped to bail without releasing it, leaking sizeof(struct rhashtable) on every probe failure — a slow kernel memory leak triggerable by repeated failed device init. This fixed form holds the object in the local tmp_sdma_rht, kfree's it on rhashtable_init failure, and publishes dd->sdma_rht only on success, so no leak occurs.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm sdma_clean() (called at bail) does NOT attempt to destroy/free dd->sdma_rht, since on this failure path dd->sdma_rht is still NULL; and confirm the device-removal teardown calls rhashtable_free_and_destroy on the published dd->sdma_rht exactly once."
+    },
+    {
+      "title": "Unguarded division by num_engines (divide-by-zero if chip reports zero engines)",
+      "anchor": "per_sdma_credits = chip_sdma_mem_size(dd) / (num_engines * SDMA_BLOCK_SIZE)",
+      "file": "corpus/train/train_0235_cwe401.c",
+      "line": "31-32",
+      "code": "\tper_sdma_credits =\n\t\tchip_sdma_mem_size(dd) / (num_engines * SDMA_BLOCK_SIZE);",
+      "bug_class": "Divide-by-zero (unvalidated hardware count as divisor)",
+      "cwe": "CWE-369",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0235_cwe401.c",
+      "invariant": "num_engines must be validated as non-zero (and in practice >= num_vls) before being used as a divisor; the mod_num_sdma clamp enforces this only when the module override is active, not on the hardware-derived path.",
+      "failure_mode": "num_engines is seeded from chip_sdma_engines(dd) (line 12) and only overridden by mod_num_sdma when that is non-zero and within bounds. If the chip (or an emulated/faulty device) reports 0 engines, num_engines stays 0, and num_engines * SDMA_BLOCK_SIZE is 0, causing an integer divide-by-zero at line 32 that faults and panics the kernel during init.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm chip_sdma_engines(dd) can never return 0 for supported hardware, or add an explicit 'if (!num_engines) goto bail/return -EINVAL' before line 31."
+    },
+    {
+      "title": "sdma_clean called with full num_engines over a possibly partially-initialized engine array",
+      "anchor": "sdma_clean(dd, num_engines)",
+      "file": "corpus/train/train_0235_cwe401.c",
+      "line": "184-185",
+      "code": "bail:\n\tsdma_clean(dd, num_engines);",
+      "bug_class": "Cleanup of partially-initialized objects (NULL-deref / double-free risk in teardown)",
+      "cwe": "CWE-476",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided) — sdma_clean()",
+      "invariant": "sdma_clean must iterate all num_engines entries tolerating NULL descq/tx_ring/head_dma and un-run tasklets/timers/krefs (from engines the loop never reached or half-built), freeing each resource at most once and never dereferencing a field that was never initialized.",
+      "failure_mode": "Any goto bail from within the engine loop (lines 118/124) or after it leaves engines [k+1..num_engines-1] zero-initialized (kcalloc-zeroed) and engine k possibly half-built (descq allocated, tx_ring NULL). If sdma_clean assumes every engine is fully initialized, it will NULL-deref or double-free during error cleanup, turning an allocation failure into a kernel crash or corruption.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify sdma_clean NULL-checks sde->descq, sde->tx_ring, sde->head_dma before freeing and safely handles tasklet/timer/kref objects for engines that were never fully brought up."
+    },
+    {
+      "title": "descq_cnt assumed non-zero power of two for ilog2 and ring mask",
+      "anchor": "sde->sdma_shift = ilog2(descq_cnt); sde->sdma_mask = (1 << sde->sdma_shift) - 1",
+      "file": "corpus/train/train_0235_cwe401.c",
+      "line": "67-68",
+      "code": "\t\tsde->sdma_shift = ilog2(descq_cnt);\n\t\tsde->sdma_mask = (1 << sde->sdma_shift) - 1;",
+      "bug_class": "Incorrect calculation from unvalidated power-of-two assumption",
+      "cwe": "CWE-682",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0235_cwe401.c; producer sdma_get_descq_cnt() in implementation (file not provided)",
+      "invariant": "descq_cnt (from sdma_get_descq_cnt) must be a non-zero power of two so that sdma_mask == descq_cnt - 1 exactly bounds ring indices used later as (index & sdma_mask).",
+      "failure_mode": "If descq_cnt were 0, ilog2(0) is undefined and yields a garbage shift; if it were not a power of two, sdma_mask would not equal descq_cnt - 1, so later fast-path ring indexing (index & sdma_mask) could address descq/tx_ring slots beyond descq_cnt, an out-of-bounds access. Not attacker-controlled here, hence low, but it is an unenforced correctness contract at init.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm sdma_get_descq_cnt() always returns a non-zero power of two (e.g. clamped/rounded), or add an explicit WARN/validation."
+    },
+    {
+      "title": "descq allocation size uses plain multiply instead of overflow-safe array_size (latent, inconsistent with tx_ring)",
+      "anchor": "dma_alloc_coherent(..., descq_cnt * sizeof(u64[2]), ...)",
+      "file": "corpus/train/train_0235_cwe401.c",
+      "line": "114-116",
+      "code": "\t\tsde->descq = dma_alloc_coherent(&dd->pcidev->dev,\n\t\t\t\t\t\tdescq_cnt * sizeof(u64[2]),\n\t\t\t\t\t\t&sde->descq_phys, GFP_KERNEL);",
+      "bug_class": "Unchecked size multiplication (latent integer overflow)",
+      "cwe": "CWE-190",
+      "severity": "info",
+      "where_it_lives": "corpus/train/train_0235_cwe401.c",
+      "invariant": "Allocation byte sizes derived from a count times an element size should saturate/reject on overflow (as the adjacent tx_ring does via array_size()).",
+      "failure_mode": "No live overflow today: descq_cnt is u16 (<=65535) and sizeof(u64[2]) is 16, so the product is <=~1 MiB and fits size_t. The hazard is latent/consistency: unlike the very next allocation (tx_ring uses array_size at line 120), this multiply is unguarded, so widening descq_cnt or the element size in a future change could wrap it into a small allocation and later overflow the descq buffer.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm descq_cnt can never exceed u16 range and, for defense in depth, switch to array_size(descq_cnt, sizeof(u64[2]))."
+    },
+    {
+      "title": "Caller-supplied u8 port used as unchecked index into dd->pport",
+      "anchor": "struct hfi1_pportdata *ppd = dd->pport + port",
+      "file": "corpus/train/train_0235_cwe401.c",
+      "line": "9",
+      "code": "\tstruct hfi1_pportdata *ppd = dd->pport + port;",
+      "bug_class": "Unvalidated array index (out-of-bounds access if contract violated)",
+      "cwe": "CWE-125",
+      "severity": "info",
+      "where_it_lives": "corpus/train/train_0235_cwe401.c; callers in implementation (file not provided)",
+      "invariant": "Every caller must pass port < dd->num_pports so that dd->pport + port stays within the allocated port array before it is stored (sde->ppd, line 63) and dereferenced (ppd->vls_operational, line 163).",
+      "failure_mode": "port is a u8 and is not bound-checked in this function; if a caller ever passed a port >= dd->num_pports, ppd would point outside the port array and subsequent reads/writes through it would be out-of-bounds. In the current driver sdma_init is invoked from the probe path with a validated port, so this is a caller contract rather than a live bug.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm all call sites of sdma_init pass a port already validated against dd->num_pports."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm chip_sdma_engines(dd) cannot return 0 (or add a zero-guard before the per_sdma_credits division at line 32) to prevent a divide-by-zero panic.",
+    "Verify sdma_clean(dd, num_engines) NULL-tolerates partially-initialized engines: NULL-check descq, tx_ring, head_dma and safely handle un-run tasklets/timers/krefs, freeing each resource at most once.",
+    "Confirm dd->sdma_rht is only freed once, in device-removal teardown, and that sdma_clean does not attempt to destroy the still-NULL dd->sdma_rht on the rhashtable_init failure path.",
+    "Confirm sdma_get_descq_cnt() always yields a non-zero power of two so ilog2(descq_cnt) and sdma_mask correctly bound ring indexing.",
+    "Confirm descq_cnt stays within u16 range and consider array_size() for the descq allocation (line 115) to match the overflow-safe tx_ring allocation.",
+    "Confirm all sdma_init callers pass port < dd->num_pports so dd->pport + port is in-bounds.",
+    "Confirm the DMA regions (descq, sdma_heads_dma, sdma_pad_dma) allocated here are freed on the matching teardown with the same sizes recorded (dd->sdma_heads_size) to avoid leaks/mismatched frees."
+  ]
+}

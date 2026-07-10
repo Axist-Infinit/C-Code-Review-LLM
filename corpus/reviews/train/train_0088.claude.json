@@ -1,0 +1,176 @@
+{
+  "subsystem": "FastCGITransport::onHeader — the per-parameter callback in HHVM's (HipHop Virtual Machine) FastCGI server transport. It receives one FastCGI FCGI_PARAMS name/value pair (a CGI meta-variable such as HTTP_HOST, REQUEST_METHOD, or a client-supplied HTTP_* header) as two folly::IOBuf chains, materialises them into std::strings, applies the httpoxy mitigation, and records the pair in the request's parameter map that later becomes the script's $_SERVER / environment.",
+  "provenance": "Identified from the fully-qualified method name FastCGITransport::onHeader and the FastCGI wire types: folly::IOBuf and folly::io::Cursor (readFixedString / the .get() chain API) are Facebook's folly library, and FastCGITransport is HHVM's runtime/server/fastcgi transport. The banner comment 'sample: primevul_train_2071_fixed' and the file name train_0088_cwe665.cpp mark it as a PrimeVul-derived sample. The inline comment on lines 7-8 ('Don't allow requests to inject an HTTP_PROXY environment variable by sending a Proxy header') is the textbook description of the httpoxy fix.",
+  "trust_boundary": "onHeader is driven by the FastCGI record parser: key_chain and value_chain hold raw bytes read off the FastCGI socket, i.e. attacker-influenced wire data. In the normal deployment a trusted front-end web server (nginx/apache) speaks FastCGI to HHVM, but the FCGI_PARAMS it forwards include CGI variables derived from client-controlled HTTP request headers — in particular the 'Proxy:' request header is mapped to the HTTP_PROXY CGI variable. So even with a trusted front-end, the NAME and VALUE bytes reaching onHeader are partly client-controlled; both the length prefixes (via computeChainDataLength) and the raw name/value bytes are hostile. If the FastCGI port is reachable directly, every parameter name and value is fully attacker-controlled.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0088_cwe665.cpp",
+      "lines": "2-3",
+      "code": "void FastCGITransport::onHeader(std::unique_ptr<folly::IOBuf> key_chain,\n                                std::unique_ptr<folly::IOBuf> value_chain) {",
+      "explanation": "The entry point for a single FastCGI parameter (name/value) pair. It takes ownership (std::unique_ptr) of two folly::IOBuf chains: key_chain holds the parameter NAME bytes and value_chain holds the VALUE bytes, exactly as they arrived on the FastCGI record stream. An IOBuf is a linked chain of buffer segments, so a single logical parameter may be spread across several IOBuf nodes. Taking the buffers by unique_ptr means onHeader is responsible for their lifetime and is the choke point through which every FastCGI parameter must pass — which is precisely why the httpoxy filter lives here."
+    },
+    {
+      "file": "corpus/train/train_0088_cwe665.cpp",
+      "lines": "4-5",
+      "code": "  Cursor keyCur(key_chain.get());\n  auto key = keyCur.readFixedString(key_chain->computeChainDataLength());",
+      "explanation": "A folly Cursor is constructed over the raw key_chain to read across its segments. key_chain->computeChainDataLength() sums the byte length of every segment in the chain and returns a size_t — this is the attacker-influenced length of the parameter name. readFixedString(n) then allocates and copies exactly n bytes out of the cursor into a std::string named key. Because it is a byte-count-driven fixed-length read (not a C-string read), key can legally contain embedded NUL bytes and any binary content; its length is whatever the wire said it was."
+    },
+    {
+      "file": "corpus/train/train_0088_cwe665.cpp",
+      "lines": "7-9",
+      "code": "  // Don't allow requests to inject an HTTP_PROXY environment variable by\n  // sending a Proxy header.\n  if (strcasecmp(key.c_str(), \"HTTP_PROXY\") == 0) return;",
+      "explanation": "This is the httpoxy mitigation. strcasecmp performs a case-insensitive comparison between the parameter name (via key.c_str(), a NUL-terminated C-string view of the std::string) and the literal \"HTTP_PROXY\". If they match, the function returns immediately WITHOUT storing the parameter, so the malicious HTTP_PROXY meta-variable never reaches the request map or the child script's environment. The case-insensitive compare is deliberate: it catches Http_Proxy, http_proxy, etc. This blocks CVE-2016-1000109 (the HHVM instance of the httpoxy family), where a client 'Proxy:' request header is translated by the web server into an HTTP_PROXY CGI variable that outbound-HTTP libraries then honour as a proxy address."
+    },
+    {
+      "file": "corpus/train/train_0088_cwe665.cpp",
+      "lines": "11-12",
+      "code": "  Cursor valCur(value_chain.get());\n  auto value = valCur.readFixedString(value_chain->computeChainDataLength());",
+      "explanation": "Symmetric to the key read: a Cursor is built over value_chain, its total chained length is computed with computeChainDataLength() (again an attacker-influenced size_t), and readFixedString copies exactly that many bytes into the std::string value. This runs only for parameters that survived the HTTP_PROXY check on line 9. As with the key, value is a length-delimited binary string and may hold NULs or arbitrary bytes."
+    },
+    {
+      "file": "corpus/train/train_0088_cwe665.cpp",
+      "lines": "14-15",
+      "code": "  m_requestParams[key] = value;\n}",
+      "explanation": "The surviving name/value pair is inserted into the member map m_requestParams (an associative container keyed by the parameter name). This map is the accumulated CGI parameter set for the current request and is later exposed to the executing script as $_SERVER and, for the affected variables, the process environment. operator[] inserts-or-overwrites, so a repeated key silently replaces the earlier value with the last one seen. After the insert the function returns and the two IOBuf chains are freed with their unique_ptrs."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0088_cwe665.cpp",
+      "lines": "7-9",
+      "code": "  // Don't allow requests to inject an HTTP_PROXY environment variable by\n  // sending a Proxy header.\n  if (strcasecmp(key.c_str(), \"HTTP_PROXY\") == 0) return;",
+      "explanation": "This single hard-coded blocklist entry is the entire httpoxy defense, so its safety depends on two contracts the implementation must uphold. (1) onHeader must be the ONLY path by which a FastCGI parameter reaches m_requestParams / the child environment — if any other code path (a different record type, a bulk copy, or a pre-populated environment) can set HTTP_PROXY, the filter is bypassed. (2) The exact byte string tested here must equal the name the downstream environment builder and any outbound-HTTP client (which calls getenv(\"HTTP_PROXY\") / getenv(\"http_proxy\")) will look up. The check covers the upper-case HTTP_PROXY that the CGI convention produces and is case-insensitive, which is correct for this variable; but it is a denylist of exactly one string, so it is inherently fragile to any future or alternate name (e.g. a lower-case 'http_proxy' passed through verbatim by a non-conforming front-end would be stored, since CGI normally upper-cases but this code never normalises). If the invariant 'the front-end always presents this variable as HTTP_PROXY' fails, the mitigation misses it. This is the CWE-665 essence: an untrusted request header improperly initialising a security-sensitive environment variable used to configure outbound connections."
+    },
+    {
+      "file": "corpus/train/train_0088_cwe665.cpp",
+      "lines": "9",
+      "code": "  if (strcasecmp(key.c_str(), \"HTTP_PROXY\") == 0) return;",
+      "explanation": "The comparison operates on key.c_str(), a NUL-terminated C-string, whereas key was produced by readFixedString as a length-delimited std::string that may contain embedded NUL bytes, and the value stored on line 14 (m_requestParams[key]) uses the FULL binary std::string. strcasecmp therefore compares only the bytes up to the first NUL, while storage keeps every byte — a validation-view vs use-view mismatch (CWE-158 / CWE-20). Concretely: for a key like \"HTTP_PROXY\\0extra\", c_str() truncates to \"HTTP_PROXY\" and the request is (correctly) blocked; for \"HTTP_PROXYx\" it is not equal and is stored, but the resulting env name is HTTP_PROXYx which getenv(\"HTTP_PROXY\") will not match — so no concrete bypass to inject exactly HTTP_PROXY exists in THIS check. The finding is that comparing a filtered C-string while persisting the full binary string is a fragile pattern: it only stays safe because the sensitive name has no NUL-prefix that both matches the filter target and the downstream lookup. Any additional denylist entry, or a downstream consumer that keys on the full std::string, would be bypassable via an embedded NUL. The implementation must key its filter on the same byte string it stores."
+    },
+    {
+      "file": "corpus/train/train_0088_cwe665.cpp",
+      "lines": "5",
+      "code": "  auto key = keyCur.readFixedString(key_chain->computeChainDataLength());",
+      "explanation": "computeChainDataLength() returns an attacker-influenced size_t and is passed straight to readFixedString, which allocates a std::string of that size; the same pattern repeats for the value on line 12. There is no per-parameter or per-request cap applied here. FastCGI name/value lengths are length-prefixed (up to a 4-byte, ~2^31 length), so a malicious or compromised front-end can declare and stream very large parameter names/values, forcing large heap allocations and, across many parameters/requests, memory-exhaustion denial of service (CWE-770 / CWE-789). The allocation size is bounded by the bytes actually buffered, so this is throttled by how much the peer sends rather than a pure size-field lie, which lowers severity — but the code applies no defensive ceiling of its own and relies entirely on upstream record-size limits. The implementation must enforce a maximum parameter and total-header size before materialising these strings."
+    },
+    {
+      "file": "corpus/train/train_0088_cwe665.cpp",
+      "lines": "14",
+      "code": "  m_requestParams[key] = value;",
+      "explanation": "Every parameter name except the single HTTP_PROXY case is accepted verbatim and written into the request parameter map that becomes $_SERVER / the CGI environment. Sensitive CGI meta-variables (AUTH_TYPE, REMOTE_USER, SCRIPT_FILENAME, CONTENT_LENGTH, PATH_TRANSLATED, etc.) are NOT filtered here — which is correct ONLY if the FastCGI socket is exclusively reachable by a trusted front-end that sets those variables authoritatively (CWE-20 trust-boundary assumption). If the FastCGI listener is exposed to untrusted clients, an attacker can spoof arbitrary CGI variables and application state. Additionally, operator[] overwrites on a duplicate key, so if the front-end (or an attacker who can inject a second parameter with the same name) sends the same variable twice, the last occurrence silently wins — a header-smuggling / precedence hazard if different layers pick a different occurrence. The implementation must (a) restrict who may connect to the FastCGI endpoint and (b) define a deterministic policy for duplicate parameter names."
+    }
+  ],
+  "summary": "This is the FIXED httpoxy path in HHVM's FastCGITransport::onHeader: it correctly drops the attacker-influenced HTTP_PROXY FastCGI parameter (CVE-2016-1000109 family) with a case-insensitive check before storing any other name/value pair. The core fix is sound and no concrete bypass to inject exactly HTTP_PROXY was found. Residual, mostly latent risks are defense-in-depth: the mitigation is a one-entry denylist, the filter compares a NUL-truncated c_str() while storing the full binary key, the two readFixedString calls allocate on an uncapped attacker-influenced length, and every other CGI variable is trusted to the front-end.",
+  "reviewed_anchors": [
+    {
+      "anchor": "FastCGITransport::onHeader(unique_ptr<IOBuf> key_chain, unique_ptr<IOBuf> value_chain) — signature",
+      "disposition": "finding",
+      "reason": "Sole choke point for FastCGI parameters carrying attacker-influenced wire bytes; its position is load-bearing for the httpoxy filter (trust-boundary finding)."
+    },
+    {
+      "anchor": "Cursor keyCur(key_chain.get()) / Cursor valCur(value_chain.get())",
+      "disposition": "dismissed",
+      "reason": "Cursor construction over a live, owned IOBuf; no length or lifetime contract violated on its own."
+    },
+    {
+      "anchor": "key_chain->computeChainDataLength() / value_chain->computeChainDataLength()",
+      "disposition": "finding",
+      "reason": "Attacker-influenced size_t length passed straight into an allocation with no cap (unbounded-allocation finding)."
+    },
+    {
+      "anchor": "keyCur.readFixedString(...) / valCur.readFixedString(...)",
+      "disposition": "finding",
+      "reason": "Materialises the length-delimited binary strings that later feed both the filter and the environment; allocation size is attacker-influenced."
+    },
+    {
+      "anchor": "strcasecmp(key.c_str(), \"HTTP_PROXY\") == 0 — httpoxy gate",
+      "disposition": "finding",
+      "reason": "Single-string case-insensitive denylist AND a c_str()/NUL vs full-binary-key view mismatch — two distinct findings anchored here."
+    },
+    {
+      "anchor": "key.c_str() lifetime",
+      "disposition": "dismissed",
+      "reason": "c_str() is used within the same statement while the local std::string key is alive and unmodified — no dangling pointer (CWE-416 not applicable)."
+    },
+    {
+      "anchor": "return; (early-out on HTTP_PROXY match)",
+      "disposition": "dismissed",
+      "reason": "Correct fail-closed behaviour: the parameter is dropped and never stored; no leak or state corruption."
+    },
+    {
+      "anchor": "m_requestParams[key] = value — parameter map insert",
+      "disposition": "finding",
+      "reason": "Stores every non-HTTP_PROXY name verbatim (arbitrary CGI-variable trust assumption) and overwrites on duplicate keys."
+    }
+  ],
+  "findings": [
+    {
+      "title": "httpoxy mitigation is a single-entry denylist at one choke point",
+      "anchor": "if (strcasecmp(key.c_str(), \"HTTP_PROXY\") == 0) return;",
+      "file": "corpus/train/train_0088_cwe665.cpp",
+      "line": "7-9",
+      "code": "  // Don't allow requests to inject an HTTP_PROXY environment variable by\n  // sending a Proxy header.\n  if (strcasecmp(key.c_str(), \"HTTP_PROXY\") == 0) return;",
+      "bug_class": "Improper initialization of a security-sensitive environment variable from an untrusted request header (httpoxy)",
+      "cwe": "CWE-665",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "onHeader must be the ONLY path that populates the request/environment parameter set, and the exact byte string filtered here must equal the name every downstream environment builder and outbound-HTTP client (getenv(\"HTTP_PROXY\")/\"http_proxy\") resolves, for all case/normalisation variants the front-end may emit.",
+      "failure_mode": "A client sends a 'Proxy:' HTTP header; the front-end maps it to the HTTP_PROXY CGI variable and forwards it over FastCGI. This check drops it. But if any other code path sets HTTP_PROXY, or a non-conforming front-end presents the name in a form this literal compare misses (e.g. an un-upper-cased 'http_proxy' that CGI normally normalises but this code does not), the variable reaches outbound HTTP libraries and redirects server-side requests through an attacker proxy (SSRF/credential capture).",
+      "cve_analog": "CVE-2016-1000109",
+      "what_to_confirm": "Confirm no other code writes to m_requestParams / the child environment for a proxy-influencing name, and that parameter names are normalised (upper-cased) before this compare or that only HTTP_PROXY can ever appear."
+    },
+    {
+      "title": "Filter compares NUL-truncated c_str() while storing the full binary key",
+      "anchor": "strcasecmp(key.c_str(), \"HTTP_PROXY\")",
+      "file": "corpus/train/train_0088_cwe665.cpp",
+      "line": "9",
+      "code": "  if (strcasecmp(key.c_str(), \"HTTP_PROXY\") == 0) return;",
+      "bug_class": "Validation-view vs storage-view mismatch (embedded NUL truncation)",
+      "cwe": "CWE-158",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0088_cwe665.cpp",
+      "invariant": "The denylist must be applied to the same byte sequence that is persisted; a filter must not evaluate a NUL-truncated view of a key that is stored (and later consumed) as a full binary string.",
+      "failure_mode": "key is a length-delimited std::string that may contain embedded NULs, but strcasecmp only inspects bytes before the first NUL while m_requestParams[key] stores all bytes. No concrete bypass to inject exactly HTTP_PROXY exists here (a NUL-prefixed 'HTTP_PROXY\\0x' is still caught, and 'HTTP_PROXYx' does not resolve to HTTP_PROXY downstream), so impact is limited — but the pattern is fragile: any added denylist entry, or a downstream consumer keyed on the full std::string, becomes bypassable via an embedded NUL.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify how the parameter name is turned into an environment variable name downstream (c_str vs full string) and whether embedded NULs in FCGI_PARAMS names are rejected before reaching onHeader."
+    },
+    {
+      "title": "Uncapped allocation from attacker-influenced chain length",
+      "anchor": "keyCur.readFixedString(key_chain->computeChainDataLength())",
+      "file": "corpus/train/train_0088_cwe665.cpp",
+      "line": "5",
+      "code": "  auto key = keyCur.readFixedString(key_chain->computeChainDataLength());",
+      "bug_class": "Uncontrolled resource/memory allocation",
+      "cwe": "CWE-770",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "A maximum per-parameter and total FCGI_PARAMS size must be enforced before materialising the name/value into std::strings.",
+      "failure_mode": "computeChainDataLength() returns an attacker-influenced size_t (FastCGI name/value lengths are length-prefixed up to ~2^31) and is passed straight to readFixedString for both key (line 5) and value (line 12) with no cap in this code. A malicious/compromised front-end streaming very large parameters, or many of them, forces large heap allocations and memory-exhaustion DoS. Severity is reduced because the allocation is bounded by bytes actually sent, so it relies on upstream record-size limits rather than a size-field lie.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the FastCGI record/params parser enforces a hard ceiling on individual parameter length and cumulative header size before onHeader is invoked."
+    },
+    {
+      "title": "All non-HTTP_PROXY CGI variables trusted verbatim; duplicate keys overwrite",
+      "anchor": "m_requestParams[key] = value;",
+      "file": "corpus/train/train_0088_cwe665.cpp",
+      "line": "14",
+      "code": "  m_requestParams[key] = value;",
+      "bug_class": "Improper input validation / trust-boundary assumption",
+      "cwe": "CWE-20",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "The FastCGI endpoint must be reachable only by a trusted front-end that sets authoritative CGI meta-variables, and a deterministic policy must govern duplicate parameter names.",
+      "failure_mode": "Only HTTP_PROXY is filtered; every other name (AUTH_TYPE, REMOTE_USER, SCRIPT_FILENAME, CONTENT_LENGTH, PATH_TRANSLATED, ...) is stored verbatim. If the FastCGI socket is exposed to untrusted clients, an attacker can spoof any CGI variable and application/security state. Because operator[] overwrites, a duplicated parameter name silently keeps the last occurrence, enabling precedence/smuggling confusion if different layers read different occurrences.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the FastCGI listener is bound to trusted transports only (localhost/socket perms) and how duplicate FCGI_PARAMS names are expected to resolve."
+    }
+  ],
+  "audit_checklist": [
+    "Prove onHeader is the sole writer of m_requestParams / the child environment, so no path sets HTTP_PROXY around the line-9 filter.",
+    "Confirm parameter names are normalised (upper-cased) or that only the exact CGI form HTTP_PROXY can ever reach this compare; consider matching http_proxy too for defense in depth.",
+    "Check how m_requestParams keys become environment variable names downstream (c_str vs full std::string) and whether embedded NULs in names are rejected upstream.",
+    "Verify a hard cap on individual FCGI_PARAMS name/value length and on total header size before readFixedString allocates.",
+    "Confirm the FastCGI endpoint is restricted to trusted front-ends (bind address / unix-socket permissions), since only HTTP_PROXY is filtered.",
+    "Define and verify the duplicate-parameter-name policy given operator[] last-write-wins semantics."
+  ]
+}

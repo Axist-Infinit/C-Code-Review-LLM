@@ -1,0 +1,202 @@
+{
+  "subsystem": "mruby Fiber implementation — the fiber_switch() core routine from the mruby-fiber mrbgem. It is the shared engine behind Fiber#resume, Fiber#transfer and Fiber.yield: it switches the interpreter's active context (mrb->c) to a target fiber's context, marshals the caller-supplied argument list onto the fiber's VM stack, and either re-enters the bytecode VM (vmexec) or returns control to the scheduler.",
+  "provenance": "Identified from the mruby VM idioms and type names: mrb_state, mrb_value, mrb_int, mrb_bool, struct mrb_context with fields c/prev/status/ci/cibase/stbase/vmexec/root_c, the MRB_FIBER_* state enum (MRB_FIBER_CREATED/RUNNING/RESUMED/TRANSFERRED/TERMINATED), the E_FIBER_ERROR exception class, and the helper/macro set mrb_raise, mrb_stack_extend, mrb_vm_exec, MRB_PROC_ENV, MARK_CONTEXT_MODIFY, fiber_check, fiber_check_cfunc, fiber_result, fiber_switch_context. These names are unique to mruby's src/fiber.c / mrbgems/mruby-fiber. The header banner (corpus/train/train_0308_cwe703.c) and the in-file tag 'sample: primevul_c_test_0157_vuln' mark it as a PrimeVul C sample; the code is reviewed blind on its merits.",
+  "trust_boundary": "The fiber's argument vector (a, len) originates from Ruby-level script calling fiber.resume(*args) / fiber.transfer(*args) / Fiber.yield(*args). In an embedding that runs untrusted Ruby scripts, both the argument count (len) and the number/identity of the target fiber's proc environment are attacker-influenced. The fiber's own state machine (c->status), the target proc (c->cibase->proc) and whether that proc carries an environment (MRB_PROC_ENV) are likewise reachable from script by constructing fibers over arbitrary blocks/methods. Hostile inputs: len (drives a stack allocation and a copy loop and is stored into a narrow callinfo count field), the target proc's environment (may legitimately be absent), and the fiber status transitions.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0308_cwe703.c",
+      "lines": "2-7",
+      "code": "fiber_switch(mrb_state *mrb, mrb_value self, mrb_int len, const mrb_value *a, mrb_bool resume, mrb_bool vmexec)\n{\n  struct mrb_context *c = fiber_check(mrb, self);\n  struct mrb_context *old_c = mrb->c;\n  enum mrb_fiber_state status;\n  mrb_value value;",
+      "explanation": "The function signature declares the switch engine. `self` is the Fiber object; `len` (mrb_int, a signed word-sized integer) is the number of arguments being handed to the fiber; `a` is a pointer to that argument array of `len` mrb_value slots; `resume` distinguishes resume-semantics from transfer-semantics; `vmexec` says whether this call should itself drive mrb_vm_exec or just hand back to an outer VM loop. Line 4 recovers the target fiber's context `c` from the Fiber object via fiber_check (which validates the object and unwraps its struct mrb_context). Line 5 snapshots the currently-active context `old_c = mrb->c` so it can be restored later. `status` and `value` are locals used below."
+    },
+    {
+      "file": "corpus/train/train_0308_cwe703.c",
+      "lines": "9-10",
+      "code": "  fiber_check_cfunc(mrb, c);\n  status = c->status;",
+      "explanation": "fiber_check_cfunc guards against switching into a fiber that is currently executing a C function frame (which cannot be safely suspended/resumed) and raises if so. Line 10 caches the target fiber's lifecycle state into the local `status` so the subsequent switch and the later `status == MRB_FIBER_CREATED` test see a stable value even though c->status is mutated in between."
+    },
+    {
+      "file": "corpus/train/train_0308_cwe703.c",
+      "lines": "11-26",
+      "code": "  switch (status) {\n  case MRB_FIBER_TRANSFERRED:\n    if (resume) {\n      mrb_raise(mrb, E_FIBER_ERROR, \"resuming transferred fiber\");\n    }\n    break;\n  case MRB_FIBER_RUNNING:\n  case MRB_FIBER_RESUMED:\n    mrb_raise(mrb, E_FIBER_ERROR, \"double resume\");\n    break;\n  case MRB_FIBER_TERMINATED:\n    mrb_raise(mrb, E_FIBER_ERROR, \"resuming dead fiber\");\n    break;\n  default:\n    break;\n  }",
+      "explanation": "This is the fiber state-machine gate. It rejects illegal transitions before any context mutation: resuming a fiber that was previously handed off with transfer (MRB_FIBER_TRANSFERRED + resume) is an error; resuming a fiber that is already running or already resumed (MRB_FIBER_RUNNING / MRB_FIBER_RESUMED) is a 'double resume'; and resuming a terminated fiber is 'resuming dead fiber'. mrb_raise performs a non-local exit (longjmp) so these paths do not fall through. The `default` case deliberately allows MRB_FIBER_CREATED (a not-yet-started fiber) and MRB_FIBER_SUSPENDED to proceed; MRB_FIBER_CREATED is handled specially further down."
+    },
+    {
+      "file": "corpus/train/train_0308_cwe703.c",
+      "lines": "27-29",
+      "code": "  old_c->status = resume ? MRB_FIBER_RESUMED : MRB_FIBER_TRANSFERRED;\n  c->prev = resume ? mrb->c : (c->prev ? c->prev : mrb->root_c);\n  fiber_switch_context(mrb, c);",
+      "explanation": "Now the actual switch happens. Line 27 marks the CALLER's context (old_c) as either RESUMED (its resume will return here) or TRANSFERRED (it gave up control). Line 28 records the target fiber's `prev` link — for a resume it is the current context (so control returns to the resumer), and for a transfer it keeps any existing prev, falling back to the root context mrb->root_c. Line 29 (fiber_switch_context) makes `c` the live context: it swaps mrb->c, saves/loads VM registers and stack pointers, so from here on stack accesses operate on the target fiber's stack."
+    },
+    {
+      "file": "corpus/train/train_0308_cwe703.c",
+      "lines": "30-35",
+      "code": "  if (status == MRB_FIBER_CREATED) {\n    mrb_value *b, *e;\n\n    if (!c->ci->proc) {\n      mrb_raise(mrb, E_FIBER_ERROR, \"double resume (current)\");\n    }",
+      "explanation": "This branch runs only the first time a fiber is entered (it was in the CREATED state). It must set up the initial call frame and copy the launch arguments onto the fresh fiber stack. Line 33 sanity-checks that the top callinfo has a proc attached; if not, it raises 'double resume (current)' rather than dereferencing a NULL proc, and mrb_raise longjmps out so the following setup is skipped."
+    },
+    {
+      "file": "corpus/train/train_0308_cwe703.c",
+      "lines": "36-41",
+      "code": "    mrb_stack_extend(mrb, len+2); /* for receiver and (optional) block */\n    b = c->stbase+1;\n    e = b + len;\n    while (b<e) {\n      *b++ = *a++;\n    }",
+      "explanation": "Line 36 grows the (now-current) fiber's VM stack so it can hold len argument slots plus 2 extra (index 0 for the receiver/self, and a trailing slot for an optional block). Line 37 sets the copy destination to c->stbase+1 (skipping slot 0 = receiver). Line 38 computes the exclusive end e = stbase+1+len. Lines 39-41 copy exactly len mrb_value entries from the caller's argument array `a` into the fiber stack. Crucially b and e are computed AFTER mrb_stack_extend, so a reallocation of stbase by the extend is correctly accounted for. The written range is stbase[1..len], and the stack was sized to len+2 slots (indices 0..len+1), so the copy stays in bounds provided len+2 did not overflow and provided `a` really has len readable elements."
+    },
+    {
+      "file": "corpus/train/train_0308_cwe703.c",
+      "lines": "42-46",
+      "code": "    if (vmexec) {\n      c->ci--;                    /* pop dummy callinfo */\n    }\n    c->cibase->n = len;\n    value = c->stbase[0] = MRB_PROC_ENV(c->cibase->proc)->stack[0];",
+      "explanation": "Line 42-44: when this call will itself drive the VM, a placeholder callinfo pushed during setup is popped (c->ci--). Line 45 records the argument count into the base callinfo's `n` field so the VM knows how many operands were passed. Line 46 initializes the receiver slot stbase[0]: it fetches the fiber block's captured self out of the proc's environment — MRB_PROC_ENV(c->cibase->proc) yields the REnv of the fiber's base proc, and ->stack[0] is that environment's stored self, which is copied into both the stack slot and the return `value`."
+    },
+    {
+      "file": "corpus/train/train_0308_cwe703.c",
+      "lines": "48-53",
+      "code": "  else {\n    value = fiber_result(mrb, a, len);\n    if (vmexec) {\n      c->ci[1].stack[0] = value;\n    }\n  }",
+      "explanation": "For an already-started fiber being resumed/transferred (status != CREATED), the arguments are not spilled onto a fresh frame; instead fiber_result packages the argument array (a, len) into a single mrb_value — one value if len==1, an array if len>1, nil if len==0 — which becomes the return value of the suspended Fiber.yield inside the fiber. When vmexec is set, that value is also planted into the next callinfo's stack slot 0 (c->ci[1].stack[0]) so the resumed VM sees it."
+    },
+    {
+      "file": "corpus/train/train_0308_cwe703.c",
+      "lines": "55-63",
+      "code": "  if (vmexec) {\n    c->vmexec = TRUE;\n    value = mrb_vm_exec(mrb, c->ci->proc, c->ci->pc);\n    mrb->c = old_c;\n  }\n  else {\n    MARK_CONTEXT_MODIFY(c);\n  }\n  return value;",
+      "explanation": "Finally, if vmexec, the routine sets c->vmexec = TRUE and re-enters the bytecode interpreter mrb_vm_exec on the fiber's proc/pc, running the fiber until it yields or terminates; on return it restores mrb->c = old_c so the embedding's active context is put back. Otherwise (the caller is an outer VM loop) it just calls MARK_CONTEXT_MODIFY(c) to flag that the context/stack pointers changed so the outer loop reloads them. The computed `value` is returned to the caller."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0308_cwe703.c",
+      "lines": "46",
+      "code": "    value = c->stbase[0] = MRB_PROC_ENV(c->cibase->proc)->stack[0];",
+      "explanation": "PRIMARY BUG — unchecked exceptional condition (CWE-703) leading to a NULL-pointer dereference (CWE-476). MRB_PROC_ENV(proc) returns the proc's captured environment (REnv), but a proc does NOT always have one: only closures that capture outer locals carry an REnv; a fiber built over a proc/method with no captured environment yields a NULL env. The code immediately dereferences it with ->stack[0] without a NULL check, so `MRB_PROC_ENV(c->cibase->proc)` == NULL causes a read through NULL+offset and crashes the interpreter. This is reachable from script: create a Fiber over a block/proc whose environment is elided and resume it for the first time (status == MRB_FIBER_CREATED). The invariant the implementation must uphold is: verify MRB_PROC_ENV(c->cibase->proc) is non-NULL (or that the base proc is guaranteed a closure with a valid env) before dereferencing stack[0]; the fixed mruby guards this path. Impact: remote/script-triggered denial of service (interpreter crash), and any downstream logic that assumes a valid env is corrupted."
+    },
+    {
+      "file": "corpus/train/train_0308_cwe703.c",
+      "lines": "45",
+      "code": "    c->cibase->n = len;",
+      "explanation": "Argument-count stored into a narrow callinfo field (CWE-190 truncation / CWE-704 incorrect type conversion). `len` is an mrb_int (word-sized signed), but callinfo's `n` operand-count field is a small width (historically a byte / narrow bitfield in mruby). Assigning an attacker-chosen large `len` truncates modulo the field width, so the VM's recorded operand count no longer matches the len values actually copied at lines 37-41. A mismatch between the copied count and the stored `n` lets the VM under- or over-read the operand region on the next bytecode dispatch (out-of-bounds read of stack slots, CWE-125, or use of uninitialized slots). The implementation must reject or clamp argument counts that do not fit `n` (mruby limits call arguments; that cap must be enforced before this store) rather than silently truncating."
+    },
+    {
+      "file": "corpus/train/train_0308_cwe703.c",
+      "lines": "36-41",
+      "code": "    mrb_stack_extend(mrb, len+2); /* for receiver and (optional) block */\n    b = c->stbase+1;\n    e = b + len;\n    while (b<e) {\n      *b++ = *a++;\n    }",
+      "explanation": "Latent integer-overflow -> out-of-bounds write (CWE-190 -> CWE-787). The stack is sized with `len+2`, and the copy writes len slots. If `len` is close to MRB_INT_MAX, the expression `len+2` overflows mrb_int and wraps to a negative/small value; mrb_stack_extend then sizes the stack far too small (or treats a negative request degenerately), yet the loop still copies `len` (huge) elements from `a`, writing past the fiber stack — a heap/stack buffer overflow. Even without overflow, the loop trusts that `a` really points at `len` readable mrb_value entries and that mrb_stack_extend honored the request. The invariant: bound len (e.g. to the argument-count limit) BEFORE computing len+2, and reject len such that len+2 overflows, before allocating and copying. Whether this is exploitable depends on how large a `len` a caller of fiber_switch can supply; the header/contract here does not enforce a bound."
+    },
+    {
+      "file": "corpus/train/train_0308_cwe703.c",
+      "lines": "27-29",
+      "code": "  old_c->status = resume ? MRB_FIBER_RESUMED : MRB_FIBER_TRANSFERRED;\n  c->prev = resume ? mrb->c : (c->prev ? c->prev : mrb->root_c);\n  fiber_switch_context(mrb, c);",
+      "explanation": "State-machine / self-switch edge case (CWE-703 improper handling). The status guard at lines 11-26 rejects RUNNING/RESUMED/TRANSFERRED/TERMINATED for the resume path, but there is no explicit guard that `c` differs from old_c, nor that the SUSPENDED path leaves prev links acyclic. If a fiber can be made to transfer/resume into itself or form a prev cycle (c->prev chain looping back), a later unwind that walks prev could loop or double-visit a context. The invariant: the set of reachable states reaching line 27 must exclude self-switch and prev cycles; confirm fiber_check / the caller enforce that. Lower severity because the enumerated illegal states are already rejected, but the cyclic-prev case is not visibly excluded here."
+    },
+    {
+      "file": "corpus/train/train_0308_cwe703.c",
+      "lines": "57-58",
+      "code": "    value = mrb_vm_exec(mrb, c->ci->proc, c->ci->pc);\n    mrb->c = old_c;",
+      "explanation": "Context-restore assumption (CWE-703 / potential use-after-free CWE-416 latent). After mrb_vm_exec runs the fiber to completion or yield, mrb->c is unconditionally restored to old_c. If the fiber terminated and its context (or old_c) was freed/collected during execution (fibers are GC objects, and a terminated fiber's context can be reclaimed), restoring or subsequently using old_c/value could touch freed memory. The invariant: old_c must remain live across the mrb_vm_exec call (rooted against GC), and c's termination must not free structures the caller still reads. Confirm the GC arena/root protection around old_c and the returned value. Marked latent — the freeing lives in mrb_vm_exec/GC not shown here."
+    }
+  ],
+  "summary": "This is mruby's fiber_switch() context-switch core. The sharpest issue is an unchecked exceptional condition at line 46: MRB_PROC_ENV(c->cibase->proc) is dereferenced with ->stack[0] even though a fiber's base proc may have no environment, giving a script-triggerable NULL-pointer crash (CWE-476/CWE-703). Secondary concerns are truncation of the argument count into the narrow callinfo `n` field (line 45) and the unbounded len driving len+2 stack sizing and the copy loop (lines 36-41), both of which need explicit bounds before use.",
+  "reviewed_anchors": [
+    {"anchor": "fiber_switch(mrb_state*, mrb_value self, mrb_int len, const mrb_value *a, mrb_bool resume, mrb_bool vmexec) — signature", "disposition": "finding", "reason": "len (count) and a (arg vector) are attacker-influenced from script and flow into an allocation, a copy loop, and a narrow count field"},
+    {"anchor": "fiber_check(mrb, self) (line 4)", "disposition": "dismissed", "reason": "validates/unwraps the Fiber object; raises on bad type, carries no memory-safety contract visible here"},
+    {"anchor": "old_c = mrb->c (line 5)", "disposition": "finding", "reason": "snapshot restored unconditionally after mrb_vm_exec (line 58); liveness/GC-rooting across the VM call must be confirmed"},
+    {"anchor": "fiber_check_cfunc(mrb, c) (line 9)", "disposition": "dismissed", "reason": "guard that raises if the fiber is inside a C frame; defensive, not a hazard itself"},
+    {"anchor": "status = c->status; switch(status) (lines 10-26)", "disposition": "finding", "reason": "state machine gate; rejects listed illegal transitions but does not visibly exclude self-switch / cyclic prev"},
+    {"anchor": "MRB_FIBER_TRANSFERRED / RUNNING / RESUMED / TERMINATED / CREATED enum constants", "disposition": "dismissed", "reason": "named lifecycle states; correctly compared, no per-constant contract broken"},
+    {"anchor": "old_c->status assignment (line 27)", "disposition": "dismissed", "reason": "sets caller status after guards; benign state write"},
+    {"anchor": "c->prev = ... root_c (line 28)", "disposition": "finding", "reason": "prev-link construction; cyclic prev not excluded (covered by the state-machine finding)"},
+    {"anchor": "fiber_switch_context(mrb, c) (line 29)", "disposition": "dismissed", "reason": "performs the register/stack swap; implementation not shown, no local contract violated"},
+    {"anchor": "if (status == MRB_FIBER_CREATED) (line 30)", "disposition": "dismissed", "reason": "correct first-entry gate for the argument-spill path"},
+    {"anchor": "if (!c->ci->proc) raise (lines 33-35)", "disposition": "dismissed", "reason": "explicit NULL check that raises before deref; this is a correct guard"},
+    {"anchor": "mrb_stack_extend(mrb, len+2) (line 36)", "disposition": "finding", "reason": "len+2 can overflow mrb_int for large len, under-sizing the stack before the copy loop"},
+    {"anchor": "b = c->stbase+1; e = b + len; while(b<e) *b++ = *a++; (lines 37-41)", "disposition": "finding", "reason": "fixed copy loop bounded only by len; writes len slots and reads len from a — OOB write/read if len exceeds allocation or a is short"},
+    {"anchor": "if (vmexec) c->ci-- (lines 42-44)", "disposition": "dismissed", "reason": "pops a placeholder callinfo; pointer arithmetic paired with the earlier setup, no independent hazard shown"},
+    {"anchor": "c->cibase->n = len (line 45)", "disposition": "finding", "reason": "stores word-sized len into the narrow callinfo count field n — truncation desynchronizes copied count vs recorded count"},
+    {"anchor": "value = c->stbase[0] = MRB_PROC_ENV(c->cibase->proc)->stack[0] (line 46)", "disposition": "finding", "reason": "MRB_PROC_ENV may be NULL for a proc without a captured environment; ->stack[0] dereferences it unchecked"},
+    {"anchor": "value = fiber_result(mrb, a, len) (line 49)", "disposition": "dismissed", "reason": "packages (a,len) into a return value; consumes len as a bound only, no fixed buffer here"},
+    {"anchor": "c->ci[1].stack[0] = value (line 51)", "disposition": "dismissed", "reason": "writes into the next callinfo's frame set up by the resume machinery; in-bounds by construction of the resume path"},
+    {"anchor": "c->vmexec = TRUE; value = mrb_vm_exec(mrb, c->ci->proc, c->ci->pc) (lines 56-57)", "disposition": "dismissed", "reason": "re-enters the VM; the risk is the post-return restore, captured by the old_c finding"},
+    {"anchor": "mrb->c = old_c (line 58)", "disposition": "finding", "reason": "unconditional restore; old_c must survive GC/termination across mrb_vm_exec (covered by old_c finding)"},
+    {"anchor": "MARK_CONTEXT_MODIFY(c) (line 61)", "disposition": "dismissed", "reason": "signals the outer VM loop to reload context pointers; correct non-vmexec bookkeeping"}
+  ],
+  "findings": [
+    {
+      "title": "NULL-pointer dereference of proc environment on first fiber entry",
+      "anchor": "value = c->stbase[0] = MRB_PROC_ENV(c->cibase->proc)->stack[0];",
+      "file": "corpus/train/train_0308_cwe703.c",
+      "line": "46",
+      "code": "    value = c->stbase[0] = MRB_PROC_ENV(c->cibase->proc)->stack[0];",
+      "bug_class": "NULL-pointer dereference from unchecked exceptional condition",
+      "cwe": "CWE-476",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0308_cwe703.c (and the wider mruby-fiber implementation)",
+      "invariant": "Before dereferencing ->stack[0], the code must confirm MRB_PROC_ENV(c->cibase->proc) is non-NULL — i.e. the fiber's base proc is guaranteed to be a closure carrying an REnv — or take a safe default (e.g. mrb_nil_value / self from elsewhere) when there is no environment.",
+      "failure_mode": "A Fiber is created over a proc/method whose captured environment is absent (a non-closure proc, or one whose env was elided). On the first resume, status == MRB_FIBER_CREATED, so control reaches line 46; MRB_PROC_ENV(c->cibase->proc) returns NULL and ->stack[0] reads through a NULL pointer, crashing the interpreter. This is reachable directly from untrusted Ruby script, giving a denial of service.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether MRB_PROC_ENV can return NULL for the set of procs a Fiber can be constructed from, and whether any guard exists upstream (fiber_check / fiber construction) that forces the base proc to be an env-bearing closure. Compare against the fixed mruby which guards this line."
+    },
+    {
+      "title": "Argument count truncated into narrow callinfo n field",
+      "anchor": "c->cibase->n = len;",
+      "file": "corpus/train/train_0308_cwe703.c",
+      "line": "45",
+      "code": "    c->cibase->n = len;",
+      "bug_class": "Integer truncation / lossy type conversion of operand count",
+      "cwe": "CWE-190",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0308_cwe703.c (callinfo layout in mruby VM headers)",
+      "invariant": "The number of arguments must be validated to fit the width of callinfo.n before being stored, and must equal the count actually copied onto the stack; mruby's per-call argument limit must be enforced before this assignment.",
+      "failure_mode": "len is an mrb_int (word-sized) while callinfo.n is a narrow field. A large len truncates on assignment, so the VM's recorded operand count diverges from the len slots copied at lines 37-41. On the next bytecode dispatch the VM reads the operand region using the truncated n, mis-counting arguments and reading stale/uninitialized or out-of-bounds stack slots (CWE-125), or corrupting the call frame.",
+      "cve_analog": "",
+      "what_to_confirm": "The declared type/width of struct mrb_callinfo.n and whether callers of fiber_switch cap len to that width before reaching line 45."
+    },
+    {
+      "title": "Unbounded argument count sizes the stack and drives the copy loop",
+      "anchor": "mrb_stack_extend(mrb, len+2); ... e = b + len; while (b<e) *b++ = *a++;",
+      "file": "corpus/train/train_0308_cwe703.c",
+      "line": "36-41",
+      "code": "    mrb_stack_extend(mrb, len+2); /* for receiver and (optional) block */\n    b = c->stbase+1;\n    e = b + len;\n    while (b<e) {\n      *b++ = *a++;\n    }",
+      "bug_class": "Integer overflow leading to out-of-bounds write",
+      "cwe": "CWE-787",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0308_cwe703.c (with mrb_stack_extend in the mruby VM)",
+      "invariant": "len must be validated (>= 0 and <= the argument-count limit) BEFORE computing len+2, so the addition cannot overflow mrb_int and the stack is always sized to hold every element the loop writes; the loop must never write more slots than mrb_stack_extend allocated.",
+      "failure_mode": "If len is near MRB_INT_MAX, len+2 overflows and wraps, so mrb_stack_extend under-sizes the fiber stack while the loop still copies len elements into stbase[1..len], writing past the allocation (heap/stack overflow). Even short of overflow, the loop trusts that a supplies len readable mrb_value entries; a len larger than the true argument array over-reads a (CWE-125). Exploitability hinges on the maximum len a caller can pass, which this contract does not bound.",
+      "cve_analog": "",
+      "what_to_confirm": "The range of len reachable at fiber_switch's callers (Fiber#resume/#transfer/Fiber.yield argument marshalling) and whether mrb_stack_extend clamps or faults on huge/negative requests."
+    },
+    {
+      "title": "Caller context restored unconditionally after re-entering the VM",
+      "anchor": "value = mrb_vm_exec(mrb, c->ci->proc, c->ci->pc); mrb->c = old_c;",
+      "file": "corpus/train/train_0308_cwe703.c",
+      "line": "57-58",
+      "code": "    value = mrb_vm_exec(mrb, c->ci->proc, c->ci->pc);\n    mrb->c = old_c;",
+      "bug_class": "Object-lifetime / use-after-free (latent)",
+      "cwe": "CWE-416",
+      "severity": "low",
+      "where_it_lives": "implementation (mrb_vm_exec / GC, file not provided)",
+      "invariant": "old_c (and the returned value) must remain GC-rooted and live across the entire mrb_vm_exec call; a fiber that terminates during execution must not free the context the caller restores into mrb->c.",
+      "failure_mode": "mrb_vm_exec runs arbitrary Ruby, which can trigger GC and fiber termination. If old_c or its backing context is collected during that window, line 58's restore of mrb->c = old_c, or any subsequent use of the returned value, touches freed memory. Latent because the freeing occurs inside code not shown here.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether old_c is protected on the GC arena/root stack across mrb_vm_exec and whether a self-terminating fiber can free old_c."
+    },
+    {
+      "title": "Self-switch / cyclic prev links not explicitly excluded",
+      "anchor": "c->prev = resume ? mrb->c : (c->prev ? c->prev : mrb->root_c);",
+      "file": "corpus/train/train_0308_cwe703.c",
+      "line": "27-29",
+      "code": "  old_c->status = resume ? MRB_FIBER_RESUMED : MRB_FIBER_TRANSFERRED;\n  c->prev = resume ? mrb->c : (c->prev ? c->prev : mrb->root_c);\n  fiber_switch_context(mrb, c);",
+      "bug_class": "Improper handling of exceptional state (potential infinite loop on unwind)",
+      "cwe": "CWE-703",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0308_cwe703.c",
+      "invariant": "The prev chain must stay acyclic and c must not equal the currently active context when the switch commits, so later code that walks prev (e.g. on fiber return/termination) terminates.",
+      "failure_mode": "The state guard at lines 11-26 rejects RUNNING/RESUMED/TRANSFERRED/TERMINATED on the resume path but does not prove c != old_c nor that assigning c->prev cannot form a cycle. If a script can arrange a fiber to transfer/resume into itself or build a prev loop, a subsequent traversal of the prev chain could loop or double-process a context.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether fiber_check or the SUSPENDED/CREATED transition set can produce c == old_c or a cyclic c->prev, and whether prev-walking code is loop-guarded."
+    }
+  ],
+  "audit_checklist": [
+    "At line 46, confirm whether MRB_PROC_ENV(c->cibase->proc) can be NULL for any fiber-constructible proc and add a NULL guard (or prove the base proc is always an env-bearing closure) before ->stack[0].",
+    "Check the declared width of struct mrb_callinfo.n versus mrb_int and enforce mruby's argument-count limit before 'c->cibase->n = len' (line 45).",
+    "Validate len (non-negative, within the arg-count cap) before computing len+2 (line 36) so the addition cannot overflow and the copy loop (lines 39-41) never exceeds the extended stack.",
+    "Verify old_c is GC-rooted across mrb_vm_exec (lines 57-58) and that a fiber terminating during execution cannot free the context restored into mrb->c.",
+    "Confirm the state machine plus fiber_check exclude self-switch (c == old_c) and cyclic c->prev links (line 28), and that all prev-chain walks are loop-guarded.",
+    "Confirm mrb_stack_extend honors and bounds its size argument (rejects negative/overflowed requests) and that stbase is re-read after it, which the code does at lines 37-38."
+  ]
+}

@@ -1,0 +1,177 @@
+{
+  "subsystem": "QEMU USB redirection device (usb-redir / hw/usb/redirect.c). bufp_alloc() takes a completed USB packet that arrived over the usbredir wire protocol and queues it on the per-endpoint buffered-packet queue (bufpq) of a USBRedirDevice, applying a back-pressure / drop policy when the queue grows past twice its target size. It processes USB bulk/iso data payloads (data,len), a completion status, an endpoint address (ep), and an ownership pointer (free_on_destroy) that names the heap block to release when the queued packet is eventually consumed or dropped.",
+  "provenance": "Identified from QEMU-specific symbols: the USBRedirDevice type, the EP2I(ep) endpoint-address-to-index macro, the bufpq/bufp_alloc/buf_packet naming, the QTAILQ_INSERT_TAIL queue macro (QEMU/BSD sys/queue), g_new()/glib allocation, and the DPRINTF debug macro. These are the hallmarks of hw/usb/redirect.c, the QEMU glue around the libusbredirparser USB-over-network protocol. The header banner marks the sample as primevul_c_train_3064_fixed and the eval file name is eval_0069_cwe763.c (CWE-763, release of invalid pointer/reference).",
+  "trust_boundary": "The data/len/status/ep arguments originate from the usbredirparser callbacks that decode the remote usbredir stream (a network/IPC peer: usbredirhost/usbredirserver reached over a Spice USB channel or socket). That peer is untrusted: ep is an 8-bit endpoint address the remote side chooses, len is a 16-bit length the remote side chooses, data points at a heap buffer the parser filled from the wire, and free_on_destroy is the pointer the caller expects this queue to own. Hostile fields: ep (drives the endpoint[] array index via EP2I), len, and the data/free_on_destroy ownership pair.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/eval/eval_0069_cwe763.c",
+      "lines": "2-3",
+      "code": "static int bufp_alloc(USBRedirDevice *dev, uint8_t *data, uint16_t len,\n    uint8_t status, uint8_t ep, void *free_on_destroy)",
+      "explanation": "Declares the internal helper bufp_alloc. dev is the USB redirection device holding an array of per-endpoint state (dev->endpoint[]). data is a pointer to a heap buffer that holds the received USB payload; len (uint16_t, so up to 65535) is that buffer's logical length; status is the USB completion status for the transfer; ep is the raw 8-bit USB endpoint address (bit 7 = direction, low nibble = endpoint number) that selects which endpoint queue this packet belongs to. free_on_destroy is a void* that records which heap block must be free()'d when the queued packet is later destroyed — it lets the caller decouple the payload pointer (data) from the allocation that owns it. Returns 0 on success and -1 when the packet is dropped."
+    },
+    {
+      "file": "corpus/eval/eval_0069_cwe763.c",
+      "lines": "5-5",
+      "code": "struct buf_packet *bufp;",
+      "explanation": "Local pointer that will hold the freshly allocated buf_packet queue node. struct buf_packet is the queue element type (declared elsewhere) with fields data, len, offset, status, free_on_destroy, and a QTAILQ 'next' link, as evidenced by the field assignments on lines 25-30."
+    },
+    {
+      "file": "corpus/eval/eval_0069_cwe763.c",
+      "lines": "7-12",
+      "code": "if (!dev->endpoint[EP2I(ep)].bufpq_dropping_packets &&\n        dev->endpoint[EP2I(ep)].bufpq_size >\n            2 * dev->endpoint[EP2I(ep)].bufpq_target_size) {\n        DPRINTF(\"bufpq overflow, dropping packets ep %02X\\n\", ep);\n        dev->endpoint[EP2I(ep)].bufpq_dropping_packets = 1;\n    }",
+      "explanation": "Back-pressure trigger. EP2I(ep) converts the raw endpoint address into an index into the fixed-size dev->endpoint[] array. If this endpoint is NOT already in the dropping state and its current queue depth (bufpq_size) has grown beyond twice the configured target depth (bufpq_target_size), the code logs a debug message and latches bufpq_dropping_packets = 1. This is the hysteresis 'high water mark': once the queue balloons to 2x target, the device commits to shedding packets until it drains back down."
+    },
+    {
+      "file": "corpus/eval/eval_0069_cwe763.c",
+      "lines": "13-22",
+      "code": "/* Since we're interupting the stream anyways, drop enough packets to get\n       back to our target buffer size */\n    if (dev->endpoint[EP2I(ep)].bufpq_dropping_packets) {\n        if (dev->endpoint[EP2I(ep)].bufpq_size >\n                dev->endpoint[EP2I(ep)].bufpq_target_size) {\n            free(free_on_destroy);\n            return -1;\n        }\n        dev->endpoint[EP2I(ep)].bufpq_dropping_packets = 0;\n    }",
+      "explanation": "The drop path. If the endpoint is currently in the dropping state, the code checks whether the queue is still above the low water mark (bufpq_target_size). While it is, each incoming packet is discarded: the owning allocation is released with free(free_on_destroy) and the function returns -1 without enqueuing anything. Once the queue has drained down to or below target, the dropping flag is cleared and control falls through to normal enqueue. Note the ownership decision here: on the drop path ONLY free_on_destroy is released; data is not touched, on the assumption that free_on_destroy is the allocation that backs data."
+    },
+    {
+      "file": "corpus/eval/eval_0069_cwe763.c",
+      "lines": "24-29",
+      "code": "bufp = g_new(struct buf_packet, 1);\n    bufp->data   = data;\n    bufp->len    = len;\n    bufp->offset = 0;\n    bufp->status = status;\n    bufp->free_on_destroy = free_on_destroy;",
+      "explanation": "Normal enqueue path. g_new allocates one struct buf_packet (glib aborts the process on allocation failure, so bufp is non-NULL here). The node then takes ownership of the payload: data pointer and its len are stored, offset (the consumer's read cursor into data) is initialized to 0, the completion status is copied, and free_on_destroy is stored so that whoever later dequeues/destroys this node knows which block to free. From this point the queue node — not the caller — owns free_on_destroy."
+    },
+    {
+      "file": "corpus/eval/eval_0069_cwe763.c",
+      "lines": "30-32",
+      "code": "QTAILQ_INSERT_TAIL(&dev->endpoint[EP2I(ep)].bufpq, bufp, next);\n    dev->endpoint[EP2I(ep)].bufpq_size++;\n    return 0;",
+      "explanation": "Links the new node onto the tail of this endpoint's bufpq tail-queue via the 'next' link field, increments the queue-depth counter bufpq_size (which the water-mark logic above reads), and returns 0 to signal the packet was accepted. The counter and the actual list are kept in lockstep here, so their consistency depends on every enqueue going through this single increment site."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/eval/eval_0069_cwe763.c",
+      "lines": "18-18",
+      "code": "free(free_on_destroy);",
+      "explanation": "free_on_destroy is a caller-supplied void* released with the libc free(). The safety contract is that free_on_destroy is either NULL or the exact base address of a live heap block allocated by a free()-compatible allocator, owned by nobody else. If a caller ever passes an interior pointer (e.g. free_on_destroy pointing inside data rather than at the allocation base), a pointer to stack/static/pool memory, or a block that was allocated with a mismatched allocator (g_malloc/g_slice vs free), this is a release of an invalid pointer (CWE-763) and corrupts the heap. More concretely for this code: bufp->data and free_on_destroy are stored as two independent pointers, so callers plausibly pass free_on_destroy == data. On the drop path free(free_on_destroy) runs and the function returns -1; if the caller treats -1 as 'packet not queued, I still own data' and frees data itself, data == free_on_destroy is freed twice (double free, CWE-415/CWE-763). The invariant the implementation must uphold is exactly one owner of free_on_destroy and one free() of it, with data never used after that free."
+    },
+    {
+      "file": "corpus/eval/eval_0069_cwe763.c",
+      "lines": "7-9",
+      "code": "if (!dev->endpoint[EP2I(ep)].bufpq_dropping_packets &&\n        dev->endpoint[EP2I(ep)].bufpq_size >\n            2 * dev->endpoint[EP2I(ep)].bufpq_target_size) {",
+      "explanation": "ep is an attacker-influenced 8-bit endpoint address and it indexes the fixed-size dev->endpoint[] array through EP2I(ep) at five sites (lines 7, 8, 11, 15/16, 30, 31). The macro body is not shown; usbredir's EP2I maps direction bit + endpoint number to a 0..31 index for a 32-entry array. Safety depends entirely on EP2I masking ep so the result is always in [0, MAX_ENDPOINTS): if the macro does not fully clamp (or if MAX_ENDPOINTS differs from what EP2I can produce), a hostile ep drives an out-of-bounds read of bufpq_dropping_packets/bufpq_size (CWE-125) and an out-of-bounds write when it sets bufpq_dropping_packets, inserts the node, and increments bufpq_size (CWE-787). This is a latent contract: the bug, if any, lives in the EP2I definition and the endpoint[] array bound in the header/implementation not shown here."
+    },
+    {
+      "file": "corpus/eval/eval_0069_cwe763.c",
+      "lines": "18-19",
+      "code": "free(free_on_destroy);\n            return -1;",
+      "explanation": "On the drop path the node is never created, so bufp->data is never stored and data is never freed — only free_on_destroy is released. This is correct ONLY if free_on_destroy is the sole allocation backing data (they alias, or free_on_destroy owns data). If a caller ever passes a distinct data and free_on_destroy (data owned separately), the dropped data buffer leaks on every discarded packet (CWE-401); a remote peer that deliberately overruns the queue can drive unbounded leakage. Conversely, if the caller passes free_on_destroy == NULL while data is a real allocation, the drop path free(NULL) is a no-op and data leaks. The implementation must guarantee the drop-path free covers precisely the same memory the success path would eventually free."
+    },
+    {
+      "file": "corpus/eval/eval_0069_cwe763.c",
+      "lines": "25-26",
+      "code": "bufp->data   = data;\n    bufp->len    = len;",
+      "explanation": "len (uint16_t, up to 65535) is stored verbatim alongside data with no verification here that the data allocation is actually len bytes long. bufp->offset starts at 0 and downstream consumers read (len - offset) bytes from data+offset. If the parser ever hands bufp_alloc a len larger than the real size of data, every consumer performs an out-of-bounds read (CWE-125). bufp_alloc itself does no copy, so this is a contract obligation on the caller/parser: the invariant is len <= actual size of the data allocation, and offset <= len for all consumers."
+    },
+    {
+      "file": "corpus/eval/eval_0069_cwe763.c",
+      "lines": "9-9",
+      "code": "2 * dev->endpoint[EP2I(ep)].bufpq_target_size) {",
+      "explanation": "The high-water comparison multiplies bufpq_target_size by 2. If bufpq_target_size is a signed int that can be set close to INT_MAX (or is otherwise attacker/negotiation-influenced), 2 * target_size can overflow to a negative or wrapped value (CWE-190), defeating the drop policy so the queue never sheds and grows without bound (memory exhaustion / DoS), or conversely tripping the drop policy spuriously. This is minor relative to the free() issue but the multiplication should be bounded/widened and target_size validated at the point it is set."
+    }
+  ],
+  "summary": "A small, blind-reviewed QEMU usb-redir queue helper. Its central contract risk is the caller-supplied free_on_destroy pointer released with free() on the drop path (line 18): if that pointer is ever an interior/mismatched/aliased-and-double-owned pointer it becomes a release of an invalid pointer or a double free (CWE-763/415). Secondary latent risks are the attacker-controlled endpoint address indexing dev->endpoint[] via the unseen EP2I macro (out-of-bounds if unmasked) and the unverified (data,len) ownership pair. No overflow is visible inside this function; the exposures are ownership/index contracts the surrounding implementation must uphold.",
+  "reviewed_anchors": [
+    {"anchor": "bufp_alloc(USBRedirDevice *dev, uint8_t *data, uint16_t len, uint8_t status, uint8_t ep, void *free_on_destroy) signature", "disposition": "finding", "reason": "Ownership pointer free_on_destroy plus attacker-controlled ep/len enter here."},
+    {"anchor": "void *free_on_destroy parameter + free(free_on_destroy) (line 18)", "disposition": "finding", "reason": "Caller-supplied pointer passed to free(); invalid-pointer/double-free contract (CWE-763)."},
+    {"anchor": "uint8_t ep parameter + EP2I(ep) index into dev->endpoint[] (lines 7,8,11,15-16,30,31)", "disposition": "finding", "reason": "8-bit attacker value drives fixed-array index; OOB if EP2I does not clamp."},
+    {"anchor": "uint16_t len parameter + bufp->len = len (line 26)", "disposition": "finding", "reason": "Length stored with data but not validated against the buffer's real size; downstream over-read contract."},
+    {"anchor": "uint8_t *data parameter + bufp->data = data (line 25)", "disposition": "finding", "reason": "Payload pointer whose ownership is split from free_on_destroy; leak/UAF depends on aliasing invariant."},
+    {"anchor": "2 * dev->endpoint[EP2I(ep)].bufpq_target_size (line 9)", "disposition": "finding", "reason": "Signed multiply can overflow if target_size is large, defeating the drop policy (CWE-190/DoS)."},
+    {"anchor": "bufpq_dropping_packets field (lines 7,11,15,21)", "disposition": "dismissed", "reason": "Simple latched boolean hysteresis flag; no memory-safety contract of its own beyond the endpoint[] index issue."},
+    {"anchor": "bufpq_size field / bufpq_size++ (lines 8,16,31)", "disposition": "dismissed", "reason": "Counter kept in lockstep with the single insert site here; correctness contract, not a direct vulnerability in this function."},
+    {"anchor": "uint8_t status parameter + bufp->status = status (line 28)", "disposition": "dismissed", "reason": "Opaque status byte copied verbatim; not interpreted as a pointer/length here."},
+    {"anchor": "bufp->offset = 0 (line 27)", "disposition": "dismissed", "reason": "Initialized to 0; read cursor whose bound (offset <= len) is enforced by consumers, not here."},
+    {"anchor": "bufp = g_new(struct buf_packet, 1) (line 24)", "disposition": "dismissed", "reason": "glib g_new aborts on OOM, so bufp is non-NULL; no unchecked-allocation NULL-deref."},
+    {"anchor": "QTAILQ_INSERT_TAIL(&dev->endpoint[EP2I(ep)].bufpq, bufp, next) (line 30)", "disposition": "dismissed", "reason": "Standard intrusive tail-queue insert; safe given a valid bufp and in-range index."},
+    {"anchor": "DPRINTF(\"bufpq overflow, dropping packets ep %02X\\n\", ep) (line 10)", "disposition": "dismissed", "reason": "Constant format string with a single %02X for a uint8_t; no format-string or NULL-deref risk."},
+    {"anchor": "struct buf_packet type (line 5)", "disposition": "dismissed", "reason": "Node type declared elsewhere; its fields are covered by the data/len/free_on_destroy anchors above."}
+  ],
+  "findings": [
+    {
+      "title": "Release of caller-supplied free_on_destroy pointer on drop path (invalid free / double free)",
+      "anchor": "free(free_on_destroy);",
+      "file": "corpus/eval/eval_0069_cwe763.c",
+      "line": "18",
+      "code": "free(free_on_destroy);",
+      "bug_class": "Release of invalid pointer / double free",
+      "cwe": "CWE-763",
+      "severity": "high",
+      "where_it_lives": "corpus/eval/eval_0069_cwe763.c (and the callers/destroy path in the implementation, file not provided)",
+      "invariant": "free_on_destroy must be NULL or the exact base address of a live block allocated by a free()-compatible allocator, owned solely by this queue entry, and freed exactly once (here on the drop path, or later on the destroy path — never both, and never also by the caller).",
+      "failure_mode": "The queue stores bufp->data and free_on_destroy as two independent pointers, so callers plausibly pass free_on_destroy == data. When the endpoint is shedding packets, free(free_on_destroy) runs and the function returns -1. If the caller interprets -1 as 'not queued, I still own the buffer' and frees data (== free_on_destroy) itself, the same block is freed twice (double free). Likewise if any caller ever passes an interior pointer into data, a non-heap pointer, or a block allocated with a mismatched allocator (g_malloc/g_slice vs libc free), free() releases an invalid pointer and corrupts the heap. A remote usbredir peer that forces the queue over 2x target repeatedly exercises this drop path.",
+      "cve_analog": "",
+      "what_to_confirm": "At every bufp_alloc call site, confirm free_on_destroy is the base of a malloc/family allocation, that the caller does NOT free data or free_on_destroy after receiving -1, and that the later bufpq destroy/flush path frees free_on_destroy exactly once and never also frees data separately."
+    },
+    {
+      "title": "Attacker-controlled endpoint address indexes fixed endpoint[] array via unclamped EP2I",
+      "anchor": "dev->endpoint[EP2I(ep)]",
+      "file": "corpus/eval/eval_0069_cwe763.c",
+      "line": "7-8",
+      "code": "if (!dev->endpoint[EP2I(ep)].bufpq_dropping_packets &&\n        dev->endpoint[EP2I(ep)].bufpq_size >",
+      "bug_class": "Out-of-bounds array read/write via unbounded index",
+      "cwe": "CWE-787",
+      "severity": "high",
+      "where_it_lives": "implementation (file not provided) — EP2I macro and dev->endpoint[] declaration",
+      "invariant": "EP2I(ep) must map any 8-bit ep into a valid index in [0, ARRAY_SIZE(dev->endpoint)) for every possible ep, so no attacker-chosen endpoint address can address memory outside dev->endpoint[].",
+      "failure_mode": "ep comes from the untrusted usbredir stream. It is fed to EP2I(ep) and used to read bufpq_dropping_packets/bufpq_size (OOB read, CWE-125) and to write bufpq_dropping_packets, insert the node, and increment bufpq_size (OOB write, CWE-787). If EP2I does not fully mask ep to the array's index range — or if the array is smaller than EP2I's output range — a crafted ep corrupts memory adjacent to the endpoint table. This is latent because the macro/array bound are not in the shown code.",
+      "cve_analog": "",
+      "what_to_confirm": "Read the EP2I definition and the size of dev->endpoint[]; verify EP2I masks direction bit and endpoint number so its result is always < the array length, and that callers validate/normalize ep before reaching bufp_alloc."
+    },
+    {
+      "title": "Payload length stored without validating the data buffer size",
+      "anchor": "bufp->len = len;",
+      "file": "corpus/eval/eval_0069_cwe763.c",
+      "line": "26",
+      "code": "bufp->len    = len;",
+      "bug_class": "Missing input validation enabling downstream out-of-bounds read",
+      "cwe": "CWE-125",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided) — the usbredirparser callback that supplies data/len and the consumers that read data+offset",
+      "invariant": "len must be <= the actual allocated size of the data buffer, and consumers must keep offset <= len; bufp_alloc trusts the caller for this.",
+      "failure_mode": "len (uint16_t, up to 65535) is recorded verbatim with data and offset=0. bufp_alloc performs no copy, but any consumer that reads (len - offset) bytes starting at data+offset will read past the allocation if the remote peer supplied a len larger than the real buffer. The over-read is not in this function; the danger is that this function is the point where the untrusted length is committed to the queue without a bound check.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the parser guarantees data was allocated with at least len bytes, and that all bufpq consumers clamp reads to [offset, len]."
+    },
+    {
+      "title": "Split ownership of data vs free_on_destroy can leak the payload on drop",
+      "anchor": "bufp->data = data / free(free_on_destroy)",
+      "file": "corpus/eval/eval_0069_cwe763.c",
+      "line": "18-25",
+      "code": "free(free_on_destroy);\n            return -1;",
+      "bug_class": "Memory leak from asymmetric ownership handling",
+      "cwe": "CWE-401",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0069_cwe763.c and its call sites (implementation, file not provided)",
+      "invariant": "free_on_destroy must be the single allocation that backs data, so that freeing free_on_destroy on the drop path (and on destroy) reclaims everything data points into; data must never own memory separate from free_on_destroy.",
+      "failure_mode": "On the drop path only free_on_destroy is freed and data is dropped on the floor. If a caller ever supplies a data buffer whose backing allocation is distinct from free_on_destroy (or passes free_on_destroy == NULL while data is heap-allocated), each dropped packet leaks the data buffer. A hostile peer that keeps the endpoint queue above 2x target can drive continuous leakage and eventual memory exhaustion (DoS).",
+      "cve_analog": "",
+      "what_to_confirm": "Verify at every call site that free_on_destroy aliases/owns data, so the single free covers the payload; if separate buffers are ever passed, the drop path must free both."
+    },
+    {
+      "title": "Signed multiply 2 * bufpq_target_size may overflow and defeat the drop policy",
+      "anchor": "2 * dev->endpoint[EP2I(ep)].bufpq_target_size",
+      "file": "corpus/eval/eval_0069_cwe763.c",
+      "line": "9",
+      "code": "2 * dev->endpoint[EP2I(ep)].bufpq_target_size) {",
+      "bug_class": "Integer overflow weakening a resource-limit check",
+      "cwe": "CWE-190",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided) — where bufpq_target_size is set/negotiated",
+      "invariant": "bufpq_target_size must be bounded such that 2 * target_size cannot overflow the type used for the comparison, so the high-water mark stays meaningful.",
+      "failure_mode": "If bufpq_target_size is a signed int settable near INT_MAX (via configuration or protocol negotiation), 2 * target_size wraps to a negative/small value, so bufpq_size can never exceed it and the drop policy never engages — the queue grows unbounded (memory exhaustion). Impact is limited to DoS and requires an unusually large target_size, hence low severity.",
+      "cve_analog": "",
+      "what_to_confirm": "Check the type and clamping of bufpq_target_size and whether it is influenced by the guest/remote; widen or bound the multiplication."
+    }
+  ],
+  "audit_checklist": [
+    "Trace every bufp_alloc call site: confirm free_on_destroy is the base of a free()-compatible allocation, is not an interior pointer into data, and is never freed by the caller after a -1 return (guard against double free at line 18).",
+    "Confirm the bufpq destroy/flush path frees free_on_destroy exactly once and does not also separately free bufp->data, matching the drop-path assumption.",
+    "Read the EP2I macro and ARRAY_SIZE(dev->endpoint); prove EP2I(ep) is in-range for all 256 possible ep values so the endpoint[] accesses on lines 7,8,11,15-16,30,31 cannot go out of bounds.",
+    "Verify the usbredirparser callback guarantees data is allocated with at least len bytes and that all bufpq consumers keep offset <= len (no over-read of the payload).",
+    "Check whether callers ever pass distinct data and free_on_destroy (or free_on_destroy == NULL) and ensure the drop path cannot leak the data buffer.",
+    "Confirm bufpq_size and the actual queue length stay consistent across all enqueue/dequeue/drop paths, and that bufpq_target_size is bounded so 2*target_size cannot overflow."
+  ]
+}

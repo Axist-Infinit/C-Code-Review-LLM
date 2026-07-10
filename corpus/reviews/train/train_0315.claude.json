@@ -1,0 +1,170 @@
+{
+  "subsystem": "Python Imaging Library (PIL / Pillow) core C library, libImaging. The function ImagingNew is the top-level image-buffer allocator: given a pixel mode string and image dimensions it decides how many bytes each pixel occupies, sanity-checks the size, and chooses between a single contiguous block allocation (ImagingNewBlock) and a per-line array allocation (ImagingNewArray). It is the entry point every decoder and Python-level Image.new() call funnels through to obtain backing storage.",
+  "provenance": "Identified by the Imaging type, the ImagingNew/ImagingNewBlock/ImagingNewArray/ImagingError_ValueError/ImagingError_Clear symbol family, and the 'F'/'I' single-character pixel-mode convention — all signatures of Pillow's libImaging/Storage.c. The banner comment `/* sample: primevul_c_train_3348_fixed */` marks this as a post-fix revision harvested from PrimeVul; the `(int64_t)` casts on the size product are the visible remnant of that fix.",
+  "trust_boundary": "xsize and ysize are attacker-influenced: for decoder call paths they are the width/height read from a crafted image file, so they are hostile 32-bit integers. mode is normally an internal, trusted string constant, but ImagingNew performs no NULL check and no content validation, so any caller (including future ones or fuzzers) that passes a NULL or empty mode reaches the arithmetic below. THRESHOLD is a compile-time constant. Everything downstream (ImagingNewBlock/ImagingNewArray) trusts that ImagingNew has already vetted the size and computed a sane bytes-per-pixel.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0315_cwe284.c",
+      "lines": "1-5",
+      "code": "/* sample: primevul_c_train_3348_fixed */\nImagingNew(const char* mode, int xsize, int ysize)\n{\n    int bytes;\n    Imaging im;",
+      "explanation": "The function signature takes a pixel-mode descriptor string `mode` (e.g. \"L\", \"RGB\", \"RGBA\", \"F\", \"I\"), and the image width `xsize` and height `ysize` as signed 32-bit ints. It returns an `Imaging` handle (an opaque pointer type to Pillow's image struct). Two locals are declared: `bytes`, an int that will hold the derived per-pixel storage size used only to pick an allocation strategy, and `im`, the Imaging handle that will receive the block-allocation result. Note the return type is elided in this excerpt but is `Imaging` in Pillow."
+    },
+    {
+      "file": "corpus/train/train_0315_cwe284.c",
+      "lines": "7-13",
+      "code": "if (strlen(mode) == 1) {\n        if (mode[0] == 'F' || mode[0] == 'I')\n            bytes = 4;\n        else\n            bytes = 1;\n    } else\n        bytes = strlen(mode); /* close enough */",
+      "explanation": "This block derives `bytes`, an estimate of bytes-per-pixel, purely from the mode string. If the mode is a single character, the code special-cases the two 32-bit-per-pixel modes: 'F' (32-bit float) and 'I' (32-bit signed int) get bytes=4; every other single-character mode (e.g. 'L', 'P', '1') gets bytes=1. For any mode whose length is not exactly 1 (e.g. \"RGB\", \"RGBA\", \"YCbCr\", or the empty string \"\"), it falls into the else branch and simply assigns `bytes = strlen(mode)`, i.e. it uses the number of characters in the mode name as a proxy for the pixel byte width. The self-deprecating comment `/* close enough */` acknowledges this is a heuristic, not an exact per-pixel size; it happens to match for \"RGB\" (3) and \"RGBA\" (4) but is only ever used to choose an allocation path, not to size the real buffer. `strlen` is called on `mode` here with no prior NULL check."
+    },
+    {
+      "file": "corpus/train/train_0315_cwe284.c",
+      "lines": "15-17",
+      "code": "if (xsize < 0 || ysize < 0) {\n        return (Imaging) ImagingError_ValueError(\"bad image size\");\n    }",
+      "explanation": "A validation gate rejects negative dimensions. If either dimension is negative the function returns the result of `ImagingError_ValueError(\"bad image size\")`, cast to Imaging — Pillow's convention for signalling a value error to the caller (it sets the thread error state and returns NULL). This guards the sign of the operands so the subsequent 64-bit multiply cannot be fed a negative value, but it imposes NO upper bound on either dimension: xsize and ysize may each be up to INT_MAX."
+    },
+    {
+      "file": "corpus/train/train_0315_cwe284.c",
+      "lines": "19-25",
+      "code": "if ((int64_t) xsize * (int64_t) ysize <= THRESHOLD / bytes) {\n        im = ImagingNewBlock(mode, xsize, ysize);\n        if (im)\n            return im;\n        /* assume memory error; try allocating in array mode instead */\n        ImagingError_Clear();\n    }",
+      "explanation": "This is the allocation-strategy decision and the security-relevant heart of the function. Both dimensions are widened to int64_t BEFORE multiplying, so the pixel-count product cannot overflow a 32-bit int (this is the fix implied by the `_fixed` sample name). The product is compared against `THRESHOLD / bytes`; algebraically this asks whether the total pixel-payload (pixels times bytes-per-pixel) stays under the compile-time THRESHOLD that separates a single contiguous allocation from a segmented one. If it fits, ImagingNewBlock allocates one contiguous buffer; on success the handle is returned immediately. If ImagingNewBlock returns NULL (treated as a memory error), the thread error state is cleared via ImagingError_Clear() so the caller does not see a stale error, and control falls through to the array path. The comparison divides THRESHOLD by `bytes`; because that division is evaluated on the right, `bytes` must be non-zero for this expression to be defined."
+    },
+    {
+      "file": "corpus/train/train_0315_cwe284.c",
+      "lines": "27-28",
+      "code": "return ImagingNewArray(mode, xsize, ysize);\n}",
+      "explanation": "The fallback path: for images whose payload exceeds THRESHOLD, or for block allocations that failed, ImagingNewArray allocates the image as an array of per-row buffers (more robust for large/fragmented allocations). Its return value — the new Imaging handle or NULL on failure — is returned directly to the caller. This is the last statement; there is no separate NULL/error handling here, the caller is expected to check the returned handle."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0315_cwe284.c",
+      "lines": "12-19",
+      "code": "} else\n        bytes = strlen(mode); /* close enough */\n\n    if (xsize < 0 || ysize < 0) {\n        return (Imaging) ImagingError_ValueError(\"bad image size\");\n    }\n\n    if ((int64_t) xsize * (int64_t) ysize <= THRESHOLD / bytes) {",
+      "explanation": "Division by zero. When `mode` is the empty string \"\", strlen(mode) is 0, which is not equal to 1, so control reaches line 13 and sets `bytes = strlen(mode) = 0`. There is no check that `bytes != 0` between that assignment and line 19, where `THRESHOLD / bytes` performs an integer division by zero. On most platforms this raises SIGFPE and crashes the process (denial of service); the value-size guard on line 15 does nothing to prevent it because it only checks the dimensions, not `bytes`. The invariant the implementation must uphold is that `bytes` is strictly positive before it is used as a divisor — either reject an empty/unknown mode up front, or clamp bytes to a minimum of 1."
+    },
+    {
+      "file": "corpus/train/train_0315_cwe284.c",
+      "lines": "7-13",
+      "code": "if (strlen(mode) == 1) {\n        if (mode[0] == 'F' || mode[0] == 'I')\n            bytes = 4;\n        else\n            bytes = 1;\n    } else\n        bytes = strlen(mode); /* close enough */",
+      "explanation": "NULL pointer dereference. `mode` is dereferenced by strlen on line 7 (and again on line 13, and read as mode[0] on line 8) with no prior NULL check. If any caller passes mode == NULL — plausible from an error path, a corrupt image descriptor, or a fuzzer — strlen reads through the null pointer and the process crashes (CWE-476). The invariant is that mode must be a valid, NUL-terminated string; ImagingNew currently trusts this unconditionally and should reject NULL before touching it."
+    },
+    {
+      "file": "corpus/train/train_0315_cwe284.c",
+      "lines": "13-19",
+      "code": "bytes = strlen(mode); /* close enough */\n\n    if (xsize < 0 || ysize < 0) {\n        return (Imaging) ImagingError_ValueError(\"bad image size\");\n    }\n\n    if ((int64_t) xsize * (int64_t) ysize <= THRESHOLD / bytes) {",
+      "explanation": "Incorrect bytes-per-pixel estimate distorts the allocation-strategy threshold. `bytes` is derived from the length of the mode NAME, not the real per-pixel storage of the mode. For genuine multi-character modes this is only 'close enough': \"YCbCrK\" (6 chars) or \"I;16\" behave differently from their true storage widths, so the pixel-payload used in the THRESHOLD comparison can under- or over-estimate the true size. Under-estimating routes an image that is really larger than THRESHOLD into the contiguous ImagingNewBlock path. This is not itself the memory-corruption bug (ImagingNewBlock recomputes the real line size), but a wrong bytes value that is too small also shrinks the RIGHT-hand side `THRESHOLD / bytes` when bytes is large, or inflates it when bytes is 1, changing which allocator runs for a given size and defeating the intent of the guard. The invariant is that the value used to bound the allocation decision must equal the real per-pixel byte width the downstream allocator will use; here it is a string-length heuristic."
+    },
+    {
+      "file": "corpus/train/train_0315_cwe284.c",
+      "lines": "13",
+      "code": "bytes = strlen(mode); /* close enough */",
+      "explanation": "Sign/width truncation. strlen returns size_t (unsigned, 64-bit on LP64) but `bytes` is a signed 32-bit int. A mode string longer than INT_MAX bytes (pathological but not impossible for a fuzzed/attacker-constructed argument) truncates on assignment and can yield a negative or zero `bytes`. A negative `bytes` makes `THRESHOLD / bytes` negative, so the comparison `product <= (negative)` is almost always false and every image is forced onto the array path (a logic corruption of the guard); the zero case is the division-by-zero above. The invariant is that the derived byte width fits in the destination type and stays positive."
+    },
+    {
+      "file": "corpus/train/train_0315_cwe284.c",
+      "lines": "15-27",
+      "code": "if (xsize < 0 || ysize < 0) {\n        return (Imaging) ImagingError_ValueError(\"bad image size\");\n    }\n\n    if ((int64_t) xsize * (int64_t) ysize <= THRESHOLD / bytes) {\n        im = ImagingNewBlock(mode, xsize, ysize);\n        if (im)\n            return im;\n        /* assume memory error; try allocating in array mode instead */\n        ImagingError_Clear();\n    }\n\n    return ImagingNewArray(mode, xsize, ysize);",
+      "explanation": "No upper bound on dimensions — the whole-image size contract is delegated to the downstream allocators. The 64-bit cast prevents the pixel-count PRODUCT from overflowing, and the THRESHOLD comparison caps the contiguous path, but for images above THRESHOLD control drops straight into ImagingNewArray(mode, xsize, ysize) with xsize/ysize up to INT_MAX and no further check here. The safety of that path depends entirely on ImagingNewArray computing linesize = xsize * (real bytes-per-pixel) and the total = linesize * ysize without its own 32-bit overflow. If that internal arithmetic is not itself widened, a crafted width/height can under-allocate and later be written past — a latent heap overflow (CWE-190 -> CWE-787) that lives in ImagingNewArray/ImagingNewBlock, which this header-level review can only flag, not confirm. The invariant is that every downstream size computation must use overflow-safe (64-bit or checked) arithmetic just as line 19 now does."
+    }
+  ],
+  "summary": "This post-fix ImagingNew hardened the pixel-count multiply against 32-bit overflow (the int64_t casts on line 19), but residual input-validation gaps remain: an empty mode string drives bytes=0 and a division-by-zero crash at THRESHOLD/bytes (line 19), mode is dereferenced with no NULL check (lines 7-13), and the bytes-per-pixel figure is a strlen heuristic rather than the true storage width, weakening the allocation-strategy guard. The most severe corruption risk (heap under-allocation on huge dimensions) is latent in the ImagingNewBlock/ImagingNewArray implementations this file only calls into.",
+  "reviewed_anchors": [
+    {"anchor": "ImagingNew(const char* mode, int xsize, int ysize) signature", "disposition": "finding", "reason": "Untrusted xsize/ysize and unvalidated mode enter here; no NULL/upper-bound checks."},
+    {"anchor": "int bytes;", "disposition": "finding", "reason": "Derived per-pixel width; can be 0 or (via truncation) negative and is later a divisor."},
+    {"anchor": "Imaging im;", "disposition": "dismissed", "reason": "Local handle assigned only from ImagingNewBlock and NULL-checked before use; no contract violated."},
+    {"anchor": "strlen(mode) == 1 (line 7)", "disposition": "finding", "reason": "Dereferences mode with no NULL guard (CWE-476)."},
+    {"anchor": "mode[0] == 'F' || mode[0] == 'I' -> bytes = 4 (lines 8-9)", "disposition": "dismissed", "reason": "Correct constant per-pixel size for 32-bit modes; safe given mode non-NULL."},
+    {"anchor": "else bytes = 1 (lines 10-11)", "disposition": "dismissed", "reason": "Safe positive default for single-char modes."},
+    {"anchor": "bytes = strlen(mode) (line 13)", "disposition": "finding", "reason": "Empty mode yields 0 (div-by-zero) and string-length heuristic misestimates real pixel width; size_t->int truncation."},
+    {"anchor": "xsize < 0 || ysize < 0 guard (lines 15-17)", "disposition": "finding", "reason": "Rejects negatives but imposes no upper bound; oversize dimensions pass through to downstream allocators."},
+    {"anchor": "(int64_t) xsize * (int64_t) ysize <= THRESHOLD / bytes (line 19)", "disposition": "finding", "reason": "Division by bytes can be div-by-zero/negative; the guard's correctness depends on an accurate bytes value."},
+    {"anchor": "THRESHOLD constant (line 19)", "disposition": "dismissed", "reason": "Compile-time constant, not attacker-controlled; risk is in the divisor bytes, not THRESHOLD itself."},
+    {"anchor": "ImagingNewBlock(mode, xsize, ysize) (line 20)", "disposition": "finding", "reason": "Receives unbounded xsize/ysize; contiguous-buffer size math is latent overflow surface not shown here."},
+    {"anchor": "ImagingError_Clear() (line 24)", "disposition": "dismissed", "reason": "Clears thread error state on the memory-error fallback; benign."},
+    {"anchor": "ImagingNewArray(mode, xsize, ysize) (line 27)", "disposition": "finding", "reason": "Terminal path for oversize images with no bound applied here; internal linesize*ysize math is latent overflow surface."},
+    {"anchor": "ImagingError_ValueError(\"bad image size\") (line 16)", "disposition": "dismissed", "reason": "Standard error-signalling helper returning NULL; no security contract."}
+  ],
+  "findings": [
+    {
+      "title": "Division by zero on empty mode string",
+      "anchor": "THRESHOLD / bytes with bytes = strlen(mode)",
+      "file": "corpus/train/train_0315_cwe284.c",
+      "line": "13,19",
+      "code": "bytes = strlen(mode); /* close enough */\n...\n    if ((int64_t) xsize * (int64_t) ysize <= THRESHOLD / bytes) {",
+      "bug_class": "Division by zero (denial of service)",
+      "cwe": "CWE-369",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0315_cwe284.c",
+      "invariant": "bytes must be strictly positive before it is used as the divisor of THRESHOLD; an empty or unknown mode must be rejected or clamped to bytes>=1.",
+      "failure_mode": "mode==\"\" -> strlen==0, not ==1, so bytes=strlen(mode)=0 (line 13); THRESHOLD / bytes on line 19 divides by zero, raising SIGFPE and crashing the process. Reachable by any caller that can supply an empty mode.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm no caller can pass an empty mode, or that a bytes==0/empty-mode guard exists before line 19."
+    },
+    {
+      "title": "Unchecked NULL mode dereferenced by strlen",
+      "anchor": "if (strlen(mode) == 1)",
+      "file": "corpus/train/train_0315_cwe284.c",
+      "line": "7",
+      "code": "if (strlen(mode) == 1) {",
+      "bug_class": "NULL pointer dereference",
+      "cwe": "CWE-476",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0315_cwe284.c",
+      "invariant": "mode must be a valid NUL-terminated string; ImagingNew must reject mode==NULL before dereferencing it.",
+      "failure_mode": "mode==NULL causes strlen (line 7), mode[0] (line 8), or strlen again (line 13) to read through a null pointer, crashing the process. No NULL check precedes any dereference.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify every ImagingNew call site guarantees a non-NULL mode, or add an explicit NULL check at function entry."
+    },
+    {
+      "title": "Latent heap under-allocation from unbounded dimensions in downstream allocators",
+      "anchor": "return ImagingNewArray(mode, xsize, ysize)",
+      "file": "corpus/train/train_0315_cwe284.c",
+      "line": "20,27",
+      "code": "im = ImagingNewBlock(mode, xsize, ysize);\n...\n    return ImagingNewArray(mode, xsize, ysize);",
+      "bug_class": "Integer overflow leading to heap buffer overflow",
+      "cwe": "CWE-190",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "ImagingNewBlock/ImagingNewArray must compute linesize (xsize * real bytes-per-pixel) and total (linesize * ysize) with overflow-safe 64-bit or checked arithmetic; ImagingNew only bounds negativity and the block/array split, not absolute size.",
+      "failure_mode": "xsize/ysize up to INT_MAX pass the line-15 sign check and, above THRESHOLD, flow into ImagingNewArray with no further bound here. If the downstream size math is 32-bit, a crafted width/height wraps, under-allocates, and is later written past — remote heap overflow via a malicious image. Latent: not visible in this excerpt.",
+      "cve_analog": "CVE-2016-0740",
+      "what_to_confirm": "Inspect ImagingNewBlock/ImagingNewArray for 64-bit or checked linesize*ysize arithmetic and an absolute size cap."
+    },
+    {
+      "title": "bytes-per-pixel derived from mode string length, not true storage width",
+      "anchor": "bytes = strlen(mode); /* close enough */",
+      "file": "corpus/train/train_0315_cwe284.c",
+      "line": "13",
+      "code": "bytes = strlen(mode); /* close enough */",
+      "bug_class": "Incorrect calculation of buffer/allocation size heuristic",
+      "cwe": "CWE-131",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0315_cwe284.c",
+      "invariant": "The per-pixel size used to bound the block-vs-array decision must equal the real per-pixel storage the downstream allocator uses.",
+      "failure_mode": "For multi-char modes whose name length differs from their real pixel width (e.g. \"I;16\", \"YCbCrK\"), bytes is wrong, so THRESHOLD/bytes mis-sizes the guard and routes some images to the wrong allocator; combined with an oversize image this can defeat the intended contiguous-allocation cap.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the intended semantics of bytes and whether mis-routing block/array allocation has any exploitable size consequence downstream."
+    },
+    {
+      "title": "size_t to int truncation on bytes",
+      "anchor": "bytes = strlen(mode)",
+      "file": "corpus/train/train_0315_cwe284.c",
+      "line": "13",
+      "code": "bytes = strlen(mode); /* close enough */",
+      "bug_class": "Signed/unsigned width truncation",
+      "cwe": "CWE-197",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0315_cwe284.c",
+      "invariant": "The size_t result of strlen must fit in the signed int destination and remain positive.",
+      "failure_mode": "A mode string longer than INT_MAX truncates to a negative or zero int, making THRESHOLD/bytes negative (guard always false, forcing the array path) or zero (division by zero). Pathological input but unbounded because mode length is unchecked.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm mode length is bounded by callers, or store bytes in an unsigned/wider type with an explicit range check."
+    }
+  ],
+  "audit_checklist": [
+    "Add a guard that rejects mode==NULL and empty/zero-length mode before line 7/13, and ensure bytes>=1 before the THRESHOLD/bytes division on line 19.",
+    "Verify ImagingNewBlock and ImagingNewArray compute linesize and total byte count with 64-bit or overflow-checked arithmetic and enforce an absolute maximum image size.",
+    "Confirm no caller can reach ImagingNew with attacker-controlled xsize/ysize that, above THRESHOLD, produce an unbounded allocation request.",
+    "Reconcile the bytes-per-pixel heuristic (strlen(mode)) with the real per-pixel storage used downstream so the block-vs-array decision cannot be mis-routed.",
+    "Check that ImagingError_Clear() on the block-failure fallback does not mask a genuine non-memory error before retrying via ImagingNewArray."
+  ]
+}

@@ -1,0 +1,228 @@
+{
+  "subsystem": "memcached connection state machine — the drive_machine() event-loop driver from the memcached in-memory key/value cache server. It is the per-connection dispatcher that advances a conn object through its protocol states (listen/accept, read, parse, read-item-body, swallow, write) in response to libevent readiness callbacks. It processes raw client-supplied network traffic (TCP and UDP) for the memcached ASCII and binary protocols.",
+  "provenance": "Identified by the exact function name and structure: drive_machine(conn *c) with a switch over conn_listening/conn_waiting/conn_read/conn_parse_cmd/conn_new_cmd/conn_nread/conn_swallow/conn_write/conn_mwrite/conn_closing/conn_max_state is the canonical memcached state machine from memcached.c. Corroborating symbols: settings.reqs_per_event, settings.maxconns_fast, stats.rejected_conns, dispatch_conn_new(), try_read_udp()/try_read_network(), try_read_command(), reset_cmd_handler(), transmit(), build_udp_headers(), add_iov(), item_remove(), cache_free(c->thread->suffix_cache, ...), IS_UDP(c->transport), binary_prot, DATA_BUFFER_SIZE, tcp_transport. The in-file banner names it train_0254_cwe189.c and the header comment 'primevul_c_train_3257_vuln' marks provenance as a PrimeVul C training sample; these are metadata, not trusted assertions about safety.",
+  "trust_boundary": "The trust boundary is the network socket. accept() at line 18 admits a remote client; thereafter every byte read at line 145 (read(c->sfd, c->ritem, c->rlbytes)) and line 200 (read into c->rbuf) is fully attacker-controlled. The counters that drive those reads and copies — c->rlbytes (bytes still owed for the current item body), c->rbytes (bytes buffered), c->sbytes (bytes to discard), c->rsize (read-buffer capacity), and the ritem/rcurr/rbuf pointers — are set by the command parser (try_read_command, not shown) from client-supplied length fields (e.g. the byte-count of a 'set <key> <flags> <exptime> <bytes>' storage command). Those length fields are hostile: a client picks them freely, so any arithmetic that sized c->ritem versus the value now held in c->rlbytes is the security-critical contract. UDP additionally lets the peer address be spoofed.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0254_cwe189.c",
+      "lines": "2-9",
+      "code": "static void drive_machine(conn *c) {\n    bool stop = false;\n    int sfd, flags = 1;\n    socklen_t addrlen;\n    struct sockaddr_storage addr;\n    int nreqs = settings.reqs_per_event;\n    int res;\n    const char *str;",
+      "explanation": "drive_machine takes a single connection object pointer c and runs its protocol state machine to completion for the current libevent activation. Locals: stop is the loop guard, cleared until a state decides to yield control back to libevent; sfd/flags hold a newly accepted socket and its fcntl flags; addrlen and addr (a sockaddr_storage large enough for IPv4/IPv6) receive the peer address from accept(); nreqs is seeded from settings.reqs_per_event and used to cap how many requests one connection may process before yielding, preventing a busy client from starving others; res is a scratch int reused for read()/transmit() results; str points at a static error string. Note res and rlbytes-style counts are plain signed int — a signedness detail that matters below."
+    },
+    {
+      "file": "corpus/train/train_0254_cwe189.c",
+      "lines": "11-15",
+      "code": "assert(c != NULL);\n\n    while (!stop) {\n\n        switch(c->state) {",
+      "explanation": "The connection pointer is asserted non-NULL (a debug-only guard; assert compiles out under NDEBUG, so it is not a real defense). The outer while (!stop) loop lets a connection make progress through several states in one call — e.g. accept then dispatch, or read then parse then read-body — without returning to the event loop between each, which is what makes correct per-state bookkeeping of the byte counters essential. The switch on c->state selects the handler for the connection's current phase."
+    },
+    {
+      "file": "corpus/train/train_0254_cwe189.c",
+      "lines": "16-54",
+      "code": "case conn_listening:\n            addrlen = sizeof(addr);\n            if ((sfd = accept(c->sfd, (struct sockaddr *)&addr, &addrlen)) == -1) {\n                if (errno == EAGAIN || errno == EWOULDBLOCK) {\n                    /* these are transient, so don't log anything */\n                    stop = true;\n                } else if (errno == EMFILE) {\n                    if (settings.verbose > 0)\n                        fprintf(stderr, \"Too many open connections\\n\");\n                    accept_new_conns(false);\n                    stop = true;\n                } else {\n                    perror(\"accept()\");\n                    stop = true;\n                }\n                break;\n            }\n            if ((flags = fcntl(sfd, F_GETFL, 0)) < 0 ||\n                fcntl(sfd, F_SETFL, flags | O_NONBLOCK) < 0) {\n                perror(\"setting O_NONBLOCK\");\n                close(sfd);\n                break;\n            }\n\n            if (settings.maxconns_fast &&\n                stats.curr_conns + stats.reserved_fds >= settings.maxconns - 1) {\n                str = \"ERROR Too many open connections\\r\\n\";\n                res = write(sfd, str, strlen(str));\n                close(sfd);\n                STATS_LOCK();\n                stats.rejected_conns++;\n                STATS_UNLOCK();\n            } else {\n                dispatch_conn_new(sfd, conn_new_cmd, EV_READ | EV_PERSIST,\n                                     DATA_BUFFER_SIZE, tcp_transport);\n            }\n\n            stop = true;\n            break;",
+      "explanation": "conn_listening is the accept path for the listener connection. addrlen is reset to sizeof(addr) before each accept (required, since accept updates it). accept() pulls one pending connection; on -1 it distinguishes transient EAGAIN/EWOULDBLOCK (just stop), EMFILE fd-exhaustion (throttle via accept_new_conns(false) and stop), or a hard error (perror and stop). On success it sets the new socket non-blocking via fcntl; failure closes sfd. Then an admission-control gate: if maxconns_fast is on and current connections plus reserved fds would hit the ceiling, it writes an 'ERROR Too many open connections' string, closes the socket, and bumps stats.rejected_conns under STATS_LOCK. Otherwise it hands the socket to a worker thread via dispatch_conn_new() with initial state conn_new_cmd, a DATA_BUFFER_SIZE read buffer, and tcp_transport. It always stops after one accept per activation."
+    },
+    {
+      "file": "corpus/train/train_0254_cwe189.c",
+      "lines": "56-66",
+      "code": "case conn_waiting:\n            if (!update_event(c, EV_READ | EV_PERSIST)) {\n                if (settings.verbose > 0)\n                    fprintf(stderr, \"Couldn't update event\\n\");\n                conn_set_state(c, conn_closing);\n                break;\n            }\n\n            conn_set_state(c, conn_read);\n            stop = true;\n            break;",
+      "explanation": "conn_waiting re-arms the libevent read interest via update_event(); if that fails the connection is moved to conn_closing for teardown. On success the connection transitions to conn_read and yields (stop = true) so libevent will call back when data is available. This is the idle-between-commands parking state."
+    },
+    {
+      "file": "corpus/train/train_0254_cwe189.c",
+      "lines": "68-85",
+      "code": "case conn_read:\n            res = IS_UDP(c->transport) ? try_read_udp(c) : try_read_network(c);\n\n            switch (res) {\n            case READ_NO_DATA_RECEIVED:\n                conn_set_state(c, conn_waiting);\n                break;\n            case READ_DATA_RECEIVED:\n                conn_set_state(c, conn_parse_cmd);\n                break;\n            case READ_ERROR:\n                conn_set_state(c, conn_closing);\n                break;\n            case READ_MEMORY_ERROR: /* Failed to allocate more memory */\n                /* State already set by try_read_network */\n                break;\n            }\n            break;",
+      "explanation": "conn_read pulls bytes off the socket into the connection's read buffer using the UDP or TCP reader depending on c->transport. The reader's return code drives the transition: no data -> back to conn_waiting; data received -> conn_parse_cmd to interpret a command; a read error -> conn_closing; a memory-allocation error leaves the state as already arranged by try_read_network. These readers (not shown) are where c->rbytes/c->rcurr/c->rsize get populated, so their arithmetic underlies the copies performed in later states."
+    },
+    {
+      "file": "corpus/train/train_0254_cwe189.c",
+      "lines": "87-93",
+      "code": "case conn_parse_cmd :\n            if (try_read_command(c) == 0) {\n                /* wee need more data! */\n                conn_set_state(c, conn_waiting);\n            }\n\n            break;",
+      "explanation": "conn_parse_cmd invokes try_read_command() to parse a complete command line out of the buffered bytes. try_read_command (not shown) is the parser that reads the client-supplied byte count of a storage command and sets up c->ritem / c->rlbytes and transitions the connection into conn_nread. If it returns 0 the buffer does not yet hold a full command line and the connection parks in conn_waiting for more data. Because this parser converts the untrusted textual/binary length field into the numeric c->rlbytes that later reads/copies trust, it is the origin of the hostile length value."
+    },
+    {
+      "file": "corpus/train/train_0254_cwe189.c",
+      "lines": "95-122",
+      "code": "case conn_new_cmd:\n            /* Only process nreqs at a time to avoid starving other\n               connections */\n\n            --nreqs;\n            if (nreqs >= 0) {\n                reset_cmd_handler(c);\n            } else {\n                pthread_mutex_lock(&c->thread->stats.mutex);\n                c->thread->stats.conn_yields++;\n                pthread_mutex_unlock(&c->thread->stats.mutex);\n                if (c->rbytes > 0) {\n                    if (!update_event(c, EV_WRITE | EV_PERSIST)) {\n                        if (settings.verbose > 0)\n                            fprintf(stderr, \"Couldn't update event\\n\");\n                        conn_set_state(c, conn_closing);\n                        break;\n                    }\n                }\n                stop = true;\n            }\n            break;",
+      "explanation": "conn_new_cmd is the per-request throttle. Each pass decrements nreqs; while it stays non-negative it calls reset_cmd_handler() to clear per-command state and loop back to parse the next pipelined command. When the request budget is exhausted it records a conn_yields statistic under the thread stats mutex and yields to the event loop. If there are still buffered bytes (c->rbytes > 0) it registers write interest as a wakeup hack (comment note) so libevent will re-activate the connection even though no new socket read is pending; failure to update the event closes the connection. This bounds CPU per connection but does not itself touch attacker buffers."
+    },
+    {
+      "file": "corpus/train/train_0254_cwe189.c",
+      "lines": "124-142",
+      "code": "case conn_nread:\n            if (c->rlbytes == 0) {\n                complete_nread(c);\n                break;\n            }\n            /* first check if we have leftovers in the conn_read buffer */\n            if (c->rbytes > 0) {\n                int tocopy = c->rbytes > c->rlbytes ? c->rlbytes : c->rbytes;\n                if (c->ritem != c->rcurr) {\n                    memmove(c->ritem, c->rcurr, tocopy);\n                }\n                c->ritem += tocopy;\n                c->rlbytes -= tocopy;\n                c->rcurr += tocopy;\n                c->rbytes -= tocopy;\n                if (c->rlbytes == 0) {\n                    break;\n                }\n            }",
+      "explanation": "conn_nread reads the body of a storage item into a buffer c->ritem previously allocated to hold exactly the item's declared size. c->rlbytes is the number of body bytes still owed. If it is already 0 the item is complete and complete_nread() finalizes it. Otherwise, if bytes are already sitting in the command read buffer (c->rbytes > 0), it copies as many as apply: tocopy = min(c->rbytes, c->rlbytes). When the item destination differs from the current buffer cursor it memmove()s tocopy bytes from c->rcurr into c->ritem, then advances all four counters/pointers (ritem forward by tocopy, rlbytes down, rcurr forward, rbytes down). If that satisfied the item (rlbytes hits 0) it breaks; the finalize happens on the next entry. Everything here trusts that the c->ritem allocation was sized to the original rlbytes."
+    },
+    {
+      "file": "corpus/train/train_0254_cwe189.c",
+      "lines": "144-181",
+      "code": "res = read(c->sfd, c->ritem, c->rlbytes);\n            if (res > 0) {\n                pthread_mutex_lock(&c->thread->stats.mutex);\n                c->thread->stats.bytes_read += res;\n                pthread_mutex_unlock(&c->thread->stats.mutex);\n                if (c->rcurr == c->ritem) {\n                    c->rcurr += res;\n                }\n                c->ritem += res;\n                c->rlbytes -= res;\n                break;\n            }\n            if (res == 0) { /* end of stream */\n                conn_set_state(c, conn_closing);\n                break;\n            }\n            if (res == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {\n                if (!update_event(c, EV_READ | EV_PERSIST)) {\n                    if (settings.verbose > 0)\n                        fprintf(stderr, \"Couldn't update event\\n\");\n                    conn_set_state(c, conn_closing);\n                    break;\n                }\n                stop = true;\n                break;\n            }\n            /* otherwise we have a real error, on which we close the connection */\n            if (settings.verbose > 0) {\n                fprintf(stderr, \"Failed to read, and not due to blocking:\\n\"\n                        \"errno: %d %s \\n\"\n                        \"rcurr=%lx ritem=%lx rbuf=%lx rlbytes=%d rsize=%d\\n\",\n                        errno, strerror(errno),\n                        (long)c->rcurr, (long)c->ritem, (long)c->rbuf,\n                        (int)c->rlbytes, (int)c->rsize);\n            }\n            conn_set_state(c, conn_closing);\n            break;",
+      "explanation": "When the buffer is drained, the remaining body is pulled straight from the socket: read(c->sfd, c->ritem, c->rlbytes) requests exactly the outstanding byte count into the item buffer. On a positive result it accounts bytes_read under the stats mutex, advances rcurr if it aliases ritem, advances ritem by res and decrements rlbytes by res, then breaks to loop again until rlbytes reaches 0. res == 0 is EOF -> conn_closing. res == -1 with EAGAIN/EWOULDBLOCK re-arms read interest and yields. Any other error logs the connection's buffer pointers and rlbytes/rsize (note the format uses %d and casts rlbytes/rsize to int, confirming they are signed) and closes. The safety of the read hinges entirely on rlbytes never exceeding the space remaining in the c->ritem allocation and never being negative — both determined upstream in the parser."
+    },
+    {
+      "file": "corpus/train/train_0254_cwe189.c",
+      "lines": "183-226",
+      "code": "case conn_swallow:\n            /* we are reading sbytes and throwing them away */\n            if (c->sbytes == 0) {\n                conn_set_state(c, conn_new_cmd);\n                break;\n            }\n\n            /* first check if we have leftovers in the conn_read buffer */\n            if (c->rbytes > 0) {\n                int tocopy = c->rbytes > c->sbytes ? c->sbytes : c->rbytes;\n                c->sbytes -= tocopy;\n                c->rcurr += tocopy;\n                c->rbytes -= tocopy;\n                break;\n            }\n\n            /*  now try reading from the socket */\n            res = read(c->sfd, c->rbuf, c->rsize > c->sbytes ? c->sbytes : c->rsize);\n            if (res > 0) {\n                pthread_mutex_lock(&c->thread->stats.mutex);\n                c->thread->stats.bytes_read += res;\n                pthread_mutex_unlock(&c->thread->stats.mutex);\n                c->sbytes -= res;\n                break;\n            }\n            if (res == 0) { /* end of stream */\n                conn_set_state(c, conn_closing);\n                break;\n            }\n            if (res == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {\n                if (!update_event(c, EV_READ | EV_PERSIST)) {\n                    if (settings.verbose > 0)\n                        fprintf(stderr, \"Couldn't update event\\n\");\n                    conn_set_state(c, conn_closing);\n                    break;\n                }\n                stop = true;\n                break;\n            }\n            /* otherwise we have a real error, on which we close the connection */\n            if (settings.verbose > 0)\n                fprintf(stderr, \"Failed to read, and not due to blocking\\n\");\n            conn_set_state(c, conn_closing);\n            break;",
+      "explanation": "conn_swallow discards c->sbytes bytes of an over-long or rejected payload (e.g. body of a command whose item could not be stored). When sbytes hits 0 it returns to conn_new_cmd. Buffered bytes are consumed first: tocopy = min(c->rbytes, c->sbytes), sbytes/rcurr/rbytes are adjusted — no copy happens, bytes are simply skipped. When the buffer is empty it reads from the socket into the scratch c->rbuf, and crucially bounds the request by min(c->sbytes, c->rsize), so the read length can never exceed the rbuf capacity c->rsize regardless of sbytes. EOF, EAGAIN/EWOULDBLOCK, and hard-error handling mirror conn_nread. Because the socket read here is capped by rsize, this state is materially safer than conn_nread's uncapped read into ritem."
+    },
+    {
+      "file": "corpus/train/train_0254_cwe189.c",
+      "lines": "228-243",
+      "code": "case conn_write:\n            /*\n             * We want to write out a simple response. If we haven't already,\n             * assemble it into a msgbuf list (this will be a single-entry\n             * list for TCP or a two-entry list for UDP).\n             */\n            if (c->iovused == 0 || (IS_UDP(c->transport) && c->iovused == 1)) {\n                if (add_iov(c, c->wcurr, c->wbytes) != 0) {\n                    if (settings.verbose > 0)\n                        fprintf(stderr, \"Couldn't build response\\n\");\n                    conn_set_state(c, conn_closing);\n                    break;\n                }\n            }\n\n            /* fall through... */",
+      "explanation": "conn_write emits a simple (single-buffer) response. If no iovec entries have been assembled yet (or exactly one for UDP, where slot 0 is the datagram header), it appends the response region [c->wcurr, c->wbytes) to the connection's iovec list via add_iov(); failure closes the connection. It then deliberately falls through into conn_mwrite to perform the actual transmission — a fall-through the reader must track because conn_write does not break."
+    },
+    {
+      "file": "corpus/train/train_0254_cwe189.c",
+      "lines": "245-295",
+      "code": "case conn_mwrite:\n          if (IS_UDP(c->transport) && c->msgcurr == 0 && build_udp_headers(c) != 0) {\n            if (settings.verbose > 0)\n              fprintf(stderr, \"Failed to build UDP headers\\n\");\n            conn_set_state(c, conn_closing);\n            break;\n          }\n            switch (transmit(c)) {\n            case TRANSMIT_COMPLETE:\n                if (c->state == conn_mwrite) {\n                    while (c->ileft > 0) {\n                        item *it = *(c->icurr);\n                        assert((it->it_flags & ITEM_SLABBED) == 0);\n                        item_remove(it);\n                        c->icurr++;\n                        c->ileft--;\n                    }\n                    while (c->suffixleft > 0) {\n                        char *suffix = *(c->suffixcurr);\n                        cache_free(c->thread->suffix_cache, suffix);\n                        c->suffixcurr++;\n                        c->suffixleft--;\n                    }\n                    /* XXX:  I don't know why this wasn't the general case */\n                    if(c->protocol == binary_prot) {\n                        conn_set_state(c, c->write_and_go);\n                    } else {\n                        conn_set_state(c, conn_new_cmd);\n                    }\n                } else if (c->state == conn_write) {\n                    if (c->write_and_free) {\n                        free(c->write_and_free);\n                        c->write_and_free = 0;\n                    }\n                    conn_set_state(c, c->write_and_go);\n                } else {\n                    if (settings.verbose > 0)\n                        fprintf(stderr, \"Unexpected state %d\\n\", c->state);\n                    conn_set_state(c, conn_closing);\n                }\n                break;\n\n            case TRANSMIT_INCOMPLETE:\n            case TRANSMIT_HARD_ERROR:\n                break;                   /* Continue in state machine. */\n\n            case TRANSMIT_SOFT_ERROR:\n                stop = true;\n                break;\n            }\n            break;",
+      "explanation": "conn_mwrite writes a multi-buffer (gather) response. For UDP it first builds datagram headers once (msgcurr == 0). transmit() flushes the iovec list. On TRANSMIT_COMPLETE it releases the resources referenced by the response: it walks the item pointer array (c->icurr/c->ileft), asserts each item is not still slab-free, and calls item_remove() to drop the reference taken for the response; then it frees per-item suffix buffers back to the thread's suffix_cache. The next state depends on how the write started: from conn_mwrite it goes to write_and_go (binary) or conn_new_cmd (ascii); from conn_write it frees any c->write_and_free buffer and goes to write_and_go. TRANSMIT_INCOMPLETE/HARD_ERROR continue the loop; TRANSMIT_SOFT_ERROR yields. The item_remove refcount contract is what keeps stored items alive during the write."
+    },
+    {
+      "file": "corpus/train/train_0254_cwe189.c",
+      "lines": "297-308",
+      "code": "case conn_closing:\n            if (IS_UDP(c->transport))\n                conn_cleanup(c);\n            else\n                conn_close(c);\n            stop = true;\n            break;\n\n        case conn_max_state:\n            assert(false);\n            break;\n        }",
+      "explanation": "conn_closing tears the connection down: UDP connections are recycled via conn_cleanup() (the socket is shared, so it is not closed), TCP connections are fully closed via conn_close(). It then stops. conn_max_state is a sentinel that should never be the live state; reaching it trips assert(false) (a debug-only trap that is a no-op under NDEBUG). The switch and the enclosing while loop close here; the function returns at line 311."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0254_cwe189.c",
+      "lines": "124-145",
+      "code": "if (c->rlbytes == 0) {\n                complete_nread(c);\n                break;\n            }\n            ...\n            res = read(c->sfd, c->ritem, c->rlbytes);",
+      "explanation": "c->rlbytes is a signed int carrying the number of body bytes still owed for the current storage item, derived from the client-supplied byte count of a 'set/add/replace/append/... <bytes>' command. conn_nread guards only rlbytes == 0, never rlbytes < 0 and never rlbytes > (space remaining in the c->ritem allocation). If the parser (try_read_command / item allocation, not shown) let the declared size overflow — e.g. a byte count near INT_MAX, or arithmetic on nbytes + overhead that wraps a signed int — then either (a) the c->ritem buffer was allocated smaller than the value now in rlbytes, so read(c->sfd, c->ritem, c->rlbytes) and the memmove of tocopy=min(rbytes,rlbytes) write past the allocation (remote heap overflow, CWE-787 driven by CWE-190/191), or (b) rlbytes is negative and, converted to the size_t parameter of read(), becomes an enormous length, again overflowing c->ritem. The invariant the implementation must uphold is: rlbytes is validated as strictly positive AND never larger than the residual capacity of the buffer c->ritem points into, established before this state is ever entered. This is the classic CWE-189 numeric-error surface this file is centered on."
+    },
+    {
+      "file": "corpus/train/train_0254_cwe189.c",
+      "lines": "130-138",
+      "code": "if (c->rbytes > 0) {\n                int tocopy = c->rbytes > c->rlbytes ? c->rlbytes : c->rbytes;\n                if (c->ritem != c->rcurr) {\n                    memmove(c->ritem, c->rcurr, tocopy);\n                }\n                c->ritem += tocopy;\n                c->rlbytes -= tocopy;\n                c->rcurr += tocopy;\n                c->rbytes -= tocopy;",
+      "explanation": "The leftover-drain memmove writes tocopy = min(c->rbytes, c->rlbytes) bytes into c->ritem. tocopy is a signed int; if rlbytes is negative (from the upstream overflow described above) the ternary selects it and memmove receives a negative length that converts to a huge size_t, an immediate massive out-of-bounds write. Even when rlbytes is positive, the copy is bounded by rlbytes, not by the true remaining capacity of the ritem allocation — so if that allocation was under-sized relative to rlbytes the memmove overflows the item buffer just as the socket read does. The implementation must guarantee both operands are non-negative and that rlbytes never exceeds ritem's remaining room; this block trusts the parser to have enforced that."
+    },
+    {
+      "file": "corpus/train/train_0254_cwe189.c",
+      "lines": "199-206",
+      "code": "res = read(c->sfd, c->rbuf, c->rsize > c->sbytes ? c->sbytes : c->rsize);\n            if (res > 0) {\n                pthread_mutex_lock(&c->thread->stats.mutex);\n                c->thread->stats.bytes_read += res;\n                pthread_mutex_unlock(&c->thread->stats.mutex);\n                c->sbytes -= res;\n                break;\n            }",
+      "explanation": "conn_swallow's socket read is bounded by min(c->sbytes, c->rsize), so it can never write more than the c->rbuf capacity (c->rsize) — the length overflow risk of conn_nread does not exist here. The residual concern is the signedness of c->sbytes: if it is negative the ternary c->rsize > c->sbytes is true (rsize positive > negative), selecting the negative sbytes as the read length, which converts to a huge size_t and overflows c->rbuf. So this state is safe only while sbytes is guaranteed non-negative; the implementation must ensure the swallow count set by the parser cannot be negative. Absent that, it is a lower-likelihood variant of the same numeric-error class."
+    },
+    {
+      "file": "corpus/train/train_0254_cwe189.c",
+      "lines": "255-261",
+      "code": "while (c->ileft > 0) {\n                        item *it = *(c->icurr);\n                        assert((it->it_flags & ITEM_SLABBED) == 0);\n                        item_remove(it);\n                        c->icurr++;\n                        c->ileft--;\n                    }",
+      "explanation": "On TRANSMIT_COMPLETE the code dereferences each item pointer in the c->icurr array and calls item_remove() to drop the response's reference. Two latent hazards live in the implementation this depends on: (1) the assert on it->it_flags is a debug-only check — under NDEBUG a slab-freed (already-reclaimed) item would be item_remove()'d anyway, a use-after-free / double-decrement (CWE-416) if the item array and the LRU/slab reclaimer ever race or if refcount accounting on the enqueue side was wrong; (2) it presumes c->ileft exactly matches the number of valid entries in c->icurr and that every referenced item still holds a live reference taken when it was queued. If a concurrent worker or a callback freed an item mid-write, item_remove here operates on freed memory. These are contract obligations on the (unshown) item lifetime code, not visibly broken in this excerpt."
+    },
+    {
+      "file": "corpus/train/train_0254_cwe189.c",
+      "lines": "40-47",
+      "code": "if (settings.maxconns_fast &&\n                stats.curr_conns + stats.reserved_fds >= settings.maxconns - 1) {\n                str = \"ERROR Too many open connections\\r\\n\";\n                res = write(sfd, str, strlen(str));\n                close(sfd);",
+      "explanation": "Minor robustness rather than memory safety: the return value of write() is stored in res but never checked, and the socket is immediately closed, so a partial/failed rejection write is silently dropped (the client may not receive the error). More structurally, the admission gate reads stats.curr_conns + stats.reserved_fds outside STATS_LOCK (the lock is only taken to bump rejected_conns), so the ceiling check races with other threads updating those counters; the worst case is admitting one connection over the limit, not memory corruption. Note also assert(c != NULL) at line 11 and assert(false)/assert(it_flags) elsewhere are compiled out under NDEBUG, so none of the asserts in this function are load-bearing security checks."
+    }
+  ],
+  "summary": "This is memcached's drive_machine() connection state machine driving fully attacker-controlled socket data. The central risk is a CWE-189 numeric-error class in conn_nread: c->rlbytes is a signed int used directly as the length for read(c->sfd, c->ritem, c->rlbytes) and for the leftover memmove, guarded only against == 0, so an upstream integer overflow or a negative/oversized item-body length produces a remote heap buffer overflow of the c->ritem allocation. conn_swallow shares the pattern but is capped by the buffer size c->rsize, and the conn_mwrite item_remove loop carries a latent item-lifetime/UAF contract. Overall risk is high, contingent on the (unshown) command parser's validation of the item byte count.",
+  "reviewed_anchors": [
+    {"anchor": "drive_machine(conn *c) signature (line 2)", "disposition": "dismissed", "reason": "Entry point; risk is in the states it dispatches, not the signature itself."},
+    {"anchor": "int sfd, flags; socklen_t addrlen; struct sockaddr_storage addr (lines 4-6)", "disposition": "dismissed", "reason": "addrlen is correctly reset to sizeof(addr) before accept (line 17); sockaddr_storage is sized for any family — no truncation."},
+    {"anchor": "int nreqs = settings.reqs_per_event (line 7)", "disposition": "dismissed", "reason": "Local request-budget counter; bounds CPU per connection, no attacker-controlled memory interaction."},
+    {"anchor": "assert(c != NULL) (line 11)", "disposition": "dismissed", "reason": "Debug-only; compiled out under NDEBUG so not a security guard, but c is caller-supplied trusted state, not a real NULL-deref surface."},
+    {"anchor": "accept(c->sfd, (struct sockaddr *)&addr, &addrlen) (line 18)", "disposition": "dismissed", "reason": "Standard accept with proper addrlen init; error branches handle EAGAIN/EMFILE/other correctly."},
+    {"anchor": "stats.curr_conns + stats.reserved_fds >= settings.maxconns - 1 (line 41)", "disposition": "finding", "reason": "Read outside STATS_LOCK; benign race, folded into the low-severity robustness finding."},
+    {"anchor": "res = write(sfd, str, strlen(str)) (line 43)", "disposition": "finding", "reason": "Return value ignored; partial/failed rejection notice silently lost — low severity robustness."},
+    {"anchor": "dispatch_conn_new(sfd, conn_new_cmd, EV_READ | EV_PERSIST, DATA_BUFFER_SIZE, tcp_transport) (line 49)", "disposition": "dismissed", "reason": "Hands socket to worker with a fixed DATA_BUFFER_SIZE read buffer; sizing is a constant, no attacker length here."},
+    {"anchor": "res = IS_UDP(c->transport) ? try_read_udp(c) : try_read_network(c) (line 69)", "disposition": "dismissed", "reason": "Return-code dispatch only; the buffer arithmetic lives inside the (unshown) readers."},
+    {"anchor": "try_read_command(c) (line 88)", "disposition": "dismissed", "reason": "Not shown; it is the origin of c->rlbytes but no arithmetic is visible here to fault — the resulting hostile value is charged against conn_nread."},
+    {"anchor": "c->rlbytes == 0 guard and read(c->sfd, c->ritem, c->rlbytes) (lines 125,145)", "disposition": "finding", "reason": "Signed rlbytes used as read length with only a ==0 guard; primary heap-overflow / CWE-189 surface."},
+    {"anchor": "int tocopy = c->rbytes > c->rlbytes ? c->rlbytes : c->rbytes; memmove(c->ritem, c->rcurr, tocopy) (lines 131-133)", "disposition": "finding", "reason": "Leftover memmove bounded by rlbytes (not true remaining capacity) and unguarded against negative rlbytes — OOB write."},
+    {"anchor": "c->ritem/c->rcurr/c->rbytes/c->rlbytes counter updates (lines 135-138, 150-154)", "disposition": "dismissed", "reason": "Consistent decrement/advance bookkeeping; correct given the length invariant, so covered by the rlbytes finding rather than separately."},
+    {"anchor": "c->sbytes == 0 guard and read into c->rbuf capped by c->rsize (lines 185,200)", "disposition": "finding", "reason": "Swallow read is capped by rsize (buffer size), so bounded; residual negative-sbytes concern reported as a lower-severity variant."},
+    {"anchor": "int tocopy = c->rbytes > c->sbytes ? c->sbytes : c->rbytes (line 192)", "disposition": "dismissed", "reason": "Only advances rcurr/adjusts counters, performs no copy into a fixed buffer; bounded by rbytes."},
+    {"anchor": "add_iov(c, c->wcurr, c->wbytes) (line 235)", "disposition": "dismissed", "reason": "Appends an outbound (server-owned) response region to the iovec list; wbytes is server-produced, not attacker-sized."},
+    {"anchor": "build_udp_headers(c) (line 246)", "disposition": "dismissed", "reason": "Builds outbound UDP datagram headers; not shown and operates on server-side response state."},
+    {"anchor": "transmit(c) switch (line 252)", "disposition": "dismissed", "reason": "Return-code dispatch for the gather write; no attacker length interaction in this excerpt."},
+    {"anchor": "item *it = *(c->icurr); assert(!ITEM_SLABBED); item_remove(it) loop (lines 255-261)", "disposition": "finding", "reason": "Item refcount/lifetime contract; latent use-after-free if a queued item was freed or refcounting is wrong (debug-only slab assert)."},
+    {"anchor": "cache_free(c->thread->suffix_cache, suffix) loop (lines 262-267)", "disposition": "dismissed", "reason": "Frees server-allocated suffix buffers back to a cache; parallels the item loop and shares its lifetime contract, no distinct new surface."},
+    {"anchor": "c->write_and_free free() / conn_set_state(c, c->write_and_go) (lines 275-279)", "disposition": "dismissed", "reason": "Frees and nulls a server-owned response buffer; write_and_go is an internal state value set by the server."},
+    {"anchor": "conn_closing: IS_UDP ? conn_cleanup(c) : conn_close(c) (lines 297-301)", "disposition": "dismissed", "reason": "Standard teardown; UDP recycles vs TCP closes — correct handling."},
+    {"anchor": "conn_max_state: assert(false) (lines 305-306)", "disposition": "dismissed", "reason": "Unreachable sentinel; debug-only assert, no security contract."}
+  ],
+  "findings": [
+    {
+      "title": "Signed item-body length (c->rlbytes) used as read/copy count with no lower- or upper-bound check — remote heap overflow",
+      "anchor": "res = read(c->sfd, c->ritem, c->rlbytes); with only an == 0 guard",
+      "file": "corpus/train/train_0254_cwe189.c",
+      "line": "125,145",
+      "code": "if (c->rlbytes == 0) {\n                complete_nread(c);\n                break;\n            }\n            ...\n            res = read(c->sfd, c->ritem, c->rlbytes);",
+      "bug_class": "Heap buffer overflow via numeric error (integer overflow / signedness) in an untrusted length field",
+      "cwe": "CWE-190",
+      "severity": "high",
+      "where_it_lives": "This file for the vulnerable use; the length is established in implementation (file not provided) — the command parser / item allocator (try_read_command).",
+      "invariant": "c->rlbytes must be validated strictly positive and never larger than the residual capacity of the buffer c->ritem points into BEFORE conn_nread reads, and the item allocation size must be computed without integer overflow.",
+      "failure_mode": "A client issues a storage command with a byte count chosen so the upstream size arithmetic overflows (signed int wrap) or yields a value larger than the allocated item buffer, or a negative rlbytes. read(c->sfd, c->ritem, c->rlbytes) then either receives a huge size_t (negative rlbytes) or writes rlbytes bytes into an under-sized c->ritem, overflowing the heap allocation and corrupting adjacent chunks — remote code execution / crash. The ==0 guard does not catch negative or oversized values.",
+      "cve_analog": "CVE-2011-4971",
+      "what_to_confirm": "In try_read_command / do_item_alloc, confirm the item body size is parsed as an unsigned value, range-checked against a maximum item size, and that the buffer c->ritem is allocated to at least the value later held in c->rlbytes with overflow-checked arithmetic."
+    },
+    {
+      "title": "Leftover-buffer memmove bounded by rlbytes rather than destination capacity, and unguarded against negative length",
+      "anchor": "int tocopy = c->rbytes > c->rlbytes ? c->rlbytes : c->rbytes; memmove(c->ritem, c->rcurr, tocopy);",
+      "file": "corpus/train/train_0254_cwe189.c",
+      "line": "131-133",
+      "code": "int tocopy = c->rbytes > c->rlbytes ? c->rlbytes : c->rbytes;\n                if (c->ritem != c->rcurr) {\n                    memmove(c->ritem, c->rcurr, tocopy);\n                }",
+      "bug_class": "Out-of-bounds write (signed length into memmove; copy sized by request length not buffer capacity)",
+      "cwe": "CWE-787",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0254_cwe189.c",
+      "invariant": "tocopy must be non-negative and must never exceed the space remaining in the c->ritem allocation; this requires the same rlbytes validation as the socket read.",
+      "failure_mode": "If rlbytes is negative (upstream overflow), the ternary selects it and memmove receives a negative length that converts to an enormous size_t, an immediate massive OOB write. If rlbytes is positive but larger than ritem's real remaining room (under-sized allocation), the buffered bytes overflow the item allocation. The copy trusts rlbytes as the bound, never the true destination size.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify that whenever conn_nread is entered, c->rlbytes <= remaining bytes in the c->ritem buffer and c->rlbytes >= 0, so tocopy = min(rbytes, rlbytes) is always a safe copy length."
+    },
+    {
+      "title": "Latent use-after-free in response item release loop if item refcount/lifetime contract is violated",
+      "anchor": "item *it = *(c->icurr); assert((it->it_flags & ITEM_SLABBED) == 0); item_remove(it);",
+      "file": "corpus/train/train_0254_cwe189.c",
+      "line": "255-261",
+      "code": "while (c->ileft > 0) {\n                        item *it = *(c->icurr);\n                        assert((it->it_flags & ITEM_SLABBED) == 0);\n                        item_remove(it);\n                        c->icurr++;\n                        c->ileft--;\n                    }",
+      "bug_class": "Use-after-free / reference-count mismanagement on cached items",
+      "cwe": "CWE-416",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided) — item.c refcount/slab reclaim and the code that enqueued c->icurr entries.",
+      "invariant": "Every item pointer in c->icurr[0..ileft) must hold a live reference taken when queued for the response, and no concurrent path may slab-free or free it before item_remove runs here; ileft must exactly match the valid entry count.",
+      "failure_mode": "The slab/reclaimer or a concurrent worker frees a queued item mid-write, or the enqueue side took no reference; item_remove() then decrements/frees already-freed memory (double free / UAF). The assert on ITEM_SLABBED is compiled out under NDEBUG, so a reclaimed item is not caught in production.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm each item added to c->icurr had its refcount incremented, that item_remove is the matching decrement, and that no unlocked window lets the LRU/slab reclaimer free a still-referenced item."
+    },
+    {
+      "title": "conn_swallow socket read length depends on non-negative c->sbytes (capped by rsize, lower risk)",
+      "anchor": "res = read(c->sfd, c->rbuf, c->rsize > c->sbytes ? c->sbytes : c->rsize);",
+      "file": "corpus/train/train_0254_cwe189.c",
+      "line": "185,200",
+      "code": "if (c->sbytes == 0) {\n                conn_set_state(c, conn_new_cmd);\n                break;\n            }\n            ...\n            res = read(c->sfd, c->rbuf, c->rsize > c->sbytes ? c->sbytes : c->rsize);",
+      "bug_class": "Numeric error (signed swallow count) feeding a read length",
+      "cwe": "CWE-191",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0254_cwe189.c",
+      "invariant": "c->sbytes must be non-negative; the read is otherwise safely capped by the buffer size c->rsize.",
+      "failure_mode": "If c->sbytes is negative, the ternary c->rsize > c->sbytes is true and selects the negative sbytes as the read length, which converts to a huge size_t and overflows the c->rbuf scratch buffer. In practice sbytes is a discard count derived from the same untrusted body length, so a negative value would require an upstream signedness bug; when sbytes is non-negative the min(sbytes, rsize) cap makes this state safe.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm c->sbytes is computed as an unsigned/positive quantity so the read length can never select a negative value; verify c->rsize is the true allocated size of c->rbuf."
+    },
+    {
+      "title": "Rejection-write return ignored and admission counters read outside the stats lock",
+      "anchor": "res = write(sfd, str, strlen(str)); / stats.curr_conns + stats.reserved_fds >= settings.maxconns - 1",
+      "file": "corpus/train/train_0254_cwe189.c",
+      "line": "41-43",
+      "code": "stats.curr_conns + stats.reserved_fds >= settings.maxconns - 1) {\n                str = \"ERROR Too many open connections\\r\\n\";\n                res = write(sfd, str, strlen(str));\n                close(sfd);",
+      "bug_class": "Unchecked return value / benign data race on statistics counters",
+      "cwe": "CWE-252",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0254_cwe189.c",
+      "invariant": "The rejection notice should be best-effort only (acceptable to drop), and the admission ceiling need only be approximately enforced; neither counter read corrupts memory.",
+      "failure_mode": "write()'s result is stored in res but never inspected before close(sfd), so a short/failed write silently drops the client-facing error. The ceiling comparison reads stats.curr_conns/reserved_fds without STATS_LOCK (taken only to bump rejected_conns), so it races with other threads; worst case is admitting one connection over the configured limit. No memory-safety impact.",
+      "cve_analog": "",
+      "what_to_confirm": "Decide whether the over-limit rejection must be reliably delivered; confirm the counter read racing the ceiling check is acceptable for capacity accounting."
+    }
+  ],
+  "audit_checklist": [
+    "Trace how c->rlbytes and the c->ritem buffer size are set in try_read_command / item allocation: confirm the client byte count is parsed unsigned, bounded by a max item size, and the allocation uses overflow-checked arithmetic so read(c->sfd, c->ritem, c->rlbytes) can never exceed the allocation.",
+    "Prove c->rlbytes is always > 0 (not merely != 0) and never negative when conn_nread runs, so both the memmove (line 133) and the socket read (line 145) have safe, in-bounds lengths.",
+    "Confirm c->sbytes is a non-negative discard count so conn_swallow's read length min(sbytes, rsize) can never select a negative value, and that c->rsize equals the true allocated size of c->rbuf.",
+    "Verify the response item array c->icurr[0..ileft): every entry held an incremented refcount, item_remove is the exact matching decrement, ileft matches the valid count, and no concurrent slab reclaim can free a queued item mid-write (the ITEM_SLABBED assert is compiled out under NDEBUG).",
+    "Check that c->write_and_free (freed at line 276) and the suffix buffers (cache_free at line 264) each have exactly one owner so no double free occurs across the conn_write/conn_mwrite transitions.",
+    "Confirm all assert()s in this function (lines 11, 257, 306) are not relied upon as security checks in release builds compiled with NDEBUG."
+  ]
+}

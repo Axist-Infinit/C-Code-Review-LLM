@@ -1,0 +1,240 @@
+{
+  "subsystem": "SQLite SQL compiler — the SELECT-statement expander. selectExpander() is the Walker callback that expands a parsed SELECT AST: it resolves every table/view/subquery named in the FROM clause, assigns cursor numbers, processes NATURAL/ON/USING join clauses, and rewrites every \"*\" and \"TABLE.*\" wildcard in the result-set column list into the explicit list of column-reference expressions. It runs on every compiled query.",
+  "provenance": "Identified by SQLite-internal type and API names: Walker/Select/Parse/SrcList/ExprList/struct SrcList_item, u16/u32/u8/i16 typedefs, WRC_Abort/WRC_Prune/WRC_Continue walker return codes, SF_Expanded/SF_NestedFrom/SF_IncludeHidden/SF_ComplexResult select flags, TK_ASTERISK/TK_DOT/TK_ID token ops, EP_HasFunc/EP_Subquery/EP_IntValue expr properties, and sqlite3-prefixed helpers (sqlite3WalkSelect, sqlite3ExpandSubquery, sqlite3LocateTableItem, sqlite3ViewGetColumnNames, sqlite3ExprListAppend, sqlite3MatchSpanName, sqlite3MPrintf). This is verbatim SQLite src/select.c selectExpander(). The sample banner (\"primevul_c_validation_0213_fixed\", file name cwe755) marks it as the post-fix revision.",
+  "trust_boundary": "The attacker controls the SQL text. The tokenizer/parser turns that text into the Select AST (p), the SrcList (p->pSrc) and the result ExprList (p->pEList) that this function consumes, so the structure is fully attacker-shaped: the number and nesting of FROM items, whether each is a table/view/subquery, the presence of \"*\"/\"TABLE.*\" wildcards, NATURAL/USING joins, view definitions, and nested-FROM subqueries. Table/column metadata (pTab->nCol, aCol[], the subquery result list pSub->pEList) is derived from the schema and from these attacker-authored subqueries. selectExpander runs on this input before execution, so any memory-safety fault here is reachable from a crafted query (or a malicious view/schema).",
+  "what_the_code_does": [
+    {
+      "file": "corpus/eval/eval_0068_cwe755.c",
+      "lines": "2-11",
+      "code": "static int selectExpander(Walker *pWalker, Select *p){\n  Parse *pParse = pWalker->pParse;\n  int i, j, k;\n  SrcList *pTabList;\n  ExprList *pEList;\n  struct SrcList_item *pFrom;\n  sqlite3 *db = pParse->db;\n  Expr *pE, *pRight, *pExpr;\n  u16 selFlags = p->selFlags;\n  u32 elistFlags = 0;",
+      "explanation": "The function is a Walker callback returning a WRC_* code. It receives the walker (which carries pParse and a scratch eCode flag) and the Select node p being expanded. It caches the database handle db, snapshots the select's flags into a 16-bit selFlags, and initializes a 32-bit elistFlags accumulator that will OR together per-expression flag bits (EP_HasFunc/EP_Subquery) as the result list is scanned. i, j, k are loop indices reused across the three nested loops; pFrom will iterate the FROM-clause items."
+    },
+    {
+      "file": "corpus/eval/eval_0068_cwe755.c",
+      "lines": "13-20",
+      "code": "p->selFlags |= SF_Expanded;\n  if( db->mallocFailed  ){\n    return WRC_Abort;\n  }\n  assert( p->pSrc!=0 );\n  if( (selFlags & SF_Expanded)!=0 ){\n    return WRC_Prune;\n  }",
+      "explanation": "It marks this SELECT as expanded up front, then bails with WRC_Abort if the allocator has already failed (an exceptional-condition gate — CWE-755 territory). It asserts the FROM list exists. Crucially it checks the *snapshotted* selFlags (taken before the SF_Expanded OR at line 13): if the node was already expanded on a previous visit it returns WRC_Prune to stop the walker from descending again. This is the idempotency/once guard that prevents double expansion of a shared subtree."
+    },
+    {
+      "file": "corpus/eval/eval_0068_cwe755.c",
+      "lines": "21-27",
+      "code": "if( pWalker->eCode ){\n    /* Renumber selId because it has been copied from a view */\n    p->selId = ++pParse->nSelect;\n  }\n  pTabList = p->pSrc;\n  pEList = p->pEList;\n  sqlite3WithPush(pParse, p->pWith, 0);",
+      "explanation": "When pWalker->eCode is set (turned on at line 84 while walking a view's duplicated body), the node's selId is renumbered from the parser's monotonically increasing counter so that select IDs copied out of a view definition do not collide with the outer statement. It then binds the local pTabList/pEList to the FROM list and result list and pushes this SELECT's WITH (CTE) clause onto the name-resolution stack so CTE names resolve while expanding this scope."
+    },
+    {
+      "file": "corpus/eval/eval_0068_cwe755.c",
+      "lines": "29-32",
+      "code": "/* Make sure cursor numbers have been assigned to all entries in\n  ** the FROM clause of the SELECT statement.\n  */\n  sqlite3SrcListAssignCursors(pParse, pTabList);",
+      "explanation": "Assigns a VDBE cursor number to every FROM-clause item so later code generation has a stable cursor handle per source. Purely bookkeeping, no attacker-controlled sizing."
+    },
+    {
+      "file": "corpus/eval/eval_0068_cwe755.c",
+      "lines": "38-46",
+      "code": "for(i=0, pFrom=pTabList->a; i<pTabList->nSrc; i++, pFrom++){\n    Table *pTab;\n    assert( pFrom->fg.isRecursive==0 || pFrom->pTab!=0 );\n    if( pFrom->fg.isRecursive ) continue;\n    assert( pFrom->pTab==0 );\n#ifndef SQLITE_OMIT_CTE\n    if( withExpand(pWalker, pFrom) ) return WRC_Abort;\n    if( pFrom->pTab ) {} else\n#endif",
+      "explanation": "First FROM pass: iterate the nSrc source items via pointer pFrom over the flexible array pTabList->a. Recursive-CTE items are already resolved (pTab set) and are skipped. For each remaining item it calls withExpand to try resolving it as a common-table-expression; if that populated pFrom->pTab the following table/subquery branches are skipped. withExpand returning nonzero aborts the walk."
+    },
+    {
+      "file": "corpus/eval/eval_0068_cwe755.c",
+      "lines": "47-55",
+      "code": "if( pFrom->zName==0 ){\n#ifndef SQLITE_OMIT_SUBQUERY\n      Select *pSel = pFrom->pSelect;\n      /* A sub-query in the FROM clause of a SELECT */\n      assert( pSel!=0 );\n      assert( pFrom->pTab==0 );\n      if( sqlite3WalkSelect(pWalker, pSel) ) return WRC_Abort;\n      if( sqlite3ExpandSubquery(pParse, pFrom) ) return WRC_Abort;\n#endif\n    }else{",
+      "explanation": "A FROM item with no zName is a parenthesized subquery. Its inner SELECT (pFrom->pSelect) is recursively walked/expanded first, then sqlite3ExpandSubquery synthesizes a transient Table describing the subquery's result columns and stores it in pFrom->pTab. After this branch pFrom->pTab is expected to be non-NULL with nCol equal to the subquery's result-column count — an invariant later loops rely on."
+    },
+    {
+      "file": "corpus/eval/eval_0068_cwe755.c",
+      "lines": "56-70",
+      "code": "}else{\n      /* An ordinary table or view name in the FROM clause */\n      assert( pFrom->pTab==0 );\n      pFrom->pTab = pTab = sqlite3LocateTableItem(pParse, 0, pFrom);\n      if( pTab==0 ) return WRC_Abort;\n      if( pTab->nTabRef>=0xffff ){\n        sqlite3ErrorMsg(pParse, \"too many references to \\\"%s\\\": max 65535\",\n           pTab->zName);\n        pFrom->pTab = 0;\n        return WRC_Abort;\n      }\n      pTab->nTabRef++;\n      if( !IsVirtual(pTab) && cannotBeFunction(pParse, pFrom) ){\n        return WRC_Abort;\n      }",
+      "explanation": "A named FROM item is resolved to a schema Table via sqlite3LocateTableItem; a NULL result aborts. Before bumping the table's reference count nTabRef, it enforces a hard ceiling of 0xffff (65535) and aborts with an error if reached — this reject-before-increment guard prevents a 16-bit reference counter from wrapping when a single query references the same table an enormous number of times. It then increments nTabRef and, for non-virtual tables, rejects use of a table-valued-function syntax where a plain table is required."
+    },
+    {
+      "file": "corpus/eval/eval_0068_cwe755.c",
+      "lines": "71-89",
+      "code": "#if !defined(SQLITE_OMIT_VIEW) || !defined (SQLITE_OMIT_VIRTUALTABLE)\n      if( IsVirtual(pTab) || pTab->pSelect ){\n        i16 nCol;\n        u8 eCodeOrig = pWalker->eCode;\n        if( sqlite3ViewGetColumnNames(pParse, pTab) ) return WRC_Abort;\n        assert( pFrom->pSelect==0 );\n        if( pTab->pSelect && (db->flags & SQLITE_EnableView)==0 ){\n          sqlite3ErrorMsg(pParse, \"access to view \\\"%s\\\" prohibited\",\n              pTab->zName);\n        }\n        pFrom->pSelect = sqlite3SelectDup(db, pTab->pSelect, 0);\n        nCol = pTab->nCol;\n        pTab->nCol = -1;\n        pWalker->eCode = 1;  /* Turn on Select.selId renumbering */\n        sqlite3WalkSelect(pWalker, pFrom->pSelect);\n        pWalker->eCode = eCodeOrig;\n        pTab->nCol = nCol;\n      }\n#endif",
+      "explanation": "For a view or virtual table it resolves the column names, enforces the SQLITE_EnableView authorization, then duplicates the view's defining SELECT into pFrom->pSelect and walks it. The pattern nCol=pTab->nCol; pTab->nCol=-1; ... pTab->nCol=nCol is a re-entrancy sentinel: while the view body is being expanded pTab->nCol is set to the impossible value -1 so that a view that (directly or transitively) references itself is detected by sqlite3ViewGetColumnNames (which errors on nCol<0) instead of recursing forever. eCode is set to 1 across the nested walk to trigger the selId renumbering at line 23, and both nCol and eCode are restored afterward."
+    },
+    {
+      "file": "corpus/eval/eval_0068_cwe755.c",
+      "lines": "92-102",
+      "code": "/* Locate the index named by the INDEXED BY clause, if any. */\n    if( sqlite3IndexedByLookup(pParse, pFrom) ){\n      return WRC_Abort;\n    }\n  }\n\n  /* Process NATURAL keywords, and ON and USING clauses of joins.\n  */\n  if( pParse->nErr || db->mallocFailed || sqliteProcessJoin(pParse, p) ){\n    return WRC_Abort;\n  }",
+      "explanation": "Still inside the FROM loop, it resolves any INDEXED BY hint. After the loop it processes join semantics (NATURAL/ON/USING), first short-circuiting on any accumulated parse error or allocation failure. Any of these failing aborts the expansion — another cluster of exceptional-condition gates."
+    },
+    {
+      "file": "corpus/eval/eval_0068_cwe755.c",
+      "lines": "115-122",
+      "code": "for(k=0; k<pEList->nExpr; k++){\n    pE = pEList->a[k].pExpr;\n    if( pE->op==TK_ASTERISK ) break;\n    assert( pE->op!=TK_DOT || pE->pRight!=0 );\n    assert( pE->op!=TK_DOT || (pE->pLeft!=0 && pE->pLeft->op==TK_ID) );\n    if( pE->op==TK_DOT && pE->pRight->op==TK_ASTERISK ) break;\n    elistFlags |= pE->flags;\n  }",
+      "explanation": "First result-list pass: scan every expression looking for a bare \"*\" (TK_ASTERISK) or a \"TABLE.*\" (TK_DOT whose right side is TK_ASTERISK), breaking at the first one found. If none is found the loop finishes with k==nExpr and elistFlags has accumulated the flags of all expressions. This cheap scan avoids rebuilding the list when there is nothing to expand."
+    },
+    {
+      "file": "corpus/eval/eval_0068_cwe755.c",
+      "lines": "123-152",
+      "code": "if( k<pEList->nExpr ){\n    /*\n    ** If we get here it means the result set contains one or more \"*\"\n    ** operators that need to be expanded.  Loop through each expression\n    ** in the result set and expand them one by one.\n    */\n    struct ExprList_item *a = pEList->a;\n    ExprList *pNew = 0;\n    int flags = pParse->db->flags;\n    int longNames = (flags & SQLITE_FullColNames)!=0\n                      && (flags & SQLITE_ShortColNames)==0;\n\n    for(k=0; k<pEList->nExpr; k++){\n      pE = a[k].pExpr;\n      elistFlags |= pE->flags;\n      pRight = pE->pRight;\n      assert( pE->op!=TK_DOT || pRight!=0 );\n      if( pE->op!=TK_ASTERISK\n       && (pE->op!=TK_DOT || pRight->op!=TK_ASTERISK)\n      ){\n        /* This particular expression does not need to be expanded.\n        */\n        pNew = sqlite3ExprListAppend(pParse, pNew, a[k].pExpr);\n        if( pNew ){\n          pNew->a[pNew->nExpr-1].zName = a[k].zName;\n          pNew->a[pNew->nExpr-1].zSpan = a[k].zSpan;\n          a[k].zName = 0;\n          a[k].zSpan = 0;\n        }\n        a[k].pExpr = 0;\n      }else{",
+      "explanation": "Because at least one wildcard exists, the whole result list is rebuilt into a fresh pNew. longNames controls whether fully-qualified column names are generated. For a non-wildcard expression, ownership is transferred into pNew: the expression is appended, and the name/span strings are moved (copied then nulled in the source) so a single owner frees them. The pNew!=0 check before touching pNew->a[pNew->nExpr-1] correctly handles an allocation failure inside sqlite3ExprListAppend."
+    },
+    {
+      "file": "corpus/eval/eval_0068_cwe755.c",
+      "lines": "153-180",
+      "code": "}else{\n        /* This expression is a \"*\" or a \"TABLE.*\" and needs to be\n        ** expanded. */\n        int tableSeen = 0;      /* Set to 1 when TABLE matches */\n        char *zTName = 0;       /* text of name of TABLE */\n        if( pE->op==TK_DOT ){\n          assert( pE->pLeft!=0 );\n          assert( !ExprHasProperty(pE->pLeft, EP_IntValue) );\n          zTName = pE->pLeft->u.zToken;\n        }\n        for(i=0, pFrom=pTabList->a; i<pTabList->nSrc; i++, pFrom++){\n          Table *pTab = pFrom->pTab;\n          Select *pSub = pFrom->pSelect;\n          char *zTabName = pFrom->zAlias;\n          const char *zSchemaName = 0;\n          int iDb;\n          if( zTabName==0 ){\n            zTabName = pTab->zName;\n          }\n          if( db->mallocFailed ) break;\n          if( pSub==0 || (pSub->selFlags & SF_NestedFrom)==0 ){\n            pSub = 0;\n            if( zTName && sqlite3StrICmp(zTName, zTabName)!=0 ){\n              continue;\n            }\n            iDb = sqlite3SchemaToIndex(db, pTab->pSchema);\n            zSchemaName = iDb>=0 ? db->aDb[iDb].zDbSName : \"*\";\n          }",
+      "explanation": "For a wildcard, zTName is the qualifying table name for \"TABLE.*\" (or NULL for a bare \"*\"). It then loops over every FROM item to emit that table's columns. zTabName defaults to the alias, else the table's real name pTab->zName (dereferencing pTab). It breaks on a mid-loop allocation failure. Items that are not SF_NestedFrom subqueries clear pSub, skip non-matching tables for \"TABLE.*\", and compute the schema name for qualified output. When pSub survives (a nested-FROM subquery) its own result list will be consulted for span text below."
+    },
+    {
+      "file": "corpus/eval/eval_0068_cwe755.c",
+      "lines": "181-218",
+      "code": "for(j=0; j<pTab->nCol; j++){\n            char *zName = pTab->aCol[j].zName;\n            char *zColname;  /* The computed column name */\n            char *zToFree;   /* Malloced string that needs to be freed */\n            Token sColname;  /* Computed column name as a token */\n\n            assert( zName );\n            if( zTName && pSub\n             && sqlite3MatchSpanName(pSub->pEList->a[j].zSpan, 0, zTName, 0)==0\n            ){\n              continue;\n            }\n\n            /* If a column is marked as 'hidden', omit it from the expanded\n            ** result-set list unless the SELECT has the SF_IncludeHidden\n            ** bit set.\n            */\n            if( (p->selFlags & SF_IncludeHidden)==0\n             && IsHiddenColumn(&pTab->aCol[j]) \n            ){\n              continue;\n            }\n            tableSeen = 1;\n\n            if( i>0 && zTName==0 ){\n              if( (pFrom->fg.jointype & JT_NATURAL)!=0\n                && tableAndColumnIndex(pTabList, i, zName, 0, 0)\n              ){\n                /* In a NATURAL join, omit the join columns from the \n                ** table to the right of the join */\n                continue;\n              }\n              if( sqlite3IdListIndex(pFrom->pUsing, zName)>=0 ){\n                /* In a join with a USING clause, omit columns in the\n                ** using clause from the table on the right. */\n                continue;\n              }\n            }",
+      "explanation": "Inner column loop: for each of the table's nCol columns it reads the column name from aCol[j]. When expanding a \"TABLE.*\" against a nested-FROM subquery, it filters columns by matching zTName against the subquery result's span using pSub->pEList->a[j] — indexing the subquery's result list by the same j that ranges over pTab->nCol. It skips hidden columns unless SF_IncludeHidden is set, and for right-hand tables of a join it omits NATURAL-join duplicate columns and USING-clause columns. tableSeen records that at least one column was emitted."
+    },
+    {
+      "file": "corpus/eval/eval_0068_cwe755.c",
+      "lines": "219-253",
+      "code": "pRight = sqlite3Expr(db, TK_ID, zName);\n            zColname = zName;\n            zToFree = 0;\n            if( longNames || pTabList->nSrc>1 ){\n              Expr *pLeft;\n              pLeft = sqlite3Expr(db, TK_ID, zTabName);\n              pExpr = sqlite3PExpr(pParse, TK_DOT, pLeft, pRight);\n              if( zSchemaName ){\n                pLeft = sqlite3Expr(db, TK_ID, zSchemaName);\n                pExpr = sqlite3PExpr(pParse, TK_DOT, pLeft, pExpr);\n              }\n              if( longNames ){\n                zColname = sqlite3MPrintf(db, \"%s.%s\", zTabName, zName);\n                zToFree = zColname;\n              }\n            }else{\n              pExpr = pRight;\n            }\n            pNew = sqlite3ExprListAppend(pParse, pNew, pExpr);\n            sqlite3TokenInit(&sColname, zColname);\n            sqlite3ExprListSetName(pParse, pNew, &sColname, 0);\n            if( pNew && (p->selFlags & SF_NestedFrom)!=0 ){\n              struct ExprList_item *pX = &pNew->a[pNew->nExpr-1];\n              if( pSub ){\n                pX->zSpan = sqlite3DbStrDup(db, pSub->pEList->a[j].zSpan);\n                testcase( pX->zSpan==0 );\n              }else{\n                pX->zSpan = sqlite3MPrintf(db, \"%s.%s.%s\",\n                                           zSchemaName, zTabName, zColname);\n                testcase( pX->zSpan==0 );\n              }\n              pX->bSpanIsTab = 1;\n            }\n            sqlite3DbFree(db, zToFree);",
+      "explanation": "It builds the replacement expression: a TK_ID for the column, optionally wrapped in TK_DOT nodes to qualify it with table and schema when longNames is set or more than one source table exists, and a printed \"table.column\" display name. The new expression is appended to pNew and named. When the outer SELECT is itself a nested-FROM, it also sets the span: for a subquery source it copies the subquery result's span pSub->pEList->a[j].zSpan (again indexing by j), otherwise it synthesizes \"schema.table.column\". zToFree (the malloced long-name string, if any) is freed each iteration to avoid a leak."
+    },
+    {
+      "file": "corpus/eval/eval_0068_cwe755.c",
+      "lines": "255-266",
+      "code": "if( !tableSeen ){\n          if( zTName ){\n            sqlite3ErrorMsg(pParse, \"no such table: %s\", zTName);\n          }else{\n            sqlite3ErrorMsg(pParse, \"no tables specified\");\n          }\n        }\n      }\n    }\n    sqlite3ExprListDelete(db, pEList);\n    p->pEList = pNew;\n  }",
+      "explanation": "After processing one wildcard against all FROM items, if no table matched (a bogus \"TABLE.*\" or empty FROM) it raises an error. Once the whole result list has been rebuilt, the original pEList is freed and p->pEList is replaced with pNew. Note the old list is deleted regardless of whether pNew ended up NULL (an OOM during the rebuild) — callers must tolerate p->pEList becoming NULL under mallocFailed."
+    },
+    {
+      "file": "corpus/eval/eval_0068_cwe755.c",
+      "lines": "267-277",
+      "code": "if( p->pEList ){\n    if( p->pEList->nExpr>db->aLimit[SQLITE_LIMIT_COLUMN] ){\n      sqlite3ErrorMsg(pParse, \"too many columns in result set\");\n      return WRC_Abort;\n    }\n    if( (elistFlags & (EP_HasFunc|EP_Subquery))!=0 ){\n      p->selFlags |= SF_ComplexResult;\n    }\n  }\n  return WRC_Continue;\n}",
+      "explanation": "Finally, if a result list survives, it enforces the SQLITE_LIMIT_COLUMN cap on the expanded column count (a real DoS bound, since \"*\" over many wide tables multiplies out) and records SF_ComplexResult when the list contains function calls or subqueries. It returns WRC_Continue so the walker proceeds. The p->pEList!=0 guard correctly skips both checks when the rebuild ran out of memory."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/eval/eval_0068_cwe755.c",
+      "lines": "181-190",
+      "code": "for(j=0; j<pTab->nCol; j++){\n            char *zName = pTab->aCol[j].zName;\n            char *zColname;  /* The computed column name */\n            char *zToFree;   /* Malloced string that needs to be freed */\n            Token sColname;  /* Computed column name as a token */\n\n            assert( zName );\n            if( zTName && pSub\n             && sqlite3MatchSpanName(pSub->pEList->a[j].zSpan, 0, zTName, 0)==0\n            ){",
+      "explanation": "j indexes two different arrays that are assumed to have the same length: pTab->aCol[] (length pTab->nCol, the loop bound) and pSub->pEList->a[] (the nested-FROM subquery's result list). The code never checks that pSub->pEList->nExpr == pTab->nCol; it relies on sqlite3ExpandSubquery having built the transient Table with exactly one column per subquery result expression. If any path lets those counts diverge (e.g. a nested-FROM subquery whose result-column count differs from the synthesized table's nCol — for instance via generated columns, duplicate/renamed columns, or an error partway through expansion that leaves nCol stale), then pSub->pEList->a[j].zSpan reads past the end of the subquery result array. This is a heap out-of-bounds read of an Expr_list_item and the resulting garbage pointer is passed to sqlite3MatchSpanName, which may dereference it. The implementation must guarantee pTab->nCol <= pSub->pEList->nExpr whenever pSub is non-NULL here."
+    },
+    {
+      "file": "corpus/eval/eval_0068_cwe755.c",
+      "lines": "240-244",
+      "code": "if( pNew && (p->selFlags & SF_NestedFrom)!=0 ){\n              struct ExprList_item *pX = &pNew->a[pNew->nExpr-1];\n              if( pSub ){\n                pX->zSpan = sqlite3DbStrDup(db, pSub->pEList->a[j].zSpan);\n                testcase( pX->zSpan==0 );",
+      "explanation": "Same unchecked index j into pSub->pEList->a[], reached on the span-copy path. Here the out-of-bounds zSpan pointer is duplicated with sqlite3DbStrDup, which walks the string until a NUL — so an OOB-read of a stale/garbage pointer becomes an unbounded string read (potential crash or information disclosure of adjacent heap into a column span). It is the same invariant (nested-subquery result count must cover pTab->nCol); this is a second, distinct sink for the same missing bound and would need the same guard."
+    },
+    {
+      "file": "corpus/eval/eval_0068_cwe755.c",
+      "lines": "163-170",
+      "code": "for(i=0, pFrom=pTabList->a; i<pTabList->nSrc; i++, pFrom++){\n          Table *pTab = pFrom->pTab;\n          Select *pSub = pFrom->pSelect;\n          char *zTabName = pFrom->zAlias;\n          const char *zSchemaName = 0;\n          int iDb;\n          if( zTabName==0 ){\n            zTabName = pTab->zName;\n          }",
+      "explanation": "When a FROM item has no alias, zTabName is taken from pTab->zName, unconditionally dereferencing pFrom->pTab. The first FROM pass sets pTab for every non-recursive item (via CTE/subquery/table resolution), so in the normal flow pTab is non-NULL here. But this loop runs unconditionally once any wildcard is present, including after earlier iterations may have hit mallocFailed. If any resolution path can leave pFrom->pTab NULL while pFrom->zAlias is also NULL for that item, this is a NULL-pointer dereference and crash driven purely by query shape. The invariant to confirm: every FROM item reaching this loop has pTab != NULL, or the mallocFailed break at line 172 fires before the deref (note the break is at line 172, AFTER this line-169 dereference)."
+    },
+    {
+      "file": "corpus/eval/eval_0068_cwe755.c",
+      "lines": "61-67",
+      "code": "if( pTab->nTabRef>=0xffff ){\n        sqlite3ErrorMsg(pParse, \"too many references to \\\"%s\\\": max 65535\",\n           pTab->zName);\n        pFrom->pTab = 0;\n        return WRC_Abort;\n      }\n      pTab->nTabRef++;",
+      "explanation": "nTabRef is a fixed-width (u16) reference counter. The guard rejects at 0xffff BEFORE the increment, so a query that references one table 65535+ times is rejected instead of wrapping nTabRef to 0 — a wrap would later free the Table while references remain (use-after-free) or leak it. This is the correct reject-before-increment shape; the finding is that the whole safety of the shared Table lifetime rests on this single comparison using the exact >= (not >) and running before every ++. Confirm no other code path increments nTabRef without this gate."
+    },
+    {
+      "file": "corpus/eval/eval_0068_cwe755.c",
+      "lines": "82-87",
+      "code": "nCol = pTab->nCol;\n        pTab->nCol = -1;\n        pWalker->eCode = 1;  /* Turn on Select.selId renumbering */\n        sqlite3WalkSelect(pWalker, pFrom->pSelect);\n        pWalker->eCode = eCodeOrig;\n        pTab->nCol = nCol;",
+      "explanation": "This is the anti-recursion sentinel for self-referential views: pTab->nCol is set to -1 so a view that references itself is caught (sqlite3ViewGetColumnNames refuses nCol<0) rather than recursing without bound (CWE-674). The restore pTab->nCol = nCol happens only if control reaches line 87; sqlite3WalkSelect itself does not return an error code here (its result is ignored), so the sentinel is always restored on this path. The risk to confirm is that no early return exists between line 83 and 87 that would leave nCol permanently -1, and that -1 fits the i16/nCol type as the reserved sentinel."
+    },
+    {
+      "file": "corpus/eval/eval_0068_cwe755.c",
+      "lines": "264-268",
+      "code": "sqlite3ExprListDelete(db, pEList);\n    p->pEList = pNew;\n  }\n  if( p->pEList ){\n    if( p->pEList->nExpr>db->aLimit[SQLITE_LIMIT_COLUMN] ){",
+      "explanation": "During \"*\" expansion the original pEList is deleted and p->pEList is set to pNew, which can be NULL if any sqlite3ExprListAppend hit OOM mid-rebuild. The function guards the subsequent limit/flag checks with if(p->pEList), and the entry-time SF_Expanded marking plus the various mallocFailed returns are the exceptional-condition handling (CWE-755) that keeps a half-built statement from being executed. The contract to confirm: every caller and later walker stage tolerates p->pEList==0 after a mallocFailed expansion, and the SQLITE_LIMIT_COLUMN cap is the only thing bounding a combinatorial \"*\" blow-up across many wide tables (a resource-exhaustion DoS otherwise)."
+    }
+  ],
+  "summary": "Post-fix SQLite selectExpander(): the exceptional-condition handling is solid (mallocFailed gates, the nTabRef>=0xffff reject-before-increment, the pTab->nCol=-1 self-view recursion sentinel, the SF_Expanded once-guard, and the SQLITE_LIMIT_COLUMN cap are all present and correctly ordered). The remaining latent memory-safety contract is the nested-FROM wildcard path, which indexes the subquery result list pSub->pEList->a[j] by j ranging over pTab->nCol without checking the two counts agree — an out-of-bounds read if that invariant is ever violated. Overall risk is low-to-moderate and concentrated in that one contract.",
+  "reviewed_anchors": [
+    {"anchor": "selectExpander(Walker *pWalker, Select *p) signature (line 2)", "disposition": "dismissed", "reason": "Walker callback; both pointers are internal, non-nullable by the walker contract."},
+    {"anchor": "u16 selFlags snapshot (line 10)", "disposition": "dismissed", "reason": "Snapshot taken before line-13 OR; correctly used for the already-expanded guard, no overflow."},
+    {"anchor": "u32 elistFlags accumulator (line 11)", "disposition": "dismissed", "reason": "Pure bit-OR of flag bits; cannot overflow meaningfully."},
+    {"anchor": "SF_Expanded set/check (lines 13,18)", "disposition": "dismissed", "reason": "Idempotency once-guard; correct because it tests the pre-set snapshot."},
+    {"anchor": "db->mallocFailed gates (lines 14,100,172)", "disposition": "finding", "reason": "Exceptional-condition (CWE-755) handling; enumerated as the OOM-tolerance contract (line 172 break is AFTER the line-169 deref)."},
+    {"anchor": "pWalker->eCode / selId renumber (lines 21-23,74,84,86)", "disposition": "dismissed", "reason": "Saved/restored around the nested view walk; renumbering avoids selId collisions, no memory contract."},
+    {"anchor": "FROM loop bound i<pTabList->nSrc (lines 38,163)", "disposition": "dismissed", "reason": "Iterates the parser-built SrcList; nSrc matches the a[] flexible array by construction."},
+    {"anchor": "withExpand / sqlite3ExpandSubquery (lines 44,54)", "disposition": "dismissed", "reason": "Set pFrom->pTab; their correctness underlies the nCol==result-count invariant flagged below but the calls themselves are just error-checked."},
+    {"anchor": "pTab->nTabRef>=0xffff guard + ++ (lines 61-67)", "disposition": "finding", "reason": "Fixed-width refcount; reject-before-increment prevents u16 wrap/UAF — enumerated as a load-bearing guard."},
+    {"anchor": "sqlite3LocateTableItem NULL check (lines 59-60)", "disposition": "dismissed", "reason": "NULL result is checked and aborts; no deref of a null Table here."},
+    {"anchor": "pTab->nCol = -1 recursion sentinel (lines 82-87)", "disposition": "finding", "reason": "Anti-recursion (CWE-674) guard; enumerated to confirm restore-on-all-paths."},
+    {"anchor": "SQLITE_EnableView authorization (line 77)", "disposition": "dismissed", "reason": "Access-control error message; not a memory-safety anchor."},
+    {"anchor": "first result-list scan for TK_ASTERISK/TK_DOT (lines 115-122)", "disposition": "dismissed", "reason": "Bounded by pEList->nExpr; asserts guard the TK_DOT pRight deref."},
+    {"anchor": "pNew->a[pNew->nExpr-1] after append (lines 147-148,241)", "disposition": "dismissed", "reason": "Guarded by if(pNew); nExpr>=1 after a successful append."},
+    {"anchor": "zTabName = pTab->zName (lines 169-170)", "disposition": "finding", "reason": "Unconditional deref of pFrom->pTab when zAlias is NULL; possible NULL deref if any item reaches this loop with pTab==0."},
+    {"anchor": "pSub / SF_NestedFrom selection (lines 165,173)", "disposition": "dismissed", "reason": "Selects whether the subquery result list is consulted; the hazard is the indexing below, tracked separately."},
+    {"anchor": "pSub->pEList->a[j].zSpan indexed by j<pTab->nCol (lines 188-189, 243)", "disposition": "finding", "reason": "Out-of-bounds read if subquery result-column count < pTab->nCol; the central latent contract."},
+    {"anchor": "column loop j<pTab->nCol / pTab->aCol[j] (lines 181-182)", "disposition": "dismissed", "reason": "aCol[] is sized nCol by construction; the mismatch risk is only with the parallel pSub->pEList (flagged)."},
+    {"anchor": "IsHiddenColumn / SF_IncludeHidden (lines 198-200)", "disposition": "dismissed", "reason": "Reads &aCol[j] within the nCol bound; visibility filter only."},
+    {"anchor": "NATURAL join tableAndColumnIndex / USING sqlite3IdListIndex (lines 206-213)", "disposition": "dismissed", "reason": "Join-column suppression logic; no attacker-sized buffer access."},
+    {"anchor": "sqlite3Expr/sqlite3PExpr/sqlite3MPrintf name building (lines 219-236)", "disposition": "dismissed", "reason": "Allocation helpers; NULL results are tolerated by downstream append/set-name under mallocFailed."},
+    {"anchor": "zToFree free each iteration (line 252)", "disposition": "dismissed", "reason": "Frees only the malloced long-name; zToFree is NULL when not allocated, so no double free."},
+    {"anchor": "sqlite3ExprListDelete(pEList); p->pEList=pNew (lines 264-265)", "disposition": "finding", "reason": "pNew may be NULL under OOM; enumerated as the p->pEList==0 tolerance contract."},
+    {"anchor": "SQLITE_LIMIT_COLUMN cap (line 268)", "disposition": "dismissed", "reason": "Present and correct; bounds the wildcard column blow-up (DoS mitigation)."},
+    {"anchor": "SF_ComplexResult flag (line 273)", "disposition": "dismissed", "reason": "Sets a planning hint; no security contract."}
+  ],
+  "findings": [
+    {
+      "title": "Out-of-bounds read of nested-FROM subquery result list (index j bounded by pTab->nCol)",
+      "anchor": "sqlite3MatchSpanName(pSub->pEList->a[j].zSpan, ...) and pX->zSpan = sqlite3DbStrDup(db, pSub->pEList->a[j].zSpan)",
+      "file": "corpus/eval/eval_0068_cwe755.c",
+      "line": "181-189, 242-243",
+      "code": "for(j=0; j<pTab->nCol; j++){\n            char *zName = pTab->aCol[j].zName;\n...\n            if( zTName && pSub\n             && sqlite3MatchSpanName(pSub->pEList->a[j].zSpan, 0, zTName, 0)==0\n            ){\n...\n              if( pSub ){\n                pX->zSpan = sqlite3DbStrDup(db, pSub->pEList->a[j].zSpan);",
+      "bug_class": "Out-of-bounds read (parallel-array index mismatch)",
+      "cwe": "CWE-125",
+      "severity": "high",
+      "where_it_lives": "corpus/eval/eval_0068_cwe755.c (this function) plus implementation (sqlite3ExpandSubquery, file not provided)",
+      "invariant": "For every FROM item with a non-NULL SF_NestedFrom subquery pSub, pSub->pEList->nExpr must be >= pTab->nCol so that indexing pSub->pEList->a[j] for j in [0, pTab->nCol) stays in bounds.",
+      "failure_mode": "The loop bound is pTab->nCol (the synthesized transient table's column count) but j also indexes the subquery's own result list pSub->pEList->a[]. The counts are never compared here. If a crafted nested-FROM subquery produces a transient Table whose nCol exceeds its result-list length (or the result list was truncated/altered — e.g. via error recovery, generated/hidden columns, or a subquery result count that diverges from nCol), pSub->pEList->a[j].zSpan reads past the array end; the garbage pointer is then dereferenced by sqlite3MatchSpanName or copied by sqlite3DbStrDup (unbounded string read), yielding a crash or heap information disclosure into a column-span string.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm in sqlite3ExpandSubquery (and any view/nested-FROM path) that pTab->nCol is set to exactly pSub->pEList->nExpr and can never exceed it before this loop runs; add an assert(j < pSub->pEList->nExpr) or bound the loop by the subquery result count when pSub!=0."
+    },
+    {
+      "title": "Possible NULL-pointer dereference of pFrom->pTab in wildcard expansion loop",
+      "anchor": "if( zTabName==0 ){ zTabName = pTab->zName; }",
+      "file": "corpus/eval/eval_0068_cwe755.c",
+      "line": "163-172",
+      "code": "for(i=0, pFrom=pTabList->a; i<pTabList->nSrc; i++, pFrom++){\n          Table *pTab = pFrom->pTab;\n          Select *pSub = pFrom->pSelect;\n          char *zTabName = pFrom->zAlias;\n          const char *zSchemaName = 0;\n          int iDb;\n          if( zTabName==0 ){\n            zTabName = pTab->zName;\n          }\n          if( db->mallocFailed ) break;",
+      "bug_class": "NULL pointer dereference",
+      "cwe": "CWE-476",
+      "severity": "medium",
+      "where_it_lives": "corpus/eval/eval_0068_cwe755.c (this function)",
+      "invariant": "Every FROM item reaching the wildcard-expansion loop must have pFrom->pTab != NULL whenever pFrom->zAlias is NULL.",
+      "failure_mode": "pTab->zName is dereferenced with no NULL check when the FROM item has no alias. The first FROM pass sets pTab for all non-recursive items, so normally pTab is non-NULL, but the mallocFailed break is placed at line 172 — AFTER the line-169 dereference — so if an item is left with pTab==NULL (e.g. an allocation failure during earlier subquery/CTE resolution that still let control reach this loop with a shape that has a wildcard), the code crashes before the OOM break can fire. Impact is a query-shape-triggered NULL dereference / denial of service.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm no path leaves pFrom->pTab==NULL for an alias-less item entering this loop; if the OOM guard is meant to protect this deref, move the `if( db->mallocFailed ) break;` above the `zTabName = pTab->zName;` line."
+    },
+    {
+      "title": "16-bit table reference counter integrity depends solely on the reject-before-increment guard",
+      "anchor": "if( pTab->nTabRef>=0xffff ){ ... } pTab->nTabRef++;",
+      "file": "corpus/eval/eval_0068_cwe755.c",
+      "line": "61-67",
+      "code": "if( pTab->nTabRef>=0xffff ){\n        sqlite3ErrorMsg(pParse, \"too many references to \\\"%s\\\": max 65535\",\n           pTab->zName);\n        pFrom->pTab = 0;\n        return WRC_Abort;\n      }\n      pTab->nTabRef++;",
+      "bug_class": "Integer overflow of reference counter (guarded)",
+      "cwe": "CWE-190",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0068_cwe755.c (this function); Table.nTabRef definition in implementation (file not provided)",
+      "invariant": "nTabRef must never be incremented past its unsigned 16-bit maximum; every increment site must be preceded by the >=0xffff reject.",
+      "failure_mode": "nTabRef is a fixed-width (u16) shared-Table reference count. If any increment path lacked this reject-before-increment guard, a query referencing the same table 65536 times would wrap nTabRef to 0, later causing the Table to be freed while references remain (use-after-free) or leaked. In this fixed revision the guard is present and correctly ordered (>= and before ++), so the risk is latent and lives in other increment sites, not here.",
+      "cve_analog": "",
+      "what_to_confirm": "Grep the implementation for all `nTabRef++` / nTabRef mutations and confirm each is gated by the same 0xffff ceiling, and that nTabRef's declared type is unsigned 16-bit as assumed."
+    },
+    {
+      "title": "Self-referential view recursion sentinel (pTab->nCol = -1) must be restored on every path",
+      "anchor": "nCol = pTab->nCol; pTab->nCol = -1; ... pTab->nCol = nCol;",
+      "file": "corpus/eval/eval_0068_cwe755.c",
+      "line": "82-87",
+      "code": "nCol = pTab->nCol;\n        pTab->nCol = -1;\n        pWalker->eCode = 1;  /* Turn on Select.selId renumbering */\n        sqlite3WalkSelect(pWalker, pFrom->pSelect);\n        pWalker->eCode = eCodeOrig;\n        pTab->nCol = nCol;",
+      "bug_class": "Uncontrolled recursion guard / stale sentinel",
+      "cwe": "CWE-674",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0068_cwe755.c (this function)",
+      "invariant": "While a view body is being expanded pTab->nCol must read as the reserved -1 sentinel so a self-referencing view is rejected by sqlite3ViewGetColumnNames instead of recursing forever, and nCol must be restored before the Table is used elsewhere.",
+      "failure_mode": "The sentinel guards against unbounded recursion for a view that references itself. The nested sqlite3WalkSelect result is ignored and no return sits between lines 83 and 87, so on this code path nCol is always restored. The residual concern is a defensive one: if a future edit introduced an early return inside the guarded region, pTab->nCol would be left at -1, corrupting later column-count logic (potential misindex of aCol[]).",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm sqlite3ViewGetColumnNames treats nCol<0 as the recursion-detected error, that -1 is representable in nCol's (i16) type as the reserved value, and that no early exit exists between the set and restore."
+    }
+  ],
+  "audit_checklist": [
+    "In sqlite3ExpandSubquery / nested-FROM handling, prove pTab->nCol == pSub->pEList->nExpr (or add an explicit j < pSub->pEList->nExpr bound) before indexing pSub->pEList->a[j] at lines 189 and 243.",
+    "Verify no FROM item can reach the line-169 `zTabName = pTab->zName` deref with pFrom->pTab==NULL and zAlias==NULL; consider moving the mallocFailed break above that deref.",
+    "Grep every nTabRef increment in the codebase and confirm each is gated by the >=0xffff reject-before-increment, and that nTabRef is an unsigned 16-bit field.",
+    "Confirm sqlite3ViewGetColumnNames rejects nCol<0 (self-view recursion) and that the pTab->nCol=-1 sentinel is restored on all control paths.",
+    "Confirm every caller and later walker stage tolerates p->pEList becoming NULL after an OOM during \"*\" expansion (lines 264-267).",
+    "Confirm SQLITE_LIMIT_COLUMN meaningfully bounds the combinatorial \"*\"/TABLE.* expansion across many wide joined tables to prevent memory-exhaustion DoS.",
+    "Confirm the SF_Expanded snapshot-based once-guard (lines 10,13,18) cannot be bypassed by a shared/duplicated Select subtree causing double expansion or double free of pEList."
+  ]
+}

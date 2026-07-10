@@ -1,0 +1,400 @@
+{
+  "subsystem": "Linux kernel x86-64 eBPF JIT compiler. This is do_jit(), the per-pass code-generator that translates one verified eBPF program (an array of struct bpf_insn) into native x86-64 machine code, emitting each instruction into a small stack scratch buffer and then copying it into the executable image. It is the arch/x86/net/bpf_jit_comp.c back end of the BPF subsystem.",
+  "provenance": "Identified by the unmistakable BPF-JIT idiom: the do_jit(bpf_prog, addrs, image, oldproglen, ctx, jmp_padding) signature, struct bpf_prog / struct bpf_insn / struct jit_context, the EMIT/EMIT2/EMIT3/EMIT1_off32/EMIT2_off32/EMIT3_off32 x86 encoding macros, the BPF_ALU/BPF_JMP/BPF_LDX/BPF_STX opcode decode via BPF_CLASS/BPF_OP/BPF_SIZE/BPF_MODE, x86 opcodes (0x48 REX.W, 0xC1/0xD1/0xD3 shifts, 0xF7 mul/div, CMPXCHG loop), pr_err() diagnostics, and helpers detect_reg_usage/emit_prologue/push_callee_regs/emit_bpf_tail_call_*/ex_handler_bpf. The header comment 'sample: primevul_c_validation_0398_fixed' and filename '...cwe77.c' are dataset labels only; the code is not command processing and CWE-77 does not apply. Reviewed blind on its merits.",
+  "trust_boundary": "The input eBPF program (bpf_prog->insnsi, bpf_prog->len, and every per-insn field: insn->code, insn->dst_reg, insn->src_reg, insn->imm, insn->off) originates from userspace via the bpf(2) syscall / seccomp / socket filters and is attacker-influenced. do_jit runs AFTER the in-kernel BPF verifier, so its entire safety model is 'the verifier already proved these invariants' (valid opcodes, in-range registers, in-range jump targets, well-formed 16-byte LD_IMM64 pairs, tail-call indices within poke_tab, exception-table count matching). do_jit itself performs almost no bounds validation on these fields. The addrs[] array and image buffer are kernel-allocated based on a prior sizing pass; the hostile inputs are the insn stream fields that drive array indices (addrs[i+insn->off], poke_tab[imm32-1], insn[1]) and the total emitted byte counts written into the fixed-size 'temp' stack buffer and the 'image' output. Any gap between what the verifier actually guarantees and what do_jit assumes becomes a kernel memory-safety bug reachable from userspace.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0203_cwe77.c",
+      "lines": "2-15",
+      "code": "static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image,\n\t\t  int oldproglen, struct jit_context *ctx, bool jmp_padding)\n{\n\tbool tail_call_reachable = bpf_prog->aux->tail_call_reachable;\n\tstruct bpf_insn *insn = bpf_prog->insnsi;\n\tbool callee_regs_used[4] = {};\n\tint insn_cnt = bpf_prog->len;\n\tbool tail_call_seen = false;\n\tbool seen_exit = false;\n\tu8 temp[BPF_MAX_INSN_SIZE + BPF_INSN_SAFETY];\n\tint i, cnt = 0, excnt = 0;\n\tint ilen, proglen = 0;\n\tu8 *prog = temp;\n\tint err;",
+      "explanation": "The entry point. bpf_prog is the verified program; addrs is a caller-provided int array that records the cumulative x86 byte offset of each BPF instruction (used to resolve branch displacements across the multi-pass JIT); image is the executable output buffer (NULL on sizing passes, non-NULL once its size is known); oldproglen is the length computed by the previous pass; ctx holds cross-pass state (cleanup_addr); jmp_padding controls whether nop padding is inserted to keep image size stable between passes. Locals: insn walks the instruction array, insn_cnt = bpf_prog->len is the instruction count, proglen is the running output size, and prog is a moving write cursor. The critical object is 'temp' (line 11): a fixed-size on-stack scratch buffer sized BPF_MAX_INSN_SIZE + BPF_INSN_SAFETY, into which the x86 encoding of a SINGLE BPF instruction is emitted before being copied to image. Every EMIT* macro advances 'prog' inside this buffer."
+    },
+    {
+      "file": "corpus/train/train_0203_cwe77.c",
+      "lines": "17-26",
+      "code": "\tdetect_reg_usage(insn, insn_cnt, callee_regs_used,\n\t\t\t &tail_call_seen);\n\n\t/* tail call's presence in current prog implies it is reachable */\n\ttail_call_reachable |= tail_call_seen;\n\n\temit_prologue(&prog, bpf_prog->aux->stack_depth,\n\t\t      bpf_prog_was_classic(bpf_prog), tail_call_reachable,\n\t\t      bpf_prog->aux->func_idx != 0);\n\tpush_callee_regs(&prog, callee_regs_used);",
+      "explanation": "Pre-loop setup. detect_reg_usage scans the program to learn which callee-saved registers the body uses (callee_regs_used[4]) and whether a tail call is present (tail_call_seen). tail_call_reachable is then OR-ed with that observation. emit_prologue writes the function prologue into 'temp' via the &prog cursor, parameterised by the verifier-computed stack_depth, whether the program is a classic (cBPF-origin) filter, tail-call reachability, and whether this is a sub-program (func_idx != 0). push_callee_regs emits pushes for the used callee-saved registers. All of these write into 'temp' through &prog without any inline bound check here."
+    },
+    {
+      "file": "corpus/train/train_0203_cwe77.c",
+      "lines": "28-33",
+      "code": "\tilen = prog - temp;\n\tif (image)\n\t\tmemcpy(image + proglen, temp, ilen);\n\tproglen += ilen;\n\taddrs[0] = proglen;\n\tprog = temp;",
+      "explanation": "The prologue bytes emitted into 'temp' are measured as ilen = prog - temp, then (only when image is non-NULL) copied to image+proglen (proglen is still 0 here). proglen is advanced and addrs[0] records the prologue's size as the offset of the first BPF instruction. prog is reset to the start of 'temp' to reuse the scratch buffer for the next instruction. Note this prologue copy is guarded only by 'if (image)' — unlike the in-loop copy later, it performs no proglen+ilen vs oldproglen bound check."
+    },
+    {
+      "file": "corpus/train/train_0203_cwe77.c",
+      "lines": "35-45",
+      "code": "\tfor (i = 1; i <= insn_cnt; i++, insn++) {\n\t\tconst s32 imm32 = insn->imm;\n\t\tu32 dst_reg = insn->dst_reg;\n\t\tu32 src_reg = insn->src_reg;\n\t\tu8 b2 = 0, b3 = 0;\n\t\tu8 *start_of_ldx;\n\t\ts64 jmp_offset;\n\t\tu8 jmp_cond;\n\t\tu8 *func;\n\t\tint nops;",
+      "explanation": "The main loop iterates i from 1 to insn_cnt inclusive, advancing insn each pass. For each BPF instruction it snapshots the attacker-supplied fields into locals: imm32 (32-bit immediate), dst_reg / src_reg (BPF register numbers as raw u32, unvalidated here), and scratch encoding variables. Because 'prog' was reset to 'temp', each loop body emits exactly one BPF instruction's worth of x86 into the scratch buffer. dst_reg/src_reg feed directly into register-encoding helpers and, later, into table indices — their in-range-ness is a verifier contract, not checked here."
+    },
+    {
+      "file": "corpus/train/train_0203_cwe77.c",
+      "lines": "46-62",
+      "code": "\t\tswitch (insn->code) {\n\t\t\t/* ALU */\n\t\tcase BPF_ALU | BPF_ADD | BPF_X:\n\t\tcase BPF_ALU | BPF_SUB | BPF_X:\n\t\tcase BPF_ALU | BPF_AND | BPF_X:\n\t\tcase BPF_ALU | BPF_OR | BPF_X:\n\t\tcase BPF_ALU | BPF_XOR | BPF_X:\n\t\tcase BPF_ALU64 | BPF_ADD | BPF_X:\n\t\tcase BPF_ALU64 | BPF_SUB | BPF_X:\n\t\tcase BPF_ALU64 | BPF_AND | BPF_X:\n\t\tcase BPF_ALU64 | BPF_OR | BPF_X:\n\t\tcase BPF_ALU64 | BPF_XOR | BPF_X:\n\t\t\tmaybe_emit_mod(&prog, dst_reg, src_reg,\n\t\t\t\t       BPF_CLASS(insn->code) == BPF_ALU64);\n\t\t\tb2 = simple_alu_opcodes[BPF_OP(insn->code)];\n\t\t\tEMIT2(b2, add_2reg(0xC0, dst_reg, src_reg));\n\t\t\tbreak;",
+      "explanation": "The giant opcode switch dispatches on insn->code. This first arm handles register-to-register ALU (ADD/SUB/AND/OR/XOR, 32- and 64-bit). maybe_emit_mod emits a REX prefix if needed; simple_alu_opcodes[BPF_OP(insn->code)] looks up the x86 opcode byte in a small table indexed by the 4-bit BPF operation code (BPF_OP masks to the arithmetic-op nibble, keeping the index in-table); add_2reg encodes the ModRM byte for the two registers. EMIT2 writes two bytes into 'temp'. This is the template every ALU arm follows."
+    },
+    {
+      "file": "corpus/train/train_0203_cwe77.c",
+      "lines": "64-79",
+      "code": "\t\tcase BPF_ALU64 | BPF_MOV | BPF_X:\n\t\tcase BPF_ALU | BPF_MOV | BPF_X:\n\t\t\temit_mov_reg(&prog,\n\t\t\t\t     BPF_CLASS(insn->code) == BPF_ALU64,\n\t\t\t\t     dst_reg, src_reg);\n\t\t\tbreak;\n\n\t\t\t/* neg dst */\n\t\tcase BPF_ALU | BPF_NEG:\n\t\tcase BPF_ALU64 | BPF_NEG:\n\t\t\tif (BPF_CLASS(insn->code) == BPF_ALU64)\n\t\t\t\tEMIT1(add_1mod(0x48, dst_reg));\n\t\t\telse if (is_ereg(dst_reg))\n\t\t\t\tEMIT1(add_1mod(0x40, dst_reg));\n\t\t\tEMIT2(0xF7, add_1reg(0xD8, dst_reg));\n\t\t\tbreak;",
+      "explanation": "Register-to-register MOV delegates to emit_mov_reg with an is64 flag. The NEG arm emits an optional REX prefix (0x48 for 64-bit via add_1mod, or 0x40 when dst is an extended register is_ereg) then the two-byte x86 NEG (0xF7 /3 encoded as add_1reg(0xD8,...)). These are fixed, bounded emissions of at most a few bytes into 'temp'."
+    },
+    {
+      "file": "corpus/train/train_0203_cwe77.c",
+      "lines": "81-129",
+      "code": "\t\tcase BPF_ALU | BPF_ADD | BPF_K:\n\t\tcase BPF_ALU | BPF_SUB | BPF_K:\n\t\tcase BPF_ALU | BPF_AND | BPF_K:\n\t\tcase BPF_ALU | BPF_OR | BPF_K:\n\t\tcase BPF_ALU | BPF_XOR | BPF_K:\n\t\tcase BPF_ALU64 | BPF_ADD | BPF_K:\n\t\tcase BPF_ALU64 | BPF_SUB | BPF_K:\n\t\tcase BPF_ALU64 | BPF_AND | BPF_K:\n\t\tcase BPF_ALU64 | BPF_OR | BPF_K:\n\t\tcase BPF_ALU64 | BPF_XOR | BPF_K:\n\t\t\tif (BPF_CLASS(insn->code) == BPF_ALU64)\n\t\t\t\tEMIT1(add_1mod(0x48, dst_reg));\n\t\t\telse if (is_ereg(dst_reg))\n\t\t\t\tEMIT1(add_1mod(0x40, dst_reg));\n\n\t\t\t/*\n\t\t\t * b3 holds 'normal' opcode, b2 short form only valid\n\t\t\t * in case dst is eax/rax.\n\t\t\t */\n\t\t\tswitch (BPF_OP(insn->code)) {\n\t\t\tcase BPF_ADD:\n\t\t\t\tb3 = 0xC0;\n\t\t\t\tb2 = 0x05;\n\t\t\t\tbreak;\n\t\t\tcase BPF_SUB:\n\t\t\t\tb3 = 0xE8;\n\t\t\t\tb2 = 0x2D;\n\t\t\t\tbreak;\n\t\t\tcase BPF_AND:\n\t\t\t\tb3 = 0xE0;\n\t\t\t\tb2 = 0x25;\n\t\t\t\tbreak;\n\t\t\tcase BPF_OR:\n\t\t\t\tb3 = 0xC8;\n\t\t\t\tb2 = 0x0D;\n\t\t\t\tbreak;\n\t\t\tcase BPF_XOR:\n\t\t\t\tb3 = 0xF0;\n\t\t\t\tb2 = 0x35;\n\t\t\t\tbreak;\n\t\t\t}\n\n\t\t\tif (is_imm8(imm32))\n\t\t\t\tEMIT3(0x83, add_1reg(b3, dst_reg), imm32);\n\t\t\telse if (is_axreg(dst_reg))\n\t\t\t\tEMIT1_off32(b2, imm32);\n\t\t\telse\n\t\t\t\tEMIT2_off32(0x81, add_1reg(b3, dst_reg), imm32);\n\t\t\tbreak;",
+      "explanation": "ALU-with-immediate (BPF_K). After the optional REX prefix, an inner switch on BPF_OP selects the opcode-extension byte b3 (ModRM /digit form) and short-form byte b2 (accumulator form). Then the emission chooses among three encodings by immediate size: 0x83 sign-extended imm8 form (EMIT3), the special short form for eax/rax (EMIT1_off32 with a 4-byte immediate), or the general 0x81 imm32 form (EMIT2_off32). This arm therefore emits between 3 and roughly 7 bytes into 'temp' depending on the attacker-chosen imm32 magnitude and dst_reg."
+    },
+    {
+      "file": "corpus/train/train_0203_cwe77.c",
+      "lines": "131-141",
+      "code": "\t\tcase BPF_ALU64 | BPF_MOV | BPF_K:\n\t\tcase BPF_ALU | BPF_MOV | BPF_K:\n\t\t\temit_mov_imm32(&prog, BPF_CLASS(insn->code) == BPF_ALU64,\n\t\t\t\t       dst_reg, imm32);\n\t\t\tbreak;\n\n\t\tcase BPF_LD | BPF_IMM | BPF_DW:\n\t\t\temit_mov_imm64(&prog, dst_reg, insn[1].imm, insn[0].imm);\n\t\t\tinsn++;\n\t\t\ti++;\n\t\t\tbreak;",
+      "explanation": "MOV-immediate-32 delegates to emit_mov_imm32. The BPF_LD|BPF_IMM|BPF_DW arm is the 64-bit load-immediate, which is unique in that it is a DOUBLE-WIDTH BPF instruction: the full 64-bit constant is split across the current instruction (insn[0].imm, low 32 bits) and the FOLLOWING instruction slot (insn[1].imm, high 32 bits). emit_mov_imm64 assembles them, then insn++ and i++ consume the extra slot so the loop skips it. Reading insn[1] steps one element past the current insn — safe only if the verifier guaranteed a valid second half exists."
+    },
+    {
+      "file": "corpus/train/train_0203_cwe77.c",
+      "lines": "144-190",
+      "code": "\t\tcase BPF_ALU | BPF_MOD | BPF_X:\n\t\tcase BPF_ALU | BPF_DIV | BPF_X:\n\t\tcase BPF_ALU | BPF_MOD | BPF_K:\n\t\tcase BPF_ALU | BPF_DIV | BPF_K:\n\t\tcase BPF_ALU64 | BPF_MOD | BPF_X:\n\t\tcase BPF_ALU64 | BPF_DIV | BPF_X:\n\t\tcase BPF_ALU64 | BPF_MOD | BPF_K:\n\t\tcase BPF_ALU64 | BPF_DIV | BPF_K:\n\t\t\tEMIT1(0x50); /* push rax */\n\t\t\tEMIT1(0x52); /* push rdx */\n\n\t\t\tif (BPF_SRC(insn->code) == BPF_X)\n\t\t\t\t/* mov r11, src_reg */\n\t\t\t\tEMIT_mov(AUX_REG, src_reg);\n\t\t\telse\n\t\t\t\t/* mov r11, imm32 */\n\t\t\t\tEMIT3_off32(0x49, 0xC7, 0xC3, imm32);\n\n\t\t\t/* mov rax, dst_reg */\n\t\t\tEMIT_mov(BPF_REG_0, dst_reg);\n\n\t\t\t/*\n\t\t\t * xor edx, edx\n\t\t\t * equivalent to 'xor rdx, rdx', but one byte less\n\t\t\t */\n\t\t\tEMIT2(0x31, 0xd2);\n\n\t\t\tif (BPF_CLASS(insn->code) == BPF_ALU64)\n\t\t\t\t/* div r11 */\n\t\t\t\tEMIT3(0x49, 0xF7, 0xF3);\n\t\t\telse\n\t\t\t\t/* div r11d */\n\t\t\t\tEMIT3(0x41, 0xF7, 0xF3);\n\n\t\t\tif (BPF_OP(insn->code) == BPF_MOD)\n\t\t\t\t/* mov r11, rdx */\n\t\t\t\tEMIT3(0x49, 0x89, 0xD3);\n\t\t\telse\n\t\t\t\t/* mov r11, rax */\n\t\t\t\tEMIT3(0x49, 0x89, 0xC3);\n\n\t\t\tEMIT1(0x5A); /* pop rdx */\n\t\t\tEMIT1(0x58); /* pop rax */\n\n\t\t\t/* mov dst_reg, r11 */\n\t\t\tEMIT_mov(dst_reg, AUX_REG);\n\t\t\tbreak;",
+      "explanation": "DIV/MOD is the largest fixed sequence: it saves rax/rdx, loads the divisor into r11 (AUX_REG) from src_reg or imm32, moves the dividend into rax, zero-extends rdx, emits the x86 div (0xF7 /6) in 32- or 64-bit form, moves the quotient (rax) or remainder (rdx) into r11, restores rax/rdx, and copies the result back to dst_reg. This whole arm emits on the order of 20+ bytes into 'temp' — one of the longest per-instruction expansions, which is why the scratch buffer must be generously sized."
+    },
+    {
+      "file": "corpus/train/train_0203_cwe77.c",
+      "lines": "192-227",
+      "code": "\t\tcase BPF_ALU | BPF_MUL | BPF_K:\n\t\tcase BPF_ALU | BPF_MUL | BPF_X:\n\t\tcase BPF_ALU64 | BPF_MUL | BPF_K:\n\t\tcase BPF_ALU64 | BPF_MUL | BPF_X:\n\t\t{\n\t\t\tbool is64 = BPF_CLASS(insn->code) == BPF_ALU64;\n\n\t\t\tif (dst_reg != BPF_REG_0)\n\t\t\t\tEMIT1(0x50); /* push rax */\n\t\t\tif (dst_reg != BPF_REG_3)\n\t\t\t\tEMIT1(0x52); /* push rdx */\n\n\t\t\t/* mov r11, dst_reg */\n\t\t\tEMIT_mov(AUX_REG, dst_reg);\n\n\t\t\tif (BPF_SRC(insn->code) == BPF_X)\n\t\t\t\temit_mov_reg(&prog, is64, BPF_REG_0, src_reg);\n\t\t\telse\n\t\t\t\temit_mov_imm32(&prog, is64, BPF_REG_0, imm32);\n\n\t\t\tif (is64)\n\t\t\t\tEMIT1(add_1mod(0x48, AUX_REG));\n\t\t\telse if (is_ereg(AUX_REG))\n\t\t\t\tEMIT1(add_1mod(0x40, AUX_REG));\n\t\t\t/* mul(q) r11 */\n\t\t\tEMIT2(0xF7, add_1reg(0xE0, AUX_REG));\n\n\t\t\tif (dst_reg != BPF_REG_3)\n\t\t\t\tEMIT1(0x5A); /* pop rdx */\n\t\t\tif (dst_reg != BPF_REG_0) {\n\t\t\t\t/* mov dst_reg, rax */\n\t\t\t\tEMIT_mov(dst_reg, BPF_REG_0);\n\t\t\t\tEMIT1(0x58); /* pop rax */\n\t\t\t}\n\t\t\tbreak;\n\t\t}",
+      "explanation": "Multiply. Conditionally saves rax/rdx (skipping the save when dst is already that register), loads the multiplicand into r11, moves the other operand into rax (from register or immediate), emits the x86 unsigned mul (0xF7 /4), then conditionally restores rdx/rax and moves the low result into dst_reg. The scoped block exists to declare is64. Emission length varies with dst_reg and operand form."
+    },
+    {
+      "file": "corpus/train/train_0203_cwe77.c",
+      "lines": "229-245",
+      "code": "\t\t\t/* Shifts */\n\t\tcase BPF_ALU | BPF_LSH | BPF_K:\n\t\tcase BPF_ALU | BPF_RSH | BPF_K:\n\t\tcase BPF_ALU | BPF_ARSH | BPF_K:\n\t\tcase BPF_ALU64 | BPF_LSH | BPF_K:\n\t\tcase BPF_ALU64 | BPF_RSH | BPF_K:\n\t\tcase BPF_ALU64 | BPF_ARSH | BPF_K:\n\t\t\tif (BPF_CLASS(insn->code) == BPF_ALU64)\n\t\t\t\tEMIT1(add_1mod(0x48, dst_reg));\n\t\t\telse if (is_ereg(dst_reg))\n\t\t\t\tEMIT1(add_1mod(0x40, dst_reg));\n\n\t\t\tb3 = simple_alu_opcodes[BPF_OP(insn->code)];\n\t\t\tif (imm32 == 1)\n\t\t\t\tEMIT2(0xD1, add_1reg(b3, dst_reg));\n\t\t\telse\n\t\t\t\tEMIT3(0xC1, add_1reg(b3, dst_reg), imm32);\n\t\t\tbreak;",
+      "explanation": "Immediate shifts (LSH/RSH/ARSH). After the optional REX prefix, b3 is looked up from simple_alu_opcodes[BPF_OP(...)] (the ModRM /digit selecting shl/shr/sar). A shift of 1 uses the 0xD1 encoding, otherwise the 0xC1 imm8 encoding carries the shift count as imm32 (which the verifier bounds to < 64). Fixed, small emission."
+    },
+    {
+      "file": "corpus/train/train_0203_cwe77.c",
+      "lines": "247-283",
+      "code": "\t\tcase BPF_ALU | BPF_LSH | BPF_X:\n\t\tcase BPF_ALU | BPF_RSH | BPF_X:\n\t\tcase BPF_ALU | BPF_ARSH | BPF_X:\n\t\tcase BPF_ALU64 | BPF_LSH | BPF_X:\n\t\tcase BPF_ALU64 | BPF_RSH | BPF_X:\n\t\tcase BPF_ALU64 | BPF_ARSH | BPF_X:\n\n\t\t\t/* Check for bad case when dst_reg == rcx */\n\t\t\tif (dst_reg == BPF_REG_4) {\n\t\t\t\t/* mov r11, dst_reg */\n\t\t\t\tEMIT_mov(AUX_REG, dst_reg);\n\t\t\t\tdst_reg = AUX_REG;\n\t\t\t}\n\n\t\t\tif (src_reg != BPF_REG_4) { /* common case */\n\t\t\t\tEMIT1(0x51); /* push rcx */\n\n\t\t\t\t/* mov rcx, src_reg */\n\t\t\t\tEMIT_mov(BPF_REG_4, src_reg);\n\t\t\t}\n\n\t\t\t/* shl %rax, %cl | shr %rax, %cl | sar %rax, %cl */\n\t\t\tif (BPF_CLASS(insn->code) == BPF_ALU64)\n\t\t\t\tEMIT1(add_1mod(0x48, dst_reg));\n\t\t\telse if (is_ereg(dst_reg))\n\t\t\t\tEMIT1(add_1mod(0x40, dst_reg));\n\n\t\t\tb3 = simple_alu_opcodes[BPF_OP(insn->code)];\n\t\t\tEMIT2(0xD3, add_1reg(b3, dst_reg));\n\n\t\t\tif (src_reg != BPF_REG_4)\n\t\t\t\tEMIT1(0x59); /* pop rcx */\n\n\t\t\tif (insn->dst_reg == BPF_REG_4)\n\t\t\t\t/* mov dst_reg, r11 */\n\t\t\t\tEMIT_mov(insn->dst_reg, AUX_REG);\n\t\t\tbreak;",
+      "explanation": "Variable (register) shifts, where the shift count must live in rcx (%cl). Because x86 forces the count into rcx (BPF_REG_4), the code special-cases dst_reg==rcx by relocating it to r11, saves/loads rcx from src_reg when needed, emits the 0xD3 shift-by-cl, then restores rcx and moves the result back if dst was rcx. Note it re-reads insn->dst_reg at the end (the original, before the local dst_reg was reassigned to AUX_REG)."
+    },
+    {
+      "file": "corpus/train/train_0203_cwe77.c",
+      "lines": "285-340",
+      "code": "\t\tcase BPF_ALU | BPF_END | BPF_FROM_BE:\n\t\t\tswitch (imm32) {\n\t\t\tcase 16:\n\t\t\t\t/* Emit 'ror %ax, 8' to swap lower 2 bytes */\n\t\t\t\tEMIT1(0x66);\n\t\t\t\tif (is_ereg(dst_reg))\n\t\t\t\t\tEMIT1(0x41);\n\t\t\t\tEMIT3(0xC1, add_1reg(0xC8, dst_reg), 8);\n\n\t\t\t\t/* Emit 'movzwl eax, ax' */\n\t\t\t\tif (is_ereg(dst_reg))\n\t\t\t\t\tEMIT3(0x45, 0x0F, 0xB7);\n\t\t\t\telse\n\t\t\t\t\tEMIT2(0x0F, 0xB7);\n\t\t\t\tEMIT1(add_2reg(0xC0, dst_reg, dst_reg));\n\t\t\t\tbreak;\n\t\t\tcase 32:\n\t\t\t\t/* Emit 'bswap eax' to swap lower 4 bytes */\n\t\t\t\tif (is_ereg(dst_reg))\n\t\t\t\t\tEMIT2(0x41, 0x0F);\n\t\t\t\telse\n\t\t\t\t\tEMIT1(0x0F);\n\t\t\t\tEMIT1(add_1reg(0xC8, dst_reg));\n\t\t\t\tbreak;\n\t\t\tcase 64:\n\t\t\t\t/* Emit 'bswap rax' to swap 8 bytes */\n\t\t\t\tEMIT3(add_1mod(0x48, dst_reg), 0x0F,\n\t\t\t\t      add_1reg(0xC8, dst_reg));\n\t\t\t\tbreak;\n\t\t\t}\n\t\t\tbreak;\n\n\t\tcase BPF_ALU | BPF_END | BPF_FROM_LE:\n\t\t\tswitch (imm32) {\n\t\t\tcase 16:\n\t\t\t\t/*\n\t\t\t\t * Emit 'movzwl eax, ax' to zero extend 16-bit\n\t\t\t\t * into 64 bit\n\t\t\t\t */\n\t\t\t\tif (is_ereg(dst_reg))\n\t\t\t\t\tEMIT3(0x45, 0x0F, 0xB7);\n\t\t\t\telse\n\t\t\t\t\tEMIT2(0x0F, 0xB7);\n\t\t\t\tEMIT1(add_2reg(0xC0, dst_reg, dst_reg));\n\t\t\t\tbreak;\n\t\t\tcase 32:\n\t\t\t\t/* Emit 'mov eax, eax' to clear upper 32-bits */\n\t\t\t\tif (is_ereg(dst_reg))\n\t\t\t\t\tEMIT1(0x45);\n\t\t\t\tEMIT2(0x89, add_2reg(0xC0, dst_reg, dst_reg));\n\t\t\t\tbreak;\n\t\t\tcase 64:\n\t\t\t\t/* nop */\n\t\t\t\tbreak;\n\t\t\t}\n\t\t\tbreak;",
+      "explanation": "Endianness conversions (byte swaps). The BE and LE arms dispatch on imm32 (the operand width: 16/32/64). BE emits ror/bswap sequences plus zero-extension; LE emits movzwl / mov-eax-eax to zero-extend or a nop for 64-bit. imm32 here is a width selector; if it is not 16/32/64 the inner switch falls through and emits nothing for this instruction, which is a correctness concern but not a memory-safety one (the verifier restricts these to the three legal widths)."
+    },
+    {
+      "file": "corpus/train/train_0203_cwe77.c",
+      "lines": "342-370",
+      "code": "\t\t\t/* ST: *(u8*)(dst_reg + off) = imm */\n\t\tcase BPF_ST | BPF_MEM | BPF_B:\n\t\t\tif (is_ereg(dst_reg))\n\t\t\t\tEMIT2(0x41, 0xC6);\n\t\t\telse\n\t\t\t\tEMIT1(0xC6);\n\t\t\tgoto st;\n\t\tcase BPF_ST | BPF_MEM | BPF_H:\n\t\t\tif (is_ereg(dst_reg))\n\t\t\t\tEMIT3(0x66, 0x41, 0xC7);\n\t\t\telse\n\t\t\t\tEMIT2(0x66, 0xC7);\n\t\t\tgoto st;\n\t\tcase BPF_ST | BPF_MEM | BPF_W:\n\t\t\tif (is_ereg(dst_reg))\n\t\t\t\tEMIT2(0x41, 0xC7);\n\t\t\telse\n\t\t\t\tEMIT1(0xC7);\n\t\t\tgoto st;\n\t\tcase BPF_ST | BPF_MEM | BPF_DW:\n\t\t\tEMIT2(add_1mod(0x48, dst_reg), 0xC7);\n\n\t\tst:\t\t\tif (is_imm8(insn->off))\n\t\t\t\tEMIT2(add_1reg(0x40, dst_reg), insn->off);\n\t\t\telse\n\t\t\t\tEMIT1_off32(add_1reg(0x80, dst_reg), insn->off);\n\n\t\t\tEMIT(imm32, bpf_size_to_x86_bytes(BPF_SIZE(insn->code)));\n\t\t\tbreak;",
+      "explanation": "Store-immediate to memory (*(dst_reg+off)=imm). Each width (B/H/W/DW) emits the appropriate opcode prefix then falls through the shared 'st:' label, which encodes the displacement: an imm8 form when insn->off fits in a signed byte, otherwise the imm32 (off32) form. Finally EMIT writes the immediate value itself, sized by bpf_size_to_x86_bytes(BPF_SIZE(...)) — 1/2/4 bytes (DW stores are sign-extended imm32). insn->off is attacker-supplied but is a memory displacement, not a bound on emission length."
+    },
+    {
+      "file": "corpus/train/train_0203_cwe77.c",
+      "lines": "373-378",
+      "code": "\t\t\t/* STX: *(u8*)(dst_reg + off) = src_reg */\n\t\tcase BPF_STX | BPF_MEM | BPF_B:\n\t\tcase BPF_STX | BPF_MEM | BPF_H:\n\t\tcase BPF_STX | BPF_MEM | BPF_W:\n\t\tcase BPF_STX | BPF_MEM | BPF_DW:\n\t\t\temit_stx(&prog, BPF_SIZE(insn->code), dst_reg, src_reg, insn->off);\n\t\t\tbreak;",
+      "explanation": "Store-register to memory delegates entirely to emit_stx, passing the access size, dst/src registers, and the displacement insn->off. All the encoding complexity is hidden in that helper."
+    },
+    {
+      "file": "corpus/train/train_0203_cwe77.c",
+      "lines": "381-450",
+      "code": "\t\t\t/* LDX: dst_reg = *(u8*)(src_reg + off) */\n\t\tcase BPF_LDX | BPF_MEM | BPF_B:\n\t\tcase BPF_LDX | BPF_PROBE_MEM | BPF_B:\n\t\tcase BPF_LDX | BPF_MEM | BPF_H:\n\t\tcase BPF_LDX | BPF_PROBE_MEM | BPF_H:\n\t\tcase BPF_LDX | BPF_MEM | BPF_W:\n\t\tcase BPF_LDX | BPF_PROBE_MEM | BPF_W:\n\t\tcase BPF_LDX | BPF_MEM | BPF_DW:\n\t\tcase BPF_LDX | BPF_PROBE_MEM | BPF_DW:\n\t\t\tif (BPF_MODE(insn->code) == BPF_PROBE_MEM) {\n\t\t\t\t/* test src_reg, src_reg */\n\t\t\t\tmaybe_emit_mod(&prog, src_reg, src_reg, true); /* always 1 byte */\n\t\t\t\tEMIT2(0x85, add_2reg(0xC0, src_reg, src_reg));\n\t\t\t\t/* jne start_of_ldx */\n\t\t\t\tEMIT2(X86_JNE, 0);\n\t\t\t\t/* xor dst_reg, dst_reg */\n\t\t\t\temit_mov_imm32(&prog, false, dst_reg, 0);\n\t\t\t\t/* jmp byte_after_ldx */\n\t\t\t\tEMIT2(0xEB, 0);\n\n\t\t\t\t/* populate jmp_offset for JNE above */\n\t\t\t\ttemp[4] = prog - temp - 5 /* sizeof(test + jne) */;\n\t\t\t\tstart_of_ldx = prog;\n\t\t\t}\n\t\t\temit_ldx(&prog, BPF_SIZE(insn->code), dst_reg, src_reg, insn->off);\n\t\t\tif (BPF_MODE(insn->code) == BPF_PROBE_MEM) {\n\t\t\t\tstruct exception_table_entry *ex;\n\t\t\t\tu8 *_insn = image + proglen;\n\t\t\t\ts64 delta;\n\n\t\t\t\t/* populate jmp_offset for JMP above */\n\t\t\t\tstart_of_ldx[-1] = prog - start_of_ldx;\n\n\t\t\t\tif (!bpf_prog->aux->extable)\n\t\t\t\t\tbreak;\n\n\t\t\t\tif (excnt >= bpf_prog->aux->num_exentries) {\n\t\t\t\t\tpr_err(\"ex gen bug\\n\");\n\t\t\t\t\treturn -EFAULT;\n\t\t\t\t}\n\t\t\t\tex = &bpf_prog->aux->extable[excnt++];\n\n\t\t\t\tdelta = _insn - (u8 *)&ex->insn;\n\t\t\t\tif (!is_simm32(delta)) {\n\t\t\t\t\tpr_err(\"extable->insn doesn't fit into 32-bit\\n\");\n\t\t\t\t\treturn -EFAULT;\n\t\t\t\t}\n\t\t\t\tex->insn = delta;\n\n\t\t\t\tdelta = (u8 *)ex_handler_bpf - (u8 *)&ex->handler;\n\t\t\t\tif (!is_simm32(delta)) {\n\t\t\t\t\tpr_err(\"extable->handler doesn't fit into 32-bit\\n\");\n\t\t\t\t\treturn -EFAULT;\n\t\t\t\t}\n\t\t\t\tex->handler = delta;\n\n\t\t\t\tif (dst_reg > BPF_REG_9) {\n\t\t\t\t\tpr_err(\"verifier error\\n\");\n\t\t\t\t\treturn -EFAULT;\n\t\t\t\t}\n\t\t\t\t/*\n\t\t\t\t * Compute size of x86 insn and its target dest x86 register.\n\t\t\t\t * ex_handler_bpf() will use lower 8 bits to adjust\n\t\t\t\t * pt_regs->ip to jump over this x86 instruction\n\t\t\t\t * and upper bits to figure out which pt_regs to zero out.\n\t\t\t\t * End result: x86 insn \"mov rbx, qword ptr [rax+0x14]\"\n\t\t\t\t * of 4 bytes will be ignored and rbx will be zero inited.\n\t\t\t\t */\n\t\t\t\tex->fixup = (prog - temp) | (reg2pt_regs[dst_reg] << 8);\n\t\t\t}\n\t\t\tbreak;",
+      "explanation": "Load-register from memory, including the PROBE_MEM variant used for BPF_PROBE_MEM (kernel-pointer loads that may fault, e.g. for tracing). For PROBE_MEM it first emits a null check (test src,src; jne) and a zeroing fallback (xor dst; jmp), back-patching the JNE displacement at temp[4]. It then emits the actual load via emit_ldx and, for PROBE_MEM, records an exception_table_entry so a fault at this x86 instruction is handled: it bounds-checks excnt against num_exentries (line 416), verifies the insn/handler deltas fit in 32 bits (is_simm32), guards dst_reg <= BPF_REG_9 (line 436) before indexing reg2pt_regs[dst_reg], and encodes the fixup as (x86-insn-size) | (pt_regs slot << 8). These guards make the extable path defensively bounded."
+    },
+    {
+      "file": "corpus/train/train_0203_cwe77.c",
+      "lines": "452-506",
+      "code": "\t\tcase BPF_STX | BPF_ATOMIC | BPF_W:\n\t\tcase BPF_STX | BPF_ATOMIC | BPF_DW:\n\t\t\tif (insn->imm == (BPF_AND | BPF_FETCH) ||\n\t\t\t    insn->imm == (BPF_OR | BPF_FETCH) ||\n\t\t\t    insn->imm == (BPF_XOR | BPF_FETCH)) {\n\t\t\t\tu8 *branch_target;\n\t\t\t\tbool is64 = BPF_SIZE(insn->code) == BPF_DW;\n\t\t\t\tu32 real_src_reg = src_reg;\n\n\t\t\t\t/*\n\t\t\t\t * Can't be implemented with a single x86 insn.\n\t\t\t\t * Need to do a CMPXCHG loop.\n\t\t\t\t */\n\n\t\t\t\t/* Will need RAX as a CMPXCHG operand so save R0 */\n\t\t\t\temit_mov_reg(&prog, true, BPF_REG_AX, BPF_REG_0);\n\t\t\t\tif (src_reg == BPF_REG_0)\n\t\t\t\t\treal_src_reg = BPF_REG_AX;\n\n\t\t\t\tbranch_target = prog;\n\t\t\t\t/* Load old value */\n\t\t\t\temit_ldx(&prog, BPF_SIZE(insn->code),\n\t\t\t\t\t BPF_REG_0, dst_reg, insn->off);\n\t\t\t\t/*\n\t\t\t\t * Perform the (commutative) operation locally,\n\t\t\t\t * put the result in the AUX_REG.\n\t\t\t\t */\n\t\t\t\temit_mov_reg(&prog, is64, AUX_REG, BPF_REG_0);\n\t\t\t\tmaybe_emit_mod(&prog, AUX_REG, real_src_reg, is64);\n\t\t\t\tEMIT2(simple_alu_opcodes[BPF_OP(insn->imm)],\n\t\t\t\t      add_2reg(0xC0, AUX_REG, real_src_reg));\n\t\t\t\t/* Attempt to swap in new value */\n\t\t\t\terr = emit_atomic(&prog, BPF_CMPXCHG,\n\t\t\t\t\t\t  dst_reg, AUX_REG, insn->off,\n\t\t\t\t\t\t  BPF_SIZE(insn->code));\n\t\t\t\tif (WARN_ON(err))\n\t\t\t\t\treturn err;\n\t\t\t\t/*\n\t\t\t\t * ZF tells us whether we won the race. If it's\n\t\t\t\t * cleared we need to try again.\n\t\t\t\t */\n\t\t\t\tEMIT2(X86_JNE, -(prog - branch_target) - 2);\n\t\t\t\t/* Return the pre-modification value */\n\t\t\t\temit_mov_reg(&prog, is64, real_src_reg, BPF_REG_0);\n\t\t\t\t/* Restore R0 after clobbering RAX */\n\t\t\t\temit_mov_reg(&prog, true, BPF_REG_0, BPF_REG_AX);\n\t\t\t\tbreak;\n\n\t\t\t}\n\n\t\t\terr = emit_atomic(&prog, insn->imm, dst_reg, src_reg,\n\t\t\t\t\t\t  insn->off, BPF_SIZE(insn->code));\n\t\t\tif (err)\n\t\t\t\treturn err;\n\t\t\tbreak;",
+      "explanation": "Atomic memory operations. The fetching-and-modify forms (AND/OR/XOR with BPF_FETCH) cannot be a single x86 instruction, so the JIT emits a CMPXCHG retry loop: save R0 into AX, load the old value, compute the new value in AUX_REG, attempt CMPXCHG, and JNE back to branch_target if the swap lost the race. simple_alu_opcodes[BPF_OP(insn->imm)] selects the op byte (BPF_OP masks insn->imm to a 4-bit index). Non-fetch atomics delegate to emit_atomic with insn->imm as the operation selector. emit_atomic returning an error propagates out as a compile failure."
+    },
+    {
+      "file": "corpus/train/train_0203_cwe77.c",
+      "lines": "509-520",
+      "code": "\t\t\t/* call */\n\t\tcase BPF_JMP | BPF_CALL:\n\t\t\tfunc = (u8 *) __bpf_call_base + imm32;\n\t\t\tif (tail_call_reachable) {\n\t\t\t\tEMIT3_off32(0x48, 0x8B, 0x85,\n\t\t\t\t\t    -(bpf_prog->aux->stack_depth + 8));\n\t\t\t\tif (!imm32 || emit_call(&prog, func, image + addrs[i - 1] + 7))\n\t\t\t\t\treturn -EINVAL;\n\t\t\t} else {\n\t\t\t\tif (!imm32 || emit_call(&prog, func, image + addrs[i - 1]))\n\t\t\t\t\treturn -EINVAL;\n\t\t\t}\n\t\t\tbreak;",
+      "explanation": "Helper/function call. The absolute call target is computed as func = __bpf_call_base + imm32, i.e. imm32 is a signed offset from the BPF call base to a kernel helper. When tail calls are reachable a stack-pointer reload is emitted first (mov rax, [rbp - (stack_depth+8)]). emit_call then encodes a relative CALL from the current image position; the source PC is image + addrs[i-1] (+7 to account for the reload) — addrs[i-1] is the previous instruction's offset, always valid since i>=1 and addrs[0] was set before the loop. A zero imm32 or an out-of-range call is rejected with -EINVAL."
+    },
+    {
+      "file": "corpus/train/train_0203_cwe77.c",
+      "lines": "522-532",
+      "code": "\t\tcase BPF_JMP | BPF_TAIL_CALL:\n\t\t\tif (imm32)\n\t\t\t\temit_bpf_tail_call_direct(&bpf_prog->aux->poke_tab[imm32 - 1],\n\t\t\t\t\t\t\t  &prog, addrs[i], image,\n\t\t\t\t\t\t\t  callee_regs_used,\n\t\t\t\t\t\t\t  bpf_prog->aux->stack_depth);\n\t\t\telse\n\t\t\t\temit_bpf_tail_call_indirect(&prog,\n\t\t\t\t\t\t\t    callee_regs_used,\n\t\t\t\t\t\t\t    bpf_prog->aux->stack_depth);\n\t\t\tbreak;",
+      "explanation": "Tail call. When imm32 is nonzero the JIT treats it as a 1-based index into bpf_prog->aux->poke_tab (a table of poke descriptors for direct-jump tail calls), passing &poke_tab[imm32 - 1]. When imm32 is zero it emits the indirect tail-call sequence that dispatches through the runtime prog-array map. addrs[i] gives the current instruction offset used for computing the jump. The poke_tab index is derived directly from the attacker-supplied imm32 with no upper-bound check in this function."
+    },
+    {
+      "file": "corpus/train/train_0203_cwe77.c",
+      "lines": "618-696",
+      "code": "emit_cond_jmp:\t\t/* Convert BPF opcode to x86 */\n\t\t\tswitch (BPF_OP(insn->code)) {\n\t\t\tcase BPF_JEQ:\n\t\t\t\tjmp_cond = X86_JE;\n\t\t\t\tbreak;\n\t\t\tcase BPF_JSET:\n\t\t\tcase BPF_JNE:\n\t\t\t\tjmp_cond = X86_JNE;\n\t\t\t\tbreak;\n\t\t\tcase BPF_JGT:\n\t\t\t\t/* GT is unsigned '>', JA in x86 */\n\t\t\t\tjmp_cond = X86_JA;\n\t\t\t\tbreak;\n\t\t\tcase BPF_JLT:\n\t\t\t\t/* LT is unsigned '<', JB in x86 */\n\t\t\t\tjmp_cond = X86_JB;\n\t\t\t\tbreak;\n\t\t\tcase BPF_JGE:\n\t\t\t\t/* GE is unsigned '>=', JAE in x86 */\n\t\t\t\tjmp_cond = X86_JAE;\n\t\t\t\tbreak;\n\t\t\tcase BPF_JLE:\n\t\t\t\t/* LE is unsigned '<=', JBE in x86 */\n\t\t\t\tjmp_cond = X86_JBE;\n\t\t\t\tbreak;\n\t\t\tcase BPF_JSGT:\n\t\t\t\t/* Signed '>', GT in x86 */\n\t\t\t\tjmp_cond = X86_JG;\n\t\t\t\tbreak;\n\t\t\tcase BPF_JSLT:\n\t\t\t\t/* Signed '<', LT in x86 */\n\t\t\t\tjmp_cond = X86_JL;\n\t\t\t\tbreak;\n\t\t\tcase BPF_JSGE:\n\t\t\t\t/* Signed '>=', GE in x86 */\n\t\t\t\tjmp_cond = X86_JGE;\n\t\t\t\tbreak;\n\t\t\tcase BPF_JSLE:\n\t\t\t\t/* Signed '<=', LE in x86 */\n\t\t\t\tjmp_cond = X86_JLE;\n\t\t\t\tbreak;\n\t\t\tdefault: /* to silence GCC warning */\n\t\t\t\treturn -EFAULT;\n\t\t\t}\n\t\t\tjmp_offset = addrs[i + insn->off] - addrs[i];\n\t\t\tif (is_imm8(jmp_offset)) {\n\t\t\t\tif (jmp_padding) {\n\t\t\t\t\t/* To keep the jmp_offset valid, the extra bytes are\n\t\t\t\t\t * padded before the jump insn, so we substract the\n\t\t\t\t\t * 2 bytes of jmp_cond insn from INSN_SZ_DIFF.\n\t\t\t\t\t *\n\t\t\t\t\t * If the previous pass already emits an imm8\n\t\t\t\t\t * jmp_cond, then this BPF insn won't shrink, so\n\t\t\t\t\t * \"nops\" is 0.\n\t\t\t\t\t *\n\t\t\t\t\t * On the other hand, if the previous pass emits an\n\t\t\t\t\t * imm32 jmp_cond, the extra 4 bytes(*) is padded to\n\t\t\t\t\t * keep the image from shrinking further.\n\t\t\t\t\t *\n\t\t\t\t\t * (*) imm32 jmp_cond is 6 bytes, and imm8 jmp_cond\n\t\t\t\t\t *     is 2 bytes, so the size difference is 4 bytes.\n\t\t\t\t\t */\n\t\t\t\t\tnops = INSN_SZ_DIFF - 2;\n\t\t\t\t\tif (nops != 0 && nops != 4) {\n\t\t\t\t\t\tpr_err(\"unexpected jmp_cond padding: %d bytes\\n\",\n\t\t\t\t\t\t       nops);\n\t\t\t\t\t\treturn -EFAULT;\n\t\t\t\t\t}\n\t\t\t\t\tcnt += emit_nops(&prog, nops);\n\t\t\t\t}\n\t\t\t\tEMIT2(jmp_cond, jmp_offset);\n\t\t\t} else if (is_simm32(jmp_offset)) {\n\t\t\t\tEMIT2_off32(0x0F, jmp_cond + 0x10, jmp_offset);\n\t\t\t} else {\n\t\t\t\tpr_err(\"cond_jmp gen bug %llx\\n\", jmp_offset);\n\t\t\t\treturn -EFAULT;\n\t\t\t}\n\n\t\t\tbreak;",
+      "explanation": "The shared conditional-jump tail (reached via goto emit_cond_jmp from the many JMP/JMP32 compare arms above at lines 535-616, which emit the cmp/test first). It maps the BPF condition to the x86 Jcc opcode, then computes the branch displacement jmp_offset = addrs[i + insn->off] - addrs[i]: the difference between the target instruction's recorded offset and the current one. i + insn->off is the destination instruction index. It emits an imm8 Jcc when the offset fits in a byte (optionally inserting nop padding under jmp_padding to keep image size stable across passes, validating the pad is 0 or 4 bytes), an imm32 Jcc (0x0F 0x8x) otherwise, and errors if the offset exceeds 32 bits. This is the core cross-instruction addressing computation and the place attacker-controlled insn->off directly indexes addrs[]."
+    },
+    {
+      "file": "corpus/train/train_0203_cwe77.c",
+      "lines": "698-766",
+      "code": "\t\tcase BPF_JMP | BPF_JA:\n\t\t\tif (insn->off == -1)\n\t\t\t\t/* -1 jmp instructions will always jump\n\t\t\t\t * backwards two bytes. Explicitly handling\n\t\t\t\t * this case avoids wasting too many passes\n\t\t\t\t * when there are long sequences of replaced\n\t\t\t\t * dead code.\n\t\t\t\t */\n\t\t\t\tjmp_offset = -2;\n\t\t\telse\n\t\t\t\tjmp_offset = addrs[i + insn->off] - addrs[i];\n\n\t\t\tif (!jmp_offset) {\n\t\t\t\t/*\n\t\t\t\t * If jmp_padding is enabled, the extra nops will\n\t\t\t\t * be inserted. Otherwise, optimize out nop jumps.\n\t\t\t\t */\n\t\t\t\tif (jmp_padding) {\n\t\t\t\t\t/* There are 3 possible conditions.\n\t\t\t\t\t * (1) This BPF_JA is already optimized out in\n\t\t\t\t\t *     the previous run, so there is no need\n\t\t\t\t\t *     to pad any extra byte (0 byte).\n\t\t\t\t\t * (2) The previous pass emits an imm8 jmp,\n\t\t\t\t\t *     so we pad 2 bytes to match the previous\n\t\t\t\t\t *     insn size.\n\t\t\t\t\t * (3) Similarly, the previous pass emits an\n\t\t\t\t\t *     imm32 jmp, and 5 bytes is padded.\n\t\t\t\t\t */\n\t\t\t\t\tnops = INSN_SZ_DIFF;\n\t\t\t\t\tif (nops != 0 && nops != 2 && nops != 5) {\n\t\t\t\t\t\tpr_err(\"unexpected nop jump padding: %d bytes\\n\",\n\t\t\t\t\t\t       nops);\n\t\t\t\t\t\treturn -EFAULT;\n\t\t\t\t\t}\n\t\t\t\t\tcnt += emit_nops(&prog, nops);\n\t\t\t\t}\n\t\t\t\tbreak;\n\t\t\t}\nemit_jmp:\n\t\t\tif (is_imm8(jmp_offset)) {\n\t\t\t\tif (jmp_padding) {\n\t\t\t\t\t/* To avoid breaking jmp_offset, the extra bytes\n\t\t\t\t\t * are padded before the actual jmp insn, so\n\t\t\t\t\t * 2 bytes is substracted from INSN_SZ_DIFF.\n\t\t\t\t\t *\n\t\t\t\t\t * If the previous pass already emits an imm8\n\t\t\t\t\t * jmp, there is nothing to pad (0 byte).\n\t\t\t\t\t *\n\t\t\t\t\t * If it emits an imm32 jmp (5 bytes) previously\n\t\t\t\t\t * and now an imm8 jmp (2 bytes), then we pad\n\t\t\t\t\t * (5 - 2 = 3) bytes to stop the image from\n\t\t\t\t\t * shrinking further.\n\t\t\t\t\t */\n\t\t\t\t\tnops = INSN_SZ_DIFF - 2;\n\t\t\t\t\tif (nops != 0 && nops != 3) {\n\t\t\t\t\t\tpr_err(\"unexpected jump padding: %d bytes\\n\",\n\t\t\t\t\t\t       nops);\n\t\t\t\t\t\treturn -EFAULT;\n\t\t\t\t\t}\n\t\t\t\t\tcnt += emit_nops(&prog, INSN_SZ_DIFF - 2);\n\t\t\t\t}\n\t\t\t\tEMIT2(0xEB, jmp_offset);\n\t\t\t} else if (is_simm32(jmp_offset)) {\n\t\t\t\tEMIT1_off32(0xE9, jmp_offset);\n\t\t\t} else {\n\t\t\t\tpr_err(\"jmp gen bug %llx\\n\", jmp_offset);\n\t\t\t\treturn -EFAULT;\n\t\t\t}\n\t\t\tbreak;",
+      "explanation": "Unconditional jump (BPF_JA). A special-cased off==-1 becomes a fixed -2 self-loop displacement; otherwise jmp_offset = addrs[i + insn->off] - addrs[i], the same addrs-indexed displacement pattern as conditional jumps. A zero offset is either padded (jmp_padding) or optimized out. The emit_jmp label (also reached from BPF_EXIT) emits a short (0xEB imm8) or near (0xE9 imm32) JMP, with the same jmp_padding accounting and out-of-range guard."
+    },
+    {
+      "file": "corpus/train/train_0203_cwe77.c",
+      "lines": "768-790",
+      "code": "\t\tcase BPF_JMP | BPF_EXIT:\n\t\t\tif (seen_exit) {\n\t\t\t\tjmp_offset = ctx->cleanup_addr - addrs[i];\n\t\t\t\tgoto emit_jmp;\n\t\t\t}\n\t\t\tseen_exit = true;\n\t\t\t/* Update cleanup_addr */\n\t\t\tctx->cleanup_addr = proglen;\n\t\t\tpop_callee_regs(&prog, callee_regs_used);\n\t\t\tEMIT1(0xC9);         /* leave */\n\t\t\tEMIT1(0xC3);         /* ret */\n\t\t\tbreak;\n\n\t\tdefault:\n\t\t\t/*\n\t\t\t * By design x86-64 JIT should support all BPF instructions.\n\t\t\t * This error will be seen if new instruction was added\n\t\t\t * to the interpreter, but not to the JIT, or if there is\n\t\t\t * junk in bpf_prog.\n\t\t\t */\n\t\t\tpr_err(\"bpf_jit: unknown opcode %02x\\n\", insn->code);\n\t\t\treturn -EINVAL;",
+      "explanation": "Program exit. The FIRST exit emits the actual epilogue (pop callee regs, leave, ret) and records ctx->cleanup_addr = proglen so subsequent exits can jump to this single epilogue instead of duplicating it (they take the seen_exit path and emit a jump to cleanup_addr). The default arm is the safety net: any opcode not handled above (a new/unknown insn, or corrupt bpf_prog) is rejected with -EINVAL rather than silently mis-emitting — an important fail-closed property."
+    },
+    {
+      "file": "corpus/train/train_0203_cwe77.c",
+      "lines": "792-816",
+      "code": "\t\tilen = prog - temp;\n\t\tif (ilen > BPF_MAX_INSN_SIZE) {\n\t\t\tpr_err(\"bpf_jit: fatal insn size error\\n\");\n\t\t\treturn -EFAULT;\n\t\t}\n\n\t\tif (image) {\n\t\t\t/*\n\t\t\t * When populating the image, assert that:\n\t\t\t *\n\t\t\t *  i) We do not write beyond the allocated space, and\n\t\t\t * ii) addrs[i] did not change from the prior run, in order\n\t\t\t *     to validate assumptions made for computing branch\n\t\t\t *     displacements.\n\t\t\t */\n\t\t\tif (unlikely(proglen + ilen > oldproglen ||\n\t\t\t\t     proglen + ilen != addrs[i])) {\n\t\t\t\tpr_err(\"bpf_jit: fatal error\\n\");\n\t\t\t\treturn -EFAULT;\n\t\t\t}\n\t\t\tmemcpy(image + proglen, temp, ilen);\n\t\t}\n\t\tproglen += ilen;\n\t\taddrs[i] = proglen;\n\t\tprog = temp;",
+      "explanation": "Per-instruction epilogue. ilen = prog - temp measures the x86 bytes emitted for this BPF instruction. The guard ilen > BPF_MAX_INSN_SIZE detects a single instruction that emitted too much and bails. When writing the image it additionally asserts proglen+ilen does not exceed oldproglen (no image overrun) AND that proglen+ilen equals the addrs[i] recorded by the previous pass (proving the offsets converged, which is what makes the branch displacements computed above correct). Then it copies this instruction's bytes to image+proglen, advances proglen, records addrs[i], and resets prog for the next iteration. This is the primary defensive gate for the image buffer."
+    },
+    {
+      "file": "corpus/train/train_0203_cwe77.c",
+      "lines": "819-824",
+      "code": "\tif (image && excnt != bpf_prog->aux->num_exentries) {\n\t\tpr_err(\"extable is not populated\\n\");\n\t\treturn -EFAULT;\n\t}\n\treturn proglen;\n}",
+      "explanation": "After the loop, when writing the image, it asserts the number of exception entries actually generated (excnt) matches the pre-computed num_exentries — a mismatch means a PROBE_MEM insn was added or dropped between passes and is rejected. On success it returns proglen, the total emitted size, which the caller uses to size/finalize the image."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0203_cwe77.c",
+      "lines": "11-11",
+      "code": "\tu8 temp[BPF_MAX_INSN_SIZE + BPF_INSN_SAFETY];",
+      "explanation": "Every EMIT*/emit_* helper for the whole instruction switch writes into this fixed-size on-stack scratch buffer through the moving 'prog' cursor with NO per-write bounds check. The only guard is POST-hoc at lines 792-795 (ilen = prog - temp; if (ilen > BPF_MAX_INSN_SIZE) fail), which runs AFTER all bytes for the instruction have already been written into temp. If any single opcode arm's x86 expansion ever exceeds BPF_MAX_INSN_SIZE + BPF_INSN_SAFETY bytes, temp overflows on the stack and the check catches it only afterward — a stack out-of-bounds write (CWE-787) that could smash the saved return address / adjacent locals. The safety model is that BPF_INSN_SAFETY is a margin proven large enough that the worst-case single-insn expansion (e.g. the DIV/MOD or CMPXCHG-loop arms) fits with slack; correctness of that bound is the invariant. A regression that adds emission to an arm, or a corrupt insn->code slipping past the verifier into a long arm, defeats it. The check being reactive rather than preventive is the latent hazard."
+    },
+    {
+      "file": "corpus/train/train_0203_cwe77.c",
+      "lines": "662-662",
+      "code": "\t\t\tjmp_offset = addrs[i + insn->off] - addrs[i];",
+      "explanation": "insn->off is an attacker-supplied 16-bit signed branch displacement and i + insn->off is used DIRECTLY as an index into addrs[] (also at line 708 for BPF_JA) with no bounds check in the JIT. addrs is sized insn_cnt+1. If a jump's target index is out of [0, insn_cnt] the read addrs[i + insn->off] is out-of-bounds (CWE-125). The consequence is worse than a leak: the garbage value becomes a branch displacement baked into executable kernel code, i.e. a miscompiled branch that transfers control to an attacker-influenced offset. The sole protection is the BPF verifier having proven every jump target is in range and lands on an instruction boundary; do_jit fully trusts that. Historically, incorrect JIT branch-displacement handling in this exact family (x86 BPF JIT) was exploitable — see CVE-2021-29154. The invariant: i + insn->off must be a validated in-range instruction index for every JMP/JMP32/JA."
+    },
+    {
+      "file": "corpus/train/train_0203_cwe77.c",
+      "lines": "524-524",
+      "code": "\t\t\t\temit_bpf_tail_call_direct(&bpf_prog->aux->poke_tab[imm32 - 1],",
+      "explanation": "For BPF_JMP|BPF_TAIL_CALL with nonzero imm32, imm32-1 indexes bpf_prog->aux->poke_tab. imm32 is an attacker-supplied 32-bit immediate; the code only checks it is nonzero (line 523), never that imm32-1 is below the number of poke-table entries. If the verifier's guarantee that imm32 is a valid 1-based poke index is ever wrong, &poke_tab[imm32 - 1] is an out-of-bounds pointer (CWE-125) whose descriptor fields are then used to emit a direct jump target — again potentially poisoning generated code. Invariant: imm32 must be in [1, poke_tab_size] as established by the verifier for direct tail calls."
+    },
+    {
+      "file": "corpus/train/train_0203_cwe77.c",
+      "lines": "138-141",
+      "code": "\t\t\temit_mov_imm64(&prog, dst_reg, insn[1].imm, insn[0].imm);\n\t\t\tinsn++;\n\t\t\ti++;\n\t\t\tbreak;",
+      "explanation": "BPF_LD|BPF_IMM|BPF_DW is a double-width instruction whose high 32 bits live in the FOLLOWING slot, read here as insn[1].imm before insn++/i++ consume it. If a program's final instruction is a truncated LD_IMM64 with no valid second half, insn[1] reads one struct bpf_insn past the end of the insnsi array (CWE-125 out-of-bounds read), and i++ then makes i exceed insn_cnt. The verifier is responsible for guaranteeing every LD_IMM64 is followed by its paired pseudo-insn and that it never sits at the very end; do_jit performs no such check. Invariant: a BPF_LD|BPF_IMM|BPF_DW is always followed by a valid second instruction slot within bounds."
+    },
+    {
+      "file": "corpus/train/train_0203_cwe77.c",
+      "lines": "29-30",
+      "code": "\tif (image)\n\t\tmemcpy(image + proglen, temp, ilen);",
+      "explanation": "The prologue is copied into the image guarded ONLY by 'if (image)', with none of the proglen+ilen > oldproglen / == addrs[i] bounds assertions that protect the in-loop copy at lines 807-812. If the prologue's emitted size ever differs from what the sizing pass assumed (e.g. emit_prologue emits a different number of bytes because tail_call_reachable or stack_depth changed between passes), this writes past the front of an image sized for the smaller prologue — a heap/module-memory out-of-bounds write (CWE-787). In practice the prologue is deterministic for a given program, so this is a lower-likelihood latent issue, but it is an asymmetry worth confirming: the prologue copy has weaker guarding than every subsequent copy. Invariant: emit_prologue must emit exactly the byte count the image was allocated for."
+    },
+    {
+      "file": "corpus/train/train_0203_cwe77.c",
+      "lines": "510-510",
+      "code": "\t\t\tfunc = (u8 *) __bpf_call_base + imm32;",
+      "explanation": "The call target is formed by adding the attacker-supplied signed imm32 to __bpf_call_base with no range validation in this function beyond the later !imm32 check and emit_call's internal reachability test. imm32 is meant to be the verifier-normalized offset to an approved helper; if that normalization/whitelisting is bypassed, func points at an arbitrary kernel address and the JIT would emit a call to it (CWE-20 / control-flow integrity loss). do_jit trusts the verifier to have replaced imm32 with a valid helper offset. Invariant: imm32 for BPF_CALL must resolve only to an authorized helper (or a valid BPF-to-BPF subprog target)."
+    },
+    {
+      "file": "corpus/train/train_0203_cwe77.c",
+      "lines": "807-808",
+      "code": "\t\t\tif (unlikely(proglen + ilen > oldproglen ||\n\t\t\t\t     proglen + ilen != addrs[i])) {",
+      "explanation": "This is the key convergence/anti-overflow gate, and its correctness IS the JIT's memory-safety story — but note it is only exercised when image != NULL. During image population it both prevents writing past oldproglen and asserts the per-instruction offsets exactly match the prior pass (so the branch displacements computed from addrs[] are valid). If this assertion could be made to pass while offsets are subtly inconsistent (image size oscillation between passes — the very failure the jmp_padding logic exists to prevent), branch targets computed at lines 662/708 would be wrong in emitted code. The reviewer should confirm the multi-pass loop that calls do_jit converges (proglen stabilises) before committing the image, since this in-function check assumes convergence rather than forcing it."
+    }
+  ],
+  "summary": "This is the x86-64 eBPF JIT code generator do_jit(). It is not a parser with classic length/buffer bugs; its entire safety rests on the in-kernel BPF verifier having already validated the attacker-supplied instruction stream. The sharpest latent risks are: (1) a fixed stack scratch buffer 'temp' written by all EMIT macros with only a POST-hoc size check, so any single-instruction over-emission is a stack overflow before it is detected; and (2) attacker-influenced fields (insn->off, tail-call imm32, the LD_IMM64 second slot) used directly as array indices into addrs[]/poke_tab/insnsi with no JIT-side bounds check, where a verifier gap turns into out-of-bounds reads that poison generated kernel code. No in-function bug is proven here; these are dangerous contracts the implementation and verifier must jointly uphold.",
+  "reviewed_anchors": [
+    {
+      "anchor": "do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, int oldproglen, struct jit_context *ctx, bool jmp_padding) (lines 2-3)",
+      "disposition": "dismissed",
+      "reason": "Entry signature; all parameters are kernel-internal, but the insn stream they reach (via bpf_prog) is the hostile surface tracked in the field-level anchors below."
+    },
+    {
+      "anchor": "u8 temp[BPF_MAX_INSN_SIZE + BPF_INSN_SAFETY] (line 11)",
+      "disposition": "finding",
+      "reason": "Fixed-size stack scratch buffer written by every EMIT macro with only a post-hoc ilen>BPF_MAX_INSN_SIZE check (lines 792-795); over-emission overflows before detection."
+    },
+    {
+      "anchor": "int *addrs parameter and addrs[i + insn->off] indexing (lines 662, 708)",
+      "disposition": "finding",
+      "reason": "Attacker-influenced insn->off used directly as an addrs[] index for branch-displacement computation with no JIT-side bound; OOB read that miscompiles branches."
+    },
+    {
+      "anchor": "bpf_prog->aux->poke_tab[imm32 - 1] (line 524)",
+      "disposition": "finding",
+      "reason": "Tail-call index derived from attacker imm32, only checked nonzero, never upper-bounded against the poke table size."
+    },
+    {
+      "anchor": "insn[1].imm for BPF_LD|BPF_IMM|BPF_DW (line 138)",
+      "disposition": "finding",
+      "reason": "Reads the following instruction slot for the 64-bit immediate; a truncated trailing LD_IMM64 is an OOB read past insnsi."
+    },
+    {
+      "anchor": "memcpy(image + proglen, temp, ilen) prologue copy (lines 29-30)",
+      "disposition": "finding",
+      "reason": "Guarded only by 'if (image)', lacking the proglen+ilen bound/equality checks that protect the in-loop copy; latent image OOB write if prologue size diverges between passes."
+    },
+    {
+      "anchor": "func = (u8 *) __bpf_call_base + imm32 (line 510)",
+      "disposition": "finding",
+      "reason": "Call target computed from attacker imm32 with no whitelist check in this function; CFI-relevant, trusts verifier helper normalization."
+    },
+    {
+      "anchor": "proglen + ilen > oldproglen / != addrs[i] check (lines 807-808)",
+      "disposition": "finding",
+      "reason": "The central convergence/anti-overflow gate; safety depends on the multi-pass caller actually converging, and it only runs when image != NULL."
+    },
+    {
+      "anchor": "ilen > BPF_MAX_INSN_SIZE check (lines 792-795)",
+      "disposition": "dismissed",
+      "reason": "This is the mitigating guard for the temp buffer (folded into the temp-buffer finding), not itself a defect; note it is reactive, not preventive."
+    },
+    {
+      "anchor": "callee_regs_used[4] (line 7)",
+      "disposition": "dismissed",
+      "reason": "Fixed 4-element bool array populated by detect_reg_usage and indexed internally by helpers; not attacker-indexed."
+    },
+    {
+      "anchor": "reg2pt_regs[dst_reg] (line 448)",
+      "disposition": "dismissed",
+      "reason": "Guarded by 'if (dst_reg > BPF_REG_9) return -EFAULT' at line 436 before the index; bounded."
+    },
+    {
+      "anchor": "bpf_prog->aux->extable[excnt++] (line 420)",
+      "disposition": "dismissed",
+      "reason": "Guarded by 'if (excnt >= num_exentries)' at line 416 and the post-loop count assertion at line 819; bounded."
+    },
+    {
+      "anchor": "simple_alu_opcodes[BPF_OP(insn->code)] / [BPF_OP(insn->imm)] (lines 60, 240, 274, 481)",
+      "disposition": "dismissed",
+      "reason": "BPF_OP masks to a 4-bit operation code within the table's fixed range; index is inherently bounded."
+    },
+    {
+      "anchor": "temp[4] = prog - temp - 5 (line 401)",
+      "disposition": "dismissed",
+      "reason": "Fixed offset back-patch into temp, valid because the preceding test+jne (5 bytes) was just emitted at the start of the scratch buffer."
+    },
+    {
+      "anchor": "start_of_ldx[-1] = prog - start_of_ldx (line 411)",
+      "disposition": "dismissed",
+      "reason": "Back-patch of the jmp byte emitted just before start_of_ldx within temp; bounded to the current instruction's scratch bytes."
+    },
+    {
+      "anchor": "ex->insn / ex->handler is_simm32 delta checks (lines 422-434)",
+      "disposition": "dismissed",
+      "reason": "Both deltas are validated to fit in 32 bits before assignment; fail-closed with -EFAULT."
+    },
+    {
+      "anchor": "jmp_offset is_imm8 / is_simm32 range checks (lines 663, 689, 737, 760)",
+      "disposition": "dismissed",
+      "reason": "Emission form is chosen by validated displacement size and out-of-range is rejected with -EFAULT; encoding-side is bounded (the risk is the addrs index, tracked separately)."
+    },
+    {
+      "anchor": "EMIT3_off32(0x48,0x8B,0x85, -(bpf_prog->aux->stack_depth + 8)) (lines 512-513)",
+      "disposition": "dismissed",
+      "reason": "stack_depth is a verifier-computed frame size used as a displacement, not an index or copy length; no memory-safety contract here."
+    },
+    {
+      "anchor": "func_idx / bpf_prog_was_classic / tail_call_reachable prologue inputs (lines 23-25)",
+      "disposition": "dismissed",
+      "reason": "Control flags passed to emit_prologue; affect emitted prologue shape but carry no direct index/length contract in this file."
+    },
+    {
+      "anchor": "default: unknown opcode -> return -EINVAL (lines 781-789)",
+      "disposition": "dismissed",
+      "reason": "Fail-closed safety net that rejects any unhandled/corrupt insn->code; a positive control, not a defect."
+    }
+  ],
+  "findings": [
+    {
+      "title": "Fixed stack scratch buffer 'temp' bounded only by a post-emission size check",
+      "anchor": "u8 temp[BPF_MAX_INSN_SIZE + BPF_INSN_SAFETY]; and 'if (ilen > BPF_MAX_INSN_SIZE)'",
+      "file": "corpus/train/train_0203_cwe77.c",
+      "line": "11, 792-795",
+      "code": "\tu8 temp[BPF_MAX_INSN_SIZE + BPF_INSN_SAFETY];\n...\n\t\tilen = prog - temp;\n\t\tif (ilen > BPF_MAX_INSN_SIZE) {\n\t\t\tpr_err(\"bpf_jit: fatal insn size error\\n\");\n\t\t\treturn -EFAULT;\n\t\t}",
+      "bug_class": "Stack out-of-bounds write (fixed buffer written before bounds check)",
+      "cwe": "CWE-787",
+      "severity": "high",
+      "where_it_lives": "implementation (file not provided) — emit_prologue and all EMIT*/emit_* helpers write into temp",
+      "invariant": "The worst-case x86 expansion of any single BPF instruction (and the prologue) must be strictly less than BPF_MAX_INSN_SIZE + BPF_INSN_SAFETY bytes; BPF_INSN_SAFETY must be a proven margin, because the ilen>BPF_MAX_INSN_SIZE check runs only AFTER the bytes are already written into temp.",
+      "failure_mode": "If any opcode arm (e.g. a future/edited DIV/MOD, CMPXCHG-loop, or padded-jump path) emits more than the buffer holds, or a corrupt insn->code reaches a long arm, the EMIT macros overrun 'temp' on the stack, corrupting saved registers/return address; the line-793 guard only reports it afterward. Reachable from an unprivileged userspace BPF program if the emission bound is ever violated.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm BPF_INSN_SAFETY covers the largest single-instruction emission (including the PROBE_MEM null-check + ldx + jmp sequence and CMPXCHG loop with all prefixes) and that no EMIT path can exceed temp before line 793."
+    },
+    {
+      "title": "Branch displacement indexes addrs[] with attacker-controlled insn->off",
+      "anchor": "jmp_offset = addrs[i + insn->off] - addrs[i]",
+      "file": "corpus/train/train_0203_cwe77.c",
+      "line": "662, 708",
+      "code": "\t\t\tjmp_offset = addrs[i + insn->off] - addrs[i];",
+      "bug_class": "Out-of-bounds read feeding a miscompiled branch",
+      "cwe": "CWE-125",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0203_cwe77.c (do_jit) plus the BPF verifier that must validate jump targets",
+      "invariant": "For every BPF_JMP/BPF_JMP32/BPF_JA, i + insn->off must be a validated in-range instruction index (0..insn_cnt) landing on an instruction boundary, as guaranteed by the verifier; do_jit performs no bounds check.",
+      "failure_mode": "A jump whose target index is out of range reads addrs[] out of bounds; the resulting garbage becomes the encoded branch displacement written into executable kernel code, redirecting control flow to an attacker-influenced offset. Triggered by a crafted BPF program if verifier jump-target validation is incomplete/bypassed.",
+      "cve_analog": "CVE-2021-29154",
+      "what_to_confirm": "Confirm the verifier proves all jump targets in-range and on instruction boundaries, and that addrs[] is sized insn_cnt+1 and fully populated across passes before these reads."
+    },
+    {
+      "title": "Tail-call poke_tab indexed by unvalidated imm32",
+      "anchor": "&bpf_prog->aux->poke_tab[imm32 - 1]",
+      "file": "corpus/train/train_0203_cwe77.c",
+      "line": "523-524",
+      "code": "\t\t\tif (imm32)\n\t\t\t\temit_bpf_tail_call_direct(&bpf_prog->aux->poke_tab[imm32 - 1],",
+      "bug_class": "Out-of-bounds read (attacker-controlled array index)",
+      "cwe": "CWE-125",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0203_cwe77.c (do_jit) plus the verifier that assigns poke indices",
+      "invariant": "imm32 for a direct BPF_TAIL_CALL must be in [1, poke_tab_size]; only the nonzero check exists here, so the upper bound is entirely the verifier's responsibility.",
+      "failure_mode": "If imm32 exceeds the number of poke-table entries, &poke_tab[imm32-1] is an out-of-bounds pointer whose descriptor is read and used to emit a direct-jump tail call, potentially poisoning generated code or reading adjacent kernel memory. Reachable via a crafted tail-call instruction if the index is not verifier-bounded.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the verifier bounds the tail-call imm32 against poke_tab size and that poke_tab is allocated with that many entries."
+    },
+    {
+      "title": "LD_IMM64 reads the following instruction slot without an end-of-program check",
+      "anchor": "emit_mov_imm64(&prog, dst_reg, insn[1].imm, insn[0].imm)",
+      "file": "corpus/train/train_0203_cwe77.c",
+      "line": "137-141",
+      "code": "\t\tcase BPF_LD | BPF_IMM | BPF_DW:\n\t\t\temit_mov_imm64(&prog, dst_reg, insn[1].imm, insn[0].imm);\n\t\t\tinsn++;\n\t\t\ti++;\n\t\t\tbreak;",
+      "bug_class": "Out-of-bounds read (past end of instruction array)",
+      "cwe": "CWE-125",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0203_cwe77.c (do_jit) plus the verifier that validates LD_IMM64 pairing",
+      "invariant": "Every BPF_LD|BPF_IMM|BPF_DW must be followed by its valid second pseudo-instruction within insnsi bounds; it must never be the last instruction.",
+      "failure_mode": "If the final instruction is a truncated LD_IMM64, insn[1].imm reads one struct bpf_insn past the end of insnsi (OOB read) and i++ pushes i past insn_cnt. Requires a malformed program that evades verifier pairing checks.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the verifier rejects a trailing/half LD_IMM64 and guarantees insn[1] is always in bounds when this arm runs."
+    },
+    {
+      "title": "Prologue image copy lacks the bound/convergence checks used elsewhere",
+      "anchor": "if (image) memcpy(image + proglen, temp, ilen);",
+      "file": "corpus/train/train_0203_cwe77.c",
+      "line": "29-30",
+      "code": "\tif (image)\n\t\tmemcpy(image + proglen, temp, ilen);",
+      "bug_class": "Out-of-bounds write (unchecked copy into sized image)",
+      "cwe": "CWE-787",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0203_cwe77.c (do_jit); image allocated by the caller from a prior sizing pass",
+      "invariant": "emit_prologue must emit exactly the byte count the image buffer was allocated for; unlike the in-loop copy (lines 807-812), this prologue copy has no proglen+ilen<=oldproglen / ==addrs[] guard.",
+      "failure_mode": "If the prologue's emitted size differs between the sizing pass and this pass (e.g. tail_call_reachable/stack_depth-dependent prologue shape changes), the copy writes past the front of an image sized for a smaller prologue — a module-memory OOB write. Low likelihood because the prologue is deterministic per program, but the guarding asymmetry is real.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm emit_prologue is byte-for-byte stable across passes for a given program, or add the same bound check as the in-loop copy."
+    },
+    {
+      "title": "Call target computed from attacker imm32 with no in-function whitelist",
+      "anchor": "func = (u8 *) __bpf_call_base + imm32",
+      "file": "corpus/train/train_0203_cwe77.c",
+      "line": "510",
+      "code": "\t\t\tfunc = (u8 *) __bpf_call_base + imm32;",
+      "bug_class": "Missing input validation on call target (control-flow integrity)",
+      "cwe": "CWE-20",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0203_cwe77.c (do_jit) plus verifier helper-ID normalization and emit_call reachability check",
+      "invariant": "imm32 for BPF_CALL must have been normalized by the verifier to a valid, authorized helper offset (or valid subprog target); do_jit only rejects imm32==0 and relies on emit_call's reachability test.",
+      "failure_mode": "If verifier helper whitelisting is bypassed, func = __bpf_call_base + imm32 points at an arbitrary kernel address and the JIT emits a call to it, breaking control-flow integrity. Requires the verifier's call-target validation to be defeated.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm every BPF_CALL imm32 reaching the JIT has been mapped to an approved helper/subprog and that emit_call rejects unreachable/unaligned targets."
+    }
+  ],
+  "audit_checklist": [
+    "Verify BPF_INSN_SAFETY is a proven upper bound on the largest single-instruction x86 expansion (PROBE_MEM ldx sequence, CMPXCHG loop, padded jumps) so 'temp' can never overflow before the line-793 ilen check.",
+    "Confirm the BPF verifier guarantees every jump target (i + insn->off at lines 662 and 708) is an in-range, instruction-aligned index into addrs[], and that addrs[] is sized insn_cnt+1 and fully populated each pass.",
+    "Confirm direct tail-call imm32 (line 524) is verifier-bounded to [1, poke_tab_size] and poke_tab is allocated accordingly.",
+    "Confirm no program can present a trailing/half BPF_LD|BPF_IMM|BPF_DW so insn[1].imm (line 138) never reads past insnsi.",
+    "Confirm emit_prologue emits a byte-count stable across passes, so the unguarded prologue memcpy (line 30) cannot overrun a smaller-sized image; consider adding the same proglen+ilen bound check used at lines 807-812.",
+    "Confirm the multi-pass driver that calls do_jit converges (proglen stable, addrs[] unchanged) before committing the image, since the line 807-808 assertion assumes convergence and only runs when image != NULL.",
+    "Confirm every BPF_CALL imm32 was normalized to an authorized helper/subprog target and emit_call rejects out-of-range/unaligned targets.",
+    "Confirm dst_reg/src_reg from the insn stream cannot exceed the register-encoding helpers' assumptions except where explicitly guarded (dst_reg > BPF_REG_9 at line 436 for reg2pt_regs)."
+  ]
+}

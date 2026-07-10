@@ -1,0 +1,167 @@
+{
+  "subsystem": "Linux kernel Bluetooth transport driver — the virtio Bluetooth (virtio_bt / virtbt) receive path. virtbt_rx_handle() takes one sk_buff pulled off the device's RX virtqueue, peels the leading HCI packet-type byte, and dispatches the frame into the core HCI stack (hci_recv_frame) or drops it.",
+  "provenance": "Identified from Linux-kernel idioms and exact names: the function virtbt_rx_handle with a struct virtio_bluetooth *vbt handle matches drivers/bluetooth/virtio_bt.c; struct sk_buff, skb->data, skb_pull(), and kfree_skb() are net/core socket-buffer APIs; HCI_EVENT_PKT / HCI_ACLDATA_PKT / HCI_SCODATA_PKT / HCI_ISODATA_PKT, hci_skb_pkt_type(), hci_recv_frame(), and vbt->hdev are the Bluetooth core (include/net/bluetooth/hci.h, hci_core). The in-file banner comment `/* sample: primevul_c_test_0224_fixed */` and the corpus filename train_0276_cwe772.c mark this as the post-fix ('fixed') revision of a CWE-772 (missing resource release) sample.",
+  "trust_boundary": "This runs in a guest/VM kernel as a virtio driver. The RX virtqueue buffers are produced by the virtio device backend — i.e. the host/hypervisor (QEMU, vhost, or a hardware/emulated device). For a guest, that backend is OUTSIDE the guest trust boundary: a malicious or compromised host, or a buggy device model, fully controls both the CONTENT of skb->data (the pkt_type byte and payload) and the LENGTH of the buffer (skb->len), including a zero-length buffer. Everything reached through skb here is therefore hostile input, and every field must be validated before use.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0276_cwe772.c",
+      "lines": "1-3",
+      "code": "/* sample: primevul_c_test_0224_fixed */\nstatic void virtbt_rx_handle(struct virtio_bluetooth *vbt, struct sk_buff *skb)\n{",
+      "explanation": "A file-static (internal linkage) helper that handles one received Bluetooth frame. It takes the driver's private context object `struct virtio_bluetooth *vbt` (which holds the HCI device handle vbt->hdev, virtqueues, etc.) and a single `struct sk_buff *skb` — a socket buffer holding the raw bytes the virtio device delivered on the RX queue. The function returns void, so its only outputs are side effects: it either forwards the skb up the HCI stack or frees it. Because it owns the skb for the duration of the call, it is responsible for exactly-once disposal (hand-off or free) on every path.",
+      "role": "entry point of the RX dispatch"
+    },
+    {
+      "file": "corpus/train/train_0276_cwe772.c",
+      "lines": "4-4",
+      "code": "\t__u8 pkt_type;",
+      "explanation": "A single unsigned 8-bit local that will hold the HCI packet-type discriminator taken from the front of the frame. As a __u8 it can take any value 0..255; the switch below only recognizes a handful of these, so the vast majority of possible byte values fall through to the default (drop) arm. Nothing is read into it yet."
+    },
+    {
+      "file": "corpus/train/train_0276_cwe772.c",
+      "lines": "6-7",
+      "code": "\tpkt_type = *((__u8 *) skb->data);\n\tskb_pull(skb, 1);",
+      "explanation": "The core parse step. skb->data points at the first unconsumed byte of the frame; `*((__u8 *) skb->data)` dereferences it to read one byte — the HCI packet type — and stores it in pkt_type. skb_pull(skb, 1) then logically consumes that byte by advancing skb->data forward by 1 and decrementing skb->len by 1, so the remainder of the buffer (the HCI event/ACL/SCO/ISO payload) is what downstream code will see. Critically, both operations assume the buffer contains at least one byte; there is no `if (skb->len < 1)` guard anywhere before them."
+    },
+    {
+      "file": "corpus/train/train_0276_cwe772.c",
+      "lines": "9-13",
+      "code": "\tswitch (pkt_type) {\n\tcase HCI_EVENT_PKT:\n\tcase HCI_ACLDATA_PKT:\n\tcase HCI_SCODATA_PKT:\n\tcase HCI_ISODATA_PKT:",
+      "explanation": "The dispatcher classifies the frame by its packet-type byte. The four recognized constants are the standard HCI transport packet types: HCI_EVENT_PKT (0x04) for controller->host events, HCI_ACLDATA_PKT (0x02) for ACL data, HCI_SCODATA_PKT (0x03) for SCO audio, and HCI_ISODATA_PKT (0x05) for isochronous data. All four share the same handling body (fall-through case labels). Any other value (including HCI_COMMAND_PKT 0x01, or arbitrary attacker bytes) is not accepted here and falls to the default arm."
+    },
+    {
+      "file": "corpus/train/train_0276_cwe772.c",
+      "lines": "14-16",
+      "code": "\t\thci_skb_pkt_type(skb) = pkt_type;\n\t\thci_recv_frame(vbt->hdev, skb);\n\t\tbreak;",
+      "explanation": "For a recognized type, the code stamps the packet type into the skb's Bluetooth control block — hci_skb_pkt_type(skb) is a macro expanding to bt_cb(skb)->pkt_type, i.e. it writes pkt_type into scratch space reserved inside the skb — so the core stack knows how to interpret the payload. It then hands the skb to hci_recv_frame(vbt->hdev, skb), which enqueues the frame into the HCI RX machinery of the device vbt->hdev. hci_recv_frame TAKES OWNERSHIP of the skb (it frees it internally on both success and error), so this path must NOT also free it. break exits the switch and the function returns."
+    },
+    {
+      "file": "corpus/train/train_0276_cwe772.c",
+      "lines": "17-20",
+      "code": "\tdefault:\n\t\tkfree_skb(skb);\n\t\tbreak;",
+      "explanation": "For any unrecognized packet-type byte, the frame is dropped and its socket buffer is released with kfree_skb(skb). This is the corrective code that distinguishes the 'fixed' revision: it ensures the skb is freed on the reject path instead of being leaked. Because the accepted path hands the skb to hci_recv_frame (which owns it) and the default path frees it, every control-flow path now disposes of the skb exactly once — satisfying the CWE-772 resource contract that was the subject of this sample."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0276_cwe772.c",
+      "lines": "6-7",
+      "code": "\tpkt_type = *((__u8 *) skb->data);\n\tskb_pull(skb, 1);",
+      "explanation": "There is no check that the received frame is non-empty before it is dereferenced and pulled. The virtio backend (host) controls the buffer length, so it can deliver a zero-length skb (skb->len == 0). Line 6 then reads a byte at skb->data that lies past the valid data region (an out-of-bounds / uninitialized read, CWE-125) — at minimum leaking stale buffer contents into the type dispatch. Worse, line 7 calls skb_pull(skb, 1): __skb_pull contains BUG_ON(skb->len < len), so pulling 1 byte from a 0-length skb trips the BUG_ON and panics (or oopses) the guest kernel. A malicious host can thus reliably crash the guest by queuing a single empty RX buffer — a remote/host-triggered denial of service. The invariant the implementation MUST uphold is: reject (free and return) any skb with skb->len < 1 BEFORE reading skb->data[0] and before skb_pull."
+    },
+    {
+      "file": "corpus/train/train_0276_cwe772.c",
+      "lines": "14-15",
+      "code": "\t\thci_skb_pkt_type(skb) = pkt_type;\n\t\thci_recv_frame(vbt->hdev, skb);",
+      "explanation": "Even when pkt_type is one of the four accepted values, the code performs no lower-bound length validation on the REMAINING payload after the 1-byte pull. After skb_pull consumes the type byte a valid-typed frame can be left with skb->len == 0 (host sent exactly one byte equal to, say, HCI_EVENT_PKT). That empty-but-typed frame is forwarded into hci_recv_frame / the core HCI RX path, which then attempts to parse an event/ACL/SCO/ISO header out of a shorter-than-minimum buffer. This shifts the burden of minimum-length validation onto hci_recv_frame and the per-type receive handlers; if any of them assume a minimum header size without re-checking, the truncated frame becomes an out-of-bounds read there. The driver should ideally reject frames shorter than the minimum for their declared type rather than relying entirely on the core stack."
+    },
+    {
+      "file": "corpus/train/train_0276_cwe772.c",
+      "lines": "15-18",
+      "code": "\t\thci_recv_frame(vbt->hdev, skb);\n\t\tbreak;\n\tdefault:\n\t\tkfree_skb(skb);",
+      "explanation": "Resource-lifetime (CWE-772/CWE-415) contract, the historical subject of this sample. In this fixed revision it is satisfied: the accepted path passes the skb to hci_recv_frame, which consumes/frees it (so the driver must NOT free it again — doing so would be a double free, CWE-415), and the default path frees it exactly once with kfree_skb. The latent hazard the sample was created around is the pre-fix code path where the default arm did NOT free the skb, leaking one socket buffer per malformed frame (CWE-772) — an attacker-controlled memory-exhaustion vector, since the host chooses pkt_type and can flood unrecognized types. Anyone modifying this function must preserve the exactly-once-disposal property: every switch arm, and any early-return added for the length check above, must free-or-hand-off the skb precisely once."
+    }
+  ],
+  "summary": "The 'fixed' revision correctly closes the original CWE-772 skb leak (the default arm now calls kfree_skb). However the RX handler still trusts the host-supplied frame length: it dereferences skb->data[0] and calls skb_pull(skb, 1) with no `skb->len >= 1` guard, so a host-delivered zero-length RX buffer causes an out-of-bounds read and, deterministically, a skb_pull BUG_ON kernel panic — a host-triggered guest DoS. It also forwards possibly-empty valid-typed frames into the HCI core without a per-type minimum-length check.",
+  "reviewed_anchors": [
+    {
+      "anchor": "static void virtbt_rx_handle(struct virtio_bluetooth *vbt, struct sk_buff *skb) (line 2)",
+      "disposition": "finding",
+      "reason": "Function owns a host-controlled skb and must dispose of it exactly once on every path and validate its length; both contracts are attached to findings."
+    },
+    {
+      "anchor": "__u8 pkt_type (line 4)",
+      "disposition": "dismissed",
+      "reason": "A local scalar of fixed width holding one byte; it cannot overflow a buffer and every 0..255 value is handled by the switch (recognized cases or default). Not a buffer/length anchor."
+    },
+    {
+      "anchor": "pkt_type = *((__u8 *) skb->data) (line 6)",
+      "disposition": "finding",
+      "reason": "Dereferences the first byte of a host-controlled skb with no length check — out-of-bounds/uninitialized read when skb->len == 0 (CWE-125)."
+    },
+    {
+      "anchor": "skb_pull(skb, 1) (line 7)",
+      "disposition": "finding",
+      "reason": "skb_pull's internal BUG_ON(skb->len < len) panics the kernel when a zero-length skb is pulled; no guard precedes it. Host-triggered DoS."
+    },
+    {
+      "anchor": "switch (pkt_type) with cases HCI_EVENT_PKT/HCI_ACLDATA_PKT/HCI_SCODATA_PKT/HCI_ISODATA_PKT (lines 9-13)",
+      "disposition": "dismissed",
+      "reason": "Correct discriminator design; recognized types handled, all others dropped. The classification itself carries no memory-safety contract (the missing length check is captured separately)."
+    },
+    {
+      "anchor": "hci_skb_pkt_type(skb) = pkt_type (line 14)",
+      "disposition": "dismissed",
+      "reason": "Writes into the skb's reserved bt_cb control block (fixed in-skb scratch space), not attacker-sized; no overflow."
+    },
+    {
+      "anchor": "hci_recv_frame(vbt->hdev, skb) (line 15)",
+      "disposition": "finding",
+      "reason": "Forwards a possibly-empty, unchecked-minimum-length frame into the core HCI stack and transfers skb ownership; per-type minimum-length validation is absent here (latent OOB-read reliance on downstream)."
+    },
+    {
+      "anchor": "vbt->hdev (line 15)",
+      "disposition": "dismissed",
+      "reason": "Device handle established at probe/registration time; not attacker-controlled data and expected non-NULL by the time RX runs. NULL-handle concern is a driver-lifecycle issue outside this frame's data path."
+    },
+    {
+      "anchor": "default: kfree_skb(skb) (lines 17-18)",
+      "disposition": "finding",
+      "reason": "The resource-release site central to this CWE-772 sample; correct in this fixed revision but the exactly-once-disposal contract is the latent finding to preserve (and not double-free against the hci_recv_frame path)."
+    }
+  ],
+  "findings": [
+    {
+      "title": "Missing minimum-length check on host-supplied skb → OOB read and skb_pull BUG_ON kernel panic",
+      "anchor": "pkt_type = *((__u8 *) skb->data); skb_pull(skb, 1);",
+      "file": "corpus/train/train_0276_cwe772.c",
+      "line": "6-7",
+      "code": "pkt_type = *((__u8 *) skb->data);\nskb_pull(skb, 1);",
+      "bug_class": "Missing input validation of buffer length → out-of-bounds read and reachable BUG_ON panic (DoS)",
+      "cwe": "CWE-20",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0276_cwe772.c",
+      "invariant": "Before dereferencing skb->data[0] or calling skb_pull(skb, 1), the code MUST verify skb->len >= 1 (reject and free the skb otherwise); a valid-typed frame should also satisfy the minimum payload length for its type before pulling.",
+      "failure_mode": "The virtio device backend (host) controls the RX buffer length. If it delivers a zero-length skb, line 6 reads a byte outside the valid data region (out-of-bounds / uninitialized read, CWE-125), and line 7's skb_pull(skb, 1) hits __skb_pull's BUG_ON(skb->len < len), panicking/oopsing the guest kernel. A malicious or buggy host thus deterministically crashes the guest by queuing one empty RX buffer — a host-triggered denial of service.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm no caller of virtbt_rx_handle guarantees skb->len >= 1 (e.g. the RX work/callback that skb_put()s the received length), and that no `if (skb->len < 1)` guard precedes line 6; verify skb_pull still contains BUG_ON on skb->len < len in the target kernel."
+    },
+    {
+      "title": "Truncated valid-typed frame forwarded to HCI core without per-type minimum-length validation",
+      "anchor": "hci_skb_pkt_type(skb) = pkt_type; hci_recv_frame(vbt->hdev, skb);",
+      "file": "corpus/train/train_0276_cwe772.c",
+      "line": "14-15",
+      "code": "hci_skb_pkt_type(skb) = pkt_type;\nhci_recv_frame(vbt->hdev, skb);",
+      "bug_class": "Insufficient validation of payload length before upcall (latent out-of-bounds read downstream)",
+      "cwe": "CWE-125",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "A frame accepted for a given HCI packet type must carry at least that type's minimum header before being handed to hci_recv_frame, or the core RX handlers must themselves re-validate the remaining length.",
+      "failure_mode": "After skb_pull consumes the type byte, an accepted frame may have skb->len == 0 (host sent a single byte equal to a recognized type). That empty frame is forwarded to hci_recv_frame and the per-type receive handlers, which may parse a fixed-size event/ACL/SCO/ISO header out of a shorter buffer, producing an out-of-bounds read if they do not re-check the length. The driver relies entirely on the core stack for this bound.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify that hci_recv_frame and the ACL/SCO/ISO/event receive paths enforce their own minimum-length checks on the pulled skb, so a zero-length valid-typed frame cannot underflow header parsing."
+    },
+    {
+      "title": "skb resource-release contract (CWE-772 subject) — correct here, must stay exactly-once",
+      "anchor": "default: kfree_skb(skb);",
+      "file": "corpus/train/train_0276_cwe772.c",
+      "line": "17-18",
+      "code": "default:\n\t\tkfree_skb(skb);",
+      "bug_class": "Resource lifetime — missing release (leak) vs double free (latent)",
+      "cwe": "CWE-772",
+      "severity": "info",
+      "where_it_lives": "corpus/train/train_0276_cwe772.c",
+      "invariant": "Every control-flow path must dispose of the skb exactly once: the accepted path hands ownership to hci_recv_frame (must NOT also free), and every reject/error/early-return path must kfree_skb exactly once.",
+      "failure_mode": "This 'fixed' revision satisfies the contract — the default arm now frees the skb, closing the original leak (CWE-772) where malformed/unrecognized frames were dropped without release, an attacker-controlled memory-exhaustion vector. The latent hazards to guard when editing: (a) reintroducing a path that neither frees nor hands off the skb (leak, CWE-772), or (b) adding a kfree_skb on the hci_recv_frame path, which already owns and frees the skb (double free, CWE-415).",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm hci_recv_frame consumes/frees the skb on all outcomes (so the accepted path must not free), and that any newly added length-check early-return frees the skb before returning."
+    }
+  ],
+  "audit_checklist": [
+    "Add an `if (!skb->len)` (or skb->len < 1) guard that frees the skb and returns BEFORE line 6's skb->data[0] read and line 7's skb_pull(skb, 1).",
+    "Trace the caller (RX work/virtqueue callback) to see whether it can ever pass a zero-length skb, i.e. whether it skb_put()s the device-reported length unchecked.",
+    "Confirm skb_pull/__skb_pull still BUG_ON(skb->len < len) in the target kernel, making the zero-length pull a hard panic.",
+    "Verify hci_recv_frame and each per-type (event/ACL/SCO/ISO) handler enforce their own minimum-length checks on the post-pull skb.",
+    "Confirm hci_recv_frame takes ownership and frees the skb on all paths, so the accepted arm must not free it (no double free).",
+    "Ensure every switch arm and any future early-return disposes of the skb exactly once (no leak, no double free)."
+  ]
+}

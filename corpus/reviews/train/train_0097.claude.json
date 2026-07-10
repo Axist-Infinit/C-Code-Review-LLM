@@ -1,0 +1,158 @@
+{
+  "subsystem": "Linux kernel SCTP (Stream Control Transmission Protocol) chunk-builder. sctp_make_strreset_req() constructs an SCTP RE-CONFIG chunk (RFC 6525) carrying an Outgoing SSN Reset Request Parameter (SCTP_PARAM_RESET_OUT_REQUEST) and/or an Incoming SSN Reset Request Parameter (SCTP_PARAM_RESET_IN_REQUEST), each optionally followed by a caller-supplied list of 16-bit stream numbers. It is invoked when a local socket asks the stack to reset the sequence numbers of one or more SCTP streams.",
+  "provenance": "Identified by the kernel-internal SCTP naming and types: the function name sctp_make_strreset_req and helpers sctp_make_reconf() / sctp_addto_chunk() / SCTP_PAD4(); the parameter enum names SCTP_PARAM_RESET_OUT_REQUEST and SCTP_PARAM_RESET_IN_REQUEST; the on-wire structs sctp_strreset_outreq / sctp_strreset_inreq with their param_hdr, request_seq, response_seq and send_reset_at_tsn fields; the kernel fixed-width types __u16 / __be16 and the byte-swap helpers htons()/htonl(); and struct sctp_association fields strreset_outseq, strreset_inseq, next_tsn. This is net/sctp/sm_make_chunk.c. The banner comment 'primevul_c_test_0211_fixed' is untrusted metadata and was ignored for the security judgement.",
+  "trust_boundary": "stream_num and stream_list are attacker-influenced. They originate at the socket API: a user calls setsockopt(SCTP_RESET_STREAMS), the kernel copies the user's struct sctp_reset_streams (which contains srs_number_streams and a variable-length srs_stream_list[]) in from userspace, and that count and array are threaded down to this builder as stream_num (a 16-bit count) and stream_list (a pointer to stream_num __be16 entries). stream_num is therefore an untrusted 16-bit value that can be as large as 65535, and stream_list is an untrusted buffer whose true byte length is 2*stream_num. asoc and its sequence-number fields are internal association state and are trusted. The chunk being built is later transmitted, so the wire-format length fields also cross a trust boundary to the remote peer.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0097_cwe704.c",
+      "lines": "2-6",
+      "code": "struct sctp_chunk *sctp_make_strreset_req(\n\t\t\t\t\tconst struct sctp_association *asoc,\n\t\t\t\t\t__u16 stream_num, __be16 *stream_list,\n\t\t\t\t\tbool out, bool in)\n{",
+      "explanation": "Entry point that returns a newly allocated struct sctp_chunk* (NULL on failure). Parameters: asoc is the (trusted) SCTP association the chunk belongs to; stream_num is a 16-bit count of streams to reset; stream_list points to an array of stream_num big-endian 16-bit stream identifiers to embed in the request; out and in are booleans selecting whether an outgoing-reset parameter, an incoming-reset parameter, or both are appended. stream_num and stream_list carry data derived from a userspace setsockopt buffer, so their magnitude and contents are attacker-influenced."
+    },
+    {
+      "file": "corpus/train/train_0097_cwe704.c",
+      "lines": "7-11",
+      "code": "\t__u16 stream_len = stream_num * sizeof(__u16);\n\tstruct sctp_strreset_outreq outreq;\n\tstruct sctp_strreset_inreq inreq;\n\tstruct sctp_chunk *retval;\n\t__u16 outlen, inlen;",
+      "explanation": "stream_len is meant to be the byte size of the trailing stream list: stream_num entries times 2 bytes each. Note the destination type is __u16 while the right-hand side stream_num * sizeof(__u16) is evaluated in size_t (sizeof yields size_t / unsigned long), so the product is computed at full 64-bit width and then narrowed on assignment. outreq and inreq are stack copies of the two on-wire parameter headers that will be filled in and appended. retval holds the chunk being built. outlen and inlen are 16-bit accumulators for the total byte length of the outgoing and incoming parameters respectively."
+    },
+    {
+      "file": "corpus/train/train_0097_cwe704.c",
+      "lines": "13-14",
+      "code": "\toutlen = (sizeof(outreq) + stream_len) * out;\n\tinlen = (sizeof(inreq) + stream_len) * in;",
+      "explanation": "Each parameter's total length is the fixed header size (sizeof(outreq) / sizeof(inreq), the on-wire struct including param_hdr and the sequence fields) plus stream_len bytes of stream list. The multiply by the boolean out / in is a branchless conditional: when out is false the whole expression is 0, meaning 'no outgoing parameter.' As on line 7, the additions and the multiply are performed in size_t but the result is stored back into 16-bit outlen / inlen, so any value above 65535 is truncated modulo 65536."
+    },
+    {
+      "file": "corpus/train/train_0097_cwe704.c",
+      "lines": "16-18",
+      "code": "\tretval = sctp_make_reconf(asoc, SCTP_PAD4(outlen) + SCTP_PAD4(inlen));\n\tif (!retval)\n\t\treturn NULL;",
+      "explanation": "sctp_make_reconf() allocates the RE-CONFIG chunk with room for SCTP_PAD4(outlen) + SCTP_PAD4(inlen) bytes of parameters, where SCTP_PAD4 rounds each length up to a 4-byte boundary as SCTP requires. This allocation size is derived from the possibly-truncated 16-bit outlen / inlen values, NOT from stream_len. The NULL check on lines 17-18 correctly aborts on allocation failure, so there is no unchecked-NULL use of retval below."
+    },
+    {
+      "file": "corpus/train/train_0097_cwe704.c",
+      "lines": "20-27",
+      "code": "\tif (outlen) {\n\t\toutreq.param_hdr.type = SCTP_PARAM_RESET_OUT_REQUEST;\n\t\toutreq.param_hdr.length = htons(outlen);\n\t\toutreq.request_seq = htonl(asoc->strreset_outseq);\n\t\toutreq.response_seq = htonl(asoc->strreset_inseq - 1);\n\t\toutreq.send_reset_at_tsn = htonl(asoc->next_tsn - 1);\n\n\t\tsctp_addto_chunk(retval, sizeof(outreq), &outreq);",
+      "explanation": "If an outgoing parameter was requested (outlen != 0) the stack fills the parameter header: the type constant, the on-wire length as htons(outlen) (big-endian), and three association-derived sequence numbers (outgoing reset sequence, one-less-than the incoming reset sequence, and one-less-than next_tsn) converted with htonl. sctp_addto_chunk() then appends the fixed sizeof(outreq) header bytes to the chunk's data area (skb tail). The advertised on-wire length outreq.param_hdr.length is set from outlen, the value that also drove the allocation."
+    },
+    {
+      "file": "corpus/train/train_0097_cwe704.c",
+      "lines": "29-31",
+      "code": "\t\tif (stream_len)\n\t\t\tsctp_addto_chunk(retval, stream_len, stream_list);\n\t}",
+      "explanation": "After the header, if there is a stream list (stream_len != 0) the code appends stream_len bytes copied from the untrusted stream_list buffer into the chunk. Critically, the copy length here is stream_len, whereas the space reserved for this parameter was SCTP_PAD4(outlen) with outlen = sizeof(outreq) + stream_len computed and truncated independently on line 13. The safety of this append depends entirely on outlen having faithfully accounted for stream_len."
+    },
+    {
+      "file": "corpus/train/train_0097_cwe704.c",
+      "lines": "33-42",
+      "code": "\tif (inlen) {\n\t\tinreq.param_hdr.type = SCTP_PARAM_RESET_IN_REQUEST;\n\t\tinreq.param_hdr.length = htons(inlen);\n\t\tinreq.request_seq = htonl(asoc->strreset_outseq + out);\n\n\t\tsctp_addto_chunk(retval, sizeof(inreq), &inreq);\n\n\t\tif (stream_len)\n\t\t\tsctp_addto_chunk(retval, stream_len, stream_list);\n\t}",
+      "explanation": "Symmetric handling for the incoming-reset parameter: fill the shorter inreq header (type, htons(inlen), and request_seq = outgoing reset seq plus the boolean out so the two requests get distinct sequence numbers), append sizeof(inreq) header bytes, then append the same stream_len bytes of stream_list again. As on line 30 the payload copy length is stream_len while the reservation was SCTP_PAD4(inlen); the two must agree for the append to stay in bounds."
+    },
+    {
+      "file": "corpus/train/train_0097_cwe704.c",
+      "lines": "44-45",
+      "code": "\treturn retval;\n}",
+      "explanation": "Returns the assembled chunk to the caller for queuing and transmission. By this point the chunk's data area has had, potentially, an outgoing header + stream list and an incoming header + stream list appended into the buffer that sctp_make_reconf() sized from outlen/inlen."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0097_cwe704.c",
+      "lines": "7",
+      "code": "\t__u16 stream_len = stream_num * sizeof(__u16);",
+      "explanation": "Incorrect type conversion / numeric truncation (CWE-704 / CWE-197). stream_num is a 16-bit count fully controlled by userspace and may be up to 65535. stream_num * sizeof(__u16) is evaluated in size_t and can reach 131070, but the result is stored into the 16-bit stream_len, so it is reduced modulo 65536. For any stream_num >= 32768 the stored stream_len no longer equals the true byte length (2*stream_num) of the stream_list buffer: e.g. stream_num = 32768 yields stream_len = 0, and stream_num = 32769 yields stream_len = 2. This desynchronizes the length variable that is used BOTH to size the parameter and to bound the payload copy from the actual size of the attacker-supplied buffer, and is the root incorrect-conversion that feeds the overflow below. Invariant: the byte length used for allocation and for copying must equal 2*stream_num computed in a width that cannot overflow (do the arithmetic in size_t/int and bound stream_num before narrowing)."
+    },
+    {
+      "file": "corpus/train/train_0097_cwe704.c",
+      "lines": "13-14",
+      "code": "\toutlen = (sizeof(outreq) + stream_len) * out;\n\tinlen = (sizeof(inreq) + stream_len) * in;",
+      "explanation": "Second truncation that turns the desync into an allocation-vs-copy size mismatch (CWE-190 integer overflow leading to CWE-787 out-of-bounds write). Even when stream_len is a large legitimate value (say 65534, from stream_num = 32767), sizeof(outreq) + stream_len = 16 + 65534 = 65550 is truncated to 16-bit outlen = 14. sctp_make_reconf() on line 16 then reserves only SCTP_PAD4(14) = 16 bytes for the outgoing parameter, yet the guard 'if (outlen)' on line 20 is true (14 != 0), so the code proceeds to append sizeof(outreq) header bytes AND, on line 30, stream_len = 65534 payload bytes. The reservation (16 bytes) is far smaller than what is written (~16 + 65534 bytes), producing a heap/skb-tail out-of-bounds write of tens of kilobytes of attacker-controlled data — kernel memory corruption. Invariant: the length used to size the chunk (outlen/inlen) must be computed at a width wide enough to hold sizeof(header) + 2*stream_num and must not be able to wrap below the number of bytes actually appended."
+    },
+    {
+      "file": "corpus/train/train_0097_cwe704.c",
+      "lines": "29-30",
+      "code": "\t\tif (stream_len)\n\t\t\tsctp_addto_chunk(retval, stream_len, stream_list);",
+      "explanation": "The payload copy is bounded by stream_len, a value derived on a DIFFERENT truncation path than the outlen that sized the allocation. Because the guard here is 'if (stream_len)' rather than a check that the remaining reserved space in retval can hold stream_len bytes, sctp_addto_chunk() will happily advance the skb tail past the reserved end when outlen underestimated the total (the scenario above). The same defect is duplicated at lines 40-41 for the incoming parameter, where stream_list is appended a second time under the same unchecked stream_len. Invariant: every sctp_addto_chunk() append must be bounded by the space actually reserved in the chunk; the builder must reject or clamp when stream_num is large enough that the 16-bit length fields cannot represent the true size."
+    },
+    {
+      "file": "corpus/train/train_0097_cwe704.c",
+      "lines": "22",
+      "code": "\t\toutreq.param_hdr.length = htons(outlen);",
+      "explanation": "Even absent memory corruption, the on-wire parameter length is set from the truncated outlen (and inlen on line 35). If truncation occurs, the transmitted SCTP RE-CONFIG parameter advertises a length that is inconsistent with the number of stream bytes actually placed after it, yielding malformed chunks that can confuse or crash a remote peer's parser (protocol-level CWE-20 / malformed length). This is a lower-severity consequence of the same 16-bit length model but worth confirming because it changes what the receiver reads."
+    },
+    {
+      "file": "corpus/train/train_0097_cwe704.c",
+      "lines": "23-25",
+      "code": "\t\toutreq.request_seq = htonl(asoc->strreset_outseq);\n\t\toutreq.response_seq = htonl(asoc->strreset_inseq - 1);\n\t\toutreq.send_reset_at_tsn = htonl(asoc->next_tsn - 1);",
+      "explanation": "These dereference asoc. If a caller ever invoked this builder with asoc == NULL it would be a NULL pointer dereference (CWE-476). In the SCTP call graph asoc is always a live, non-NULL association, so this is trusted and low risk; it is called out only for completeness. The subtractions strreset_inseq - 1 and next_tsn - 1 are on trusted internal counters and are not attacker-controlled."
+    }
+  ],
+  "summary": "This SCTP RE-CONFIG stream-reset chunk builder computes all of its length quantities (stream_len, outlen, inlen) in 16-bit __u16 variables even though the underlying arithmetic (stream_num * 2, plus a fixed header) is done in size_t and can exceed 65535 for large userspace-supplied stream_num. The resulting truncation (CWE-704/CWE-197) lets the length that SIZES the chunk (outlen/inlen) diverge from the length that BOUNDS the payload copy (stream_len), so a crafted stream count can make sctp_make_reconf() under-allocate while sctp_addto_chunk() copies the full, larger stream list — a kernel heap/skb out-of-bounds write (CWE-787). Safety hinges entirely on the caller strictly bounding stream_num before this point.",
+  "reviewed_anchors": [
+    {"anchor": "sctp_make_strreset_req(asoc, stream_num, stream_list, out, in) signature (lines 2-5)", "disposition": "finding", "reason": "stream_num (16-bit count) and stream_list (untrusted buffer) are the attacker-influenced inputs whose relationship to the 16-bit length fields is unsound"},
+    {"anchor": "__u16 stream_len = stream_num * sizeof(__u16) (line 7)", "disposition": "finding", "reason": "size_t product truncated into 16-bit stream_len — incorrect type conversion / truncation, the root desync"},
+    {"anchor": "outlen = (sizeof(outreq) + stream_len) * out (line 13)", "disposition": "finding", "reason": "16-bit truncation of the allocation length; wraps below the bytes actually appended"},
+    {"anchor": "inlen = (sizeof(inreq) + stream_len) * in (line 14)", "disposition": "finding", "reason": "same 16-bit truncation for the incoming parameter length"},
+    {"anchor": "sctp_make_reconf(asoc, SCTP_PAD4(outlen) + SCTP_PAD4(inlen)) (line 16)", "disposition": "finding", "reason": "allocation is sized from the truncated outlen/inlen rather than from stream_len, creating the size mismatch"},
+    {"anchor": "if (!retval) return NULL (lines 17-18)", "disposition": "dismissed", "reason": "correct allocation-failure guard; retval is not used unchecked"},
+    {"anchor": "if (outlen) guard (line 20) / if (inlen) guard (line 33)", "disposition": "finding", "reason": "gates on the truncated length, so a truncated-nonzero outlen still enters the append path with a large stream_len"},
+    {"anchor": "outreq.param_hdr.length = htons(outlen) (line 22) / inreq.param_hdr.length = htons(inlen) (line 35)", "disposition": "finding", "reason": "advertises the truncated length on the wire, producing malformed parameters"},
+    {"anchor": "sctp_addto_chunk(retval, sizeof(outreq), &outreq) (line 27) / (retval, sizeof(inreq), &inreq) (line 38)", "disposition": "dismissed", "reason": "fixed-size header appends of sizeof(struct); constant length, not attacker-scaled"},
+    {"anchor": "if (stream_len) sctp_addto_chunk(retval, stream_len, stream_list) (lines 29-30 and 40-41)", "disposition": "finding", "reason": "payload copy bounded by stream_len rather than by remaining reserved space; the write site of the overflow"},
+    {"anchor": "asoc->strreset_outseq / strreset_inseq - 1 / next_tsn - 1 (lines 23-25, 36)", "disposition": "dismissed", "reason": "trusted internal association counters; asoc is non-NULL in the SCTP call graph"},
+    {"anchor": "* out and * in branchless conditionals (lines 13-14, 36)", "disposition": "dismissed", "reason": "bool is 0/1; intended select-or-zero idiom, not itself a vulnerability"},
+    {"anchor": "SCTP_PAD4(outlen) + SCTP_PAD4(inlen) padding (line 16)", "disposition": "dismissed", "reason": "each padded value is <= ~65536 and the sum is computed in int; the padding itself does not overflow — the danger is upstream truncation of outlen/inlen"}
+  ],
+  "findings": [
+    {
+      "title": "16-bit truncation of parameter length under-allocates chunk while full stream list is copied (heap OOB write)",
+      "anchor": "outlen = (sizeof(outreq) + stream_len) * out; ... sctp_make_reconf(...) ; sctp_addto_chunk(retval, stream_len, stream_list)",
+      "file": "corpus/train/train_0097_cwe704.c",
+      "line": "13-16, 29-30",
+      "code": "outlen = (sizeof(outreq) + stream_len) * out;\ninlen = (sizeof(inreq) + stream_len) * in;\n\nretval = sctp_make_reconf(asoc, SCTP_PAD4(outlen) + SCTP_PAD4(inlen));\n...\n\t\tif (stream_len)\n\t\t\tsctp_addto_chunk(retval, stream_len, stream_list);",
+      "bug_class": "Integer truncation causing allocation/copy size mismatch -> heap out-of-bounds write",
+      "cwe": "CWE-787",
+      "severity": "critical",
+      "where_it_lives": "corpus/train/train_0097_cwe704.c (and the appended-to buffer in sctp_make_reconf/sctp_addto_chunk, implementation file not provided)",
+      "invariant": "The length used to reserve space in the chunk must be computed at a width that cannot overflow (>= sizeof(header) + 2*stream_num) and must be >= the number of bytes subsequently appended for that parameter; equivalently, stream_num must be bounded so sizeof(outreq)+2*stream_num fits in the 16-bit length field before it is used.",
+      "failure_mode": "With attacker-influenced stream_num chosen so sizeof(outreq) + 2*stream_num exceeds 65535 (e.g. stream_num = 32767 -> stream_len = 65534, outlen = (16+65534) & 0xffff = 14), sctp_make_reconf reserves only SCTP_PAD4(14)=16 bytes, but 'if (outlen)' is still true and sctp_addto_chunk then appends sizeof(outreq) header bytes plus stream_len=65534 payload bytes, writing ~65550 bytes into a 16-byte reservation. Result is a kernel skb-tail/heap out-of-bounds write of attacker-controlled data, i.e. remote-adjacent memory corruption and likely privilege escalation or panic. The incoming-reset branch (inlen, lines 33-41) has the identical defect.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether every caller path into sctp_make_strreset_req bounds stream_num so that sizeof(struct sctp_strreset_outreq) + stream_num*2 <= 65535, and whether sctp_addto_chunk/sctp_make_reconf perform any independent tail-room check; if not, this is an exploitable OOB write."
+    },
+    {
+      "title": "Incorrect type conversion: stream list byte length computed in size_t then truncated to __u16",
+      "anchor": "__u16 stream_len = stream_num * sizeof(__u16);",
+      "file": "corpus/train/train_0097_cwe704.c",
+      "line": "7",
+      "code": "__u16 stream_len = stream_num * sizeof(__u16);",
+      "bug_class": "Incorrect type conversion / numeric truncation of an untrusted length",
+      "cwe": "CWE-704",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0097_cwe704.c",
+      "invariant": "The byte length of the stream list must faithfully represent 2*stream_num; the multiplication must be carried in a width (size_t or int) that holds up to 131070 and stream_num must be bounded before the value is narrowed to 16 bits.",
+      "failure_mode": "sizeof(__u16) is size_t, so stream_num * sizeof(__u16) is evaluated in 64-bit but assigned to the 16-bit stream_len, discarding the high bit for stream_num >= 32768. The stored length then diverges from the actual 2*stream_num size of stream_list: it can wrap to 0 (dropping the copy entirely, a logic/interop bug) or, combined with the outlen truncation on lines 13-14, drive the allocation/copy mismatch that overflows the chunk. This is the root incorrect-conversion feeding finding #1.",
+      "cve_analog": "",
+      "what_to_confirm": "That stream_num is validated (e.g. against asoc->stream.outcnt/incnt) to a value small enough that 2*stream_num cannot wrap the 16-bit stream_len, and that no path reaches here with stream_num >= 32768."
+    },
+    {
+      "title": "On-wire parameter length advertised from truncated value",
+      "anchor": "outreq.param_hdr.length = htons(outlen); inreq.param_hdr.length = htons(inlen);",
+      "file": "corpus/train/train_0097_cwe704.c",
+      "line": "22, 35",
+      "code": "outreq.param_hdr.length = htons(outlen);\n...\n\t\tinreq.param_hdr.length = htons(inlen);",
+      "bug_class": "Malformed protocol length field from truncated internal length",
+      "cwe": "CWE-20",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0097_cwe704.c",
+      "invariant": "The RE-CONFIG parameter length placed on the wire must equal the number of bytes actually serialized for that parameter (header + stream list).",
+      "failure_mode": "When outlen/inlen truncate, the transmitted parameter header advertises a length inconsistent with the bytes that follow, producing malformed SCTP chunks that can confuse or crash a peer's RE-CONFIG parser. This is a downstream symptom of the same 16-bit length model rather than an independent memory bug, hence low severity.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether a receiving SCTP implementation tolerates or rejects a stream-reset parameter whose param_hdr.length does not match the trailing stream-list byte count."
+    }
+  ],
+  "audit_checklist": [
+    "Trace every caller of sctp_make_strreset_req (SCTP_RESET_STREAMS setsockopt path -> sctp_send_reset_streams -> sctp_stream_reset) and confirm stream_num is clamped so sizeof(struct sctp_strreset_outreq) + 2*stream_num <= 65535 before this function runs.",
+    "Widen stream_len, outlen and inlen to size_t/u32 (or bound stream_num) so the length computations on lines 7, 13, 14 cannot truncate.",
+    "Verify that sctp_make_reconf reserves space based on the same length that bounds every sctp_addto_chunk append, and that sctp_addto_chunk asserts remaining tailroom >= the copy length.",
+    "Confirm the guards on lines 20/33 (if outlen / if inlen) and 29/40 (if stream_len) cannot be true while the reservation is smaller than the bytes appended.",
+    "Check that the on-wire param_hdr.length (lines 22, 35) always equals the serialized parameter size, and that a peer validates it.",
+    "Confirm asoc is guaranteed non-NULL at every call site for the dereferences on lines 23-25 and 36."
+  ]
+}

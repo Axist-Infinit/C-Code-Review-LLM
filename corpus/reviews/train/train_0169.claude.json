@@ -1,0 +1,230 @@
+{
+  "subsystem": "librepo YUM/RPM metadata download planner. The function prepare_repo_download_targets() is the per-repository step that walks the parsed repomd (repomd.xml) record list and, for each enabled metadata file (primary, filelists, updateinfo, zchunk headers, etc.), builds an LrDownloadTarget describing where that file is fetched from and where it is written on local disk. It is the glue between the parsed remote metadata index and the concrete download/write jobs handed to the transfer engine.",
+  "provenance": "Identified by the librepo naming and type vocabulary: LrHandle, LrYumRepo, LrYumRepoMd, LrYumRepoMdRecord, LrMetadataTarget, LrDownloadTarget, LrEndCb, and helper calls lr_yum_switch_to_zchunk, lr_yum_repomd_record_enabled, lr_downloadtarget_new, lr_yum_repo_update, lr_free, plus GLib primitives (GSList, g_slist_next, g_slist_append, g_debug, GError). The WITH_ZCHUNK / zchunk (zck) code paths and the record->location_href / location_base / header_checksum / size_header fields are the librepo repomd record model. The leading comment '/* sample: primevul_c_validation_0279_vuln */' is dataset provenance metadata and is treated as untrusted, non-authoritative text, not a safety claim.",
+  "trust_boundary": "The LrYumRepoMd (repomd) and every LrYumRepoMdRecord it carries are parsed from repomd.xml, which is fetched from a remote repository over HTTP(S) selected via mirrorlist/metalink/baseurl. Therefore record->location_href, record->location_base, record->type, record->header_checksum and record->size_header are ATTACKER-CONTROLLABLE wire data: a malicious or compromised mirror, or a man-in-the-middle where TLS/GPG is not enforced, fully controls their contents. handle->destdir and handle->cachedir are local, trusted configuration. The security-critical crossing is that an untrusted location_href/location_base string is used to derive the LOCAL destination path (via prepare_repo_download_std_target / prepare_repo_download_zck_target and lr_downloadtarget_new) under the trusted destdir, so hostile path components determine where bytes land on the local filesystem.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0169_cwe22.c",
+      "lines": "2-9",
+      "code": "prepare_repo_download_targets(LrHandle *handle,\n                              LrYumRepo *repo,\n                              LrYumRepoMd *repomd,\n                              LrMetadataTarget *mdtarget,\n                              GSList **targets,\n                              GSList **cbdata_list,\n                              GError **err)\n{",
+      "explanation": "The function signature. handle is the librepo session/config object holding destdir, cachedir, user callbacks and transfer state. repo is the LrYumRepo being (re)built and updated in place. repomd is the parsed repomd.xml index whose ->records list drives the loop. mdtarget is an optional per-metadata target carrying caller callback/cbdata and a running download counter. targets is an in/out GSList** that accumulates the LrDownloadTarget jobs to be executed later. cbdata_list is an in/out GSList** accumulating heap-allocated CbData callback contexts so they can be freed after the transfer. err is the GLib GError out-parameter. The return type is omitted in the shown slice but the body returns TRUE/FALSE, so it is a gboolean success predicate.",
+      "important": true
+    },
+    {
+      "file": "corpus/train/train_0169_cwe22.c",
+      "lines": "10-15",
+      "code": "    char *destdir;  /* Destination dir */\n\n    destdir = handle->destdir;\n    assert(destdir);\n    assert(strlen(destdir));\n    assert(!err || *err == NULL);",
+      "explanation": "A local destdir pointer is bound to handle->destdir, the trusted base directory into which repository metadata is written. Three asserts encode preconditions: destdir must be non-NULL, must be non-empty, and the caller must not pass an err out-parameter that already holds an error. Note these are the ONLY validation of destdir here, and assert() is a debug-only construct; the value destdir is not otherwise re-checked before it is combined with attacker-controlled record fields downstream.",
+      "important": true
+    },
+    {
+      "file": "corpus/train/train_0169_cwe22.c",
+      "lines": "17-23",
+      "code": "    if(handle->cachedir) {\n        lr_yum_switch_to_zchunk(handle, repomd);\n        repo->use_zchunk = TRUE;\n    } else {\n        g_debug(\"%s: Cache directory not set, disabling zchunk\", __func__);\n        repo->use_zchunk = FALSE;\n    }",
+      "explanation": "If a cache directory is configured, zchunk (delta metadata) support is switched on for this repomd and repo->use_zchunk is set TRUE; otherwise zchunk is disabled and a debug message is logged. lr_yum_switch_to_zchunk rewrites the repomd record set to prefer zck variants when a local cache exists to diff against. This flag gates whether per-record zchunk header downloads are prepared below.",
+      "important": false
+    },
+    {
+      "file": "corpus/train/train_0169_cwe22.c",
+      "lines": "25-33",
+      "code": "    for (GSList *elem = repomd->records; elem; elem = g_slist_next(elem)) {\n        int fd;\n        char *path;\n        LrDownloadTarget *target;\n        LrYumRepoMdRecord *record = elem->data;\n        CbData *cbdata = NULL;\n        void *user_cbdata = NULL;\n        LrEndCb endcb = NULL;",
+      "explanation": "The main loop iterates every parsed metadata record in repomd->records. Per iteration it declares an uninitialized fd (file descriptor for the destination file), an uninitialized path (the local destination path string, to be produced by the prepare_* helper), a target pointer, the current record (cast from the GSList element data — this is the attacker-controlled per-file metadata), and callback locals defaulted to NULL. fd and path are intentionally left uninitialized because the prepare_* helper is contracted to set them only on success.",
+      "important": false
+    },
+    {
+      "file": "corpus/train/train_0169_cwe22.c",
+      "lines": "34-39",
+      "code": "        if (mdtarget != NULL) {\n            user_cbdata = mdtarget->cbdata;\n            endcb = mdtarget->endcb;\n        }\n\n        assert(record);",
+      "explanation": "If a metadata target was supplied, its per-metadata callback data and end callback are copied into the loop locals so each generated download target can report completion to the caller. assert(record) encodes that every GSList element must carry a non-NULL LrYumRepoMdRecord; again this is a debug-only check that vanishes under NDEBUG.",
+      "important": false
+    },
+    {
+      "file": "corpus/train/train_0169_cwe22.c",
+      "lines": "41-42",
+      "code": "        if (!lr_yum_repomd_record_enabled(handle, record->type, repomd->records))\n            continue;",
+      "explanation": "Records whose type (e.g. 'primary', 'filelists', 'updateinfo') are not enabled for this handle are skipped. record->type is an attacker-supplied string from repomd.xml; it selects which metadata classes are downloaded and later becomes the key passed to lr_yum_repo_update at the bottom of the loop.",
+      "important": false
+    },
+    {
+      "file": "corpus/train/train_0169_cwe22.c",
+      "lines": "44-49",
+      "code": "        char *location_href = record->location_href;\n        gboolean is_zchunk = FALSE;\n        #ifdef WITH_ZCHUNK\n        if (handle->cachedir && record->header_checksum)\n            is_zchunk = TRUE;\n        #endif /* WITH_ZCHUNK */",
+      "explanation": "location_href is bound directly to record->location_href — the untrusted relative location string from repomd.xml (e.g. 'repodata/<hash>-primary.xml.gz'). This value is later passed to lr_downloadtarget_new as the remote href and participates in deriving the local destination path. is_zchunk is computed: only when zchunk is compiled in, a cache dir exists, and the record advertises a header_checksum is the zchunk path chosen. No inspection or sanitization of location_href happens here.",
+      "important": true
+    },
+    {
+      "file": "corpus/train/train_0169_cwe22.c",
+      "lines": "51-62",
+      "code": "        GSList *checksums = NULL;\n        if (is_zchunk) {\n            #ifdef WITH_ZCHUNK\n            if(!prepare_repo_download_zck_target(handle, record, &path, &fd,\n                                                 &checksums, targets, err))\n                return FALSE;\n            #endif /* WITH_ZCHUNK */\n        } else {\n            if(!prepare_repo_download_std_target(handle, record, &path, &fd,\n                                                 &checksums, targets, err))\n                return FALSE;\n        }",
+      "explanation": "Depending on is_zchunk, either the zchunk or the standard preparation helper is invoked. Both receive the untrusted record and return by out-parameter the local destination path and an open fd for it, plus a checksum list. These helpers (implementation not shown) are where destdir is joined with the record's location_href/location_base to compute path and where the file is opened for writing — i.e. the exact place a hostile '../' component in location_href would be resolved. On failure the function returns FALSE, propagating err.",
+      "important": true
+    },
+    {
+      "file": "corpus/train/train_0169_cwe22.c",
+      "lines": "64-71",
+      "code": "        if (handle->user_cb || handle->hmfcb) {\n            cbdata = cbdata_new(handle->user_data,\n                                user_cbdata,\n                                handle->user_cb,\n                                handle->hmfcb,\n                                record->type);\n            *cbdata_list = g_slist_append(*cbdata_list, cbdata);\n        }",
+      "explanation": "If the handle has a user progress callback or a handle-mirror-failure callback registered, a CbData context is allocated bundling the user data, the per-metadata cbdata, the two callbacks and record->type, then appended to *cbdata_list for later cleanup. This wires progress reporting to the download target created next.",
+      "important": false
+    },
+    {
+      "file": "corpus/train/train_0169_cwe22.c",
+      "lines": "73-90",
+      "code": "        target = lr_downloadtarget_new(handle,\n                                       location_href,\n                                       record->location_base,\n                                       fd,\n                                       NULL,\n                                       checksums,\n                                       0,\n                                       0,\n                                       NULL,\n                                       cbdata,\n                                       endcb,\n                                       NULL,\n                                       NULL,\n                                       0,\n                                       0,\n                                       NULL,\n                                       FALSE,\n                                       is_zchunk);",
+      "explanation": "A LrDownloadTarget is constructed from the untrusted location_href and record->location_base (the relative href and its base URL/path), the already-opened fd, the checksum list, the callback context, the end callback and the is_zchunk flag. location_base is a second attacker-controlled string that, combined with location_href, forms the full source and influences the resolved destination. This target is what the transfer engine will execute, writing fetched bytes into fd (the file the prepare_* helper opened at path).",
+      "important": true
+    },
+    {
+      "file": "corpus/train/train_0169_cwe22.c",
+      "lines": "92-97",
+      "code": "        if(is_zchunk) {\n            #ifdef WITH_ZCHUNK\n            target->expectedsize = record->size_header;\n            target->zck_header_size = record->size_header;\n            #endif /* WITH_ZCHUNK */\n        }",
+      "explanation": "For zchunk targets, the target's expected size and zck header size are both taken from record->size_header — an attacker-controlled integer from repomd.xml. These sizes steer buffer allocation and zchunk header parsing in the transfer/zck layer.",
+      "important": false
+    },
+    {
+      "file": "corpus/train/train_0169_cwe22.c",
+      "lines": "99-105",
+      "code": "        if (mdtarget != NULL)\n            mdtarget->repomd_records_to_download++;\n        *targets = g_slist_append(*targets, target);\n\n        /* Because path may already exists in repo (while update) */\n        lr_yum_repo_update(repo, record->type, path);\n        lr_free(path);",
+      "explanation": "If a metadata target exists, its outstanding-download counter is incremented. The finished LrDownloadTarget is appended to *targets. Then lr_yum_repo_update records, in the in-memory LrYumRepo, that metadata of record->type lives at the local path just computed — so the untrusted-derived path is persisted into the repo model and will be used to locate the file after download. Finally the path string is freed. Both record->type and path here are derived from attacker-controlled record fields.",
+      "important": false
+    },
+    {
+      "file": "corpus/train/train_0169_cwe22.c",
+      "lines": "108-109",
+      "code": "    return TRUE;\n}",
+      "explanation": "After every record is processed, the function returns TRUE to signal that all download targets were prepared successfully. Failure exits earlier via the return FALSE inside the prepare_* branches.",
+      "important": false
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0169_cwe22.c",
+      "lines": "44-90",
+      "code": "        char *location_href = record->location_href;\n...\n        target = lr_downloadtarget_new(handle,\n                                       location_href,\n                                       record->location_base,",
+      "explanation": "PATH TRAVERSAL (primary, latent in the prepare_* helper). record->location_href and record->location_base come verbatim from the remote repomd.xml and are never validated here before being used to derive the local destination path (via prepare_repo_download_std_target / prepare_repo_download_zck_target at lines 54/59, which set &path/&fd) and passed to lr_downloadtarget_new. A malicious mirror can set location_href to something like '../../../../etc/cron.d/pwn' or '/etc/passwd'; when the helper joins it under destdir (or trusts an absolute path) the fetched bytes are written OUTSIDE the intended destdir. Because this runs as part of repository sync — often as root during system update — the impact is arbitrary file overwrite / creation and hence remote code execution. The invariant the implementation MUST uphold: after resolving destdir + location_href/location_base, canonicalize and reject any path that escapes destdir (no leading '/', no '..' components, no symlink escape). This is the CWE-22 that the sample name flags and maps to the librepo directory-traversal fix.",
+      "important": true
+    },
+    {
+      "file": "corpus/train/train_0169_cwe22.c",
+      "lines": "103-104",
+      "code": "        /* Because path may already exists in repo (while update) */\n        lr_yum_repo_update(repo, record->type, path);",
+      "explanation": "The untrusted-derived path is not only written to but also stored into the LrYumRepo via lr_yum_repo_update, keyed by attacker-controlled record->type. If path escaped destdir (see the primary finding) the repo model now points subsequent operations (open/read/parse, and on the next update overwrite because the comment notes 'path may already exists') at an attacker-chosen location. record->type as the key also lets a hostile repo collide or shadow record types. The implementation must ensure path was already confined to destdir before this point and that record->type is from a known allow-list.",
+      "important": false
+    },
+    {
+      "file": "corpus/train/train_0169_cwe22.c",
+      "lines": "12-15",
+      "code": "    destdir = handle->destdir;\n    assert(destdir);\n    assert(strlen(destdir));\n    assert(!err || *err == NULL);",
+      "explanation": "SECURITY CHECK VIA assert() (CWE-617 / reliance on assert). The only guards that destdir is non-NULL and non-empty, and that err is clean, are assert() calls, which the C standard elides when NDEBUG is defined — the normal setting for release builds. In a release build, if handle->destdir is NULL the assert disappears and destdir (NULL) flows into the prepare_* helpers, risking a NULL-pointer dereference (CWE-476) or, worse, path construction from an empty/NULL base that turns relative location_href into a write relative to CWD. Preconditions on trusted-but-fallible config should be enforced with real runtime checks that set err and return FALSE, not asserts.",
+      "important": false
+    },
+    {
+      "file": "corpus/train/train_0169_cwe22.c",
+      "lines": "94-95",
+      "code": "            target->expectedsize = record->size_header;\n            target->zck_header_size = record->size_header;",
+      "explanation": "ATTACKER-CONTROLLED SIZE (latent, zchunk path). record->size_header is a wire-supplied integer copied unchecked into target->expectedsize and target->zck_header_size. Downstream the zchunk/transfer layer uses these to size allocations and bound header parsing. A hostile or absurd value (huge, zero, or negative if the field is signed) can drive over-allocation / DoS, a truncated-header mismatch, or feed an unchecked length into zck header parsing. The implementation must sanity-bound size_header against a maximum and against the actually downloaded byte count before trusting it.",
+      "important": false
+    },
+    {
+      "file": "corpus/train/train_0169_cwe22.c",
+      "lines": "39-42",
+      "code": "        assert(record);\n\n        if (!lr_yum_repomd_record_enabled(handle, record->type, repomd->records))\n            continue;",
+      "explanation": "record is dereferenced (record->type) immediately after only an assert(record) guard. If a malformed repomd list can yield a NULL element->data, the assert vanishes under NDEBUG and record->type dereferences NULL (CWE-476). Additionally record->type is attacker-controlled and is compared/used by lr_yum_repomd_record_enabled and later as the repo-update key; the implementation must treat it as untrusted (bounded, allow-listed) rather than a trusted enum string.",
+      "important": false
+    }
+  ],
+  "summary": "This is librepo's per-record metadata download planner. Its central, labeled risk is CWE-22 path traversal: the remote-controlled record->location_href / location_base (from repomd.xml) are used unsanitized to derive the local destination path under destdir, so a malicious mirror can write files outside destdir (arbitrary file overwrite, typically as root during sync). Secondary concerns are the use of assert() for preconditions (elided under NDEBUG) and unchecked attacker-controlled record->size_header feeding zchunk allocation/parsing.",
+  "reviewed_anchors": [
+    {"anchor": "prepare_repo_download_targets(handle, repo, repomd, mdtarget, targets, cbdata_list, err)", "disposition": "finding", "reason": "Entry point that consumes untrusted repomd records and produces local download targets; the traversal contract lives across its body."},
+    {"anchor": "destdir = handle->destdir (line 12)", "disposition": "finding", "reason": "Trusted base directory that must confine all derived paths; only assert-guarded here."},
+    {"anchor": "assert(destdir); assert(strlen(destdir)); assert(!err || *err == NULL) (lines 13-15)", "disposition": "finding", "reason": "Security-relevant preconditions enforced only by assert(), elided under NDEBUG (CWE-617)."},
+    {"anchor": "handle->cachedir / lr_yum_switch_to_zchunk / repo->use_zchunk (lines 17-23)", "disposition": "dismissed", "reason": "Local trusted config gating zchunk; no untrusted data crosses here."},
+    {"anchor": "for (GSList *elem = repomd->records; ...) (line 25)", "disposition": "dismissed", "reason": "Iteration over the record list; the risk is in the record fields, not the loop mechanics."},
+    {"anchor": "int fd; char *path; (lines 26-27)", "disposition": "dismissed", "reason": "Left uninitialized by contract; set by prepare_* only on success before use, and helpers return FALSE on failure."},
+    {"anchor": "LrYumRepoMdRecord *record = elem->data (line 29)", "disposition": "finding", "reason": "Attacker-controlled per-file metadata; NULL-element deref possible with only assert guard."},
+    {"anchor": "mdtarget->cbdata / mdtarget->endcb (lines 35-36)", "disposition": "dismissed", "reason": "Caller-provided callback plumbing; not attacker-controlled wire data."},
+    {"anchor": "assert(record) (line 39)", "disposition": "finding", "reason": "NULL check for an untrusted list element via assert only; folded with record->type deref risk."},
+    {"anchor": "lr_yum_repomd_record_enabled(handle, record->type, repomd->records) (line 41)", "disposition": "dismissed", "reason": "Enable filter on record->type; type is untrusted but its main hazard is captured under the repo-update/type finding."},
+    {"anchor": "location_href = record->location_href (line 44)", "disposition": "finding", "reason": "Untrusted relative path used to derive the local write path; primary CWE-22 anchor."},
+    {"anchor": "record->header_checksum / is_zchunk (lines 45-49)", "disposition": "dismissed", "reason": "Boolean gate for zchunk selection; presence of a checksum only chooses a code path, no length/buffer contract."},
+    {"anchor": "prepare_repo_download_zck_target(handle, record, &path, &fd, &checksums, targets, err) (line 54)", "disposition": "finding", "reason": "Sets local path/fd from the untrusted record; where zchunk traversal is resolved (implementation not provided)."},
+    {"anchor": "prepare_repo_download_std_target(handle, record, &path, &fd, &checksums, targets, err) (line 59)", "disposition": "finding", "reason": "Sets local path/fd from the untrusted record; where standard traversal is resolved (implementation not provided)."},
+    {"anchor": "cbdata_new(...) / *cbdata_list = g_slist_append (lines 65-70)", "disposition": "dismissed", "reason": "Callback context allocation and bookkeeping; no untrusted length or path contract."},
+    {"anchor": "lr_downloadtarget_new(handle, location_href, record->location_base, fd, ...) (lines 73-90)", "disposition": "finding", "reason": "Consumes untrusted location_href and location_base to build the download/write job; core of the traversal path."},
+    {"anchor": "target->expectedsize = record->size_header; target->zck_header_size = record->size_header (lines 94-95)", "disposition": "finding", "reason": "Attacker-controlled size copied unchecked into allocation/parse sizes."},
+    {"anchor": "mdtarget->repomd_records_to_download++ (line 100)", "disposition": "dismissed", "reason": "Local counter increment; bounded by list length, no security contract."},
+    {"anchor": "*targets = g_slist_append(*targets, target) (line 101)", "disposition": "dismissed", "reason": "List bookkeeping of the produced target; no untrusted-length hazard."},
+    {"anchor": "lr_yum_repo_update(repo, record->type, path) (line 104)", "disposition": "finding", "reason": "Stores the untrusted-derived path (keyed by untrusted type) into the repo model; second-stage use of a possibly-escaped path."},
+    {"anchor": "lr_free(path) (line 105)", "disposition": "dismissed", "reason": "Frees the per-iteration path; correct single-owner free, no double-free visible."}
+  ],
+  "findings": [
+    {
+      "title": "Path traversal via untrusted repomd location_href/location_base into local destination path",
+      "anchor": "char *location_href = record->location_href; ... lr_downloadtarget_new(handle, location_href, record->location_base, ...)",
+      "file": "corpus/train/train_0169_cwe22.c",
+      "line": "44,73-90",
+      "code": "        char *location_href = record->location_href;\n        target = lr_downloadtarget_new(handle,\n                                       location_href,\n                                       record->location_base,\n                                       fd,",
+      "bug_class": "Path traversal / arbitrary file write (relative path outside destination directory)",
+      "cwe": "CWE-22",
+      "severity": "critical",
+      "where_it_lives": "implementation (file not provided) — prepare_repo_download_std_target / prepare_repo_download_zck_target and lr_downloadtarget_new resolve destdir + location_href into the local path/fd",
+      "invariant": "The local destination path derived from destdir and the untrusted record->location_href / location_base must be canonicalized and confirmed to remain strictly inside handle->destdir: reject absolute paths, reject any '..' component, and resolve symlinks so the final write target cannot escape destdir.",
+      "failure_mode": "A malicious or compromised repository (or MITM without enforced TLS/GPG) sets location_href/location_base in repomd.xml to values like '../../../../etc/cron.d/evil' or an absolute path. Because these strings are used unsanitized to open fd and compute path, the downloaded content is written outside destdir. During a system repo sync this typically runs as root, yielding arbitrary file overwrite/creation and remote code execution.",
+      "cve_analog": "CVE-2020-14352",
+      "what_to_confirm": "In prepare_repo_download_std_target / prepare_repo_download_zck_target, verify how path is built from destdir and record->location_href / location_base, and confirm there is a canonicalization + destdir-containment check (rejecting '..' and absolute paths) before open() and before lr_yum_repo_update stores it."
+    },
+    {
+      "title": "Security-relevant preconditions enforced only by assert() (elided under NDEBUG)",
+      "anchor": "assert(destdir); assert(strlen(destdir)); assert(!err || *err == NULL);",
+      "file": "corpus/train/train_0169_cwe22.c",
+      "line": "13-15",
+      "code": "    destdir = handle->destdir;\n    assert(destdir);\n    assert(strlen(destdir));\n    assert(!err || *err == NULL);",
+      "bug_class": "Reliance on assert() for validation / NULL dereference in release build",
+      "cwe": "CWE-617",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0169_cwe22.c",
+      "invariant": "destdir non-NULL/non-empty and the err contract must be enforced with real runtime checks (set *err and return FALSE) that survive release compilation, not with assert() which is removed when NDEBUG is defined.",
+      "failure_mode": "In a release build (NDEBUG), if handle->destdir is NULL or empty the asserts vanish and destdir flows into the path-construction helpers, causing a NULL-pointer dereference (CWE-476) or path resolution from an empty base (turning a relative location_href into a CWD-relative write).",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm whether librepo is built with NDEBUG in production and whether callers ever reach this with a NULL/empty destdir; if so replace the asserts with explicit error returns."
+    },
+    {
+      "title": "Untrusted record->size_header copied unchecked into zchunk allocation/parse sizes",
+      "anchor": "target->expectedsize = record->size_header; target->zck_header_size = record->size_header;",
+      "file": "corpus/train/train_0169_cwe22.c",
+      "line": "94-95",
+      "code": "            target->expectedsize = record->size_header;\n            target->zck_header_size = record->size_header;",
+      "bug_class": "Missing validation of attacker-controlled size feeding allocation/parse",
+      "cwe": "CWE-20",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided) — zchunk/transfer layer consuming target->expectedsize and target->zck_header_size",
+      "invariant": "record->size_header must be range-checked (bounded against a sane maximum and against the actual number of bytes received) before it is used to allocate buffers or to bound zchunk header parsing.",
+      "failure_mode": "A hostile repomd.xml supplies an absurd size_header (very large, zero, or out-of-range). The zchunk layer may over-allocate (memory-exhaustion DoS), mis-bound its header parse, or trust a header size larger than the downloaded data, leading to out-of-bounds reads during zck header processing.",
+      "cve_analog": "",
+      "what_to_confirm": "Trace target->expectedsize / zck_header_size into the zchunk download and header-parsing code and confirm size_header is validated against the received byte count and a maximum before use."
+    },
+    {
+      "title": "NULL record element dereferenced under assert-only guard; untrusted record->type trusted as key",
+      "anchor": "assert(record); lr_yum_repomd_record_enabled(handle, record->type, ...); lr_yum_repo_update(repo, record->type, path)",
+      "file": "corpus/train/train_0169_cwe22.c",
+      "line": "39,41,104",
+      "code": "        assert(record);\n\n        if (!lr_yum_repomd_record_enabled(handle, record->type, repomd->records))\n            continue;",
+      "bug_class": "NULL-pointer dereference (assert-only) plus untrusted type string used as identity key",
+      "cwe": "CWE-476",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0169_cwe22.c",
+      "invariant": "Each records element must be verified non-NULL with a real check before record->type is dereferenced, and record->type must be validated against a known set before it is used to enable a record or key the repo update.",
+      "failure_mode": "If the repomd parser can produce a NULL list element, the NDEBUG-elided assert(record) lets record->type dereference NULL and crash. Separately, record->type is attacker-controlled and used both to gate downloads and as the lr_yum_repo_update key, so a crafted type can shadow/collide legitimate metadata entries.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the repomd parser guarantees non-NULL elements and non-NULL record->type, and that lr_yum_repomd_record_enabled / lr_yum_repo_update treat type as an untrusted, allow-listed string."
+    }
+  ],
+  "audit_checklist": [
+    "In prepare_repo_download_std_target and prepare_repo_download_zck_target, show exactly how the local path is built from destdir + record->location_href / location_base, and prove it is canonicalized and confined to destdir (reject '..', absolute paths, and symlink escapes) before open().",
+    "Confirm record->location_href and record->location_base are validated at parse time (repomd.xml) or here before use — not merely trusted.",
+    "Check whether librepo release builds define NDEBUG; if so, replace the assert() preconditions at lines 13-15 and 39 with runtime error returns.",
+    "Bound-check record->size_header before assigning target->expectedsize / target->zck_header_size, and re-verify against actual downloaded bytes in the zchunk parser.",
+    "Verify lr_yum_repo_update treats record->type as an untrusted allow-listed key and that storing the derived path cannot let a later update overwrite an out-of-destdir file.",
+    "Confirm fd is always opened under a destdir-confined path and is never opened before path containment is validated.",
+    "Map the traversal behavior against CVE-2020-14352 and confirm the corresponding containment fix is present in the deployed version."
+  ]
+}

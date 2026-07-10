@@ -1,0 +1,208 @@
+{
+  "subsystem": "SLURM (Simple Linux Utility for Resource Management) X11 forwarding support. x11_delete_xauth() tears down an X11 authorization (MIT-MAGIC-COOKIE) entry by shelling out to the external `xauth` binary with the arguments `xauth -v -f <xauthority> remove <host>/unix:<display>`. It runs during X11-forwarding cleanup for a job/step, building an argv vector and invoking the xauth utility to remove the per-session cookie from the user's Xauthority file.",
+  "provenance": "Identified from the SLURM internal utility API used throughout: xmalloc()/xfree() (abort-on-OOM allocators), xstrdup()/xstrdup_printf() (SLURM string helpers), xassert() (SLURM assertion), debug2() (SLURM logging macro), run_command()/free_command_argv() (SLURM src/common/run_command helpers), and the XAUTH_PATH constant. The symbol name x11_delete_xauth matches SLURM's src/common/x11_util.c. The sample header `primevul_c_validation_0182_fixed` marks this as the PrimeVul-dataset 'fixed' variant of the function.",
+  "trust_boundary": "x11_delete_xauth() is called during SLURM X11-forwarding teardown. Its three parameters — xauthority (path to the Xauthority file), host (a hostname string), and display (uint16_t X display number) — derive from the job/step X11-forwarding request, which is influenced by the submitting/remote user and is therefore not fully trusted. Those values flow into (a) an argv vector consumed by an external setuid-context command (xauth) and (b) format strings. The external process invocation of XAUTH_PATH and the Xauthority file it manipulates are the security-relevant sink; host/display/xauthority are the hostile-by-default inputs.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/eval/eval_0003_cwe362.c",
+      "lines": "2-6",
+      "code": "extern int x11_delete_xauth(char *xauthority, char *host, uint16_t display)\n{\n\tint i=0, status;\n\tchar *result;\n\tchar **xauth_argv;",
+      "explanation": "The function is declared `extern int` and takes three inputs: `xauthority`, a C string that is the filesystem path to the X11 Xauthority file; `host`, a hostname string; and `display`, a 16-bit unsigned X display number. It returns an int (the exit status of the spawned command). Three locals are declared: `i`, an argv write index initialized to 0; `status`, an int that is declared but NOT initialized here and is intended to receive the child's exit status via run_command; and two pointers, `result` (the captured stdout/stderr text of the child) and `xauth_argv` (the argv vector to be built). The uninitialized `status` is significant: whether it holds a defined value at the return depends entirely on run_command writing through &status."
+    },
+    {
+      "file": "corpus/eval/eval_0003_cwe362.c",
+      "lines": "8",
+      "code": "\txauth_argv = xmalloc(sizeof(char *) * 10);",
+      "explanation": "A fixed-size argv vector of 10 `char *` slots is allocated with SLURM's xmalloc. xmalloc aborts the process on allocation failure (so there is no NULL-deref risk on the allocation itself) and zero-fills the memory, so any slots not explicitly written remain NULL. The capacity 10 is a hard-coded magic number that must be kept in sync with the number of argv entries written below (currently 7 including the NULL terminator)."
+    },
+    {
+      "file": "corpus/eval/eval_0003_cwe362.c",
+      "lines": "9-13",
+      "code": "\txauth_argv[i++] = xstrdup(\"xauth\");\n\txauth_argv[i++] = xstrdup(\"-v\");\n\txauth_argv[i++] = xstrdup(\"-f\");\n\txauth_argv[i++] = xstrdup(xauthority);\n\txauth_argv[i++] = xstrdup(\"remove\");",
+      "explanation": "The first five argv slots are populated using post-increment indexing (`i++`), so after these lines i == 5. Slots 0-2 are the constant tokens \"xauth\", \"-v\" (verbose), and \"-f\" (specify authority file). Slot 3 is `xstrdup(xauthority)` — a heap copy of the caller-supplied Xauthority path, which will be the argument to `-f`. Slot 4 is the literal subcommand \"remove\". Each xstrdup allocates a new string owned by the argv vector; SLURM's xstrdup returns NULL when passed a NULL argument, which for a NULL element is harmless to the vector but means a NULL `xauthority` yields a NULL `-f` argument. Passing user-controlled data as discrete argv elements (rather than through a shell) avoids classic shell-metacharacter command injection."
+    },
+    {
+      "file": "corpus/eval/eval_0003_cwe362.c",
+      "lines": "14",
+      "code": "\txauth_argv[i++] = xstrdup_printf(\"%s/unix:%u\", host, display);",
+      "explanation": "Slot 5 is built by xstrdup_printf, which formats `\"%s/unix:%u\"` with `host` and `display`, producing a display specifier like `myhost/unix:10`. This is the target argument to the xauth `remove` subcommand. `host` is a caller-supplied string interpolated directly with `%s`; `display` is the uint16_t formatted as an unsigned integer. After this line i == 6."
+    },
+    {
+      "file": "corpus/eval/eval_0003_cwe362.c",
+      "lines": "15",
+      "code": "\txauth_argv[i++] = NULL;",
+      "explanation": "Slot 6 is set to NULL, the required argv terminator for execv-family calls. After this line i == 7. The NULL sentinel is what tells the exec machinery where the argument list ends."
+    },
+    {
+      "file": "corpus/eval/eval_0003_cwe362.c",
+      "lines": "16",
+      "code": "\txassert(i < 10);",
+      "explanation": "A SLURM assertion checks that i (now 7) is strictly less than the vector capacity 10. This is a post-hoc sanity check that the writes above did not exceed the allocated 10 slots. Note that it fires AFTER all writes have already happened, so it can only detect an overflow that already occurred, not prevent one; and it depends on xassert remaining active (SLURM's xassert aborts, but assertions in general can be compiled out)."
+    },
+    {
+      "file": "corpus/eval/eval_0003_cwe362.c",
+      "lines": "18-19",
+      "code": "\tresult = run_command(\"xauth\", XAUTH_PATH, xauth_argv, 10000, 0,\n\t\t\t     &status);",
+      "explanation": "run_command spawns the external xauth binary. The arguments are: a label \"xauth\" (for logging), XAUTH_PATH (the resolved filesystem path of the xauth executable to exec), the argv vector just built, 10000 (a timeout in milliseconds — 10 seconds), 0 (a flag/track-id argument), and &status (an out-parameter receiving the child's exit status). run_command returns a newly allocated string `result` containing the child's captured output (or NULL on some failure/timeout paths). The child process runs with the privileges of the SLURM daemon/step context, so the argv contents matter for security."
+    },
+    {
+      "file": "corpus/eval/eval_0003_cwe362.c",
+      "lines": "21",
+      "code": "\tfree_command_argv(xauth_argv);",
+      "explanation": "free_command_argv frees every string element of the argv vector and then the vector itself. This is the correct cleanup for a vector whose elements were all produced by xstrdup/xstrdup_printf. It is called unconditionally after run_command returns, which is correct because the vector is no longer needed once the child has been spawned and completed."
+    },
+    {
+      "file": "corpus/eval/eval_0003_cwe362.c",
+      "lines": "23-24",
+      "code": "\tdebug2(\"%s: result from xauth: %s\", __func__, result);\n\txfree(result);",
+      "explanation": "The captured child output is logged at debug level 2 via `%s`, then freed with xfree (which tolerates a NULL argument safely). The log line interpolates `result` with `%s`; if run_command returned NULL, this passes a NULL pointer to a `%s` conversion. The subsequent xfree(result) is safe on NULL."
+    },
+    {
+      "file": "corpus/eval/eval_0003_cwe362.c",
+      "lines": "26",
+      "code": "\treturn status;",
+      "explanation": "The function returns `status`, which is meant to be the exit status of the xauth child written by run_command through &status. Because `status` was never initialized (line 4), the correctness of this return value depends on run_command always writing a defined value into it on every path — including error/timeout paths."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/eval/eval_0003_cwe362.c",
+      "lines": "23",
+      "code": "\tdebug2(\"%s: result from xauth: %s\", __func__, result);",
+      "explanation": "run_command can return NULL (for example on spawn failure, timeout, or when no output is captured). Passing a NULL pointer to a `%s` conversion specifier is undefined behavior in C: while glibc happens to print \"(null)\", other libc implementations (and non-glibc targets) dereference the NULL and crash the daemon. There is no `if (result)` guard before the debug2 call, so a failed/empty xauth invocation can turn into a NULL-pointer dereference at the log site. The invariant the implementation must uphold is: either run_command guarantees a non-NULL result, or the code must null-check `result` before formatting it with `%s`. Impact is a denial of service (daemon crash) on the xauth-failure path."
+    },
+    {
+      "file": "corpus/eval/eval_0003_cwe362.c",
+      "lines": "4",
+      "code": "\tint i=0, status;",
+      "explanation": "`status` is declared without an initializer and is only ever assigned indirectly, if run_command writes through the &status out-parameter at line 18. If run_command returns early on an error path WITHOUT writing *status (e.g., it fails to fork/exec, or bails before the wait), then `return status;` at line 26 returns an indeterminate stack value. Callers that interpret the return as a pass/fail exit code may misread a garbage value as success (leaving a stale X11 cookie in place) or as an unexpected failure. The invariant is that run_command must set *status on every return path, or `status` must be initialized to a safe default (e.g. -1) at declaration. This is CWE-457 (use of uninitialized variable), latent in the run_command contract."
+    },
+    {
+      "file": "corpus/eval/eval_0003_cwe362.c",
+      "lines": "12-14",
+      "code": "\txauth_argv[i++] = xstrdup(xauthority);\n\txauth_argv[i++] = xstrdup(\"remove\");\n\txauth_argv[i++] = xstrdup_printf(\"%s/unix:%u\", host, display);",
+      "explanation": "`host` is interpolated with `%s` in xstrdup_printf at line 14. If a caller passes a NULL `host`, the underlying vsnprintf receives a NULL pointer for a `%s` conversion — undefined behavior and a potential crash, exactly as for the debug2 case. (SLURM's xstrdup(xauthority) at line 12 tolerates a NULL argument and simply yields a NULL element, so a NULL xauthority is less dangerous, but it silently produces a `-f` flag with no operand, changing the xauth command semantics.) The invariant is that `host` must be non-NULL before reaching this line; the function performs no such precondition check, so it inherits the caller's guarantees. CWE-476, latent and caller-dependent."
+    },
+    {
+      "file": "corpus/eval/eval_0003_cwe362.c",
+      "lines": "14",
+      "code": "\txauth_argv[i++] = xstrdup_printf(\"%s/unix:%u\", host, display);",
+      "explanation": "`host` is attacker-influenceable and is concatenated into the xauth `remove` operand as `<host>/unix:<display>`. Because arguments are passed as a discrete argv vector rather than through a shell, classic shell metacharacter injection is prevented — this is the safe design. However, argument-injection remains possible at the xauth-option level: if `host` begins with a leading dash (e.g. `-something`), the resulting token `-something/unix:0` may be parsed by xauth as an option rather than a display name, altering the intended `remove` behavior. The impact is bounded (xauth is not a shell and the token is a single argv element), but the implementation should validate/sanitize `host` (reject leading `-`, reject `/` and whitespace) so it cannot be reinterpreted as an option or a different display target. CWE-88 (argument delimiter injection), low severity."
+    },
+    {
+      "file": "corpus/eval/eval_0003_cwe362.c",
+      "lines": "8-16",
+      "code": "\txauth_argv = xmalloc(sizeof(char *) * 10);\n\txauth_argv[i++] = xstrdup(\"xauth\");\n\txauth_argv[i++] = xstrdup(\"-v\");\n\txauth_argv[i++] = xstrdup(\"-f\");\n\txauth_argv[i++] = xstrdup(xauthority);\n\txauth_argv[i++] = xstrdup(\"remove\");\n\txauth_argv[i++] = xstrdup_printf(\"%s/unix:%u\", host, display);\n\txauth_argv[i++] = NULL;\n\txassert(i < 10);",
+      "explanation": "The vector capacity 10 is a hard-coded magic number, and the bounds check `xassert(i < 10)` is performed AFTER all seven writes rather than before each write. Today only 7 slots are used, so no overflow occurs, but the pattern is fragile: if a future edit adds argv entries past index 9, the out-of-bounds heap writes happen at lines 9-15 BEFORE the assert at line 16 ever runs, and if xassert is compiled out (NDEBUG-style builds) the guard disappears entirely, yielding a heap out-of-bounds write (CWE-787). The invariant is that the number of writes must be provably < capacity by construction (or the capacity derived from the entry count), and any bound check must precede the write. Latent/info: not currently exploitable, but a defensive-coding weakness worth hardening."
+    },
+    {
+      "file": "corpus/eval/eval_0003_cwe362.c",
+      "lines": "18-19",
+      "code": "\tresult = run_command(\"xauth\", XAUTH_PATH, xauth_argv, 10000, 0,\n\t\t\t     &status);",
+      "explanation": "This is the external-command sink: it execs XAUTH_PATH to mutate the user's Xauthority file. Two contract concerns live in the implementation this call reaches. First, xauth operates on the file named by `xauthority`; if that path is attacker-controllable and points into a location the caller can race (create/rename/symlink between the time SLURM decides the path and the time xauth opens it), a time-of-check/time-of-use race (CWE-362/CWE-367) could redirect xauth's file operations — this snippet does not itself open the file, so safety depends entirely on how `xauthority` is derived and protected upstream. Second, XAUTH_PATH must be an absolute, trusted path (not resolved via PATH) so an attacker cannot substitute a malicious `xauth` binary. The invariant: XAUTH_PATH is a fixed trusted absolute path, and `xauthority` is a path the invoking user already controls exclusively (no privilege boundary crossed) so the exec cannot be leveraged to touch files outside the user's authority. What to confirm is upstream of this function."
+    }
+  ],
+  "summary": "This is the argv-based (shell-injection-safe) 'fixed' form of SLURM's x11_delete_xauth(), which execs `xauth ... remove <host>/unix:<display>` to drop an X11 cookie. No memory-corruption bug is present in the shown code (xmalloc aborts on OOM; only 7 of 10 argv slots are used; free paths are correct). The residual risks are latent and contract-dependent: a NULL run_command result reaching a `%s` (NULL deref), an uninitialized `status` returned if run_command fails to set it, NULL/attacker-shaped `host` reaching xstrdup_printf (NULL deref and dash-prefixed argument injection into xauth), a fragile check-after-write bounds pattern, and upstream TOCTOU/trusted-path assumptions around the Xauthority file and XAUTH_PATH. Overall risk is low-to-medium.",
+  "reviewed_anchors": [
+    {"anchor": "x11_delete_xauth(char *xauthority, char *host, uint16_t display) — signature", "disposition": "finding", "reason": "Untrusted-influenced host/xauthority/display flow into an external command and format strings; NULL/adversarial values are unguarded."},
+    {"anchor": "int i=0, status; (line 4) — uninitialized status", "disposition": "finding", "reason": "status is returned but only set indirectly by run_command; indeterminate value if not written on error paths (CWE-457)."},
+    {"anchor": "char *result; (line 5)", "disposition": "finding", "reason": "May be NULL from run_command and is passed to a %s conversion at line 23 before any null check."},
+    {"anchor": "char **xauth_argv; (line 6)", "disposition": "dismissed", "reason": "Plain owning pointer for the argv vector; allocation and freeing are correct and complete."},
+    {"anchor": "xmalloc(sizeof(char *) * 10) (line 8) — fixed 10-slot argv", "disposition": "finding", "reason": "Hard-coded capacity with a post-write bounds assert; safe today (7 used) but a fragile pattern (latent CWE-787)."},
+    {"anchor": "xstrdup(xauthority) (line 12)", "disposition": "dismissed", "reason": "SLURM xstrdup tolerates NULL; a NULL yields a NULL -f operand (semantic change) but no crash; path-trust concern captured under the run_command anchor."},
+    {"anchor": "xstrdup_printf(\"%s/unix:%u\", host, display) (line 14)", "disposition": "finding", "reason": "NULL host -> NULL %s deref (CWE-476); dash-prefixed host -> xauth argument injection (CWE-88)."},
+    {"anchor": "xauth_argv[i++] = NULL; (line 15) — argv terminator", "disposition": "dismissed", "reason": "Correct NULL sentinel required by execv-family; no security contract violated."},
+    {"anchor": "xassert(i < 10); (line 16)", "disposition": "finding", "reason": "Bounds check runs after the writes and can be compiled out; folded into the fixed-array finding as a check-after-write weakness."},
+    {"anchor": "run_command(\"xauth\", XAUTH_PATH, xauth_argv, 10000, 0, &status) (lines 18-19)", "disposition": "finding", "reason": "External-command sink; safety depends on XAUTH_PATH being a trusted absolute path and on the xauthority file not being race-able/attacker-redirectable (latent CWE-362/trusted-path)."},
+    {"anchor": "XAUTH_PATH constant (line 18)", "disposition": "finding", "reason": "Must be a fixed trusted absolute path; if PATH-resolved or writable, an attacker could substitute the xauth binary. Covered under the run_command finding."},
+    {"anchor": "free_command_argv(xauth_argv) (line 21)", "disposition": "dismissed", "reason": "Correct, unconditional cleanup of an all-xstrdup argv vector; no double-free or leak."},
+    {"anchor": "debug2(\"%s: result from xauth: %s\", __func__, result) (line 23)", "disposition": "finding", "reason": "Possibly-NULL result passed to %s -> undefined behavior / NULL deref (CWE-476)."},
+    {"anchor": "xfree(result) (line 24)", "disposition": "dismissed", "reason": "xfree tolerates NULL and correctly frees the single run_command allocation; no leak or double-free."},
+    {"anchor": "return status; (line 26)", "disposition": "finding", "reason": "Returns the possibly-uninitialized status; folded into the uninitialized-status finding."}
+  ],
+  "findings": [
+    {
+      "title": "Possibly-NULL run_command result passed to %s (NULL-pointer dereference)",
+      "anchor": "debug2(\"%s: result from xauth: %s\", __func__, result);",
+      "file": "corpus/eval/eval_0003_cwe362.c",
+      "line": "23",
+      "code": "\tdebug2(\"%s: result from xauth: %s\", __func__, result);",
+      "bug_class": "NULL-pointer dereference via %s on a possibly-NULL string",
+      "cwe": "CWE-476",
+      "severity": "medium",
+      "where_it_lives": "corpus/eval/eval_0003_cwe362.c (log site) with the contract in run_command implementation (file not provided)",
+      "invariant": "Either run_command must guarantee a non-NULL return, or result must be null-checked before being formatted with %s.",
+      "failure_mode": "When run_command fails, times out, or captures no output it can return NULL. debug2 formats result with %s with no preceding null check; a NULL %s argument is undefined behavior and dereferences NULL on non-glibc libc, crashing the SLURM daemon (denial of service) on the xauth-failure path.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether run_command can return NULL, and whether debug2/vsnprintf on the target libc dereferences a NULL %s argument rather than printing \"(null)\"."
+    },
+    {
+      "title": "Uninitialized status returned when run_command fails to set it",
+      "anchor": "int i=0, status;  ...  return status;",
+      "file": "corpus/eval/eval_0003_cwe362.c",
+      "line": "4",
+      "code": "\tint i=0, status;",
+      "bug_class": "Use of uninitialized variable as a return/exit code",
+      "cwe": "CWE-457",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0003_cwe362.c (declaration line 4, return line 26); depends on run_command implementation (file not provided)",
+      "invariant": "run_command must write *status on every return path, OR status must be initialized to a defined default (e.g. -1) at declaration.",
+      "failure_mode": "status is never initialized and is only set through &status at line 18. If run_command returns on an error path without writing *status, `return status;` at line 26 yields an indeterminate stack value; a caller interpreting the code as pass/fail may treat garbage as success and leave a stale X11 cookie, or misreport failure.",
+      "cve_analog": "",
+      "what_to_confirm": "Every run_command return path sets *status before returning; otherwise initialize status = -1 at line 4."
+    },
+    {
+      "title": "NULL host and dash-prefixed host reaching the xauth remove operand",
+      "anchor": "xauth_argv[i++] = xstrdup_printf(\"%s/unix:%u\", host, display);",
+      "file": "corpus/eval/eval_0003_cwe362.c",
+      "line": "14",
+      "code": "\txauth_argv[i++] = xstrdup_printf(\"%s/unix:%u\", host, display);",
+      "bug_class": "NULL-pointer dereference (%s on NULL) and argument-delimiter injection into xauth",
+      "cwe": "CWE-476",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0003_cwe362.c (line 14); precondition owned by caller (file not provided)",
+      "invariant": "host must be non-NULL and must not be interpretable as an xauth option (no leading '-', no embedded whitespace/'/').",
+      "failure_mode": "A NULL host makes xstrdup_printf format a NULL pointer with %s — undefined behavior / crash. A host beginning with '-' (e.g. '-foo') produces the token '-foo/unix:0', which xauth may parse as an option instead of a display name, subverting the intended `remove` and potentially acting on an unintended target. Argv passing prevents shell injection, but not option injection.",
+      "cve_analog": "",
+      "what_to_confirm": "That callers guarantee host is non-NULL and validated (reject leading '-', whitespace, and '/') before x11_delete_xauth is invoked."
+    },
+    {
+      "title": "External xauth exec relies on trusted XAUTH_PATH and non-race-able Xauthority file",
+      "anchor": "result = run_command(\"xauth\", XAUTH_PATH, xauth_argv, 10000, 0, &status);",
+      "file": "corpus/eval/eval_0003_cwe362.c",
+      "line": "18-19",
+      "code": "\tresult = run_command(\"xauth\", XAUTH_PATH, xauth_argv, 10000, 0,\n\t\t\t     &status);",
+      "bug_class": "Trusted-path / TOCTOU on external-command file target",
+      "cwe": "CWE-362",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0003_cwe362.c (line 18); path derivation and file protection in caller / run_command (file not provided)",
+      "invariant": "XAUTH_PATH is a fixed, trusted, absolute path (not PATH-resolved, not attacker-writable), and `xauthority` names a file the invoking user already exclusively controls with no window for symlink/rename substitution between selection and use.",
+      "failure_mode": "If XAUTH_PATH were resolved via PATH or lived in an attacker-writable directory, a malicious `xauth` binary could execute in the SLURM context. If the Xauthority path is attacker-redirectable (symlink/rename race), xauth's -f file operations could be steered to an unintended file (TOCTOU). This snippet does not open the file itself, so both depend on upstream guarantees — this is the class the CWE-362 label points at.",
+      "cve_analog": "",
+      "what_to_confirm": "XAUTH_PATH is compile-time absolute and trusted; and the xauthority path cannot be swapped between derivation and xauth's open (no privilege boundary crossed)."
+    },
+    {
+      "title": "Fixed 10-slot argv with post-write bounds assertion (fragile check-after-write)",
+      "anchor": "xmalloc(sizeof(char *) * 10) ... xassert(i < 10);",
+      "file": "corpus/eval/eval_0003_cwe362.c",
+      "line": "8",
+      "code": "\txauth_argv = xmalloc(sizeof(char *) * 10);",
+      "bug_class": "Heap out-of-bounds write (latent) — capacity magic number with check-after-write",
+      "cwe": "CWE-787",
+      "severity": "info",
+      "where_it_lives": "corpus/eval/eval_0003_cwe362.c (lines 8-16)",
+      "invariant": "The count of argv writes must be provably less than the allocated capacity by construction, and any bound check must precede each write; capacity should be derived from the entry count rather than a bare literal.",
+      "failure_mode": "Not exploitable as written (7 of 10 slots used). But the capacity 10 is a hard-coded literal and xassert(i < 10) runs only after all writes; a future edit adding entries past index 9 would perform the out-of-bounds heap writes at lines 9-15 before the assert fires, and if xassert is disabled the guard vanishes, giving a heap OOB write.",
+      "cve_analog": "",
+      "what_to_confirm": "That the argv slot count stays below capacity and that xassert is always compiled in; prefer sizing the allocation from the number of entries."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm run_command sets *status on ALL return paths (including spawn failure and timeout); otherwise initialize status to a safe default at line 4.",
+    "Confirm run_command's NULL-return behavior and add an `if (result)` guard before the debug2 %s at line 23 (or verify the target libc prints \"(null)\" safely).",
+    "Confirm callers guarantee host and xauthority are non-NULL and validate host (reject leading '-', whitespace, '/') so it cannot be reinterpreted as an xauth option or alternate display.",
+    "Confirm XAUTH_PATH is a compile-time absolute, trusted path and is not writable by unprivileged users, and that run_command does not fall back to PATH resolution.",
+    "Confirm the xauthority file path cannot be redirected via symlink/rename between derivation and xauth's open (TOCTOU), and that no privilege boundary is crossed by the exec.",
+    "Confirm the argv slot count remains strictly below the allocated capacity and that the bounds check cannot be optimized/compiled out (prefer sizing the allocation from the entry count)."
+  ]
+}

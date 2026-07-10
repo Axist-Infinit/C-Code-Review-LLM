@@ -1,0 +1,317 @@
+Files under review: corpus/train/train_0254_cwe189.c
+
+<<<BEGIN_UNTRUSTED_CODE>>>
+/* ===== FILE: corpus/train/train_0254_cwe189.c ===== */
+   1| /* sample: primevul_c_train_3257_vuln */
+   2| static void drive_machine(conn *c) {
+   3|     bool stop = false;
+   4|     int sfd, flags = 1;
+   5|     socklen_t addrlen;
+   6|     struct sockaddr_storage addr;
+   7|     int nreqs = settings.reqs_per_event;
+   8|     int res;
+   9|     const char *str;
+  10| 
+  11|     assert(c != NULL);
+  12| 
+  13|     while (!stop) {
+  14| 
+  15|         switch(c->state) {
+  16|         case conn_listening:
+  17|             addrlen = sizeof(addr);
+  18|             if ((sfd = accept(c->sfd, (struct sockaddr *)&addr, &addrlen)) == -1) {
+  19|                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
+  20|                     /* these are transient, so don't log anything */
+  21|                     stop = true;
+  22|                 } else if (errno == EMFILE) {
+  23|                     if (settings.verbose > 0)
+  24|                         fprintf(stderr, "Too many open connections\n");
+  25|                     accept_new_conns(false);
+  26|                     stop = true;
+  27|                 } else {
+  28|                     perror("accept()");
+  29|                     stop = true;
+  30|                 }
+  31|                 break;
+  32|             }
+  33|             if ((flags = fcntl(sfd, F_GETFL, 0)) < 0 ||
+  34|                 fcntl(sfd, F_SETFL, flags | O_NONBLOCK) < 0) {
+  35|                 perror("setting O_NONBLOCK");
+  36|                 close(sfd);
+  37|                 break;
+  38|             }
+  39| 
+  40|             if (settings.maxconns_fast &&
+  41|                 stats.curr_conns + stats.reserved_fds >= settings.maxconns - 1) {
+  42|                 str = "ERROR Too many open connections\r\n";
+  43|                 res = write(sfd, str, strlen(str));
+  44|                 close(sfd);
+  45|                 STATS_LOCK();
+  46|                 stats.rejected_conns++;
+  47|                 STATS_UNLOCK();
+  48|             } else {
+  49|                 dispatch_conn_new(sfd, conn_new_cmd, EV_READ | EV_PERSIST,
+  50|                                      DATA_BUFFER_SIZE, tcp_transport);
+  51|             }
+  52| 
+  53|             stop = true;
+  54|             break;
+  55| 
+  56|         case conn_waiting:
+  57|             if (!update_event(c, EV_READ | EV_PERSIST)) {
+  58|                 if (settings.verbose > 0)
+  59|                     fprintf(stderr, "Couldn't update event\n");
+  60|                 conn_set_state(c, conn_closing);
+  61|                 break;
+  62|             }
+  63| 
+  64|             conn_set_state(c, conn_read);
+  65|             stop = true;
+  66|             break;
+  67| 
+  68|         case conn_read:
+  69|             res = IS_UDP(c->transport) ? try_read_udp(c) : try_read_network(c);
+  70| 
+  71|             switch (res) {
+  72|             case READ_NO_DATA_RECEIVED:
+  73|                 conn_set_state(c, conn_waiting);
+  74|                 break;
+  75|             case READ_DATA_RECEIVED:
+  76|                 conn_set_state(c, conn_parse_cmd);
+  77|                 break;
+  78|             case READ_ERROR:
+  79|                 conn_set_state(c, conn_closing);
+  80|                 break;
+  81|             case READ_MEMORY_ERROR: /* Failed to allocate more memory */
+  82|                 /* State already set by try_read_network */
+  83|                 break;
+  84|             }
+  85|             break;
+  86| 
+  87|         case conn_parse_cmd :
+  88|             if (try_read_command(c) == 0) {
+  89|                 /* wee need more data! */
+  90|                 conn_set_state(c, conn_waiting);
+  91|             }
+  92| 
+  93|             break;
+  94| 
+  95|         case conn_new_cmd:
+  96|             /* Only process nreqs at a time to avoid starving other
+  97|                connections */
+  98| 
+  99|             --nreqs;
+ 100|             if (nreqs >= 0) {
+ 101|                 reset_cmd_handler(c);
+ 102|             } else {
+ 103|                 pthread_mutex_lock(&c->thread->stats.mutex);
+ 104|                 c->thread->stats.conn_yields++;
+ 105|                 pthread_mutex_unlock(&c->thread->stats.mutex);
+ 106|                 if (c->rbytes > 0) {
+ 107|                     /* We have already read in data into the input buffer,
+ 108|                        so libevent will most likely not signal read events
+ 109|                        on the socket (unless more data is available. As a
+ 110|                        hack we should just put in a request to write data,
+ 111|                        because that should be possible ;-)
+ 112|                     */
+ 113|                     if (!update_event(c, EV_WRITE | EV_PERSIST)) {
+ 114|                         if (settings.verbose > 0)
+ 115|                             fprintf(stderr, "Couldn't update event\n");
+ 116|                         conn_set_state(c, conn_closing);
+ 117|                         break;
+ 118|                     }
+ 119|                 }
+ 120|                 stop = true;
+ 121|             }
+ 122|             break;
+ 123| 
+ 124|         case conn_nread:
+ 125|             if (c->rlbytes == 0) {
+ 126|                 complete_nread(c);
+ 127|                 break;
+ 128|             }
+ 129|             /* first check if we have leftovers in the conn_read buffer */
+ 130|             if (c->rbytes > 0) {
+ 131|                 int tocopy = c->rbytes > c->rlbytes ? c->rlbytes : c->rbytes;
+ 132|                 if (c->ritem != c->rcurr) {
+ 133|                     memmove(c->ritem, c->rcurr, tocopy);
+ 134|                 }
+ 135|                 c->ritem += tocopy;
+ 136|                 c->rlbytes -= tocopy;
+ 137|                 c->rcurr += tocopy;
+ 138|                 c->rbytes -= tocopy;
+ 139|                 if (c->rlbytes == 0) {
+ 140|                     break;
+ 141|                 }
+ 142|             }
+ 143| 
+ 144|             /*  now try reading from the socket */
+ 145|             res = read(c->sfd, c->ritem, c->rlbytes);
+ 146|             if (res > 0) {
+ 147|                 pthread_mutex_lock(&c->thread->stats.mutex);
+ 148|                 c->thread->stats.bytes_read += res;
+ 149|                 pthread_mutex_unlock(&c->thread->stats.mutex);
+ 150|                 if (c->rcurr == c->ritem) {
+ 151|                     c->rcurr += res;
+ 152|                 }
+ 153|                 c->ritem += res;
+ 154|                 c->rlbytes -= res;
+ 155|                 break;
+ 156|             }
+ 157|             if (res == 0) { /* end of stream */
+ 158|                 conn_set_state(c, conn_closing);
+ 159|                 break;
+ 160|             }
+ 161|             if (res == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+ 162|                 if (!update_event(c, EV_READ | EV_PERSIST)) {
+ 163|                     if (settings.verbose > 0)
+ 164|                         fprintf(stderr, "Couldn't update event\n");
+ 165|                     conn_set_state(c, conn_closing);
+ 166|                     break;
+ 167|                 }
+ 168|                 stop = true;
+ 169|                 break;
+ 170|             }
+ 171|             /* otherwise we have a real error, on which we close the connection */
+ 172|             if (settings.verbose > 0) {
+ 173|                 fprintf(stderr, "Failed to read, and not due to blocking:\n"
+ 174|                         "errno: %d %s \n"
+ 175|                         "rcurr=%lx ritem=%lx rbuf=%lx rlbytes=%d rsize=%d\n",
+ 176|                         errno, strerror(errno),
+ 177|                         (long)c->rcurr, (long)c->ritem, (long)c->rbuf,
+ 178|                         (int)c->rlbytes, (int)c->rsize);
+ 179|             }
+ 180|             conn_set_state(c, conn_closing);
+ 181|             break;
+ 182| 
+ 183|         case conn_swallow:
+ 184|             /* we are reading sbytes and throwing them away */
+ 185|             if (c->sbytes == 0) {
+ 186|                 conn_set_state(c, conn_new_cmd);
+ 187|                 break;
+ 188|             }
+ 189| 
+ 190|             /* first check if we have leftovers in the conn_read buffer */
+ 191|             if (c->rbytes > 0) {
+ 192|                 int tocopy = c->rbytes > c->sbytes ? c->sbytes : c->rbytes;
+ 193|                 c->sbytes -= tocopy;
+ 194|                 c->rcurr += tocopy;
+ 195|                 c->rbytes -= tocopy;
+ 196|                 break;
+ 197|             }
+ 198| 
+ 199|             /*  now try reading from the socket */
+ 200|             res = read(c->sfd, c->rbuf, c->rsize > c->sbytes ? c->sbytes : c->rsize);
+ 201|             if (res > 0) {
+ 202|                 pthread_mutex_lock(&c->thread->stats.mutex);
+ 203|                 c->thread->stats.bytes_read += res;
+ 204|                 pthread_mutex_unlock(&c->thread->stats.mutex);
+ 205|                 c->sbytes -= res;
+ 206|                 break;
+ 207|             }
+ 208|             if (res == 0) { /* end of stream */
+ 209|                 conn_set_state(c, conn_closing);
+ 210|                 break;
+ 211|             }
+ 212|             if (res == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+ 213|                 if (!update_event(c, EV_READ | EV_PERSIST)) {
+ 214|                     if (settings.verbose > 0)
+ 215|                         fprintf(stderr, "Couldn't update event\n");
+ 216|                     conn_set_state(c, conn_closing);
+ 217|                     break;
+ 218|                 }
+ 219|                 stop = true;
+ 220|                 break;
+ 221|             }
+ 222|             /* otherwise we have a real error, on which we close the connection */
+ 223|             if (settings.verbose > 0)
+ 224|                 fprintf(stderr, "Failed to read, and not due to blocking\n");
+ 225|             conn_set_state(c, conn_closing);
+ 226|             break;
+ 227| 
+ 228|         case conn_write:
+ 229|             /*
+ 230|              * We want to write out a simple response. If we haven't already,
+ 231|              * assemble it into a msgbuf list (this will be a single-entry
+ 232|              * list for TCP or a two-entry list for UDP).
+ 233|              */
+ 234|             if (c->iovused == 0 || (IS_UDP(c->transport) && c->iovused == 1)) {
+ 235|                 if (add_iov(c, c->wcurr, c->wbytes) != 0) {
+ 236|                     if (settings.verbose > 0)
+ 237|                         fprintf(stderr, "Couldn't build response\n");
+ 238|                     conn_set_state(c, conn_closing);
+ 239|                     break;
+ 240|                 }
+ 241|             }
+ 242| 
+ 243|             /* fall through... */
+ 244| 
+ 245|         case conn_mwrite:
+ 246|           if (IS_UDP(c->transport) && c->msgcurr == 0 && build_udp_headers(c) != 0) {
+ 247|             if (settings.verbose > 0)
+ 248|               fprintf(stderr, "Failed to build UDP headers\n");
+ 249|             conn_set_state(c, conn_closing);
+ 250|             break;
+ 251|           }
+ 252|             switch (transmit(c)) {
+ 253|             case TRANSMIT_COMPLETE:
+ 254|                 if (c->state == conn_mwrite) {
+ 255|                     while (c->ileft > 0) {
+ 256|                         item *it = *(c->icurr);
+ 257|                         assert((it->it_flags & ITEM_SLABBED) == 0);
+ 258|                         item_remove(it);
+ 259|                         c->icurr++;
+ 260|                         c->ileft--;
+ 261|                     }
+ 262|                     while (c->suffixleft > 0) {
+ 263|                         char *suffix = *(c->suffixcurr);
+ 264|                         cache_free(c->thread->suffix_cache, suffix);
+ 265|                         c->suffixcurr++;
+ 266|                         c->suffixleft--;
+ 267|                     }
+ 268|                     /* XXX:  I don't know why this wasn't the general case */
+ 269|                     if(c->protocol == binary_prot) {
+ 270|                         conn_set_state(c, c->write_and_go);
+ 271|                     } else {
+ 272|                         conn_set_state(c, conn_new_cmd);
+ 273|                     }
+ 274|                 } else if (c->state == conn_write) {
+ 275|                     if (c->write_and_free) {
+ 276|                         free(c->write_and_free);
+ 277|                         c->write_and_free = 0;
+ 278|                     }
+ 279|                     conn_set_state(c, c->write_and_go);
+ 280|                 } else {
+ 281|                     if (settings.verbose > 0)
+ 282|                         fprintf(stderr, "Unexpected state %d\n", c->state);
+ 283|                     conn_set_state(c, conn_closing);
+ 284|                 }
+ 285|                 break;
+ 286| 
+ 287|             case TRANSMIT_INCOMPLETE:
+ 288|             case TRANSMIT_HARD_ERROR:
+ 289|                 break;                   /* Continue in state machine. */
+ 290| 
+ 291|             case TRANSMIT_SOFT_ERROR:
+ 292|                 stop = true;
+ 293|                 break;
+ 294|             }
+ 295|             break;
+ 296| 
+ 297|         case conn_closing:
+ 298|             if (IS_UDP(c->transport))
+ 299|                 conn_cleanup(c);
+ 300|             else
+ 301|                 conn_close(c);
+ 302|             stop = true;
+ 303|             break;
+ 304| 
+ 305|         case conn_max_state:
+ 306|             assert(false);
+ 307|             break;
+ 308|         }
+ 309|     }
+ 310| 
+ 311|     return;
+ 312| }
+<<<END_UNTRUSTED_CODE>>>

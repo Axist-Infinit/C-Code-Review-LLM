@@ -1,0 +1,195 @@
+{
+  "subsystem": "nanopb (a small ANSI-C Protocol Buffers decoder for embedded systems). This is the internal helper pb_release_union_field, called from the field-decoding path when a `oneof`/union message member is decoded. Its job is to free any previously-decoded member of a protobuf `oneof` group before the newly-arriving member is written into the shared union storage.",
+  "provenance": "Identified by the nanopb-specific type and macro vocabulary: pb_istream_t, pb_field_iter_t, pb_size_t, the field-iterator API (pb_field_iter_find), the private helper pb_release_single_field, and the PB_RETURN_ERROR macro are all part of nanopb's pb_decode.c/pb.h. The comments `Previous which_ value` / `New which_ value` reference protobuf's generated `which_<oneof>` discriminator field. The corpus filename tag `cwe763` (Release of Invalid Pointer or Reference) and the `primevul_c_validation_0071_vuln` sample header confirm the intended bug family.",
+  "trust_boundary": "The decoder consumes a wire-format protobuf message off pb_istream_t (network / IPC / file — untrusted). An attacker fully controls the sequence and tags of fields on the wire, including sending two DIFFERENT members of the same `oneof` back-to-back, or a member whose tag differs from a which_ value already present in a caller-supplied (partially-initialized or reused) message struct. The `which_` discriminator read via `field->pSize` and the union's pointer storage are therefore attacker-reachable state; whether the old union member is freed, and whether the stale pointer is left behind, is driven by attacker input.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0270_cwe763.c",
+      "lines": "2-3",
+      "code": "static bool pb_release_union_field(pb_istream_t *stream, pb_field_iter_t *field)\n{",
+      "explanation": "Declares a file-local helper returning bool (true = success, false = error signalled through the stream). It takes the decode stream `stream` (used only to record an error message here) and a field iterator `field` positioned at the NEW `oneof` member that is about to be decoded. In nanopb a `oneof` is represented in the generated struct as a union plus a `which_<name>` discriminator; `field` describes the incoming member (its tag, its atype/htype, and pointers into the live message struct). The function's contract is: if the union already holds a different member, free that old member's owned memory before the caller overwrites the shared union storage with the new member."
+    },
+    {
+      "file": "corpus/train/train_0270_cwe763.c",
+      "lines": "4",
+      "code": "    pb_field_iter_t old_field = *field;",
+      "explanation": "Makes a shallow, by-value copy of the iterator so it can be repositioned to the OLD member without disturbing the caller's iterator that still points at the new member. Critically this is a struct copy: `old_field` and `field` now hold the SAME pointer values (pField, pSize, pData) into the one live message struct. Any free performed through `old_field` frees memory that `field` (and the union storage) still references — the copy duplicates pointers, not the pointed-to objects."
+    },
+    {
+      "file": "corpus/train/train_0270_cwe763.c",
+      "lines": "5-6",
+      "code": "    pb_size_t old_tag = *(pb_size_t*)field->pSize; /* Previous which_ value */\n    pb_size_t new_tag = field->tag; /* New which_ value */",
+      "explanation": "`field->pSize` is a void pointer to the union's `which_<oneof>` discriminator inside the live message struct; it is cast to `pb_size_t*` and dereferenced to read the tag of whatever member currently occupies the union (`old_tag`). `pb_size_t` is nanopb's configurable unsigned discriminator/size type (uint16_t by default, optionally uint8_t or uint32_t). `new_tag` is the field number of the member now being decoded, taken directly from the iterator. These two tags drive every branch below: they decide whether an old member exists, whether it is the same type, and which descriptor to look up for freeing."
+    },
+    {
+      "file": "corpus/train/train_0270_cwe763.c",
+      "lines": "8-9",
+      "code": "    if (old_tag == 0)\n        return true; /* Ok, no old data in union */",
+      "explanation": "A which_ value of 0 is nanopb's sentinel for 'union is empty / no member set yet'. In that case there is nothing to release, so the function returns success immediately and the caller proceeds to decode the new member into fresh storage. This is the common first-occurrence path."
+    },
+    {
+      "file": "corpus/train/train_0270_cwe763.c",
+      "lines": "11-12",
+      "code": "    if (old_tag == new_tag)\n        return true; /* Ok, old data is of same type => merge */",
+      "explanation": "If the incoming member has the same tag as the member already present, nanopb treats a repeated appearance as a MERGE into the existing object (e.g. sub-message fields accumulate, scalars overwrite). The existing storage is deliberately kept — freeing it would discard already-decoded data — so the function returns success without releasing anything."
+    },
+    {
+      "file": "corpus/train/train_0270_cwe763.c",
+      "lines": "14-17",
+      "code": "    /* Release old data. The find can fail if the message struct contains\n     * invalid data. */\n    if (!pb_field_iter_find(&old_field, old_tag))\n        PB_RETURN_ERROR(stream, \"invalid union tag\");",
+      "explanation": "Reaching here means a DIFFERENT member currently occupies the union, so it must be freed before being overwritten. `pb_field_iter_find` repositions the local `old_field` iterator to the descriptor for `old_tag`, so that pField/pSize/pData describe the OLD member's type and storage rather than the new member's. If `old_tag` does not correspond to any known field in this message (a corrupt or attacker-tampered which_ value), the find fails and the function bails out via PB_RETURN_ERROR, which stashes the message on the stream and returns false. Note that on this early-error path NO free has happened yet."
+    },
+    {
+      "file": "corpus/train/train_0270_cwe763.c",
+      "lines": "19",
+      "code": "    pb_release_single_field(&old_field);",
+      "explanation": "With `old_field` now pointing at the old member's descriptor and storage, this frees the memory owned by that member — for PB_ATYPE_POINTER fields it calls free() on the heap block referenced by the union pointer (and recurses into sub-messages/arrays as needed). Because `old_field` is only a local copy, this frees the pointed-to memory but does NOT write back to the live message: the union's pointer word (which `field->pField` also addresses) and the which_ discriminator (`field->pSize`) are left holding their old values."
+    },
+    {
+      "file": "corpus/train/train_0270_cwe763.c",
+      "lines": "21",
+      "code": "    return true;",
+      "explanation": "Returns success so the caller can set which_ to `new_tag` and decode the new member into the union. Notably the function returns WITHOUT re-initializing the union's now-dangling pointer storage to NULL. The upstream/fixed nanopb adds, before this return, a guard for PB_ATYPE_POINTER fields that sets `*(void**)field->pField = NULL` so the shared union pointer starts clean for the incoming member; that reset is absent here."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0270_cwe763.c",
+      "lines": "19-21",
+      "code": "    pb_release_single_field(&old_field);\n\n    return true;",
+      "explanation": "PRIMARY DEFECT (CWE-763 / invalid or double free). pb_release_single_field frees the heap block that the old union member owned, but because it operates on the local `old_field` copy the live union pointer word — the same storage that `field->pField` addresses and that the NEXT member will share — is left pointing at the just-freed block. The function then returns success without setting that union pointer to NULL. If the new `oneof` member is itself a pointer/allocated type (PB_ATYPE_POINTER) and its decode subsequently FAILS or short-circuits before it allocates and overwrites the union pointer, the discriminator has been advanced to `new_tag` while the union word still holds the dangling old address. When the caller then tears the message down via pb_release, the field iterator for `new_tag` reads that stale pointer and calls free() on already-freed memory — a double free / release of an invalid pointer. An attacker triggers this deterministically by sending two different members of the same `oneof` in one message (first allocates member A, second with a different tag drives this release path) and arranging the second member's payload to fail mid-decode. Impact ranges from heap-metadata corruption to potential remote code execution on the embedded target. The invariant the implementation MUST uphold: after freeing the old union member, the shared union pointer must be reset to NULL so a failed or partial decode of the new member cannot leave a freeable dangling pointer under the updated discriminator."
+    },
+    {
+      "file": "corpus/train/train_0270_cwe763.c",
+      "lines": "4",
+      "code": "    pb_field_iter_t old_field = *field;",
+      "explanation": "The shallow by-value copy is the structural root of the primary defect: it duplicates the pointers pField/pSize/pData rather than the objects, so freeing through `old_field` mutates the heap while leaving the aliasing live iterator/union stale. Any correct fix has to write back through the live `field` (NULL the union pointer, and/or clear which_) — operating only on the copy guarantees the live state and the freed heap fall out of sync. This is not a separate bug so much as the reason the missing NULL-reset at line 21 is dangerous."
+    },
+    {
+      "file": "corpus/train/train_0270_cwe763.c",
+      "lines": "16-17",
+      "code": "    if (!pb_field_iter_find(&old_field, old_tag))\n        PB_RETURN_ERROR(stream, \"invalid union tag\");",
+      "explanation": "Memory-leak / lost-ownership path (CWE-401). When `old_tag` names no valid field the function errors out before calling pb_release_single_field, so the old member's allocated block is never freed here. Because the which_ value is itself invalid, the caller's subsequent whole-message pb_release will also fail to locate the field and will likewise skip the free, orphaning the allocation for the lifetime of the (possibly long-lived, attacker-influenced) message struct. On a memory-constrained embedded target repeated invalid-tag messages can exhaust the heap. The invariant: an old union member with allocated storage must have exactly one owner responsible for freeing it on every exit path, including the invalid-tag error path."
+    },
+    {
+      "file": "corpus/train/train_0270_cwe763.c",
+      "lines": "5",
+      "code": "    pb_size_t old_tag = *(pb_size_t*)field->pSize; /* Previous which_ value */",
+      "explanation": "Type/width and validity assumptions on the discriminator. The code blindly dereferences `field->pSize` as a `pb_size_t*`; correctness depends on the generated struct's which_ field having exactly the pb_size_t width nanopb was compiled with and on pSize being non-NULL for oneof fields. If a caller reuses a message struct without zero-initializing it, `old_tag` is indeterminate: a garbage non-zero value that happens to match a real field tag would route execution into pb_release_single_field and free memory that was never allocated by nanopb (invalid free), while a garbage value matching no tag takes the leak path above. The invariant: message structs handed to the decoder must be zero-initialized (which_ == 0) so that an empty union is never mistaken for a populated one."
+    }
+  ],
+  "summary": "This nanopb oneof-cleanup helper frees the previously-decoded union member through a by-value iterator copy but never resets the live union's pointer storage to NULL before returning, and it operates on a shallow copy so the live state and the heap fall out of sync. A crafted message that switches oneof members and then fails to fully decode the new one leaves a dangling pointer under an advanced which_ discriminator, yielding a double/invalid free on teardown (CWE-763) — the classic nanopb oneof cleanup vulnerability. A secondary lost-free on the invalid-tag error path (CWE-401) and reliance on zero-initialized message structs round out the risk.",
+  "reviewed_anchors": [
+    {
+      "anchor": "pb_release_union_field(pb_istream_t *stream, pb_field_iter_t *field) — signature (line 2)",
+      "disposition": "finding",
+      "reason": "Entry point of the oneof cleanup contract; its post-condition (leave union pointer safe) is violated — see primary finding."
+    },
+    {
+      "anchor": "pb_field_iter_t old_field = *field; (line 4)",
+      "disposition": "finding",
+      "reason": "Shallow copy duplicates pointers; freeing via the copy leaves the aliasing live union/iterator stale — structural cause of the invalid free."
+    },
+    {
+      "anchor": "old_tag = *(pb_size_t*)field->pSize; (line 5)",
+      "disposition": "finding",
+      "reason": "Unchecked read/dereference of the which_ discriminator; drives the free decision and is unsafe on a non-zero-initialized message struct."
+    },
+    {
+      "anchor": "new_tag = field->tag; (line 6)",
+      "disposition": "dismissed",
+      "reason": "Plain read of the incoming field's tag from the iterator; no memory contract of its own."
+    },
+    {
+      "anchor": "if (old_tag == 0) return true; (lines 8-9)",
+      "disposition": "dismissed",
+      "reason": "Correct empty-union early return; carries no unsafe operation."
+    },
+    {
+      "anchor": "if (old_tag == new_tag) return true; (lines 11-12)",
+      "disposition": "dismissed",
+      "reason": "Correct same-type merge short-circuit; deliberately keeps existing storage, safe."
+    },
+    {
+      "anchor": "if (!pb_field_iter_find(&old_field, old_tag)) PB_RETURN_ERROR(...) (lines 16-17)",
+      "disposition": "finding",
+      "reason": "Invalid-tag error path returns before freeing the old member, orphaning its allocation (memory leak / lost ownership)."
+    },
+    {
+      "anchor": "pb_release_single_field(&old_field); (line 19)",
+      "disposition": "finding",
+      "reason": "Frees the old member through the local copy but does not clear the live union pointer — core of the double/invalid free."
+    },
+    {
+      "anchor": "return true; without resetting *(void**)field->pField (line 21)",
+      "disposition": "finding",
+      "reason": "Missing NULL-reset of the union pointer after release leaves a freeable dangling pointer under the new discriminator."
+    },
+    {
+      "anchor": "pb_size_t typedef (discriminator/size scalar)",
+      "disposition": "dismissed",
+      "reason": "Configurable unsigned scalar type; not a buffer. Its width matters only via the pSize cast, covered by the line-5 finding."
+    },
+    {
+      "anchor": "PB_RETURN_ERROR(stream, \"invalid union tag\") macro (line 17)",
+      "disposition": "dismissed",
+      "reason": "Standard nanopb error macro that records a message and returns false; no attacker-controlled dereference in this use."
+    }
+  ],
+  "findings": [
+    {
+      "title": "Dangling union pointer after oneof member release (invalid / double free)",
+      "anchor": "pb_release_single_field(&old_field); ... return true; (no reset of *(void**)field->pField)",
+      "file": "corpus/train/train_0270_cwe763.c",
+      "line": "19-21",
+      "code": "    pb_release_single_field(&old_field);\n\n    return true;",
+      "bug_class": "Release of invalid pointer / double free (dangling pointer left in oneof union after free)",
+      "cwe": "CWE-763",
+      "severity": "high",
+      "where_it_lives": "implementation (file not provided) — pb_release_single_field and the decode_field oneof caller in nanopb pb_decode.c",
+      "invariant": "After freeing the previously-set oneof member, the shared union pointer storage (field->pField) must be reset to NULL (for PB_ATYPE_POINTER fields) before the discriminator is advanced to the new member, so that a failed or partial decode of the new member cannot leave a freeable dangling pointer under the updated which_ value.",
+      "failure_mode": "An attacker sends two different members of the same oneof in one message: member A (a pointer/allocated type) is decoded and allocated; member B with a different tag drives this release path, freeing A's block but leaving the union pointer word pointing at freed memory and returning success. The caller sets which_ = B and decodes B; if B's payload is crafted to fail before it allocates/overwrites the union pointer, the message now has which_ = B with the union pointer still holding A's freed address. On teardown via pb_release, the iterator for B reads that stale pointer and calls free() on already-freed memory — a double/invalid free, enabling heap corruption and potentially remote code execution on embedded targets.",
+      "cve_analog": "CVE-2020-26243",
+      "what_to_confirm": "Confirm in pb_decode.c that after pb_release_union_field returns, the code resets the union pointer to NULL for POINTER-atype oneof members before decoding the new member, and that a decode failure of the new member cannot leave a non-NULL freeable pointer that pb_release will later free."
+    },
+    {
+      "title": "Old union member leaked on invalid-tag error path",
+      "anchor": "if (!pb_field_iter_find(&old_field, old_tag)) PB_RETURN_ERROR(stream, \"invalid union tag\");",
+      "file": "corpus/train/train_0270_cwe763.c",
+      "line": "16-17",
+      "code": "    if (!pb_field_iter_find(&old_field, old_tag))\n        PB_RETURN_ERROR(stream, \"invalid union tag\");",
+      "bug_class": "Memory leak / lost ownership on error path",
+      "cwe": "CWE-401",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided) — nanopb pb_decode.c cleanup path",
+      "invariant": "An old union member holding allocated storage must be freed on every exit path; a which_ value that cannot be resolved to a field must not silently strand its allocation.",
+      "failure_mode": "If the which_ discriminator holds a value that names no valid field (corrupt or attacker-tampered message state), the function returns an error before calling pb_release_single_field, so the old member's heap block is never freed. Because the whole-message pb_release will likewise fail to resolve the invalid tag, the allocation is orphaned for the message's lifetime; repeated such messages can exhaust the heap on a constrained device (denial of service).",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm whether an invalid old_tag is reachable with a live allocation present, and whether any path frees that allocation, or whether zero-init/validation upstream makes an invalid non-zero which_ with allocated storage unreachable."
+    },
+    {
+      "title": "Unchecked discriminator read assumes zero-initialized message struct",
+      "anchor": "pb_size_t old_tag = *(pb_size_t*)field->pSize;",
+      "file": "corpus/train/train_0270_cwe763.c",
+      "line": "5",
+      "code": "    pb_size_t old_tag = *(pb_size_t*)field->pSize; /* Previous which_ value */",
+      "bug_class": "Use of uninitialized/attacker-influenced discriminator driving free decision",
+      "cwe": "CWE-457",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided) — caller-supplied message struct + nanopb decode setup",
+      "invariant": "field->pSize must be non-NULL for oneof fields and the which_ storage must be zero-initialized before decode, so an empty union is never read as a populated one and old_tag reflects a real prior member.",
+      "failure_mode": "If a message struct is reused or stack-allocated without zeroing, old_tag is indeterminate. A garbage value that happens to match a real field tag routes into pb_release_single_field and frees memory nanopb never allocated for that member (invalid free); a garbage value matching no tag takes the leak/error path. The width of the read also silently depends on the pb_size_t configuration matching the generated struct.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm callers always zero-initialize message structs (PB_INIT/{} ) before decoding and that pb_size_t width matches the generated which_ field type."
+    }
+  ],
+  "audit_checklist": [
+    "Verify the caller in pb_decode.c resets the oneof union pointer to NULL (for PB_ATYPE_POINTER fields) after pb_release_union_field returns and before decoding the new member.",
+    "Confirm that a decode failure of the new oneof member after the old one was released cannot leave a non-NULL, already-freed pointer under the advanced which_ discriminator (no double free in pb_release).",
+    "Check every exit path frees the old union member's allocation or provably has none — especially the invalid-tag PB_RETURN_ERROR path (line 16-17).",
+    "Confirm pb_release_single_field frees through storage that is subsequently invalidated in the live struct, not just in the local old_field copy.",
+    "Ensure message structs are zero-initialized before decode so which_ (read via field->pSize at line 5) is never an indeterminate/garbage tag.",
+    "Validate that pb_size_t width used to cast field->pSize matches the generated which_ field type across build configurations.",
+    "Add a regression test: message containing two different pointer-type members of the same oneof, with the second crafted to fail mid-decode, run under ASan to catch the double/invalid free."
+  ]
+}

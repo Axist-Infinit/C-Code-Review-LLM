@@ -1,0 +1,190 @@
+{
+  "subsystem": "HTTP/RFC-822-style message-header parser. This is one state handler, Messageheader::Parser::state_fieldbody_crlf(char ch), of a byte-at-a-time state machine that consumes a header field body and the CRLF that follows it, deciding between end-of-header, header folding (a continuation line), and the start of the next field name. It accumulates the parsed bytes into a raw header buffer through a moving write cursor (headerdataPtr) and reports each completed name/value pair to a callback (header.onField).",
+  "provenance": "Identified by naming: the class path Messageheader::Parser, the SET_STATE()/checkHeaderspace() macros, the character cursors fieldnamePtr/fieldbodyPtr/headerdataPtr, the onField() sink returning OK/FAIL/END, and the log_debug/log_warn streaming macros are the message-header parser from cxxtools (Tommi Maekitalo, used by tntnet). The banner /* sample: primevul_train_3350_vuln */ marks it as a PrimeVul training sample; the file name train_0310_cwe200.cpp hints at an information-exposure theme, but the code was reviewed blind on its merits.",
+  "trust_boundary": "The single parameter char ch is one raw byte of an inbound HTTP request/response header, i.e. fully attacker-controlled network data fed one octet at a time. The buffers behind fieldnamePtr, fieldbodyPtr and headerdataPtr hold the attacker's header name and value bytes verbatim. Everything hostile therefore enters through ch and accumulates into the header buffer; the parser's job is to bound those writes and to hand well-formed, terminated strings to onField(). checkHeaderspace() is the only capacity gate, and onField()/log_debug() are downstream consumers of attacker text.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0310_cwe200.cpp",
+      "lines": "2-3",
+      "code": "bool Messageheader::Parser::state_fieldbody_crlf(char ch)\n{",
+      "explanation": "This is a member state-handler of the header Parser. It is invoked once per incoming byte while the machine is in the \"just saw a field body, now expecting CR/LF\" state. It takes the next raw byte ch by value and returns a bool that the driving loop uses as a signal: true means this byte was terminal/consumed for the field (or the header is complete), false means keep feeding bytes. All of its side effects are on shared parser state (the write cursor headerdataPtr, the fieldnamePtr/fieldbodyPtr markers, failedFlag, and the current state)."
+    },
+    {
+      "file": "corpus/train/train_0310_cwe200.cpp",
+      "lines": "4-5",
+      "code": "if (ch == '\\r')\n  SET_STATE(state_end_cr);",
+      "explanation": "If the byte is a carriage return, the parser transitions via the SET_STATE macro to state_end_cr, the state that expects the following LF to close the header block (the CRLF that terminates a field). No data is written here; it is a pure state transition. SET_STATE is a macro that reassigns the machine's state member (typically a member function pointer) to the named handler."
+    },
+    {
+      "file": "corpus/train/train_0310_cwe200.cpp",
+      "lines": "6-8",
+      "code": "else if (ch == '\\n')\n{\n  log_debug(\"header \" << fieldnamePtr << \": \" << fieldbodyPtr);",
+      "explanation": "A bare LF (no preceding CR seen in this state) is treated as the end of the field. Before doing anything else the handler emits a debug log line that streams the two C-string cursors fieldnamePtr and fieldbodyPtr, i.e. the fully reconstructed header NAME and VALUE, into the logging sink. log_debug is a streaming macro (operator<<), so the raw attacker-supplied name and value text are rendered into the log record."
+    },
+    {
+      "file": "corpus/train/train_0310_cwe200.cpp",
+      "lines": "9-17",
+      "code": "switch (header.onField(fieldnamePtr, fieldbodyPtr))\n{\n  case OK:\n  case END:  return true;\n             break;\n  case FAIL: failedFlag = true;\n             log_warn(\"invalid character \" << chartoprint(ch) << \" in fieldbody\");\n             break;\n}",
+      "explanation": "The completed name/value pair is handed to header.onField(fieldnamePtr, fieldbodyPtr), the sink that records or validates the header. Its return code drives control flow: OK or END both immediately return true (the field is accepted; END additionally means \"stop parsing headers\"). FAIL sets failedFlag and logs a warning that streams chartoprint(ch) (a printable rendering of the offending byte). Note the two pointers are passed as if they were terminated C-strings — the value string's terminating NUL is not written until line 19, i.e. AFTER this call."
+    },
+    {
+      "file": "corpus/train/train_0310_cwe200.cpp",
+      "lines": "19-21",
+      "code": "*headerdataPtr = '\\0';\n  return true;\n}",
+      "explanation": "After onField() returns, the handler writes a NUL byte at the current write cursor to terminate the accumulated field text, then returns true to signal the byte was consumed and the field is finished. Unlike the continuation and next-field branches below, this write is NOT preceded by a checkHeaderspace(1) capacity check — it assumes the byte at *headerdataPtr is already inside the buffer."
+    },
+    {
+      "file": "corpus/train/train_0310_cwe200.cpp",
+      "lines": "22-29",
+      "code": "else if (std::isspace(ch))\n{\n  // continuation line\n  checkHeaderspace(1);\n  *(headerdataPtr - 1) = '\\n';\n  *headerdataPtr++ = ch;\n  SET_STATE(state_fieldbody);\n}",
+      "explanation": "If the byte after the field body is whitespace (SP/TAB), this is an RFC-822 folded continuation line: the logical field value continues on the next physical line. The parser first calls checkHeaderspace(1) to ensure room for one more byte, then it overwrites the byte BEHIND the cursor (headerdataPtr - 1) with '\\n' (rewriting whatever placeholder/CR marker was there into a line break inside the folded value), appends the whitespace byte ch and advances the cursor, then transitions back to state_fieldbody to keep collecting the folded value. std::isspace(ch) is called with a raw char to classify the byte."
+    },
+    {
+      "file": "corpus/train/train_0310_cwe200.cpp",
+      "lines": "30-41",
+      "code": "else if (ch >= 33 && ch <= 126)\n{\n  switch (header.onField(fieldnamePtr, fieldbodyPtr))\n  {\n    case OK:   SET_STATE(state_fieldname);\n               break;\n    case FAIL: failedFlag = true;\n               log_warn(\"invalid character \" << chartoprint(ch) << \" in fieldbody\");\n               break;\n    case END:  return true;\n               break;\n  }",
+      "explanation": "If the byte after the field body is a printable ASCII character (33..126) rather than CR/LF/whitespace, it means the previous field ended (implicitly) and this byte begins the NEXT field name. The current name/value pair is flushed via header.onField(...). On OK the machine moves to state_fieldname to read the new field name; on FAIL it records the error and warns; on END it returns true to stop. Again onField() is called with fieldbodyPtr while no terminating NUL has been written for the just-finished value in this branch."
+    },
+    {
+      "file": "corpus/train/train_0310_cwe200.cpp",
+      "lines": "43-47",
+      "code": "fieldnamePtr = headerdataPtr;\n  checkHeaderspace(1);\n  *headerdataPtr++ = ch;\n}\nreturn false;",
+      "explanation": "For the new-field-name case, fieldnamePtr is re-pointed at the current cursor (the start of the new name), checkHeaderspace(1) reserves one byte, and the first character of the new field name (ch) is written and the cursor advanced. Falling out of the whole if/else chain (CR, whitespace, and default paths) the function returns false, telling the driver to keep feeding bytes."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0310_cwe200.cpp",
+      "lines": "19-20",
+      "code": "*headerdataPtr = '\\0';\n  return true;",
+      "explanation": "This NUL-terminating write is the only write in the function NOT guarded by checkHeaderspace() (compare lines 25 and 44, which both call checkHeaderspace(1) before writing). The field body is accumulated in state_fieldbody, where each data byte consumes one reserved slot; when the buffer is filled exactly to capacity by attacker header data, the write cursor sits one past the last reserved byte and *headerdataPtr = '\\0' stores a byte outside the buffer — a classic off-by-one out-of-bounds write. An attacker who sends a header value sized to land the cursor precisely at the buffer boundary and then a lone '\\n' triggers a one-byte heap/stack overwrite. Invariant the implementation must uphold: reserve room for the terminator (checkHeaderspace(1) before writing '\\0') or size the buffer with a guaranteed +1 slack; the fix is to gate this write like every other."
+    },
+    {
+      "file": "corpus/train/train_0310_cwe200.cpp",
+      "lines": "25-26",
+      "code": "checkHeaderspace(1);\n  *(headerdataPtr - 1) = '\\n';",
+      "explanation": "checkHeaderspace(1) only guarantees FORWARD capacity (room to write at headerdataPtr and beyond); it says nothing about headerdataPtr - 1. The continuation branch writes '\\n' one byte BEHIND the cursor. If this state is ever reached with headerdataPtr at the start of the header buffer (e.g. a request whose very first header line begins with whitespace/folding, or any path that enters state_fieldbody_crlf before any body byte has been written), headerdataPtr - 1 dereferences one byte before the buffer — an out-of-bounds/underflow WRITE of 0x0A. Invariant: the implementation must prove at least one byte has already been written into this field before folding, or bound the backward index explicitly; the guard as written does not establish that."
+    },
+    {
+      "file": "corpus/train/train_0310_cwe200.cpp",
+      "lines": "8",
+      "code": "log_debug(\"header \" << fieldnamePtr << \": \" << fieldbodyPtr);",
+      "explanation": "This logs the raw, attacker-supplied header NAME and full VALUE at debug level for EVERY header processed. HTTP headers routinely carry secrets: Authorization: Bearer <token>, Cookie:/Set-Cookie: session ids, Proxy-Authorization, X-Api-Key, etc. Whenever debug logging is enabled (or the log level is misconfigured in production) these credentials are written verbatim to log files/consoles, where they are exposed to anyone with log access, backups, or SIEM pipelines — sensitive information exposure into a log file. This matches the file's cwe200 theme. Invariant: sensitive header values must be redacted or must not be logged; at minimum such logging must never be reachable at production log levels for credential-bearing headers."
+    },
+    {
+      "file": "corpus/train/train_0310_cwe200.cpp",
+      "lines": "9",
+      "code": "switch (header.onField(fieldnamePtr, fieldbodyPtr))",
+      "explanation": "onField() is handed fieldbodyPtr as a C-string, but the terminating NUL for the just-completed value is not written until line 19 — AFTER this call (and in the printable-char branch at line 32 it is never written at all before the flush). If onField() (or anything it forwards to, or the log_debug at line 8 that also reads fieldbodyPtr) treats the value as a NUL-terminated string, it will read past the intended end until it hits a stray NUL or the buffer boundary — an out-of-bounds READ / use of an unterminated buffer. Whether this bites depends on whether the buffer is pre-zeroed and whether the previous state pre-terminated the value; that is exactly what must be confirmed. Invariant: fieldbodyPtr must be NUL-terminated BEFORE any consumer reads it."
+    },
+    {
+      "file": "corpus/train/train_0310_cwe200.cpp",
+      "lines": "22",
+      "code": "else if (std::isspace(ch))",
+      "explanation": "ch is a plain char. On platforms where char is signed, any byte with the high bit set (0x80..0xFF, common in non-ASCII header bytes) becomes a NEGATIVE int when passed to std::isspace, whose behavior is undefined for arguments that are neither representable as unsigned char nor EOF. This is a portability/undefined-behavior defect that can misclassify bytes or, with a table-based isspace, index out of bounds. Note the printable guard at line 30 (ch >= 33 && ch <= 126) sidesteps this only for that later branch — the isspace call runs first on the unfiltered byte. Invariant: classify bytes via static_cast<unsigned char>(ch) before calling ctype functions."
+    }
+  ],
+  "summary": "A single header-parser state handler with several real defects: an unguarded NUL-terminator write (off-by-one OOB write when the buffer is exactly full), a backward write in the continuation branch that checkHeaderspace() does not cover, sensitive header name/value pairs streamed to debug logs (CWE-200/532, the file's theme), onField()/log reading fieldbodyPtr before it is NUL-terminated (potential OOB read), and an isspace() call on a signed char (UB). Attacker input is a raw network byte plus the accumulated header buffer, so the memory-safety issues are remotely reachable.",
+  "reviewed_anchors": [
+    {"anchor": "bool Messageheader::Parser::state_fieldbody_crlf(char ch) (line 2)", "disposition": "finding", "reason": "Entry point taking one attacker-controlled byte; drives all writes below."},
+    {"anchor": "if (ch == '\\r') / SET_STATE(state_end_cr) (lines 4-5)", "disposition": "dismissed", "reason": "Pure state transition, no memory write or data handling."},
+    {"anchor": "log_debug(\"header \" << fieldnamePtr << \": \" << fieldbodyPtr) (line 8)", "disposition": "finding", "reason": "Logs attacker header name/value verbatim — sensitive information exposure."},
+    {"anchor": "header.onField(fieldnamePtr, fieldbodyPtr) (lines 9, 32)", "disposition": "finding", "reason": "Consumes fieldbodyPtr as a C-string before the NUL is written (line 19) — potential OOB read of an unterminated buffer."},
+    {"anchor": "OK/END/FAIL switch cases (lines 11-17, 34-40)", "disposition": "dismissed", "reason": "Control-flow dispatch on the sink's return code; no attacker-controlled memory operation of its own."},
+    {"anchor": "failedFlag = true (lines 14, 36)", "disposition": "dismissed", "reason": "Sets an error flag; no memory-safety or disclosure contract."},
+    {"anchor": "log_warn(... << chartoprint(ch) ...) (lines 15, 37)", "disposition": "dismissed", "reason": "Logs a single sanitized byte via chartoprint, not secret material; low sensitivity."},
+    {"anchor": "*headerdataPtr = '\\0' (line 19)", "disposition": "finding", "reason": "Unguarded terminator write; off-by-one OOB write when buffer is exactly full."},
+    {"anchor": "else if (std::isspace(ch)) (line 22)", "disposition": "finding", "reason": "ctype call on a possibly-negative signed char is undefined behavior."},
+    {"anchor": "checkHeaderspace(1) (lines 25, 44)", "disposition": "finding", "reason": "Only reserves forward capacity; does not cover the backward write at line 26 nor the terminator at line 19."},
+    {"anchor": "*(headerdataPtr - 1) = '\\n' (line 26)", "disposition": "finding", "reason": "Write one byte behind the cursor; OOB/underflow write if cursor is at buffer start."},
+    {"anchor": "*headerdataPtr++ = ch (lines 27, 45)", "disposition": "dismissed", "reason": "Guarded by the immediately preceding checkHeaderspace(1); the reserved forward byte covers this write."},
+    {"anchor": "SET_STATE(state_fieldbody) / SET_STATE(state_fieldname) (lines 28, 34)", "disposition": "dismissed", "reason": "State transitions only."},
+    {"anchor": "else if (ch >= 33 && ch <= 126) (line 30)", "disposition": "dismissed", "reason": "Printable-range guard; correct as a range test (though it does not retroactively fix the isspace UB on line 22)."},
+    {"anchor": "fieldnamePtr = headerdataPtr (line 43)", "disposition": "dismissed", "reason": "Pointer bookkeeping; the following checkHeaderspace(1)+write is bounded."}
+  ],
+  "findings": [
+    {
+      "title": "Off-by-one OOB write: NUL terminator stored without checkHeaderspace guard",
+      "anchor": "*headerdataPtr = '\\0';",
+      "file": "corpus/train/train_0310_cwe200.cpp",
+      "line": "19",
+      "code": "*headerdataPtr = '\\0';",
+      "bug_class": "Out-of-bounds write (off-by-one, missing capacity check)",
+      "cwe": "CWE-787",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0310_cwe200.cpp (and the state_fieldbody accumulation logic in the implementation, file not provided)",
+      "invariant": "Every write through headerdataPtr, including the terminating NUL, must be preceded by a capacity check (checkHeaderspace(1)) or the buffer must always hold one reserved slack byte for the terminator.",
+      "failure_mode": "When attacker header bytes fill the header buffer exactly to capacity, the write cursor sits one byte past the last reserved slot. A trailing '\\n' reaches this branch and stores '\\0' out of bounds — a one-byte overflow of the adjacent memory. Every other write in this function is gated by checkHeaderspace(1); this one is not, making the asymmetry the bug.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether the buffer allocation reserves an extra byte for the terminator, or whether state_fieldbody's checkHeaderspace calls leave the cursor able to reach buffer_end with no slack, making *headerdataPtr = '\\0' land at buffer_end (out of bounds)."
+    },
+    {
+      "title": "Backward OOB write in continuation branch not covered by checkHeaderspace",
+      "anchor": "*(headerdataPtr - 1) = '\\n';",
+      "file": "corpus/train/train_0310_cwe200.cpp",
+      "line": "26",
+      "code": "*(headerdataPtr - 1) = '\\n';",
+      "bug_class": "Out-of-bounds/underflow write (backward index)",
+      "cwe": "CWE-787",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0310_cwe200.cpp",
+      "invariant": "The continuation branch must only be reached after at least one byte has been written into the current field so that headerdataPtr - 1 is a valid in-buffer index; checkHeaderspace(1) guards forward space only and does not establish this.",
+      "failure_mode": "checkHeaderspace(1) reserves the forward byte for line 27 but does not validate headerdataPtr - 1. If this state is entered with the cursor at the base of the header buffer (folding whitespace before any body byte was written), *(headerdataPtr - 1) writes 0x0A one byte before the buffer — memory corruption immediately ahead of the allocation.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether any input sequence can drive the parser into state_fieldbody_crlf with headerdataPtr equal to the buffer start, or whether the state machine guarantees a prior write so headerdataPtr-1 is always valid."
+    },
+    {
+      "title": "Sensitive header name/value written verbatim to debug log",
+      "anchor": "log_debug(\"header \" << fieldnamePtr << \": \" << fieldbodyPtr);",
+      "file": "corpus/train/train_0310_cwe200.cpp",
+      "line": "8",
+      "code": "log_debug(\"header \" << fieldnamePtr << \": \" << fieldbodyPtr);",
+      "bug_class": "Insertion of sensitive information into log file / information exposure",
+      "cwe": "CWE-532",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0310_cwe200.cpp",
+      "invariant": "Credential-bearing header values (Authorization, Cookie/Set-Cookie, Proxy-Authorization, API keys) must be redacted or excluded from logs, and any raw-header logging must be unreachable at production log levels.",
+      "failure_mode": "Every parsed header is logged with its full value. With debug logging enabled or misconfigured in production, secrets carried in headers are persisted to log files/consoles and exposed to anyone with access to logs, backups, or downstream log aggregation — a sensitive-information disclosure independent of any memory bug. Matches the cwe200 theme of this sample.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether log_debug can be active in deployed configurations and whether the logging framework redacts known credential header names before emitting fieldbodyPtr."
+    },
+    {
+      "title": "onField()/log read fieldbodyPtr before it is NUL-terminated",
+      "anchor": "switch (header.onField(fieldnamePtr, fieldbodyPtr))",
+      "file": "corpus/train/train_0310_cwe200.cpp",
+      "line": "9",
+      "code": "switch (header.onField(fieldnamePtr, fieldbodyPtr))",
+      "bug_class": "Out-of-bounds read (use of unterminated buffer as C-string)",
+      "cwe": "CWE-125",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0310_cwe200.cpp (and Messageheader::onField, file not provided)",
+      "invariant": "fieldbodyPtr must point to a NUL-terminated string before any consumer (onField, log_debug) reads it as a C-string.",
+      "failure_mode": "The value's terminating NUL is written only at line 19, AFTER the onField() call at line 9; in the printable-char branch (line 32) the flush happens with no terminator written in this handler at all. If onField() or the line-8 log treats fieldbodyPtr as NUL-terminated, it reads past the value until a stray NUL or the buffer boundary, leaking adjacent buffer bytes or crashing.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether the previous state (state_fieldbody) pre-writes a NUL, whether the buffer is zero-initialized, and whether onField relies on NUL termination of fieldbodyPtr."
+    },
+    {
+      "title": "std::isspace called on a possibly-negative signed char",
+      "anchor": "else if (std::isspace(ch))",
+      "file": "corpus/train/train_0310_cwe200.cpp",
+      "line": "22",
+      "code": "else if (std::isspace(ch))",
+      "bug_class": "Undefined behavior — ctype function on out-of-range char",
+      "cwe": "CWE-704",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0310_cwe200.cpp",
+      "invariant": "Arguments to <cctype> functions must be representable as unsigned char or EOF; pass static_cast<unsigned char>(ch).",
+      "failure_mode": "With signed char, header bytes 0x80..0xFF become negative ints; std::isspace(negative) is undefined and, with a table-based implementation, can index before the classification table. At best it misclassifies high bytes and changes folding/parse behavior; the byte is unfiltered here because the printable-range guard is on the later branch (line 30).",
+      "cve_analog": "",
+      "what_to_confirm": "Whether char is signed on the target platform and whether the ctype table handles negative indices; confirm callers never mask the high bit before this handler runs."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm the header buffer reserves a slack byte (or checkHeaderspace(1) is added at line 19) so *headerdataPtr = '\\0' cannot write at buffer_end.",
+    "Prove headerdataPtr - 1 (line 26) is always in-bounds — i.e. this state is unreachable with the cursor at the buffer base — or add an explicit lower-bound guard.",
+    "Verify fieldbodyPtr is NUL-terminated before onField() (line 9) and before log_debug (line 8); the current terminator write (line 19) happens too late and the printable branch (line 32) never writes it here.",
+    "Review log_debug at line 8 for credential-bearing headers; add redaction or ensure raw-header logging is compiled out / disabled in production.",
+    "Cast ch to unsigned char before std::isspace (line 22) to remove the signed-char UB.",
+    "Audit checkHeaderspace() semantics: confirm it accounts for the terminator and for the backward write, not only a single forward byte."
+  ]
+}

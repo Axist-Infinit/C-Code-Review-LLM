@@ -1,0 +1,303 @@
+{
+  "subsystem": "read_ujpg() — the UJG/Lepton header deserializer. This is the routine that parses the custom 'UJG' container format used by Lepton (Dropbox's reversible JPEG recompressor built on the Sirikata JpegAllocator/IOUtil stack). It reads a fixed 4-byte compressed-header-size prefix from the input stream, zlib/brotli-decompresses the header into an in-memory MemReadWriter, then walks a sequence of 3-byte ASCII markers ('HDR','PAD'/'P0D','CRS','HHX','FRS','GRB','PGR'/'PGE','SIZ','EEE','CNT','CMP') each of which is followed by attacker-controlled 32-bit little-endian length fields and variable-length payloads describing the original JPEG so it can be exactly reconstructed.",
+  "provenance": "Identified from the `using namespace Sirikata;` and `using namespace IOUtil;` directives (line 4-5), the `JpegAllocator<uint8_t>`, `MemReadWriter`, `ZlibDecoderDecompressionReader::Decompress` and `Sirikata::BrotliCodec::Decompress` types, the `ThreadHandoff` deserialization, `write_byte_bill(Billing::HEADER,...)` accounting, and the `.ujg` marker vocabulary ('HDR','PAD','CRS','GRB','PGR','CMP') — all hallmarks of the Lepton / uncompressed-JPEG (UJG) format. The in-code comment `/* sample: primevul_train_2202_fixed */` (line 1) is untrusted metadata and was ignored for the security judgement; the code was reviewed on its merits.",
+  "trust_boundary": "Everything read from `str_in` and from `header_reader` is attacker-controlled: `str_in` is the raw .ujg file/stream, and `header_reader` is a MemReadWriter wrapping the zlib/brotli-decompressed header bytes that also originate from the file. All 32-bit length/count values obtained via `LEtoUint32(ujpg_mrk)` (compressed_header_size, hdrs, rst_cnt count, scnc, grbs, prefix_grbs, max_file_size, max_* EEE fields) are therefore hostile and may take any value in [0, 2^32-1]. The 64-byte stack scratch buffer `ujpg_mrk` and every heap buffer allocated from these lengths sit directly on this boundary. Only `compressed_header_size`/`max_file_size` are bounded (128 MB, line 19); the per-marker lengths inside the decompressed header are NOT re-bounded.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/eval/eval_0029_cwe399.cpp",
+      "lines": "2-9",
+      "code": "bool read_ujpg( void )\n{\n    using namespace IOUtil;\n    using namespace Sirikata;\n//    colldata.start_decoder_worker_thread(std::bind(&simple_decoder, &colldata, str_in));\n    unsigned char ujpg_mrk[ 64 ];\n    // this is where we will enable seccomp, before reading user data\n    write_byte_bill(Billing::HEADER, true, 24); // for the fixed header",
+      "explanation": "Entry point of the UJG header parser. It takes no arguments and returns a bool success flag; all state is drawn from surrounding globals/members (str_in, str_out, header_reader, hdrs, grbs, colldata, g_decoder, etc.). `ujpg_mrk[64]` is a fixed 64-byte stack scratch buffer reused throughout to hold both 3-byte marker tags and 4-to-28-byte little-endian length blocks. `write_byte_bill` is byte-accounting/telemetry, not a security control. The comment notes seccomp is meant to be enabled before user data is read — meaning everything below runs on untrusted input, ideally sandboxed."
+    },
+    {
+      "file": "corpus/eval/eval_0029_cwe399.cpp",
+      "lines": "11-16",
+      "code": "str_out->call_size_callback(max_file_size);\n    uint32_t compressed_header_size = 0;\n    if (ReadFull(str_in, ujpg_mrk, 4) != 4) {\n        custom_exit(ExitCode::SHORT_READ);\n    }\n    write_byte_bill(Billing::HEADER, true, 4);",
+      "explanation": "Reads the first 4 bytes of the stream into ujpg_mrk. This is one of the FEW ReadFull calls whose return value is checked: a short read triggers custom_exit(SHORT_READ). These 4 bytes are the compressed-header length prefix. `compressed_header_size` is declared as uint32_t and zero-initialized."
+    },
+    {
+      "file": "corpus/eval/eval_0029_cwe399.cpp",
+      "lines": "18-22",
+      "code": "compressed_header_size = LEtoUint32(ujpg_mrk);\n    if (compressed_header_size > 128 * 1024 * 1024 || max_file_size > 128 * 1024 * 1024) {\n        always_assert(false && \"Only support images < 128 megs\");\n        return false; // bool too big\n    }",
+      "explanation": "`LEtoUint32` decodes the 4 stack bytes as a little-endian uint32 into `compressed_header_size`. This is the ONE size that is properly bounded: values above 128 MiB (and max_file_size above 128 MiB) are rejected. This guard prevents an absurd `compressed_header_buffer` allocation on line 25. Note carefully that this 128 MiB cap protects ONLY compressed_header_size; the later per-marker length fields (hdrs, grbs, scnc, ...) are decoded the same way but are never subjected to a comparable bound."
+    },
+    {
+      "file": "corpus/eval/eval_0029_cwe399.cpp",
+      "lines": "23-27",
+      "code": "bool pending_header_reads = false;\n    if (header_reader == NULL) {\n        std::vector<uint8_t, JpegAllocator<uint8_t> > compressed_header_buffer(compressed_header_size);\n        IOUtil::ReadFull(str_in, compressed_header_buffer.data(), compressed_header_buffer.size());\n        header_reader = new MemReadWriter((JpegAllocator<uint8_t>()));",
+      "explanation": "If no header_reader exists yet, it allocates a compressed_header_buffer of exactly compressed_header_size bytes (bounded above) via the custom JpegAllocator, then fills it from the stream. The ReadFull return value here is NOT checked — a truncated stream leaves the tail of the buffer as whatever the vector value-initialized it to (zero for uint8_t), which is then fed to the decompressor. A fresh MemReadWriter is allocated with `new` to receive the decompressed header."
+    },
+    {
+      "file": "corpus/eval/eval_0029_cwe399.cpp",
+      "lines": "29-52",
+      "code": "if (ujgversion == 1) {\n                JpegAllocator<uint8_t> no_free_allocator;\n#if !defined(USE_STANDARD_MEMORY_ALLOCATORS) && !defined(_WIN32) && !defined(EMSCRIPTEN)\n                no_free_allocator.setup_memory_subsystem(32 * 1024 * 1024,\n                                                         16,\n                                                         &mem_init_nop,\n                                                         &MemMgrAllocatorMalloc,\n                                                         &mem_nop,\n                                                         &mem_realloc_nop,\n                                                         &MemMgrAllocatorMsize);\n#endif\n                std::pair<std::vector<uint8_t,\n                                      Sirikata::JpegAllocator<uint8_t> >,\n                          JpegError> uncompressed_header_buffer(\n                              ZlibDecoderDecompressionReader::Decompress(compressed_header_buffer.data(),\n                                                                         compressed_header_buffer.size(),\n                                                                         no_free_allocator,\n                                                                         max_file_size + 2048));\n                if (uncompressed_header_buffer.second) {\n                    always_assert(false && \"Data not properly zlib coded\");\n                    return false;\n                }\n                zlib_hdrs = compressed_header_buffer.size();\n                header_reader->SwapIn(uncompressed_header_buffer.first, 0);",
+      "explanation": "For UJG version 1, a scratch memory subsystem is configured (32 MiB arena) and the compressed header is zlib-decompressed with an output cap of `max_file_size + 2048`. The result is a pair<vector,JpegError>; a non-zero JpegError (`uncompressed_header_buffer.second`) aborts. On success the decompressed bytes are swapped into header_reader, which becomes the source for every subsequent marker read. Note that `max_file_size + 2048` is the decompression bound and max_file_size is attacker-influenced — and is later overwritten by the SIZ marker (line 198)."
+    },
+    {
+      "file": "corpus/eval/eval_0029_cwe399.cpp",
+      "lines": "53-71",
+      "code": "} else {\n                std::pair<std::vector<uint8_t,\n                                      Sirikata::JpegAllocator<uint8_t> >,\n                          JpegError> uncompressed_header_buffer(\n                              Sirikata::BrotliCodec::Decompress(compressed_header_buffer.data(),\n                                                                compressed_header_buffer.size(),\n                                                                JpegAllocator<uint8_t>(),\n                                                                ((size_t)max_file_size) * 2 + 128 * 1024 * 1024));\n                if (uncompressed_header_buffer.second) {\n                    always_assert(false && \"Data not properly zlib coded\");\n                    return false;\n                }\n                zlib_hdrs = compressed_header_buffer.size();\n                header_reader->SwapIn(uncompressed_header_buffer.first, 0);            \n            }\n        }\n        write_byte_bill(Billing::HEADER,\n                        true,\n                        compressed_header_buffer.size());",
+      "explanation": "The non-version-1 branch does the same but with Brotli decompression and an output cap of `((size_t)max_file_size) * 2 + 128 MiB`. Since max_file_size was bounded to <=128 MiB earlier, this cap is at most ~384 MiB. Again the JpegError is checked and the bytes are SwapIn'd into header_reader. Both branches leave header_reader holding the fully decompressed, attacker-controlled header stream."
+    },
+    {
+      "file": "corpus/eval/eval_0029_cwe399.cpp",
+      "lines": "72-77",
+      "code": "} else {\n        always_assert(compressed_header_size == 0 && \"Special concatenation requires 0 size header\");\n    }\n    grbs = sizeof(EOI);\n    grbgdata = EOI; // if we don't have any garbage, assume FFD9 EOI\n    // read header from file",
+      "explanation": "If header_reader already existed (concatenation path), it asserts the compressed size is 0. Then default garbage state is set: grbs = sizeof(EOI) and grbgdata = EOI (the FFD9 end-of-image marker), used unless a GRB marker later overrides them. This establishes the baseline before marker parsing."
+    },
+    {
+      "file": "corpus/eval/eval_0029_cwe399.cpp",
+      "lines": "78-93",
+      "code": "ReadFull(header_reader, ujpg_mrk, 3 ) ;\n    // check marker\n    if ( memcmp( ujpg_mrk, \"HDR\", 3 ) == 0 ) {\n        // read size of header, alloc memory\n        ReadFull(header_reader, ujpg_mrk, 4 );\n        hdrs = LEtoUint32(ujpg_mrk);\n        hdrdata = (unsigned char*) aligned_alloc(hdrs);\n        memset(hdrdata, 0, hdrs);\n        if ( hdrdata == NULL ) {\n            fprintf( stderr, MEM_ERRMSG );\n            errorlevel.store(2);\n            return false;\n        }\n        // read hdrdata\n        ReadFull(header_reader, hdrdata, hdrs );\n    }",
+      "explanation": "The first mandatory marker: 3 bytes are read (return unchecked) and compared to \"HDR\". If matched, 4 more bytes give `hdrs`, an attacker-controlled 32-bit size that is NOT bounded. `aligned_alloc(hdrs)` allocates a buffer, then `memset(hdrdata, 0, hdrs)` zeroes it — but the NULL check happens AFTER the memset, so a failed allocation dereferences NULL. Finally `hdrs` bytes are read into hdrdata. hdrs can be up to 4 GiB, an uncontrolled allocation primitive."
+    },
+    {
+      "file": "corpus/eval/eval_0029_cwe399.cpp",
+      "lines": "94-102",
+      "code": "else {\n        fprintf( stderr, \"HDR marker not found\" );\n        errorlevel.store(2);\n        return false;\n    }\n    bool memory_optimized_image = (filetype != UJG) && !g_allow_progressive;\n    // parse header for image-info\n    if ( !setup_imginfo_jpg(memory_optimized_image) )\n        return false;",
+      "explanation": "If the HDR marker is absent the function aborts. Otherwise the hdrdata bytes are handed to setup_imginfo_jpg (not shown) which parses the JPEG structural metadata; a parse failure returns false. memory_optimized_image is a mode flag derived from filetype and the progressive-allowance global."
+    },
+    {
+      "file": "corpus/eval/eval_0029_cwe399.cpp",
+      "lines": "107-132",
+      "code": "ReadFull(header_reader, ujpg_mrk, 3 );\n    // check marker\n    if ( memcmp( ujpg_mrk, \"P0D\", 3 ) == 0 ) {\n        // This is a more nuanced pad byte that can have different values per bit\n        header_reader->Read( reinterpret_cast<unsigned char*>(&padbit), 1 );\n    }\n    else if ( memcmp( ujpg_mrk, \"PAD\", 3 ) == 0 ) {\n        // this is a single pad bit that is implied to have all the same values\n        header_reader->Read( reinterpret_cast<unsigned char*>(&padbit), 1 );\n        if (!(padbit == 0 || padbit == 1 ||padbit == -1)) {\n            while (write(2,\n                        \"Legacy Padbit must be 0, 1 or -1\\n\",\n                         strlen(\"Legacy Padbit must be 0, 1 or -1\\n\")) < 0\n                   && errno == EINTR) {\n            }\n            custom_exit(ExitCode::STREAM_INCONSISTENT);\n        }\n        if (padbit == 1) {\n            padbit = 0x7f; // all 6 bits set\n        }\n    }\n    else {\n        fprintf( stderr, \"PAD marker not found\" );\n        errorlevel.store(2);\n        return false;\n    }",
+      "explanation": "Reads the pad-bit recovery marker. Both 'P0D' and 'PAD' read a single byte into `padbit` via `reinterpret_cast<unsigned char*>(&padbit)`. Because only one byte is written to a wider (signed, given the `== -1` test) integer object, the remaining bytes keep whatever value padbit held before — the byte-write cannot produce the full -1 pattern the validation expects. The 'PAD' branch validates padbit is in {0,1,-1} and normalizes 1 -> 0x7f. A missing PAD/P0D marker aborts."
+    },
+    {
+      "file": "corpus/eval/eval_0029_cwe399.cpp",
+      "lines": "133-144",
+      "code": "std::vector<ThreadHandoff> thread_handoff;\n    // read further recovery information if any\n    while ( ReadFull(header_reader, ujpg_mrk, 3 ) == 3 ) {\n        // check marker\n        if ( memcmp( ujpg_mrk, \"CRS\", 3 ) == 0 ) {\n            rst_cnt_set = true;\n            ReadFull(header_reader, ujpg_mrk, 4);\n            rst_cnt.resize(LEtoUint32(ujpg_mrk));\n            for (size_t i = 0; i < rst_cnt.size(); ++i) {\n                ReadFull(header_reader, ujpg_mrk, 4);\n                rst_cnt.at(i) = LEtoUint32(ujpg_mrk);\n            }\n        }",
+      "explanation": "The main marker loop: it reads 3-byte tags until a short read ends the loop. 'CRS' (restart counts) reads a 32-bit count and `rst_cnt.resize(count)` — an attacker-controlled resize to up to 4 billion elements, an uncontrolled allocation. It then reads 4 bytes per element with `.at(i)` (bounds-checked). The loop's cost is attacker-scalable, but the resize itself is the memory-pressure primitive."
+    },
+    {
+      "file": "corpus/eval/eval_0029_cwe399.cpp",
+      "lines": "145-153",
+      "code": "} else if ( memcmp( ujpg_mrk, \"HHX\", 2 ) == 0 ) { // only look at first two bytes\n            size_t to_alloc = ThreadHandoff::get_remaining_data_size_from_two_bytes(ujpg_mrk + 1) + 2;\n            if(to_alloc) {\n                std::vector<unsigned char> data(to_alloc);\n                data[0] = ujpg_mrk[1];\n                data[1] = ujpg_mrk[2];\n                ReadFull(header_reader, &data[2], to_alloc - 2);\n                thread_handoff = ThreadHandoff::deserialize(&data[0], to_alloc);\n            }\n        }",
+      "explanation": "'HHX' (thread-handoff) matches only the first two bytes. `get_remaining_data_size_from_two_bytes(ujpg_mrk+1)` derives a payload size from 2 header bytes (bounded to <=65535), +2. A vector of that size is filled: bytes 0-1 from the tag, and `to_alloc - 2` bytes read from the stream into &data[2]. Because to_alloc >= 2 always (the +2), the `to_alloc - 2` subtraction cannot underflow and &data[2] is in bounds — this path is well-formed. The result is deserialized into thread_handoff."
+    },
+    {
+      "file": "corpus/eval/eval_0029_cwe399.cpp",
+      "lines": "154-162",
+      "code": "} else if ( memcmp( ujpg_mrk, \"FRS\", 3 ) == 0 ) {\n            // read number of false set RST markers per scan from file\n            ReadFull(header_reader, ujpg_mrk, 4);\n            scnc = LEtoUint32(ujpg_mrk);\n            \n            rst_err.insert(rst_err.end(), scnc - rst_err.size(), 0);\n            // read data\n            ReadFull(header_reader, rst_err.data(), scnc );\n        }",
+      "explanation": "'FRS' reads a 32-bit `scnc` (false-RST count). It then grows rst_err by `scnc - rst_err.size()` elements via insert, intending rst_err to end up with scnc entries, and reads scnc bytes into rst_err.data(). The subtraction `scnc - rst_err.size()` is unsigned (size_t) arithmetic: if scnc is less than the CURRENT rst_err.size() (which can be non-zero from a prior FRS iteration in the same loop, or other prior population), the expression wraps to a near-2^64 count, making insert attempt a gigantic allocation. This is the central integer-underflow hazard."
+    },
+    {
+      "file": "corpus/eval/eval_0029_cwe399.cpp",
+      "lines": "163-176",
+      "code": "else if ( memcmp( ujpg_mrk, \"GRB\", 3 ) == 0 ) {\n            // read garbage (data after end of JPG) from file\n            ReadFull(header_reader, ujpg_mrk, 4);\n            grbs = LEtoUint32(ujpg_mrk);\n            grbgdata = aligned_alloc(grbs);\n            memset(grbgdata, 0, sizeof(grbs));\n            if ( grbgdata == NULL ) {\n                fprintf( stderr, MEM_ERRMSG );\n                errorlevel.store(2);\n                return false;\n            }\n            // read garbage data\n            ReadFull(header_reader, grbgdata, grbs );\n        }",
+      "explanation": "'GRB' (trailing garbage) reads a 32-bit `grbs` (unbounded), allocates a grbs-byte buffer with aligned_alloc, then `memset(grbgdata, 0, sizeof(grbs))`. Note `sizeof(grbs)` is the size of the length VARIABLE (4 bytes), not `grbs` — so only 4 bytes are zeroed regardless of buffer size. The NULL check again comes AFTER the memset, so a failed allocation dereferences NULL first. grbs bytes are then read into the buffer."
+    },
+    {
+      "file": "corpus/eval/eval_0029_cwe399.cpp",
+      "lines": "177-194",
+      "code": "else if ( memcmp( ujpg_mrk, \"PGR\", 3 ) == 0 || memcmp( ujpg_mrk, \"PGE\", 3 ) == 0 ) {\n            // read prefix garbage (data before beginning of JPG) from file\n            if (ujpg_mrk[2] == 'E') {\n                // embedded jpeg: full header required\n                embedded_jpeg = true;\n            }\n            ReadFull(header_reader, ujpg_mrk, 4);\n            prefix_grbs = LEtoUint32(ujpg_mrk);\n            prefix_grbgdata = aligned_alloc(prefix_grbs);\n            memset(prefix_grbgdata, 0, sizeof(prefix_grbs));\n            if ( prefix_grbgdata == NULL ) {\n                fprintf( stderr, MEM_ERRMSG );\n                errorlevel.store(2);\n                return false;\n            }\n            // read garbage data\n            ReadFull(header_reader, prefix_grbgdata, prefix_grbs );\n        }",
+      "explanation": "'PGR'/'PGE' (prefix garbage) mirrors GRB: PGE sets embedded_jpeg. A 32-bit unbounded `prefix_grbs` sizes an aligned_alloc buffer, then `memset(prefix_grbgdata, 0, sizeof(prefix_grbs))` again zeroes only 4 bytes (sizeof the scalar), and again the NULL check follows the memset. prefix_grbs bytes are then read in."
+    },
+    {
+      "file": "corpus/eval/eval_0029_cwe399.cpp",
+      "lines": "195-211",
+      "code": "else if ( memcmp( ujpg_mrk, \"SIZ\", 3 ) == 0 ) {\n            // full size of the original file\n            ReadFull(header_reader, ujpg_mrk, 4);\n            max_file_size = LEtoUint32(ujpg_mrk);\n        }\n        else if ( memcmp( ujpg_mrk, \"EEE\", 3) == 0) {\n            ReadFull(header_reader, ujpg_mrk, 28);\n            max_cmp = LEtoUint32(ujpg_mrk);\n            max_bpos = LEtoUint32(ujpg_mrk + 4);\n            max_sah = LEtoUint32(ujpg_mrk + 8);\n            max_dpos[0] = LEtoUint32(ujpg_mrk + 12);\n            max_dpos[1] = LEtoUint32(ujpg_mrk + 16);\n            max_dpos[2] = LEtoUint32(ujpg_mrk + 20);\n            max_dpos[3] = LEtoUint32(ujpg_mrk + 24);\n            early_eof_encountered = true;\n            colldata.set_truncation_bounds(max_cmp, max_bpos, max_dpos, max_sah);\n        }",
+      "explanation": "'SIZ' overwrites `max_file_size` with a fresh attacker 32-bit value AFTER the early 128 MiB gate — so any code that later trusts max_file_size sees an unvalidated number. 'EEE' (early-EOF truncation bounds) reads 28 bytes into ujpg_mrk (fits within the 64-byte buffer) and decodes seven 32-bit fields at offsets 0,4,8,12,16,20,24 — all within the 28 read — populating max_cmp/max_bpos/max_sah and the 4-element max_dpos[] array, then hands them to set_truncation_bounds. The 28-byte read and the fixed offsets are internally consistent."
+    },
+    {
+      "file": "corpus/eval/eval_0029_cwe399.cpp",
+      "lines": "212-228",
+      "code": "else {\n            if (memcmp(ujpg_mrk, \"CNT\", 3) == 0 ) {\n                pending_header_reads = true;\n                break;\n            } else if (memcmp(ujpg_mrk, \"CMP\", 3) == 0 ) {\n                break;\n            } else {\n                fprintf( stderr, \"unknown data found\" );\n                errorlevel.store(2);\n            }\n            return false;\n        }\n    }",
+      "explanation": "The catch-all: 'CNT' (continuation) sets pending_header_reads and breaks, 'CMP' (compressed data follows) breaks, anything else logs 'unknown data found' and returns false. The loop otherwise continues consuming markers until a short read on the 3-byte tag terminates it."
+    },
+    {
+      "file": "corpus/eval/eval_0029_cwe399.cpp",
+      "lines": "225-247",
+      "code": "if (!pending_header_reads) {\n        delete header_reader;\n        header_reader = NULL;\n    }\n    write_byte_bill(Billing::HEADER,\n                    false,\n                    2 + hdrs + prefix_grbs + grbs);\n\n    ReadFull(str_in, ujpg_mrk, 3 ) ;\n    write_byte_bill(Billing::HEADER, true, 3);\n\n    write_byte_bill(Billing::DELIMITERS, true, 4 * NUM_THREADS); // trailing vpx_encode bits\n    write_byte_bill(Billing::HEADER, true, 4); //trailing size\n\n    if (memcmp(ujpg_mrk, \"CMP\", 3) != 0) {\n        always_assert(false && \"CMP must be present (uncompressed) in the file or CNT continue marker\");\n        return false; // not a JPG\n    }\n    colldata.signal_worker_should_begin();\n    g_decoder->initialize(str_in, thread_handoff);\n    colldata.start_decoder(g_decoder);\n    return true;\n}",
+      "explanation": "After the loop, header_reader is freed unless a continuation is pending. Byte-billing records `2 + hdrs + prefix_grbs + grbs` (attacker sizes summed — could overflow the accounting but that is telemetry). A final 3-byte tag is read from str_in and must equal 'CMP', else abort. On success the collated data worker is signaled, g_decoder is initialized with str_in and the parsed thread_handoff, and decoding starts. Return true."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/eval/eval_0029_cwe399.cpp",
+      "lines": "157-161",
+      "code": "scnc = LEtoUint32(ujpg_mrk);\n            \n            rst_err.insert(rst_err.end(), scnc - rst_err.size(), 0);\n            // read data\n            ReadFull(header_reader, rst_err.data(), scnc );",
+      "explanation": "`scnc` is a fully attacker-controlled 32-bit value; `rst_err.size()` is a size_t. The expression `scnc - rst_err.size()` is evaluated in unsigned (size_t) arithmetic. If scnc is smaller than the current rst_err.size() — which is easily arranged because the 'FRS' branch lives inside the `while` loop and rst_err retains its size across iterations, so a second FRS with a smaller scnc than the first underflows — the count wraps to a value near 2^64. `std::vector::insert` then attempts to allocate ~2^64 bytes, throwing std::length_error/std::bad_alloc (uncaught -> terminate, a remote DoS) or, on allocators that do not throw, corrupting state. Even without underflow, if the FRS payload is shorter than scnc the following ReadFull returns short but is unchecked. The implementation MUST reject scnc that is inconsistent with the remaining buffer and compute the growth delta with an explicit `if (scnc > rst_err.size())` guard before subtracting."
+    },
+    {
+      "file": "corpus/eval/eval_0029_cwe399.cpp",
+      "lines": "83-92",
+      "code": "hdrs = LEtoUint32(ujpg_mrk);\n        hdrdata = (unsigned char*) aligned_alloc(hdrs);\n        memset(hdrdata, 0, hdrs);\n        if ( hdrdata == NULL ) {\n            fprintf( stderr, MEM_ERRMSG );\n            errorlevel.store(2);\n            return false;\n        }\n        // read hdrdata\n        ReadFull(header_reader, hdrdata, hdrs );",
+      "explanation": "`memset(hdrdata, 0, hdrs)` runs BEFORE the `if (hdrdata == NULL)` check. `hdrs` is an unbounded attacker 32-bit size, so aligned_alloc can plausibly fail (return NULL) for large values; the very next statement writes hdrs zero bytes starting at address 0, a guaranteed NULL-pointer dereference / crash before the guard can act. The NULL check is dead once the memset has already dereferenced the pointer. Even when allocation succeeds, hdrs is uncontrolled (up to 4 GiB) so this doubles as a memory-exhaustion primitive. Fix: check NULL immediately after aligned_alloc and bound hdrs before allocating."
+    },
+    {
+      "file": "corpus/eval/eval_0029_cwe399.cpp",
+      "lines": "166-168",
+      "code": "grbs = LEtoUint32(ujpg_mrk);\n            grbgdata = aligned_alloc(grbs);\n            memset(grbgdata, 0, sizeof(grbs));",
+      "explanation": "Two defects on adjacent lines. (1) `memset(grbgdata, 0, sizeof(grbs))` uses `sizeof(grbs)` — the size of the 32-bit length variable, i.e. 4 — instead of `grbs`, so only the first 4 bytes of a grbs-sized buffer are zeroed; the intent to pre-zero the allocation is silently defeated (any bytes not later overwritten by ReadFull remain uninitialized heap contents). (2) As with hdrdata, the memset precedes the NULL check (line 169), so a failed aligned_alloc(grbs) — grbs being unbounded — dereferences NULL. The prefix_grbgdata path at line 185-186 has the identical `sizeof(prefix_grbs)` bug and identical ordering defect. Fix: `memset(grbgdata, 0, grbs)` AND move the NULL test above the memset, and bound grbs."
+    },
+    {
+      "file": "corpus/eval/eval_0029_cwe399.cpp",
+      "lines": "83-84",
+      "code": "hdrs = LEtoUint32(ujpg_mrk);\n        hdrdata = (unsigned char*) aligned_alloc(hdrs);",
+      "explanation": "Unlike compressed_header_size (bounded to 128 MiB at line 19), the per-marker length fields decoded inside the decompressed header — hdrs (84), rst_cnt count (140), scnc (157/159), grbs (166), prefix_grbs (184), and max_file_size (198) — are used to size allocations, resizes, and reads with NO upper bound. A crafted header can request 4 GiB allocations repeatedly, or a single ~4 GiB one, exhausting memory / triggering OOM-kill (uncontrolled resource consumption). Because the decompressed header can be up to a few hundred MB, many such markers fit in one file. The implementation MUST validate each length against the remaining input size and a sane maximum before allocating."
+    },
+    {
+      "file": "corpus/eval/eval_0029_cwe399.cpp",
+      "lines": "78-82",
+      "code": "ReadFull(header_reader, ujpg_mrk, 3 ) ;\n    // check marker\n    if ( memcmp( ujpg_mrk, \"HDR\", 3 ) == 0 ) {\n        // read size of header, alloc memory\n        ReadFull(header_reader, ujpg_mrk, 4 );",
+      "explanation": "Almost every ReadFull in the marker path ignores its return value (lines 78, 82, 92, 139, 142, 151, 156, 161, 165, 175, 183, 193, 197, 201, 233). ReadFull can return fewer bytes than requested on a truncated header; the code then compares/decodes stale bytes left in the 64-byte ujpg_mrk buffer from a previous iteration (use of stale/uninitialized data), or reads a length from an under-filled buffer. Combined with the unchecked lengths, a truncated stream can drive the parser into decoding garbage as sizes. The invariant: every ReadFull's return count must be checked to equal the requested length before the bytes are used (as is correctly done only at line 13)."
+    },
+    {
+      "file": "corpus/eval/eval_0029_cwe399.cpp",
+      "lines": "111-116",
+      "code": "header_reader->Read( reinterpret_cast<unsigned char*>(&padbit), 1 );\n    }\n    else if ( memcmp( ujpg_mrk, \"PAD\", 3 ) == 0 ) {\n        // this is a single pad bit that is implied to have all the same values\n        header_reader->Read( reinterpret_cast<unsigned char*>(&padbit), 1 );\n        if (!(padbit == 0 || padbit == 1 ||padbit == -1)) {",
+      "explanation": "`padbit` is compared against -1, so it is a signed multi-byte integer, yet only ONE byte is written into it through `reinterpret_cast<unsigned char*>(&padbit)`. On the P0D branch padbit is never validated at all; on the PAD branch, writing a single low byte (e.g. 0xFF) cannot reconstruct the full -1 bit pattern the check expects, and the upper bytes retain whatever padbit held previously — so validation reasons over a partially-updated value. This is a type/endianness confusion (incorrect type/size in the cast) that can let unintended padbit values slip past the {0,1,-1} gate and feed a wrong pad value into JPEG reconstruction. The reads' return values are also unchecked. Fix: read into a byte, then assign to padbit with an explicit, sign-correct decode."
+    },
+    {
+      "file": "corpus/eval/eval_0029_cwe399.cpp",
+      "lines": "197-198",
+      "code": "ReadFull(header_reader, ujpg_mrk, 4);\n            max_file_size = LEtoUint32(ujpg_mrk);",
+      "explanation": "The 'SIZ' marker overwrites `max_file_size` with a fresh attacker 32-bit value AFTER the early 128 MiB validation at line 19 (and after it was already used to bound decompression at lines 46/60). Any downstream consumer of max_file_size (e.g. size callbacks, allocation sizing in the decoder initialized at line 244) therefore trusts a value that never passed the gate. The invariant: a length reused as a bound must be re-validated at each point of use, or made immutable after the initial check."
+    }
+  ],
+  "summary": "This UJG/Lepton header parser reads many attacker-controlled 32-bit length fields from a decompressed, untrusted header and uses them with almost no bounds checking. The sharpest bug is an unsigned-integer underflow at line 159 (`rst_err.insert(rst_err.end(), scnc - rst_err.size(), 0)`) that wraps to a ~2^64 element count and crashes on allocation. Compounding it: three sites memset before the NULL check (NULL-deref on allocation failure), two of those memsets zero `sizeof(len)` (4 bytes) instead of the buffer size, none of the per-marker lengths are bounded (uncontrolled allocation/DoS), and nearly all ReadFull return values are ignored. Net risk is remote denial-of-service on a crafted .ujg file, with latent memory-corruption exposure in the unshown implementations.",
+  "reviewed_anchors": [
+    {"anchor": "bool read_ujpg( void ) — signature (line 2)", "disposition": "dismissed", "reason": "Entry point taking no args; all untrusted input arrives via globals str_in/header_reader analyzed elsewhere."},
+    {"anchor": "unsigned char ujpg_mrk[ 64 ] — fixed 64-byte stack buffer (line 7)", "disposition": "dismissed", "reason": "All writes into it are of fixed sizes 3/4/28 (<=28 < 64); no length field drives a copy into it, so no overflow of this buffer."},
+    {"anchor": "compressed_header_size = LEtoUint32(ujpg_mrk) (lines 12,18)", "disposition": "dismissed", "reason": "Explicitly bounded to <=128 MiB at line 19 before use; the one properly validated size."},
+    {"anchor": "128*1024*1024 cap check (line 19)", "disposition": "dismissed", "reason": "This IS the mitigation for compressed_header_size/max_file_size; correct as written, but noted that it does not cover later per-marker lengths."},
+    {"anchor": "compressed_header_buffer(compressed_header_size) (line 25)", "disposition": "dismissed", "reason": "Sized by the bounded compressed_header_size; allocation is capped."},
+    {"anchor": "IOUtil::ReadFull(...) return values (multiple)", "disposition": "finding", "reason": "Return count ignored at lines 26,78,82,92,139,142,151,156,161,165,175,183,193,197,201,233 — short reads use stale data."},
+    {"anchor": "Decompress output caps max_file_size+2048 / *2+128MiB (lines 46,60)", "disposition": "dismissed", "reason": "Bounded by the already-capped max_file_size; JpegError checked on both branches."},
+    {"anchor": "hdrs = LEtoUint32(ujpg_mrk) (line 83)", "disposition": "finding", "reason": "Unbounded attacker 32-bit allocation size feeding aligned_alloc."},
+    {"anchor": "hdrdata = aligned_alloc(hdrs); memset(hdrdata,0,hdrs) (lines 84-85)", "disposition": "finding", "reason": "memset precedes NULL check (line 86) -> NULL deref on allocation failure."},
+    {"anchor": "padbit reinterpret_cast<unsigned char*>(&padbit), Read 1 byte (lines 111,115)", "disposition": "finding", "reason": "Single-byte write into a signed multi-byte int compared to -1; type/endianness confusion, P0D path unvalidated."},
+    {"anchor": "rst_cnt.resize(LEtoUint32(ujpg_mrk)) (line 140)", "disposition": "finding", "reason": "Unbounded attacker count -> uncontrolled resize/allocation (folded into the uncontrolled-allocation finding)."},
+    {"anchor": "to_alloc = get_remaining_data_size_from_two_bytes(ujpg_mrk+1) + 2 (line 146)", "disposition": "dismissed", "reason": "Derived from 2 bytes (<=65535)+2; to_alloc>=2 so `to_alloc-2` cannot underflow and &data[2] stays in bounds — this path is well-formed."},
+    {"anchor": "scnc = LEtoUint32(ujpg_mrk) (line 157)", "disposition": "finding", "reason": "Attacker count driving the underflowing subtraction at line 159."},
+    {"anchor": "rst_err.insert(rst_err.end(), scnc - rst_err.size(), 0) (line 159)", "disposition": "finding", "reason": "Unsigned underflow when scnc < rst_err.size() -> ~2^64 element insert -> crash. Primary finding."},
+    {"anchor": "ReadFull(header_reader, rst_err.data(), scnc) (line 161)", "disposition": "finding", "reason": "Depends on the insert having grown rst_err to scnc; unchecked read, part of the underflow finding."},
+    {"anchor": "grbs = LEtoUint32; grbgdata = aligned_alloc(grbs) (lines 166-167)", "disposition": "finding", "reason": "Unbounded allocation size (uncontrolled-allocation finding)."},
+    {"anchor": "memset(grbgdata, 0, sizeof(grbs)) (line 168)", "disposition": "finding", "reason": "sizeof(scalar)=4 zeroes only 4 bytes; also memset-before-NULL-check ordering."},
+    {"anchor": "prefix_grbs / prefix_grbgdata (lines 184-185)", "disposition": "finding", "reason": "Unbounded allocation size (uncontrolled-allocation finding)."},
+    {"anchor": "memset(prefix_grbgdata, 0, sizeof(prefix_grbs)) (line 186)", "disposition": "finding", "reason": "Identical sizeof-scalar and memset-before-NULL-check defect as line 168."},
+    {"anchor": "max_file_size = LEtoUint32(ujpg_mrk) — SIZ (line 198)", "disposition": "finding", "reason": "Re-writes a previously validated bound with an unvalidated value after the 128 MiB gate."},
+    {"anchor": "EEE: ReadFull 28 bytes + LEtoUint32 at offsets 0..24, max_dpos[4] (lines 201-208)", "disposition": "dismissed", "reason": "28-byte read fully covers the seven 4-byte decodes (max offset 24..28) and max_dpos indices 0-3 are in-bounds; internally consistent."},
+    {"anchor": "CNT/CMP break markers and unknown-data path (lines 213-221)", "disposition": "dismissed", "reason": "Control-flow terminators; no memory contract, correct behavior."},
+    {"anchor": "write_byte_bill(..., 2 + hdrs + prefix_grbs + grbs) (line 231)", "disposition": "dismissed", "reason": "Telemetry/accounting only; a wrapped sum has no memory-safety impact."},
+    {"anchor": "final memcmp(ujpg_mrk, \"CMP\", 3) gate (line 239)", "disposition": "dismissed", "reason": "Validation gate; correct, aborts if the trailing CMP marker is absent."},
+    {"anchor": "g_decoder->initialize(str_in, thread_handoff) (line 244)", "disposition": "dismissed", "reason": "Hands parsed state to the decoder; the decoder is out of scope, thread_handoff path is bounded (line 146)."}
+  ],
+  "findings": [
+    {
+      "title": "Unsigned integer underflow in rst_err growth (FRS marker)",
+      "anchor": "rst_err.insert(rst_err.end(), scnc - rst_err.size(), 0)",
+      "file": "corpus/eval/eval_0029_cwe399.cpp",
+      "line": "159",
+      "code": "rst_err.insert(rst_err.end(), scnc - rst_err.size(), 0);",
+      "bug_class": "Integer underflow leading to enormous allocation / denial of service",
+      "cwe": "CWE-191",
+      "severity": "high",
+      "where_it_lives": "corpus/eval/eval_0029_cwe399.cpp (function read_ujpg)",
+      "invariant": "The count passed to insert must be computed as a non-negative growth delta: only grow when scnc > rst_err.size(), and scnc must be bounded against the remaining input length before use.",
+      "failure_mode": "scnc is an attacker-controlled 32-bit value (line 157). When scnc < rst_err.size() — trivially reachable because 'FRS' is inside the while-loop and rst_err retains its size across iterations, so a second FRS with a smaller scnc underflows — `scnc - rst_err.size()` wraps in size_t to ~2^64. std::vector::insert then attempts a ~2^64-byte allocation, throwing bad_alloc/length_error (uncaught -> std::terminate, remote DoS) on a single crafted .ujg file.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether rst_err can be non-empty when FRS is (re)entered, and whether the surrounding code catches the resulting exception; confirm scnc's declared type and that no prior bound is applied."
+    },
+    {
+      "title": "memset before NULL check zeroes NULL on allocation failure (hdrdata/grbgdata/prefix_grbgdata)",
+      "anchor": "memset(hdrdata, 0, hdrs); ... if ( hdrdata == NULL )",
+      "file": "corpus/eval/eval_0029_cwe399.cpp",
+      "line": "84-86",
+      "code": "hdrdata = (unsigned char*) aligned_alloc(hdrs);\n        memset(hdrdata, 0, hdrs);\n        if ( hdrdata == NULL ) {",
+      "bug_class": "NULL pointer dereference (check-after-use ordering)",
+      "cwe": "CWE-476",
+      "severity": "high",
+      "where_it_lives": "corpus/eval/eval_0029_cwe399.cpp (function read_ujpg)",
+      "invariant": "A pointer returned by aligned_alloc must be tested for NULL BEFORE any dereference (memset/read); the guard must dominate the write.",
+      "failure_mode": "aligned_alloc(hdrs) can fail (return NULL) because hdrs is an unbounded attacker size; the immediately following memset(hdrdata, 0, hdrs) dereferences NULL and crashes before the `if (hdrdata == NULL)` guard on line 86 can run. The GRB path (lines 167-169) and PGR/PGE path (lines 185-187) have the identical memset-before-check ordering.",
+      "cve_analog": "",
+      "what_to_confirm": "That aligned_alloc here returns NULL (not aborts) on failure, and that no compiler reordering hides it; confirm the same fix is needed at lines 168 and 186."
+    },
+    {
+      "title": "Unbounded attacker-controlled allocation sizes (hdrs, grbs, prefix_grbs, rst_cnt, scnc)",
+      "anchor": "hdrdata = (unsigned char*) aligned_alloc(hdrs)",
+      "file": "corpus/eval/eval_0029_cwe399.cpp",
+      "line": "84",
+      "code": "hdrdata = (unsigned char*) aligned_alloc(hdrs);",
+      "bug_class": "Uncontrolled memory allocation / resource exhaustion",
+      "cwe": "CWE-789",
+      "severity": "medium",
+      "where_it_lives": "corpus/eval/eval_0029_cwe399.cpp (function read_ujpg)",
+      "invariant": "Every 32-bit length decoded from the header (hdrs L84, rst_cnt count L140, scnc L157, grbs L166, prefix_grbs L184) must be validated against a sane maximum and the remaining input size before it sizes an allocation/resize/read.",
+      "failure_mode": "Unlike compressed_header_size (capped to 128 MiB at line 19), these per-marker lengths are used raw. A crafted header can request one ~4 GiB allocation, or many large ones across markers inside the loop, exhausting memory and triggering OOM-kill — remote DoS with no memory corruption required.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether aligned_alloc / vector::resize impose any internal cap, and what the realistic maximum legitimate header size is so a bound can be added."
+    },
+    {
+      "title": "memset uses sizeof(length variable) instead of buffer size (GRB/PGR garbage buffers)",
+      "anchor": "memset(grbgdata, 0, sizeof(grbs))",
+      "file": "corpus/eval/eval_0029_cwe399.cpp",
+      "line": "168",
+      "code": "memset(grbgdata, 0, sizeof(grbs));",
+      "bug_class": "Incorrect buffer size calculation (sizeof of scalar, not element count)",
+      "cwe": "CWE-131",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0029_cwe399.cpp (function read_ujpg)",
+      "invariant": "The zero-fill length must equal the allocation size (grbs / prefix_grbs), not sizeof() of the 4-byte length variable.",
+      "failure_mode": "`sizeof(grbs)` evaluates to 4 (the size of the uint32 length), so only the first 4 bytes of a grbs-byte buffer are zeroed; any bytes the subsequent ReadFull leaves untouched (e.g. on a short read, whose return is unchecked) retain uninitialized heap contents, which may later be emitted as 'garbage' recovery bytes (information exposure). The prefix_grbgdata memset at line 186 has the identical defect with sizeof(prefix_grbs).",
+      "cve_analog": "",
+      "what_to_confirm": "Whether the buffer is always fully overwritten by ReadFull before use; if not, the uninitialized tail can leak. Confirm identical bug at line 186."
+    },
+    {
+      "title": "Unchecked ReadFull return values across the marker parser",
+      "anchor": "ReadFull(header_reader, ujpg_mrk, 3 ) ;",
+      "file": "corpus/eval/eval_0029_cwe399.cpp",
+      "line": "78",
+      "code": "ReadFull(header_reader, ujpg_mrk, 3 ) ;",
+      "bug_class": "Unchecked return value / use of stale (uninitialized) buffer data",
+      "cwe": "CWE-252",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0029_cwe399.cpp (function read_ujpg)",
+      "invariant": "Every ReadFull must have its returned byte count compared to the requested length before the bytes are consumed, as is correctly done only at line 13.",
+      "failure_mode": "At lines 26,78,82,92,139,142,151,156,161,165,175,183,193,197,201,233 the return value is discarded. On a truncated header, ujpg_mrk (or a length field) retains bytes from a prior iteration; the parser then compares/decodes stale data — e.g. reading a length from an under-filled buffer, feeding the unbounded-allocation and underflow paths above.",
+      "cve_analog": "",
+      "what_to_confirm": "ReadFull's contract on short reads (does it zero-fill or leave the buffer partial?) and whether any downstream check catches inconsistent marker sequences."
+    },
+    {
+      "title": "Single-byte read into signed multi-byte padbit via reinterpret_cast",
+      "anchor": "header_reader->Read( reinterpret_cast<unsigned char*>(&padbit), 1 )",
+      "file": "corpus/eval/eval_0029_cwe399.cpp",
+      "line": "111",
+      "code": "header_reader->Read( reinterpret_cast<unsigned char*>(&padbit), 1 );",
+      "bug_class": "Incorrect type/size conversion (partial-object write / endianness confusion)",
+      "cwe": "CWE-704",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0029_cwe399.cpp (function read_ujpg)",
+      "invariant": "A wire byte must be decoded into padbit with an explicit sign/width-correct conversion; padbit must be fully initialized before it is validated, and the P0D path must validate it too.",
+      "failure_mode": "padbit is compared to -1 (line 116), so it is a signed integer wider than one byte, yet only its low byte is written through the cast. The upper bytes keep their prior value, so the {0,1,-1} check reasons over a partially-updated object and the -1 pattern can never be produced by a single 0xFF byte; on the P0D branch (line 111) padbit is never validated at all. A wrong pad value flows into JPEG reconstruction. Read return value is also unchecked.",
+      "cve_analog": "",
+      "what_to_confirm": "The declared type/width of padbit and whether it is zero-initialized before these reads; whether P0D values need the same {0,1,-1} validation as PAD."
+    },
+    {
+      "title": "max_file_size re-written by SIZ marker after the 128 MiB validation gate",
+      "anchor": "max_file_size = LEtoUint32(ujpg_mrk)",
+      "file": "corpus/eval/eval_0029_cwe399.cpp",
+      "line": "198",
+      "code": "max_file_size = LEtoUint32(ujpg_mrk);",
+      "bug_class": "Missing re-validation of a reused bound (input validation)",
+      "cwe": "CWE-20",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0029_cwe399.cpp (function read_ujpg)",
+      "invariant": "A value that gates allocations/callbacks must be re-validated at each point of use, or made immutable after its initial bound check.",
+      "failure_mode": "The 128 MiB check at line 19 validated max_file_size, but the 'SIZ' marker overwrites it with a fresh unvalidated 32-bit value mid-parse. Downstream consumers (str_out size callback, decoder initialized at line 244) then trust an unbounded number that never passed the gate.",
+      "cve_analog": "",
+      "what_to_confirm": "Which later code reads max_file_size after SIZ and whether any of it sizes a buffer or allocation from the unvalidated value."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm rst_err can be non-empty on FRS re-entry and add an `if (scnc > rst_err.size())` guard before the subtraction at line 159; verify the caller catches bad_alloc/length_error.",
+    "Move every `if (ptr == NULL)` check to immediately after aligned_alloc and before the memset at lines 84-86, 167-169, 185-187.",
+    "Change `memset(grbgdata,0,sizeof(grbs))` (line 168) and `memset(prefix_grbgdata,0,sizeof(prefix_grbs))` (line 186) to use the byte count grbs/prefix_grbs.",
+    "Add sane upper bounds (and remaining-input checks) to hdrs (84), rst_cnt count (140), scnc (157), grbs (166), prefix_grbs (184) as is already done for compressed_header_size at line 19.",
+    "Check the return value of every ReadFull in the marker loop and abort on short reads; confirm ReadFull's short-read buffer semantics.",
+    "Decode padbit via a byte and a sign-correct conversion; validate the P0D pad value, not just PAD; ensure padbit is initialized before the {0,1,-1} test.",
+    "Audit all consumers of max_file_size after the SIZ overwrite (line 198) and re-validate before any allocation or callback uses it."
+  ]
+}

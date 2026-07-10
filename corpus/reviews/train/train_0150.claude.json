@@ -1,0 +1,231 @@
+{
+  "subsystem": "TensorFlow op kernel: the Compute() method of the SparseSplit kernel (a SparseTensor op). It takes a sparse tensor expressed as (indices matrix, values vector, dense-shape vector) plus a scalar split axis, validates the request, builds a dense TensorShape, wraps the inputs in a sparse::SparseTensor, splits it along a chosen dimension into num_split_ pieces, and emits the pieces' indices/values/shapes as op outputs.",
+  "provenance": "Identified from the TensorFlow C++ kernel idioms: OpKernelContext* context, context->input(N), Tensor/TensorShape/TensorShapeUtils, OP_REQUIRES / OP_REQUIRES_OK / errors::InvalidArgument, the int64 typedef, sparse::SparseTensor::Create and sparse::SparseTensor::Split<T>, and context->allocate_output / set_output. The member num_split_ and the (indices, values, shape) input triple are the canonical signature of core/kernels/sparse_split_op. The header comment 'sample: primevul_validation_0109_fixed' and the file name '_cwe369' indicate this is the hardened (post-fix) revision of a divide-by-zero-class report.",
+  "trust_boundary": "Every value read via context->input(...) and the op attribute num_split_ is attacker-controllable: an untrusted SavedModel/GraphDef or an untrusted caller feeding an inference server can set arbitrary tensor dtypes, ranks, element counts, and contents. Hostile fields are: input(0) axis_input (an int64 the user can set to any value including INT64_MIN and can also give the wrong rank/dtype), input(1) indices, input(2) values, input(3) shape (a vector of int64 dimension sizes, each user-chosen), and the graph-supplied num_split_ attribute. Nothing here is trusted; the op must fully validate before doing arithmetic that feeds a divide or an allocation.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0150_cwe369.cpp",
+      "lines": "2",
+      "code": "void Compute(OpKernelContext* context) override {",
+      "explanation": "The entry point of the kernel, overriding OpKernel::Compute. context is the per-invocation execution context that carries the input tensors, allows allocating outputs, and is the sink for OP_REQUIRES status reporting. All attacker-controlled data for this op arrives through this single context handle, so everything reachable from here is untrusted until validated."
+    },
+    {
+      "file": "corpus/train/train_0150_cwe369.cpp",
+      "lines": "3",
+      "code": "const int64 axis_input = context->input(0).scalar<int64>()();",
+      "explanation": "Reads input tensor 0 and interprets it as a 0-D int64 scalar, then dereferences it to obtain the requested split axis. Tensor::scalar<int64>() internally requires that the tensor's dtype is int64 and that it has exactly one element (rank 0); those requirements are enforced with internal CHECKs, not with OP_REQUIRES, and there is no preceding shape/dtype guard on input(0). axis_input is fully user-controlled and may be negative (a Python-style negative axis) or arbitrarily large/small."
+    },
+    {
+      "file": "corpus/train/train_0150_cwe369.cpp",
+      "lines": "4-6",
+      "code": "const Tensor& input_indices = context->input(1);\n    const Tensor& input_values = context->input(2);\n    const Tensor& input_shape = context->input(3);",
+      "explanation": "Binds references to the three tensors that describe the COO-form sparse tensor: input_indices is expected to be an [nnz, rank] matrix of coordinates, input_values an [nnz] vector of the non-zero values, and input_shape a [rank] vector giving the dense dimension sizes. These are borrowed references into context-owned storage; their shapes and contents are entirely attacker-chosen at this point."
+    },
+    {
+      "file": "corpus/train/train_0150_cwe369.cpp",
+      "lines": "8-11",
+      "code": "OP_REQUIRES(context, TensorShapeUtils::IsMatrix(input_indices.shape()),\n                errors::InvalidArgument(\n                    \"Input indices should be a matrix but received shape \",\n                    input_indices.shape().DebugString()));",
+      "explanation": "First validation gate: requires that input_indices is rank 2 (a matrix). OP_REQUIRES evaluates the boolean predicate and, if false, sets an InvalidArgument status on context and returns from Compute early. This enforces the [nnz, rank] contract that SparseTensor::Create will later rely on for its coordinate layout."
+    },
+    {
+      "file": "corpus/train/train_0150_cwe369.cpp",
+      "lines": "12-15",
+      "code": "OP_REQUIRES(context, TensorShapeUtils::IsVector(input_values.shape()),\n                errors::InvalidArgument(\n                    \"Input values should be a vector but received shape \",\n                    input_indices.shape().DebugString()));",
+      "explanation": "Second gate: requires that input_values is rank 1 (a vector), the [nnz] value list paired with the coordinate rows. Note the diagnostic string interpolates input_indices.shape() rather than input_values.shape() — a copy/paste slip in the error message only; the predicate itself correctly tests input_values. The check itself is sound."
+    },
+    {
+      "file": "corpus/train/train_0150_cwe369.cpp",
+      "lines": "16-19",
+      "code": "OP_REQUIRES(context, TensorShapeUtils::IsVector(input_shape.shape()),\n                errors::InvalidArgument(\n                    \"Input shape should be a vector but received shape \",\n                    input_shape.shape().DebugString()));",
+      "explanation": "Third gate: requires input_shape to be rank 1 (a vector) so it can be read as a list of dimension sizes. This guards the subsequent input_shape.vec<int64>() access — vec<int64>() itself CHECK-fails on a non-vector, so this OP_REQUIRES converts that would-be crash into a clean InvalidArgument for input(3)."
+    },
+    {
+      "file": "corpus/train/train_0150_cwe369.cpp",
+      "lines": "21",
+      "code": "const int64 input_rank = input_shape.vec<int64>().size();",
+      "explanation": "Computes the dense tensor's rank as the number of entries in the shape vector. Because line 16-19 already established that input_shape is a vector, vec<int64>() is safe here. input_rank is later used both as the upper bound for a valid axis and as the offset that turns a negative axis into a positive one. Note it can legitimately be 0 (an empty shape vector), which matters for the range checks below."
+    },
+    {
+      "file": "corpus/train/train_0150_cwe369.cpp",
+      "lines": "22",
+      "code": "const int64 axis = (axis_input < 0) ? input_rank + axis_input : axis_input;",
+      "explanation": "Normalizes a Python-style negative axis: a negative axis_input is folded by adding input_rank so that -1 maps to the last dimension. This is signed int64 arithmetic on an attacker-controlled axis_input; the addition input_rank + axis_input is performed before any bound has been placed on axis_input's magnitude."
+    },
+    {
+      "file": "corpus/train/train_0150_cwe369.cpp",
+      "lines": "24-27",
+      "code": "OP_REQUIRES(\n        context, axis >= 0 && axis < input_rank,\n        errors::InvalidArgument(\"Input axis should be in range [\", -input_rank,\n                                \", \", input_rank, \"), got \", axis_input));",
+      "explanation": "Bounds the (already normalized) axis to the half-open range [0, input_rank). This rejects out-of-range axes and, importantly, also rejects everything when input_rank == 0 (since no value can be both >= 0 and < 0), so a zero-rank shape cannot proceed. This is the guard that makes the later input_shape.vec<int64>()(axis) indexed access in-bounds."
+    },
+    {
+      "file": "corpus/train/train_0150_cwe369.cpp",
+      "lines": "29-34",
+      "code": "OP_REQUIRES(context,\n                num_split_ >= 1 && num_split_ <= input_shape.vec<int64>()(axis),\n                errors::InvalidArgument(\"Input num_split should be between 1 \"\n                                        \"and the splitting dimension size (\",\n                                        input_shape.vec<int64>()(axis),\n                                        \"), got \", num_split_));",
+      "explanation": "The central safety gate for this op family. It requires num_split_ to be at least 1 and at most the size of the dimension being split (input_shape.vec<int64>()(axis)). The lower bound num_split_ >= 1 is exactly the guard that prevents a divide-by-zero inside SparseTensor::Split, which partitions the split dimension by dividing/modding its size by num_split. The upper bound ensures each split slice has at least one index of width and that the dimension size is itself >= 1. The indexed read (axis) is safe because line 24-27 pinned axis into [0, input_rank)."
+    },
+    {
+      "file": "corpus/train/train_0150_cwe369.cpp",
+      "lines": "36-42",
+      "code": "// Prevent overflow by constructing the dense shape separately\n    TensorShape dense_shape;\n    const auto input_shape_flat = input_shape.flat<int64>();\n    for (int i = 0; i < input_shape.NumElements(); i++) {\n      OP_REQUIRES_OK(context,\n                     dense_shape.AddDimWithStatus(input_shape_flat(i)));\n    }",
+      "explanation": "Builds a TensorShape one dimension at a time from the user-supplied shape vector. AddDimWithStatus is the checked variant: it returns a non-OK Status (rather than crashing) if a dimension is negative or if the running product of dimensions would overflow the int64 element count, and OP_REQUIRES_OK converts that into an InvalidArgument. This is the deliberate 'prevent overflow' path noted in the comment and is the correct, hardened way to validate an attacker-controlled shape."
+    },
+    {
+      "file": "corpus/train/train_0150_cwe369.cpp",
+      "lines": "44-47",
+      "code": "sparse::SparseTensor sparse_tensor;\n    OP_REQUIRES_OK(context,\n                   sparse::SparseTensor::Create(input_indices, input_values,\n                                                dense_shape, &sparse_tensor));",
+      "explanation": "Constructs a SparseTensor from the validated indices, values, and dense_shape. Create performs its own consistency checks (e.g. that the number of index rows matches the number of values, and that index columns match the rank) and returns a Status, checked by OP_REQUIRES_OK. This is where indices-vs-shape coherence is enforced before any split arithmetic runs."
+    },
+    {
+      "file": "corpus/train/train_0150_cwe369.cpp",
+      "lines": "49-51",
+      "code": "std::vector<sparse::SparseTensor> outputs;\n    OP_REQUIRES_OK(context, sparse::SparseTensor::Split<T>(\n                                sparse_tensor, axis, num_split_, &outputs));",
+      "explanation": "Performs the actual split along the validated axis into num_split_ pieces, populating the outputs vector. Internally Split divides the split-dimension size by num_split_ to compute per-slice extents — the operation whose divisor is guaranteed non-zero only by the num_split_ >= 1 gate at line 29-34. The returned Status is checked, so a failed split aborts cleanly. The contract that this call fills exactly num_split_ entries into outputs is what the following loop depends on."
+    },
+    {
+      "file": "corpus/train/train_0150_cwe369.cpp",
+      "lines": "53-65",
+      "code": "for (int slice_index = 0; slice_index < num_split_; ++slice_index) {\n      context->set_output(slice_index, outputs[slice_index].indices());\n      context->set_output(slice_index + num_split_,\n                          outputs[slice_index].values());\n      Tensor* shape = nullptr;\n      OP_REQUIRES_OK(context, context->allocate_output(\n                                  slice_index + 2 * num_split_,\n                                  {outputs[slice_index].dims()}, &shape));\n      auto output_shape = outputs[slice_index].shape();\n      for (int dim = 0; dim < outputs[slice_index].dims(); ++dim) {\n        shape->vec<int64>()(dim) = output_shape[dim];\n      }\n    }\n  }",
+      "explanation": "Emits the 3*num_split_ outputs of the op: for each slice it sets output slot slice_index to the slice's indices, slot slice_index+num_split_ to its values, and allocates slot slice_index+2*num_split_ as a [dims] int64 shape vector that it fills dimension by dimension. slice_index is driven by num_split_ (the loop bound), and each iteration reads outputs[slice_index]; correctness here relies on Split having produced exactly num_split_ elements and on the op registration declaring 3*num_split_ output slots so the set_output/allocate_output indices are in range."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0150_cwe369.cpp",
+      "lines": "3",
+      "code": "const int64 axis_input = context->input(0).scalar<int64>()();",
+      "explanation": "Unlike inputs 1-3, the axis tensor input(0) is never validated for rank or dtype before it is read as a scalar<int64>. Tensor::scalar<int64>() enforces 'dtype == int64' and 'exactly one element / rank 0' with internal CHECK macros. An attacker who feeds an axis tensor of the wrong dtype (e.g. int32/float) or the wrong shape (e.g. a 2-element vector, or an empty tensor) triggers a CHECK failure, i.e. LOG(FATAL) and process abort, before any OP_REQUIRES can turn it into a graceful InvalidArgument. Impact is a remotely reachable denial of service of the serving process. The invariant the kernel must uphold is to OP_REQUIRES that input(0) is a scalar of the expected dtype BEFORE calling scalar<int64>()."
+    },
+    {
+      "file": "corpus/train/train_0150_cwe369.cpp",
+      "lines": "29-34",
+      "code": "OP_REQUIRES(context,\n                num_split_ >= 1 && num_split_ <= input_shape.vec<int64>()(axis),\n                errors::InvalidArgument(\"Input num_split should be between 1 \"\n                                        \"and the splitting dimension size (\",\n                                        input_shape.vec<int64>()(axis),\n                                        \"), got \", num_split_));",
+      "explanation": "This is the anchor the divide-by-zero class hinges on. SparseTensor::Split<T> (line 49-51) partitions the split dimension by dividing its size by num_split; if num_split_ were 0 that division/modulo faults (CWE-369). In this revision the lower-bound clause num_split_ >= 1 closes that hole, and the upper-bound clause plus the axis range guard keep the indexed shape read in-bounds. The residual/latent contract is entirely in the Split implementation (not shown): it MUST use num_split_ as the divisor and must not divide by any other zero-valued quantity (e.g. a per-slice count). If num_split_ >= 1 is ever removed, weakened to > 0 on a signed type without an upper cap, or bypassed for a different code path, the divide-by-zero returns. Here the guard is present and correct."
+    },
+    {
+      "file": "corpus/train/train_0150_cwe369.cpp",
+      "lines": "22",
+      "code": "const int64 axis = (axis_input < 0) ? input_rank + axis_input : axis_input;",
+      "explanation": "The negative-axis normalization adds attacker-controlled axis_input to input_rank in signed int64 arithmetic with no prior magnitude check. If axis_input is close to INT64_MIN, input_rank + axis_input signed-overflows, which is undefined behavior in C++ and in practice wraps to a large positive value. That wrapped value is then range-checked at line 24-27; a pathological input_rank/axis_input pair could in principle wrap into the valid [0, input_rank) window and select a different axis than intended, or trip UB in a sanitized build. The safe invariant is to reject axis_input magnitudes that cannot be represented after the add, or to perform the fold in a widened/unsigned-safe manner. Severity is low because a wrap landing inside the narrow valid range is hard to weaponize beyond a wrong-axis logic error, but it is a genuine CWE-190 signed-overflow-on-untrusted-input site."
+    },
+    {
+      "file": "corpus/train/train_0150_cwe369.cpp",
+      "lines": "53-60",
+      "code": "for (int slice_index = 0; slice_index < num_split_; ++slice_index) {\n      context->set_output(slice_index, outputs[slice_index].indices());\n      context->set_output(slice_index + num_split_,\n                          outputs[slice_index].values());\n      Tensor* shape = nullptr;\n      OP_REQUIRES_OK(context, context->allocate_output(\n                                  slice_index + 2 * num_split_,\n                                  {outputs[slice_index].dims()}, &shape));",
+      "explanation": "The loop indexes outputs[slice_index] for slice_index in [0, num_split_), assuming SparseTensor::Split filled the vector with exactly num_split_ elements. If Split ever returns OK but populates fewer than num_split_ entries, outputs[slice_index] is an out-of-bounds std::vector access (CWE-125 read, likely a crash). This is a latent contract on the not-shown Split implementation. Additionally, set_output/allocate_output are called at slot indices up to 3*num_split_-1; the op's registration MUST declare 3*num_split_ output slots or these calls index past the declared outputs. The invariant: Split returns precisely num_split_ slices and the op signature reserves 3*num_split_ outputs."
+    },
+    {
+      "file": "corpus/train/train_0150_cwe369.cpp",
+      "lines": "12-15",
+      "code": "OP_REQUIRES(context, TensorShapeUtils::IsVector(input_values.shape()),\n                errors::InvalidArgument(\n                    \"Input values should be a vector but received shape \",\n                    input_indices.shape().DebugString()));",
+      "explanation": "Non-security correctness defect: the diagnostic for the input_values vector check prints input_indices.shape().DebugString() instead of input_values.shape(). The predicate is correct, so there is no memory-safety or validation impact — only a misleading error message that reports the wrong tensor's shape to the user. Worth flagging so it is not mistaken for a logic bug during audit, but it carries no exploitable contract."
+    }
+  ],
+  "summary": "This is the hardened revision of the TensorFlow SparseSplit Compute() kernel: the divide-by-zero contract that defines this sample is correctly closed by the num_split_ >= 1 gate, and shape/rank/overflow validation on inputs 1-3 and on the dense shape is present and sound. The one genuine residual defect in the shown code is that the axis tensor input(0) is read as scalar<int64>() with no rank/dtype OP_REQUIRES, so a malformed axis tensor triggers a CHECK-failure process abort (DoS). Remaining items (signed-overflow in negative-axis folding, the outputs[] count assumption, and a cosmetic wrong-tensor error string) are low-severity or latent in the unshown Split implementation.",
+  "reviewed_anchors": [
+    {"anchor": "void Compute(OpKernelContext* context) override", "disposition": "dismissed", "reason": "Kernel entry point; the trust boundary, not itself a bug, but the source of all untrusted inputs."},
+    {"anchor": "axis_input = context->input(0).scalar<int64>()() (line 3)", "disposition": "finding", "reason": "input(0) is read as a scalar with no preceding rank/dtype validation; scalar<int64>() CHECK-fails on a malformed tensor."},
+    {"anchor": "input_indices = context->input(1) (line 4)", "disposition": "dismissed", "reason": "Rank-validated by the IsMatrix gate at lines 8-11 and coherence-checked by SparseTensor::Create."},
+    {"anchor": "input_values = context->input(2) (line 5)", "disposition": "dismissed", "reason": "Rank-validated by the IsVector gate at lines 12-15; nnz coherence enforced in Create."},
+    {"anchor": "input_shape = context->input(3) (line 6)", "disposition": "dismissed", "reason": "Rank-validated by the IsVector gate at lines 16-19; values bounds/overflow-checked via AddDimWithStatus."},
+    {"anchor": "IsMatrix(input_indices) gate (lines 8-11)", "disposition": "dismissed", "reason": "Correct guard; enforces the [nnz, rank] contract before use."},
+    {"anchor": "IsVector(input_values) gate (lines 12-15)", "disposition": "finding", "reason": "Predicate correct but the error message references input_indices.shape() — cosmetic/correctness only, non-security."},
+    {"anchor": "IsVector(input_shape) gate (lines 16-19)", "disposition": "dismissed", "reason": "Correct guard making the subsequent vec<int64>() access safe."},
+    {"anchor": "input_rank = input_shape.vec<int64>().size() (line 21)", "disposition": "dismissed", "reason": "Safe after the vector gate; value 0 is handled by the axis range check."},
+    {"anchor": "axis = (axis_input < 0) ? input_rank + axis_input : axis_input (line 22)", "disposition": "finding", "reason": "Signed int64 addition on attacker-controlled axis_input can overflow (UB) for near-INT64_MIN values."},
+    {"anchor": "axis range gate axis >= 0 && axis < input_rank (lines 24-27)", "disposition": "dismissed", "reason": "Correctly bounds axis into [0, input_rank) and rejects rank-0 shapes, making the indexed shape read safe."},
+    {"anchor": "num_split_ >= 1 && num_split_ <= input_shape.vec<int64>()(axis) (lines 29-34)", "disposition": "finding", "reason": "The divide-by-zero-defining anchor; the num_split_ >= 1 lower bound is the guard whose removal reintroduces CWE-369 in Split."},
+    {"anchor": "dense_shape build loop with AddDimWithStatus (lines 36-42)", "disposition": "dismissed", "reason": "Checked dimension add returns Status on negative/overflow; the correct hardened path."},
+    {"anchor": "SparseTensor::Create(...) (lines 44-47)", "disposition": "dismissed", "reason": "Status-checked; performs indices/values/shape coherence validation internally."},
+    {"anchor": "SparseTensor::Split<T>(sparse_tensor, axis, num_split_, &outputs) (lines 49-51)", "disposition": "finding", "reason": "Divisor is num_split_ (guarded non-zero here) but the divide and the exact output count live in the unshown implementation — latent contract."},
+    {"anchor": "output emission loop set_output/allocate_output/outputs[slice_index] (lines 53-65)", "disposition": "finding", "reason": "Indexes outputs[] up to num_split_ and output slots up to 3*num_split_; relies on Split filling exactly num_split_ entries and on a 3*num_split_ output registration."},
+    {"anchor": "num_split_ (op attribute member)", "disposition": "dismissed", "reason": "Graph-supplied and attacker-controllable, but bounded at lines 29-34; covered by the num_split_ anchor finding."},
+    {"anchor": "shape->vec<int64>()(dim) = output_shape[dim] (line 63)", "disposition": "dismissed", "reason": "Writes dims() entries into a shape tensor allocated with {dims()} elements at line 58-60, so the loop bound matches the allocation."}
+  ],
+  "findings": [
+    {
+      "title": "Axis input tensor read as scalar without rank/dtype validation (reachable CHECK-fail DoS)",
+      "anchor": "const int64 axis_input = context->input(0).scalar<int64>()();",
+      "file": "corpus/train/train_0150_cwe369.cpp",
+      "line": "3",
+      "code": "const int64 axis_input = context->input(0).scalar<int64>()();",
+      "bug_class": "Reachable assertion / missing input validation (CHECK-failure abort)",
+      "cwe": "CWE-617",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0150_cwe369.cpp",
+      "invariant": "Before calling scalar<int64>() on input(0), the kernel must OP_REQUIRES that input(0) is a scalar (rank 0, exactly one element) of dtype int64, so a malformed axis tensor yields InvalidArgument rather than a fatal CHECK.",
+      "failure_mode": "Tensor::scalar<int64>() internally CHECKs the tensor's dtype and 0-D shape. An attacker who supplies an axis tensor of wrong dtype (int32/float) or non-scalar shape (empty, or >1 element) makes the CHECK fail, invoking LOG(FATAL)/abort and killing the serving process — a remotely reachable denial of service. Inputs 1-3 receive explicit IsMatrix/IsVector guards; input(0) receives none.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm there is no earlier OP_REQUIRES on input(0)'s shape/dtype in the enclosing kernel and that TensorShapeUtils::IsScalar (or an equivalent element-count/dtype check) is not applied before line 3."
+    },
+    {
+      "title": "Divide-by-zero contract in SparseTensor::Split guarded only by num_split_ >= 1",
+      "anchor": "num_split_ >= 1 && num_split_ <= input_shape.vec<int64>()(axis)",
+      "file": "corpus/train/train_0150_cwe369.cpp",
+      "line": "29-34",
+      "code": "OP_REQUIRES(context,\n                num_split_ >= 1 && num_split_ <= input_shape.vec<int64>()(axis),\n                errors::InvalidArgument(\"Input num_split should be between 1 \"\n                                        \"and the splitting dimension size (\",\n                                        input_shape.vec<int64>()(axis),\n                                        \"), got \", num_split_));",
+      "bug_class": "Divide-by-zero (integer division by attacker-controlled divisor)",
+      "cwe": "CWE-369",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "num_split_ must be >= 1 before it is used as the divisor when SparseTensor::Split partitions the split dimension; the split dimension size must also be >= 1.",
+      "failure_mode": "SparseTensor::Split divides the split-dimension size by num_split to compute slice extents; a num_split_ of 0 (or negative) faults. In this revision the num_split_ >= 1 clause is the exact guard that closes CWE-369 and the upper bound keeps slices non-empty, so the shown code is safe. It remains a finding because the division lives in the not-shown Split implementation and the entire safety depends on this single gate: any regression that removes/weakens the >= 1 clause, or a second call path into Split without it, reintroduces the divide-by-zero.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm SparseTensor::Split uses num_split (guaranteed >= 1 here) as its only divisor and does not divide by any other unchecked zero-valued quantity, and that no alternate Compute path reaches Split without this num_split_ >= 1 gate."
+    },
+    {
+      "title": "Signed integer overflow in negative-axis normalization",
+      "anchor": "axis = (axis_input < 0) ? input_rank + axis_input : axis_input",
+      "file": "corpus/train/train_0150_cwe369.cpp",
+      "line": "22",
+      "code": "const int64 axis = (axis_input < 0) ? input_rank + axis_input : axis_input;",
+      "bug_class": "Signed integer overflow on attacker-controlled value",
+      "cwe": "CWE-190",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0150_cwe369.cpp",
+      "invariant": "The negative-axis fold input_rank + axis_input must not be computed for axis_input magnitudes that overflow int64; reject or widen before adding.",
+      "failure_mode": "axis_input is an unbounded attacker-controlled int64. When it is near INT64_MIN, input_rank + axis_input signed-overflows (undefined behavior; in practice a wrap to a large value). The wrapped result is then range-checked at lines 24-27, so a crafted input_rank/axis_input pair could wrap into the valid [0, input_rank) window and silently select the wrong axis, or trip UB under -fsanitize. Impact is limited to a wrong-axis logic error rather than memory corruption, hence low severity.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm whether axis_input is bounded before the add (e.g. magnitude-checked against input_rank) or whether INT64_MIN-class values can reach line 22 unchecked."
+    },
+    {
+      "title": "Output loop assumes Split produced exactly num_split_ slices and 3*num_split_ output slots exist",
+      "anchor": "for (int slice_index = 0; slice_index < num_split_; ++slice_index) { ... outputs[slice_index] ... }",
+      "file": "corpus/train/train_0150_cwe369.cpp",
+      "line": "53-60",
+      "code": "for (int slice_index = 0; slice_index < num_split_; ++slice_index) {\n      context->set_output(slice_index, outputs[slice_index].indices());\n      context->set_output(slice_index + num_split_,\n                          outputs[slice_index].values());\n      Tensor* shape = nullptr;\n      OP_REQUIRES_OK(context, context->allocate_output(\n                                  slice_index + 2 * num_split_,\n                                  {outputs[slice_index].dims()}, &shape));",
+      "bug_class": "Out-of-bounds container read / output-slot mismatch",
+      "cwe": "CWE-125",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "SparseTensor::Split must populate outputs with exactly num_split_ elements, and the op's registration must declare 3*num_split_ output slots so set_output/allocate_output at slice_index + 2*num_split_ stay in range.",
+      "failure_mode": "The loop reads outputs[slice_index] for slice_index in [0, num_split_) with no size check; if Split returns OK but fills fewer than num_split_ entries, this is an out-of-bounds std::vector access. Likewise the output slots span 0..3*num_split_-1, so a registration declaring fewer outputs would over-index the context's output list. Both are contracts on unshown code, hence latent/low.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm SparseTensor::Split resizes outputs to exactly num_split_ on success and that the op's REGISTER_OP declares 3*num_split_ output tensors."
+    },
+    {
+      "title": "Error message reports wrong tensor shape in values validation (cosmetic)",
+      "anchor": "errors::InvalidArgument(\"Input values should be a vector ...\", input_indices.shape().DebugString())",
+      "file": "corpus/train/train_0150_cwe369.cpp",
+      "line": "12-15",
+      "code": "OP_REQUIRES(context, TensorShapeUtils::IsVector(input_values.shape()),\n                errors::InvalidArgument(\n                    \"Input values should be a vector but received shape \",\n                    input_indices.shape().DebugString()));",
+      "bug_class": "Incorrect diagnostic (non-security)",
+      "cwe": "CWE-20",
+      "severity": "info",
+      "where_it_lives": "corpus/train/train_0150_cwe369.cpp",
+      "invariant": "A validation failure for input_values should report input_values.shape(), not input_indices.shape().",
+      "failure_mode": "The predicate correctly tests input_values, so there is no memory-safety or bypass impact; only the emitted error string prints the indices tensor's shape, which can mislead debugging. Included for completeness so it is not mistaken for a logic error.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the message argument should be input_values.shape().DebugString(); no behavioral change to validation."
+    }
+  ],
+  "audit_checklist": [
+    "Verify input(0) is validated as a scalar int64 (TensorShapeUtils::IsScalar / dtype check) before scalar<int64>() at line 3, to avoid a CHECK-failure abort on malformed axis tensors.",
+    "Inspect SparseTensor::Split<T> to confirm num_split (guaranteed >= 1 by lines 29-34) is the only divisor and that no other zero-valued quantity is divided/modded — the CWE-369 root.",
+    "Confirm num_split_ is int64/signed and that no other kernel path reaches Split bypassing the num_split_ >= 1 gate.",
+    "Check the negative-axis fold at line 22 for INT64_MIN-class axis_input overflow; ensure axis_input magnitude is bounded before input_rank + axis_input.",
+    "Verify SparseTensor::Split resizes outputs to exactly num_split_ so the outputs[slice_index] loop at lines 53-65 cannot over-index.",
+    "Confirm the op registration declares 3*num_split_ output slots so set_output/allocate_output at slice_index + 2*num_split_ are in range.",
+    "Confirm AddDimWithStatus rejects negative dimensions and element-count overflow for the attacker-supplied shape vector (lines 36-42).",
+    "Fix the input_values validation message to print input_values.shape() (lines 12-15)."
+  ]
+}

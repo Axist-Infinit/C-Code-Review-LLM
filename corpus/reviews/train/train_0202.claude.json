@@ -1,0 +1,198 @@
+{
+  "subsystem": "String-to-number coercion routine `sh_strnum` from the AT&T KornShell (ksh93 / ksh93u+ / ksh 2020 reborn) arithmetic and variable subsystem. It takes a shell string (variable value, array subscript text, or arithmetic operand) and returns it as an `Sfdouble_t` (Sfio long-double), falling back to the shell arithmetic evaluator when the string is not a plain number. It is the bridge between raw shell text and numeric/arithmetic contexts.",
+  "provenance": "Identified by the ksh-specific types and symbols: `Sfdouble_t` (Sfio long double), `Shell_t *shp` (the ksh shell state handle), `shp->inarith` (ksh 'inside arithmetic' flag), the `number()` and `strval()` internal parsers, the global `arith` evaluator reference, the `Varsubscript` global, and the ksh error machinery `errormsg(SH_DICT, ERROR_exit(1), e_lexbadchar, ...)`. `sh_strnum` is a long-standing public entry point in ksh's `src/cmd/ksh93/sh/streval.c` / `arith` layer. The sample banner `train_0202_cwe77.c` and marker `primevul_c_validation_0181_vuln` point at a command/eval-injection concern.",
+  "trust_boundary": "The `const char *str` argument is fully attacker-influenceable. In ksh, `sh_strnum` is reached whenever a string must be coerced to a number: array subscripts `${arr[expr]}`, `typeset -i`/integer-attribute variable assignment, `let`/`(( ))` operands, and `[[ ... -eq ... ]]` numeric comparisons. The string can originate from an environment variable, a command-line argument, a here-doc, a file read into a variable, or any expansion — none of which the script author controls. `mode`, `ptr`, and `shp->inarith` come from the (trusted) caller, but the DATA in `str` is hostile. The critical boundary is line 14, where non-numeric hostile text is handed to the full arithmetic evaluator `arith`, which in ksh supports command substitution and assignment side effects.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0202_cwe77.c",
+      "lines": "2-4",
+      "code": "Sfdouble_t sh_strnum(Shell_t *shp, const char *str, char **ptr, int mode) {\n    Sfdouble_t d;\n    char *last;",
+      "explanation": "Declares the coercion function. `shp` is the ksh shell state handle (carries global flags such as `inarith` and the dictionaries used for error messages). `str` is the NUL-terminated string to convert (the untrusted operand). `ptr` is an optional out-parameter: if non-NULL the function writes back a pointer to the first character it did not consume, so a caller can tell how much of `str` was numeric. `mode` selects error behavior (whether a trailing bad character is fatal). `d` will hold the parsed long-double result. `last` is an UNINITIALIZED pointer that the downstream parser `number()` is expected to set to the first unparsed character; nothing initializes it here, so the code relies entirely on `number()` writing it before it is dereferenced.",
+      "code_note": ""
+    },
+    {
+      "file": "corpus/train/train_0202_cwe77.c",
+      "lines": "6-9",
+      "code": "    if (*str == 0) {\n        if (ptr) *ptr = (char *)str;\n        return 0;\n    }",
+      "explanation": "Fast path for the empty string. If the first byte of `str` is the NUL terminator, the value is defined to be `0`. If the caller asked for an end pointer, it is set to `str` itself (the empty position), casting away the `const` — benign because the caller owns the buffer and only reads the pointer. This guard also guarantees that beyond this point `str` has at least one real character, which matters for the later `*str == '-'` test.",
+      "code_note": ""
+    },
+    {
+      "file": "corpus/train/train_0202_cwe77.c",
+      "lines": "10-11",
+      "code": "    errno = 0;\n    d = number(str, &last, shp->inarith ? 0 : 10, NULL);",
+      "explanation": "Clears `errno` so a later overflow/range error from the numeric parse can be detected, then calls the low-level numeric parser `number()`. It passes `str`, the address of `last` (so `number` reports where parsing stopped), a radix, and a NULL final argument (locale/format hint). The radix is chosen from shell state: when `shp->inarith` is set (we are inside an arithmetic evaluation) the base is `0`, meaning `number` auto-detects `0x` hex and leading-zero octal; otherwise the base is fixed at decimal `10`. So the same input string is parsed with different grammar depending on global shell mode.",
+      "code_note": ""
+    },
+    {
+      "file": "corpus/train/train_0202_cwe77.c",
+      "lines": "12-16",
+      "code": "    if (*last) {\n        if (*last != '.' || last[1] != '.') {\n            d = strval(shp, str, &last, arith, mode);\n            Varsubscript = true;\n        }",
+      "explanation": "`number()` set `last` to the first character it could not parse as a number. If `*last` is non-zero, the string was NOT a clean number — there is trailing, non-numeric text. Line 13 makes a single exception: if the leftover begins with the two-character sequence `..` (the `*last == '.'` and `last[1] == '.'` case, i.e. a range operator used in array/subscript syntax), the block is skipped and `d` keeps the numeric prefix value. For every other kind of leftover, line 14 re-parses the WHOLE string `str` through `strval()` using the shell arithmetic evaluator `arith`, overwriting `d` with the arithmetic result and again updating `last`. Line 15 sets the global `Varsubscript = true` to signal to the rest of the shell that this operand was treated as a variable/subscript expression rather than a literal number.",
+      "code_note": ""
+    },
+    {
+      "file": "corpus/train/train_0202_cwe77.c",
+      "lines": "17",
+      "code": "        if (!ptr && *last && mode > 0) errormsg(SH_DICT, ERROR_exit(1), e_lexbadchar, *last, str);",
+      "explanation": "Still inside the `if (*last)` branch. If the caller did NOT ask for an end pointer (`!ptr`), AND there is still an unconsumed character after all parsing (`*last`), AND `mode > 0` (strict mode), the function raises a fatal shell error via `errormsg` with `ERROR_exit(1)`. `e_lexbadchar` is the 'bad lexical character' message, and it reports the offending character `*last` and the full string `str`. `ERROR_exit(1)` does not return normally — in ksh it performs a longjmp/exit that unwinds the current command, so this line is a control-flow escape, not just a diagnostic.",
+      "code_note": ""
+    },
+    {
+      "file": "corpus/train/train_0202_cwe77.c",
+      "lines": "18-20",
+      "code": "    } else if (!d && *str == '-') {\n        d = -0.0;\n    }",
+      "explanation": "The `else` pairs with line 12: it runs only when `*last` was zero, i.e. the entire string parsed cleanly as a number with no leftover. If the parsed value is zero (`!d`) but the source string began with a minus sign, the result is forced to negative zero `-0.0`. This preserves the IEEE sign of zero for inputs like `\"-0\"`, which some arithmetic and formatting paths care about. It is purely a numeric-fidelity fix-up with no external side effects.",
+      "code_note": ""
+    },
+    {
+      "file": "corpus/train/train_0202_cwe77.c",
+      "lines": "21-23",
+      "code": "    if (ptr) *ptr = last;\n    return d;\n}",
+      "explanation": "If the caller passed an out-pointer, the final `last` (the end-of-parse position, possibly updated by `strval`) is written back so the caller can continue scanning from there. The parsed/evaluated value `d` is returned as the function's `Sfdouble_t` result. Note that when `strval` ran on line 14, the returned value and `last` reflect a full arithmetic evaluation, not a simple numeric prefix.",
+      "code_note": ""
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0202_cwe77.c",
+      "lines": "14",
+      "code": "            d = strval(shp, str, &last, arith, mode);",
+      "explanation": "This is the central risk. Any string that is not a clean number (and is not the `..` range case) falls through to the FULL ksh arithmetic evaluator `arith` via `strval`. ksh arithmetic is not a pure calculator: it supports command substitution `$(...)`/backticks, variable assignment side effects (`x=cmd`), array subscripts that themselves expand, and recursive evaluation of a variable whose value is again treated as an expression. Therefore, when `str` is attacker-controlled data being coerced to a number — e.g. an integer-attributed variable (`typeset -i x=\"$UNTRUSTED\"`), an array subscript `${a[$UNTRUSTED]}`, or a `(( ))` operand — a payload like `a[$(id)]` or `x[1+cmd]` causes the evaluator to EXECUTE embedded commands. The impact is arbitrary command execution from data that the author only intended to interpret as a number. The invariant the implementation must uphold: numeric coercion of untrusted text must NOT silently escalate to a Turing-complete evaluator with command-substitution and assignment side effects; either the fall-through must be gated to trusted/arithmetic-only contexts, or command substitution must be disabled while coercing. This is CWE-77/CWE-95 eval-injection, matching the sample's cwe77 tag.",
+      "code_note": ""
+    },
+    {
+      "file": "corpus/train/train_0202_cwe77.c",
+      "lines": "15",
+      "code": "            Varsubscript = true;",
+      "explanation": "`Varsubscript` is a process-global flag written as a side effect of coercion and never reset within this function. Because line 14 (`strval`/`arith`) can recurse back into subscript and arithmetic parsing, and because `errormsg(ERROR_exit(1))` on line 17 can longjmp out before any cleanup, `Varsubscript` can be left `true` across evaluations. A later, unrelated numeric coercion that reads this stale global can misclassify a literal operand as a variable subscript, changing parse semantics in a way an attacker can steer by ordering inputs. This is a re-entrancy / global-state hazard (CWE-362/CWE-665): the invariant is that `Varsubscript` must be saved and restored (or scoped) around each `sh_strnum` call so nested/failed evaluations cannot leak state.",
+      "code_note": ""
+    },
+    {
+      "file": "corpus/train/train_0202_cwe77.c",
+      "lines": "4",
+      "code": "    char *last;",
+      "explanation": "`last` is declared uninitialized and is first read at line 12 (`if (*last)`) and line 13 (`last[1]`). The code assumes `number()` on line 11 always writes `*last` before returning. If `number()` has any path that returns without setting `last` (for example an early failure on a malformed or out-of-range token, with `errno` set but `last` untouched), then `*last` dereferences an indeterminate pointer — an uninitialized-pointer read that can crash or read arbitrary memory (CWE-457/CWE-824). The invariant is that `number()` must guarantee `last` is set on every return path; if that contract is not documented and enforced, `last` should be initialized (e.g. to `str`) before the call.",
+      "code_note": ""
+    },
+    {
+      "file": "corpus/train/train_0202_cwe77.c",
+      "lines": "17",
+      "code": "        if (!ptr && *last && mode > 0) errormsg(SH_DICT, ERROR_exit(1), e_lexbadchar, *last, str);",
+      "explanation": "In strict mode (`mode > 0`) with no out-pointer requested, a single unexpected trailing character in attacker-controlled `str` forces `ERROR_exit(1)`, which aborts the current command via longjmp/exit. Where `sh_strnum` is invoked on data that merely passes through a numeric context, an attacker can supply a value with one stray byte to reliably terminate the running script or builtin — a denial-of-service / unexpected-control-transfer primitive (CWE-248/CWE-20). It also means any state made dirty earlier (such as `Varsubscript` on line 15) is not unwound here. The invariant: fatal exit on malformed numeric input must be a deliberate policy for the specific call site, and callers must be robust to the non-local jump.",
+      "code_note": ""
+    },
+    {
+      "file": "corpus/train/train_0202_cwe77.c",
+      "lines": "11",
+      "code": "    d = number(str, &last, shp->inarith ? 0 : 10, NULL);",
+      "explanation": "The parse radix depends on the global `shp->inarith`: base `0` (auto-detect hex/octal) inside arithmetic, base `10` otherwise. The same untrusted string therefore yields different numeric values and consumes a different prefix depending on shell mode the attacker may be able to influence (e.g. by getting the value evaluated in an arithmetic context). A string like `010` or `0x10` parses as 8/16 in-arith but stops early at base 10, changing both `d` and where `last` lands — which in turn changes whether the dangerous `strval` fall-through on line 14 fires. This is a parser-ambiguity / inconsistent-interpretation risk (CWE-704/CWE-20) rather than a memory bug, but it feeds the command-injection surface above by controlling whether the arithmetic evaluator is reached.",
+      "code_note": ""
+    }
+  ],
+  "summary": "`sh_strnum` coerces an untrusted shell string to a number and, for any operand that is not a clean number, falls through on line 14 to ksh's full arithmetic evaluator `strval`/`arith`, which supports command substitution and assignment side effects — turning numeric coercion of hostile data into arbitrary command/eval injection (CWE-77/CWE-95). Secondary concerns are the unreset global `Varsubscript` under re-entrancy/longjmp, reliance on `number()` to initialize the otherwise-uninitialized `last` pointer, and a strict-mode `ERROR_exit` abort driven by a single bad input byte.",
+  "reviewed_anchors": [
+    {"anchor": "sh_strnum(Shell_t *shp, const char *str, char **ptr, int mode) — signature (line 2)", "disposition": "finding", "reason": "`str` is untrusted data coerced to a number; the function routes non-numeric hostile text into the arithmetic evaluator."},
+    {"anchor": "Sfdouble_t d; (line 3)", "disposition": "dismissed", "reason": "Local result holder; no external contract or bound."},
+    {"anchor": "char *last; (line 4)", "disposition": "finding", "reason": "Uninitialized pointer dereferenced at lines 12-13; safety depends entirely on number() writing it on every return path."},
+    {"anchor": "if (*str == 0) empty-string guard (line 6)", "disposition": "dismissed", "reason": "Correct NUL check; guarantees a non-empty string thereafter, no risk."},
+    {"anchor": "*ptr = (char *)str; const cast (line 7)", "disposition": "dismissed", "reason": "Benign const-removal for an out-pointer the caller owns and only reads."},
+    {"anchor": "errno = 0; (line 10)", "disposition": "dismissed", "reason": "Standard errno reset before a parse; no security contract."},
+    {"anchor": "number(str, &last, shp->inarith ? 0 : 10, NULL) (line 11)", "disposition": "finding", "reason": "Radix selection via global shp->inarith makes interpretation mode-dependent and controls whether the dangerous strval fall-through fires."},
+    {"anchor": "shp->inarith flag (line 11)", "disposition": "dismissed", "reason": "Caller/shell state, not attacker-supplied buffer data; its effect is captured by the number() radix finding."},
+    {"anchor": "if (*last) leftover test (line 12)", "disposition": "dismissed", "reason": "Correct check for unconsumed input; the risk is in what it dispatches to, not the test itself."},
+    {"anchor": "if (*last != '.' || last[1] != '.') and last[1] read (line 13)", "disposition": "dismissed", "reason": "last[1] is only read when *last == '.', so last points inside the string and last[1] is at worst the in-bounds NUL terminator — no out-of-bounds read."},
+    {"anchor": "strval(shp, str, &last, arith, mode) (line 14)", "disposition": "finding", "reason": "Routes untrusted non-numeric text into the full ksh arithmetic evaluator, which supports command substitution — the core eval/command-injection surface."},
+    {"anchor": "Varsubscript = true; global (line 15)", "disposition": "finding", "reason": "Global side effect never reset here; leaks across recursion and longjmp exits, altering later parse semantics."},
+    {"anchor": "errormsg(SH_DICT, ERROR_exit(1), e_lexbadchar, *last, str) (line 17)", "disposition": "finding", "reason": "Single bad byte in untrusted str forces a non-local ERROR_exit abort (DoS / control-transfer)."},
+    {"anchor": "else if (!d && *str == '-') / d = -0.0; (lines 18-19)", "disposition": "dismissed", "reason": "Negative-zero fidelity fix-up; no external side effect or memory access."},
+    {"anchor": "if (ptr) *ptr = last; (line 21)", "disposition": "dismissed", "reason": "Writes back the end pointer to a caller-owned out-parameter; guarded by NULL check."},
+    {"anchor": "mode parameter", "disposition": "dismissed", "reason": "Caller-supplied policy selector; its only security-relevant effect (fatal exit) is captured by the line 17 finding."},
+    {"anchor": "ptr parameter", "disposition": "dismissed", "reason": "Optional out-pointer, NULL-checked before every write."}
+  ],
+  "findings": [
+    {
+      "title": "Untrusted numeric operand falls through to full arithmetic evaluator (command/eval injection)",
+      "anchor": "d = strval(shp, str, &last, arith, mode);",
+      "file": "corpus/train/train_0202_cwe77.c",
+      "line": "14",
+      "code": "d = strval(shp, str, &last, arith, mode);",
+      "bug_class": "Eval/command injection via arithmetic evaluation of untrusted input",
+      "cwe": "CWE-77",
+      "severity": "critical",
+      "where_it_lives": "implementation (file not provided) — the strval()/arith evaluator this line invokes",
+      "invariant": "Numeric coercion of untrusted data must not silently escalate to a Turing-complete evaluator that performs command substitution or assignment side effects; the fall-through must be restricted to trusted arithmetic-only contexts or must run with command substitution disabled.",
+      "failure_mode": "When `str` is not a clean number and not the `..` range case, the whole string is evaluated by ksh's `arith` evaluator. ksh arithmetic supports command substitution `$(...)`, assignments, and recursive variable re-evaluation, so an attacker-controlled operand such as `a[$(id)]` or an integer-attributed variable set from untrusted input executes embedded commands during what the author intended as a numeric conversion. Impact: arbitrary command execution / code injection.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm whether `strval`/`arith` performs command substitution and variable re-evaluation on `str`, and identify every caller (typeset -i, array subscripts, (( )), [[ -eq ]]) that reaches `sh_strnum` with externally-influenced data without first sanitizing it."
+    },
+    {
+      "title": "Uninitialized `last` pointer dereferenced if number() leaves it unset",
+      "anchor": "char *last;",
+      "file": "corpus/train/train_0202_cwe77.c",
+      "line": "4",
+      "code": "char *last;",
+      "bug_class": "Use of uninitialized pointer / indeterminate read",
+      "cwe": "CWE-457",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided) — number() and this function",
+      "invariant": "number() must write `*last` on every return path (success and error) before sh_strnum dereferences it at lines 12-13; otherwise `last` must be initialized (e.g. to `str`) prior to the call.",
+      "failure_mode": "If any number() path (malformed token, range/overflow error) returns without setting `last`, then `if (*last)` at line 12 and `last[1]` at line 13 dereference an indeterminate pointer, causing a crash or arbitrary read driven by whatever stack garbage `last` held.",
+      "cve_analog": "",
+      "what_to_confirm": "Audit number()'s contract to verify `last`/endptr is assigned on all return paths, including early error returns with errno set."
+    },
+    {
+      "title": "Global `Varsubscript` set as a side effect and never reset (re-entrancy / stale state)",
+      "anchor": "Varsubscript = true;",
+      "file": "corpus/train/train_0202_cwe77.c",
+      "line": "15",
+      "code": "Varsubscript = true;",
+      "bug_class": "Improper global state management under re-entrancy / non-local exit",
+      "cwe": "CWE-362",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided) — callers reading Varsubscript",
+      "invariant": "Varsubscript must be saved and restored (or otherwise scoped) around each sh_strnum invocation so nested strval evaluations or an ERROR_exit longjmp cannot leave it set for a subsequent, unrelated coercion.",
+      "failure_mode": "strval on line 14 can recurse into subscript/arithmetic parsing, and errormsg(ERROR_exit(1)) on line 17 can longjmp out before any reset. A stale `Varsubscript = true` then causes a later literal numeric operand to be misclassified as a variable subscript, changing parse behavior in an attacker-orderable way.",
+      "cve_analog": "",
+      "what_to_confirm": "Check whether Varsubscript is reset by callers before each use, and whether the longjmp path in ksh's error handling restores it."
+    },
+    {
+      "title": "Single malformed byte forces fatal ERROR_exit in strict mode (DoS)",
+      "anchor": "if (!ptr && *last && mode > 0) errormsg(SH_DICT, ERROR_exit(1), e_lexbadchar, *last, str);",
+      "file": "corpus/train/train_0202_cwe77.c",
+      "line": "17",
+      "code": "if (!ptr && *last && mode > 0) errormsg(SH_DICT, ERROR_exit(1), e_lexbadchar, *last, str);",
+      "bug_class": "Uncaught exception / non-local control transfer driven by untrusted input",
+      "cwe": "CWE-248",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided) — errormsg/ERROR_exit machinery",
+      "invariant": "Callers must expect that malformed untrusted numeric input can trigger ERROR_exit(1) (a longjmp/exit), and that abort must be an intended policy for that call site; any state dirtied earlier (e.g. Varsubscript) must be safe to unwind.",
+      "failure_mode": "With mode > 0 and no out-pointer, one stray trailing character in attacker-supplied `str` invokes ERROR_exit(1), aborting the current command/script — a reliable denial-of-service and an unexpected control transfer that skips normal cleanup.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify which call sites pass mode > 0 with ptr == NULL on externally-influenced data, and whether the resulting abort is acceptable there."
+    },
+    {
+      "title": "Parse radix depends on global shp->inarith (inconsistent interpretation feeding the injection surface)",
+      "anchor": "d = number(str, &last, shp->inarith ? 0 : 10, NULL);",
+      "file": "corpus/train/train_0202_cwe77.c",
+      "line": "11",
+      "code": "d = number(str, &last, shp->inarith ? 0 : 10, NULL);",
+      "bug_class": "Inconsistent input interpretation across modes",
+      "cwe": "CWE-704",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0202_cwe77.c",
+      "invariant": "The numeric grammar applied to untrusted input should be predictable and independent of ambient shell state, or the mode dependence must be a deliberate, documented behavior that does not change security-relevant control flow.",
+      "failure_mode": "Base 0 (in-arith) auto-detects hex/octal while base 10 does not, so the same string (e.g. `010`, `0x10`) yields a different value and a different `last`, which changes whether the dangerous strval fall-through on line 14 executes. An attacker who can get a value evaluated in arithmetic context thereby influences both the numeric result and whether arbitrary evaluation is triggered.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm number()'s base-0 auto-detection rules and that mode-dependent parsing cannot be steered to reach strval unexpectedly."
+    }
+  ],
+  "audit_checklist": [
+    "Determine whether strval()/arith on line 14 performs command substitution ($(...)/backticks), assignments, or recursive variable re-evaluation on the attacker-controlled `str`, and gate or sanitize that fall-through.",
+    "Enumerate every ksh call site that reaches sh_strnum with externally-influenced data (typeset -i, ${arr[expr]}, (( )), let, [[ -eq ]]) and confirm none allows numeric coercion to trigger evaluation of embedded commands.",
+    "Verify number() writes `last`/endptr on ALL return paths (including error/overflow); otherwise initialize `last` before line 11 to avoid the uninitialized-pointer read at lines 12-13.",
+    "Confirm Varsubscript is saved/restored or reset around each sh_strnum call so recursion and ERROR_exit longjmp cannot leak the flag into later coercions.",
+    "Check that ERROR_exit(1) on line 17 is intended for each strict-mode call site and that the non-local exit does not leave shell state inconsistent.",
+    "Validate that the base-0 vs base-10 selection from shp->inarith cannot be manipulated to change whether the strval evaluator is reached."
+  ]
+}

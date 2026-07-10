@@ -1,0 +1,179 @@
+{
+  "subsystem": "Hermes JavaScript engine native builtin implementing the reflective apply/construct path (hermesBuiltinApply) — the internal C++ routine that unpacks a JavaScript array of arguments and invokes a callable with them, i.e. the engine-side implementation behind Function.prototype.apply / Reflect.apply / Reflect.construct.",
+  "provenance": "Identified from the Hermes-specific vocabulary in the signature and body: Runtime *runtime, NativeArgs, Handle<Callable>, Handle<JSArray>, MutableHandle<>, GCScopeMarkerRAII, ScopedNativeCallFrame, ExecutionStatus::EXCEPTION, JSArray::getLength, Callable::call / Callable::construct, and the LLVM_UNLIKELY macro. These are the public class and API names of Meta's Hermes engine (the JS VM used by React Native). The function name hermesBuiltinApply and the args.dyncastArg<>/args.getArgHandle() accessors are Hermes's native-builtin calling convention. The sample banner (corpus/train/train_0008_cwe787.cpp, 'primevul_train_2156_vuln') and CWE tag point to an out-of-bounds write.",
+  "trust_boundary": "This is a JavaScript-callable native builtin: 100% of its inputs originate from untrusted JavaScript running in the VM. args.dyncastArg<Callable>(0) and args.dyncastArg<JSArray>(1) are objects the script chose; most importantly, the argument-array's length — uint32_t len = JSArray::getLength(*argArray) — is entirely attacker-controlled and can be any value up to 2^32-1 (a script can set arr.length = 0xFFFFFFFF or build a huge/holey array). isConstructor and the this value are likewise script-controlled. The register/native call stack that ScopedNativeCallFrame allocates into is the security-sensitive resource on the trusted side of the boundary; len crosses that boundary and directly sizes that allocation.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0008_cwe787.cpp",
+      "lines": "2",
+      "code": "hermesBuiltinApply(void *, Runtime *runtime, NativeArgs args) {",
+      "explanation": "This is the definition of a Hermes native builtin. Its signature follows the engine's native-function ABI: the first parameter (unnamed void *) is the builtin context pointer, runtime is the VM instance that owns the heap, register stack, and error-raising machinery, and args is a NativeArgs view over the JavaScript-supplied argument list. The function returns a CallResult/ExecutionStatus (implied by the return statements below). Semantically this routine implements the 'apply a callable to an array of arguments' primitive: it is invoked from JavaScript, so every value reachable through args is attacker-controlled."
+    },
+    {
+      "file": "corpus/train/train_0008_cwe787.cpp",
+      "lines": "3",
+      "code": "  GCScopeMarkerRAII marker{runtime};",
+      "explanation": "Establishes a GC scope marker. In Hermes, Handle<> objects root GC values so the collector does not move/free them while C++ holds raw references; GCScopeMarkerRAII records the current handle-scope high-water mark and, on destruction, flushes the transient handles allocated within this function. This is memory-management hygiene, not a validation step — it keeps the JSArray and Callable alive across the calls below but performs no bounds or type checking."
+    },
+    {
+      "file": "corpus/train/train_0008_cwe787.cpp",
+      "lines": "5-9",
+      "code": "  Handle<Callable> fn = args.dyncastArg<Callable>(0);\n  if (LLVM_UNLIKELY(!fn)) {\n    return runtime->raiseTypeErrorForValue(\n        args.getArgHandle(0), \" is not a function\");\n  }",
+      "explanation": "Fetches argument 0 and dynamically casts it to Callable. dyncastArg<Callable>(0) returns a null Handle if the argument is not actually a callable object. The guard rejects that case by raising a JavaScript TypeError ('<value> is not a function') and returning. This is correct input validation for the callee: after this block, fn is guaranteed to be a live, invocable Callable. LLVM_UNLIKELY is only a branch-prediction hint and has no security effect."
+    },
+    {
+      "file": "corpus/train/train_0008_cwe787.cpp",
+      "lines": "11-14",
+      "code": "  Handle<JSArray> argArray = args.dyncastArg<JSArray>(1);\n  if (LLVM_UNLIKELY(!argArray)) {\n    return runtime->raiseTypeError(\"args must be an array\");\n  }",
+      "explanation": "Fetches argument 1 and casts it to JSArray, again returning a null Handle on type mismatch and raising a TypeError ('args must be an array') if so. After this block argArray is a live JSArray. Note that being a valid array only guarantees the object type — it says nothing about the array's length, which is the field that matters for safety below and is not constrained here."
+    },
+    {
+      "file": "corpus/train/train_0008_cwe787.cpp",
+      "lines": "16",
+      "code": "  uint32_t len = JSArray::getLength(*argArray);",
+      "explanation": "Reads the JavaScript 'length' of the argument array into a 32-bit unsigned len. This is the pivotal value: it is fully attacker-controlled and can be any uint32_t up to 4,294,967,295, because a script can set the array's length to an arbitrary large number (including on a sparse/holey array whose backing storage is tiny). len is subsequently used both to size the native call frame (line 31) and to bound the copy loop (line 33). Everything downstream trusts len."
+    },
+    {
+      "file": "corpus/train/train_0008_cwe787.cpp",
+      "lines": "18",
+      "code": "  bool isConstructor = args.getArgCount() == 2;",
+      "explanation": "Decides whether this invocation is a construct (new) call or an ordinary call, based on how many arguments the builtin itself received: exactly 2 (callable + arg-array, with no explicit this) means construct mode; otherwise a third argument supplies the this binding. This flag steers the this-value setup below and the final call/construct dispatch. It affects control flow only, not memory sizing."
+    },
+    {
+      "file": "corpus/train/train_0008_cwe787.cpp",
+      "lines": "20-29",
+      "code": "  MutableHandle<> thisVal{runtime};\n  if (isConstructor) {\n    auto thisValRes = Callable::createThisForConstruct(fn, runtime);\n    if (LLVM_UNLIKELY(thisValRes == ExecutionStatus::EXCEPTION)) {\n      return ExecutionStatus::EXCEPTION;\n    }\n    thisVal = *thisValRes;\n  } else {\n    thisVal = args.getArg(2);\n  }",
+      "explanation": "Computes the this value that the target callable will observe. In constructor mode it asks Callable::createThisForConstruct to allocate the new object bound to fn's prototype, propagating any exception (e.g. OOM or a throwing prototype getter) by returning EXCEPTION. In plain-call mode it takes the caller-supplied third argument (args.getArg(2)) verbatim as this. thisVal is a MutableHandle so it stays GC-rooted. This block is correctly exception-checked and carries no length/buffer contract of its own."
+    },
+    {
+      "file": "corpus/train/train_0008_cwe787.cpp",
+      "lines": "31-32",
+      "code": "  ScopedNativeCallFrame newFrame{\n      runtime, len, *fn, isConstructor, thisVal.getHermesValue()};",
+      "explanation": "Constructs a native call frame on the VM's register stack sized to hold len argument slots plus the fixed callee/this/newTarget metadata. ScopedNativeCallFrame's constructor reserves len register slots from runtime's finite register stack; because len is attacker-controlled and unbounded, this reservation can exceed the remaining register-stack capacity. Hermes's ScopedNativeCallFrame is specifically designed to signal that failure non-fatally — it exposes an overflowed() predicate that the caller is REQUIRED to test before touching the frame, because on overflow the frame's argument storage was not validly reserved. Here the constructed frame's success is never checked."
+    },
+    {
+      "file": "corpus/train/train_0008_cwe787.cpp",
+      "lines": "33-35",
+      "code": "  for (uint32_t i = 0; i < len; ++i) {\n    newFrame->getArgRef(i) = argArray->at(runtime, i);\n  }",
+      "explanation": "Copies each of the len array elements into the corresponding argument slot of the freshly created frame. argArray->at(runtime, i) reads element i of the JS array (returning the hole/undefined value for absent indices, so the READ side is in-bounds for i < len). newFrame->getArgRef(i) returns a writable reference to the i-th argument register in the frame and is assigned the value — this is the write side. The loop assumes the frame actually has len validly-reserved slots, i.e. it assumes the line 31 allocation succeeded."
+    },
+    {
+      "file": "corpus/train/train_0008_cwe787.cpp",
+      "lines": "36-37",
+      "code": "  return isConstructor ? Callable::construct(fn, runtime, thisVal)\n                       : Callable::call(fn, runtime);",
+      "explanation": "Dispatches the actual invocation using the now-populated frame: Callable::construct runs fn as a constructor against the freshly created this, while Callable::call performs an ordinary call. Both consume the arguments previously written into newFrame. The ternary selects based on isConstructor computed at line 18. This is the terminal step; correctness here depends entirely on the frame having been safely built above."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0008_cwe787.cpp",
+      "lines": "31-35",
+      "code": "  ScopedNativeCallFrame newFrame{\n      runtime, len, *fn, isConstructor, thisVal.getHermesValue()};\n  for (uint32_t i = 0; i < len; ++i) {\n    newFrame->getArgRef(i) = argArray->at(runtime, i);\n  }",
+      "explanation": "Out-of-bounds write on the register stack (CWE-787). ScopedNativeCallFrame tries to reserve len argument slots from a finite register stack, but the code never tests newFrame.overflowed() before writing into it. An attacker calls this builtin from JavaScript with an argument array whose length is large enough that the frame reservation exceeds the remaining register-stack capacity (e.g. HermesInternal.apply(fn, hugeLenArray) where hugeLenArray.length is set to a very large value). When the reservation fails/clamps, the frame does not own len valid slots, yet the loop still executes newFrame->getArgRef(i) = ... for every i in [0, len), writing attacker-influenced HermesValues past the end of the reserved region and corrupting adjacent VM memory. This is a controlled-write memory-corruption primitive reachable directly from script and is the classic route to remote code execution in a JS engine. INVARIANT: after constructing the frame the implementation MUST check newFrame.overflowed() and raise a StackOverflow exception (returning before the loop) whenever the native/register stack cannot hold len arguments; the copy loop may run only once the frame is proven fully reserved."
+    },
+    {
+      "file": "corpus/train/train_0008_cwe787.cpp",
+      "lines": "16",
+      "code": "  uint32_t len = JSArray::getLength(*argArray);",
+      "explanation": "Unvalidated attacker-controlled count feeding an allocation/loop bound (CWE-20 / CWE-770). len is taken straight from the JS array's length with no upper bound and no relationship to the array's actual backing storage. It is the untrusted quantity that both sizes the native frame (line 31) and bounds the write loop (line 33). Even setting aside the missing overflowed() check, an unbounded len lets a script demand an enormous native frame, driving register-stack exhaustion and denial of service, and it is the precise input that makes the line 31-35 overflow reachable. INVARIANT: the implementation must treat len as hostile — it must either be capped against a documented maximum argument count or, at minimum, be the value whose frame reservation is verified via overflowed() before any slot is written."
+    }
+  ],
+  "summary": "hermesBuiltinApply is a script-reachable Hermes native builtin that builds a native call frame sized by an attacker-controlled JS array length (uint32_t len) and then copies len values into it WITHOUT ever checking ScopedNativeCallFrame::overflowed(). A malicious script supplying a sufficiently large array length overflows the register-stack frame reservation and the subsequent copy loop performs a controlled out-of-bounds write (CWE-787) — a memory-corruption / RCE primitive. The fix is a mandatory overflowed() guard that raises a stack-overflow exception before the copy loop.",
+  "reviewed_anchors": [
+    {
+      "anchor": "hermesBuiltinApply(void *, Runtime *runtime, NativeArgs args) — signature (line 2)",
+      "disposition": "dismissed",
+      "reason": "Native-builtin entry point / calling convention; the container itself is not a bug, but establishes that all args-derived inputs are untrusted."
+    },
+    {
+      "anchor": "GCScopeMarkerRAII marker{runtime} (line 3)",
+      "disposition": "dismissed",
+      "reason": "GC handle-scope hygiene; roots transient handles, carries no length/buffer or validation contract."
+    },
+    {
+      "anchor": "Handle<Callable> fn = args.dyncastArg<Callable>(0) + null guard (lines 5-9)",
+      "disposition": "dismissed",
+      "reason": "Type-checked with an explicit null guard that raises TypeError; correctly validated before use."
+    },
+    {
+      "anchor": "Handle<JSArray> argArray = args.dyncastArg<JSArray>(1) + null guard (lines 11-14)",
+      "disposition": "dismissed",
+      "reason": "Type-checked with a null guard raising TypeError; guarantees object type only (not length), but the type check itself is sound."
+    },
+    {
+      "anchor": "uint32_t len = JSArray::getLength(*argArray) (line 16)",
+      "disposition": "finding",
+      "reason": "Attacker-controlled unbounded 32-bit count that sizes the native frame and bounds the write loop; unvalidated length field."
+    },
+    {
+      "anchor": "bool isConstructor = args.getArgCount() == 2 (line 18)",
+      "disposition": "dismissed",
+      "reason": "Selects call vs construct control flow and this-binding path; no memory-sizing or bounds contract."
+    },
+    {
+      "anchor": "MutableHandle<> thisVal + createThisForConstruct/getArg(2) (lines 20-29)",
+      "disposition": "dismissed",
+      "reason": "this-value setup is exception-checked (EXCEPTION propagated); no buffer/length contract."
+    },
+    {
+      "anchor": "ScopedNativeCallFrame newFrame{runtime, len, *fn, isConstructor, thisVal.getHermesValue()} (lines 31-32)",
+      "disposition": "finding",
+      "reason": "Frame is sized by untrusted len and its overflowed() result is never checked before the frame is written — root of the OOB write."
+    },
+    {
+      "anchor": "for (uint32_t i = 0; i < len; ++i) { newFrame->getArgRef(i) = argArray->at(runtime, i); } (lines 33-35)",
+      "disposition": "finding",
+      "reason": "The out-of-bounds write site: writes len slots into a frame whose reservation may have overflowed (grouped with the ScopedNativeCallFrame finding)."
+    },
+    {
+      "anchor": "argArray->at(runtime, i) read (line 34)",
+      "disposition": "dismissed",
+      "reason": "Read is bounded by i < len where len is the array's own length; holes return the empty/undefined value, so the read side is in-bounds."
+    },
+    {
+      "anchor": "return Callable::construct(...) / Callable::call(...) (lines 36-37)",
+      "disposition": "dismissed",
+      "reason": "Terminal dispatch consuming the frame; correctness depends on prior frame safety but the dispatch itself introduces no new bounds contract."
+    }
+  ],
+  "findings": [
+    {
+      "title": "Missing ScopedNativeCallFrame::overflowed() check enables out-of-bounds register-stack write",
+      "anchor": "ScopedNativeCallFrame newFrame{...} followed by the unchecked copy loop",
+      "file": "corpus/train/train_0008_cwe787.cpp",
+      "line": "31-35",
+      "code": "  ScopedNativeCallFrame newFrame{\n      runtime, len, *fn, isConstructor, thisVal.getHermesValue()};\n  for (uint32_t i = 0; i < len; ++i) {\n    newFrame->getArgRef(i) = argArray->at(runtime, i);\n  }",
+      "bug_class": "Out-of-bounds write (unchecked native call-frame allocation on register-stack overflow)",
+      "cwe": "CWE-787",
+      "severity": "critical",
+      "where_it_lives": "corpus/train/train_0008_cwe787.cpp (and the ScopedNativeCallFrame implementation, file not provided)",
+      "invariant": "Immediately after constructing newFrame the code MUST test newFrame.overflowed() and, if true, raise a stack-overflow exception and return BEFORE writing any argument slot; the copy loop may run only when the frame's len slots are proven to be validly reserved.",
+      "failure_mode": "A script invokes this apply/construct builtin with an argument array whose attacker-controlled length (len) is large enough that reserving len register slots exceeds the remaining register stack. The overflow condition is never checked, so the loop writes attacker-influenced HermesValues via newFrame->getArgRef(i) past the end of the reserved region, corrupting adjacent VM memory — a controlled OOB write reachable directly from JavaScript, i.e. a memory-corruption / RCE primitive.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm that ScopedNativeCallFrame's constructor can fail/clamp when len exceeds register-stack capacity and exposes overflowed(), and that no such check exists between line 32 and the loop; the fix adds 'if (LLVM_UNLIKELY(newFrame.overflowed())) return runtime->raiseStackOverflow(...);' before line 33."
+    },
+    {
+      "title": "Attacker-controlled array length used unbounded as native argument count",
+      "anchor": "uint32_t len = JSArray::getLength(*argArray)",
+      "file": "corpus/train/train_0008_cwe787.cpp",
+      "line": "16",
+      "code": "  uint32_t len = JSArray::getLength(*argArray);",
+      "bug_class": "Missing input validation / uncontrolled resource sizing (unbounded count from untrusted JS)",
+      "cwe": "CWE-20",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0008_cwe787.cpp",
+      "invariant": "len must be treated as hostile: its value (up to UINT32_MAX) must not be trusted to fit the register stack — the frame reservation derived from it must be validated (via overflowed()) and/or capped against a maximum-argument-count limit before it drives any allocation or loop bound.",
+      "failure_mode": "A script sets the argument array's length to a very large value (including on a sparse array with tiny backing storage). len then requests an enormous native frame, causing register-stack exhaustion / denial of service, and is the exact untrusted quantity that makes the line 31-35 out-of-bounds write reachable. This is the input-validation root cause feeding the critical finding above.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm JSArray::getLength returns the script-settable 'length' property (not the physical storage size) and that len is not bounded or clamped anywhere before being passed to ScopedNativeCallFrame or used as the loop limit."
+    }
+  ],
+  "audit_checklist": [
+    "Verify a newFrame.overflowed() check exists (or is added) immediately after ScopedNativeCallFrame construction at line 32, raising a stack-overflow exception and returning before the copy loop at line 33.",
+    "Confirm ScopedNativeCallFrame's constructor can fail to reserve len slots and that getArgRef(i)/argument storage is invalid after an overflow (i.e. writing without checking corrupts memory).",
+    "Confirm JSArray::getLength(*argArray) yields the attacker-settable JS 'length' (up to UINT32_MAX), independent of the array's backing storage size.",
+    "Check whether any maximum-argument-count cap is enforced on len before it sizes the frame, to bound register-stack consumption / DoS.",
+    "Verify argArray->at(runtime, i) is in-bounds for all i in [0, len) (holes return undefined) so the read side introduces no separate OOB read.",
+    "Confirm the constructor path (isConstructor) and plain-call path both funnel through the same unchecked frame, so the fix must cover both Callable::construct and Callable::call dispatch."
+  ]
+}

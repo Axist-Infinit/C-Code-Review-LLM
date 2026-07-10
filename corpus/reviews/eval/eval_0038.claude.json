@@ -1,0 +1,173 @@
+{
+  "subsystem": "GNU/glibc POSIX regular-expression compiler. This is the internal recursive-descent parser routine parse_reg_exp() from the regex engine (posix/regcomp.c), which parses one 'regular expression' production: a sequence of branches separated by the alternation operator OP_ALT ('|'). It builds a bin_tree_t parse tree from a stream of re_token_t tokens fetched out of the re_string_t pattern buffer, and tracks which back-references have been completed (completed_bkref_map) so the DFA compiler can wire up back-reference nodes correctly.",
+  "provenance": "Identified by the glibc regex internal type and symbol names, none of which are unique to this snippet but collectively pin it: re_string_t, regex_t/preg, re_token_t, reg_syntax_t, Idx, reg_errcode_t, re_dfa_t, bin_tree_t, bitset_word_t, and the token enums OP_ALT / END_OF_RE / OP_CLOSE_SUBEXP. The BE(x,exp) macro is glibc's __builtin_expect wrapper, RE_CARET_ANCHORS_HERE is a glibc reg_syntax_t flag, and REG_NOERROR/REG_ESPACE are glibc reg_errcode_t values. The helper calls parse_branch, fetch_token, create_tree, postorder and free_tree are the exact regcomp.c parser helpers. The header comment 'sample: primevul_c_validation_0148_fixed' marks this as a post-fix revision of a PrimeVul sample.",
+  "trust_boundary": "The attacker-controlled input is the regular-expression PATTERN itself, reachable through the re_string_t *regexp cursor and consumed one token at a time via fetch_token. In every context where an application compiles a pattern that originates from an untrusted source (user input, config, a network request, a filename glob, an HTTP header matched by a rule, etc.) the entire token stream — its depth of nesting, number of alternatives, and structure — is hostile. preg/dfa are engine-internal state, but their shape is driven by that hostile pattern. The dangerous surfaces are therefore: recursion depth induced by nested sub-expressions, the alternation loop iteration count, and the parse-tree allocation/free bookkeeping on error paths.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/eval/eval_0038_cwe19.c",
+      "lines": "2-4",
+      "code": "parse_reg_exp (re_string_t *regexp, regex_t *preg, re_token_t *token,\n\t       reg_syntax_t syntax, Idx nest, reg_errcode_t *err)\n{",
+      "explanation": "The function header for parse_reg_exp (the return type sits on the preceding, unshown line; in glibc it returns bin_tree_t *). Parameters: regexp is the pattern cursor/string object the tokenizer walks; preg is the compiled-regex handle carrying the DFA under construction; token is an in/out pointer to the current lookahead token (parser lookahead is passed by reference so callees can advance it); syntax is the reg_syntax_t bitmask of POSIX/GNU syntax flags; nest is the current sub-expression nesting depth (0 at top level, incremented each time a '(' opens a group); and err is an out-parameter through which a reg_errcode_t (REG_NOERROR, REG_ESPACE, ...) is returned. This routine implements the grammar production 'reg_exp := branch ( '|' branch )*'."
+    },
+    {
+      "file": "corpus/eval/eval_0038_cwe19.c",
+      "lines": "5-7",
+      "code": "re_dfa_t *dfa = preg->buffer;\n  bin_tree_t *tree, *branch = NULL;\n  bitset_word_t initial_bkref_map = dfa->completed_bkref_map;",
+      "explanation": "dfa is aliased from preg->buffer — glibc stores the re_dfa_t (the DFA/parse state) in the regex_t's buffer field, so this is the working compiler state. tree will hold the accumulated parse tree for this production and branch each freshly parsed alternative (initialized NULL). initial_bkref_map snapshots dfa->completed_bkref_map, the bitset of back-reference numbers that have been fully seen so far. Snapshotting it here lets the parser give each alternative the SAME starting back-reference visibility (so a back-reference completed inside one branch of '(a)|(b)\\1' does not leak its 'completed' status into a sibling branch), then merge the results afterward."
+    },
+    {
+      "file": "corpus/eval/eval_0038_cwe19.c",
+      "lines": "8-10",
+      "code": "tree = parse_branch (regexp, preg, token, syntax, nest, err);\n  if (BE (*err != REG_NOERROR && tree == NULL, 0))\n    return NULL;",
+      "explanation": "Parse the first branch (a concatenation of pieces) by delegating to parse_branch, which itself recurses back into this file's grammar (parse_branch -> parse_expression -> parse_sub_exp -> parse_reg_exp for a '(' group), passing nest through. The BE(cond, 0) wrapper is __builtin_expect hinting the branch is unlikely. The guard returns NULL only when BOTH an error was set AND no tree was produced; note the asymmetry — a NULL tree with err == REG_NOERROR (a legitimately empty branch) is allowed to continue. On the error-and-NULL path the function bails immediately with no allocation to release yet."
+    },
+    {
+      "file": "corpus/eval/eval_0038_cwe19.c",
+      "lines": "12-14",
+      "code": "while (token->type == OP_ALT)\n    {\n      fetch_token (token, regexp, syntax | RE_CARET_ANCHORS_HERE);",
+      "explanation": "The main loop: as long as the current lookahead token is the alternation operator OP_ALT ('|'), consume another alternative. fetch_token advances the lookahead past the '|' to the first token of the next alternative, OR-ing RE_CARET_ANCHORS_HERE into the syntax so that a '^' appearing right after '|' is treated as an anchor in this position. Each loop iteration corresponds to one more '|'-separated alternative in the pattern; the number of iterations is bounded only by how many '|' the attacker writes."
+    },
+    {
+      "file": "corpus/eval/eval_0038_cwe19.c",
+      "lines": "15-17",
+      "code": "if (token->type != OP_ALT && token->type != END_OF_RE\n\t  && (nest == 0 || token->type != OP_CLOSE_SUBEXP))\n\t{",
+      "explanation": "Decide whether the alternative just introduced by '|' is non-empty. It is parsed as a real branch only if the next token is not another '|' (empty middle alternative 'a||b'), not END_OF_RE (trailing '|' at end of pattern), and — when inside a group (nest != 0) — not a closing ')' (a '|' immediately before ')'). When nest == 0 a ')' is not a group terminator here, so it does not short-circuit. If any of these terminal conditions holds, the alternative is empty and control falls to the else clause."
+    },
+    {
+      "file": "corpus/eval/eval_0038_cwe19.c",
+      "lines": "18-20",
+      "code": "bitset_word_t accumulated_bkref_map = dfa->completed_bkref_map;\n\t  dfa->completed_bkref_map = initial_bkref_map;\n\t  branch = parse_branch (regexp, preg, token, syntax, nest, err);",
+      "explanation": "Back-reference bookkeeping around parsing a sibling alternative. accumulated_bkref_map preserves whatever back-references had been completed up to now; then completed_bkref_map is reset to the initial snapshot so this new alternative parses with the same back-reference visibility the first branch had (alternatives are independent — a group completed in one arm must not be considered 'available' in a parallel arm). parse_branch then parses the alternative, again recursing into the grammar with nest unchanged."
+    },
+    {
+      "file": "corpus/eval/eval_0038_cwe19.c",
+      "lines": "21-27",
+      "code": "if (BE (*err != REG_NOERROR && branch == NULL, 0))\n\t    {\n\t      if (tree != NULL)\n\t\tpostorder (tree, free_tree, NULL);\n\t      return NULL;\n\t    }\n\t  dfa->completed_bkref_map |= accumulated_bkref_map;",
+      "explanation": "Error handling for the sibling alternative. If parse_branch both set an error and returned no branch, the partially built left-hand tree accumulated so far is freed by a post-order traversal (postorder walks the bin_tree_t applying free_tree to every node) before returning NULL — this release of `tree` on the error path is the memory-management behavior a 'fixed' revision is expected to contain. If parsing succeeded, line 27 merges the back-references completed in this branch back with those from earlier branches via OR, so completed_bkref_map ends up the union across all alternatives."
+    },
+    {
+      "file": "corpus/eval/eval_0038_cwe19.c",
+      "lines": "29-30",
+      "code": "else\n\tbranch = NULL;",
+      "explanation": "The empty-alternative case (matched by the terminal conditions at lines 15-16). No branch is parsed; branch is explicitly NULL. This models patterns like 'a|' or 'a||b' where an alternative matches the empty string; the OP_ALT node built next will have a NULL child on that side."
+    },
+    {
+      "file": "corpus/eval/eval_0038_cwe19.c",
+      "lines": "31-36",
+      "code": "tree = create_tree (dfa, tree, branch, OP_ALT);\n      if (BE (tree == NULL, 0))\n\t{\n\t  *err = REG_ESPACE;\n\t  return NULL;\n\t}",
+      "explanation": "Combine the accumulated left tree and the new branch into an OP_ALT interior node via create_tree, and reassign tree to that new node. create_tree allocates a bin_tree_t; on allocation failure it returns NULL, whereupon the parser sets *err = REG_ESPACE (out of memory) and returns NULL. Note that on this failure path the previous `tree` and `branch` sub-trees are NOT freed here — see the risk walkthrough. The loop then repeats to fold in any further '|' alternatives, giving a left-leaning chain of OP_ALT nodes."
+    },
+    {
+      "file": "corpus/eval/eval_0038_cwe19.c",
+      "lines": "38-39",
+      "code": "return tree;\n}",
+      "explanation": "After the loop exhausts the '|' operators, return the fully built OP_ALT tree (or the single branch if there was no alternation) to the caller (parse_sub_exp / parse_expression), which continues compiling the enclosing expression. *err carries REG_NOERROR on this success path."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/eval/eval_0038_cwe19.c",
+      "lines": "8-8",
+      "code": "tree = parse_branch (regexp, preg, token, syntax, nest, err);",
+      "explanation": "Uncontrolled recursion / stack exhaustion (latent, in the mutual recursion this call enters). parse_branch descends into parse_expression, which for a '(' sub-expression calls parse_sub_exp, which calls back into parse_reg_exp with nest+1. The nest parameter counts depth but this function imposes NO cap on it — a pattern of deeply nested groups '((((((((...))))))))' (or nested alternations inside groups) drives the C call stack proportionally to the attacker's nesting depth. With an untrusted pattern this is a classic recursive-descent stack-overflow DoS (SIGSEGV / crash of the process compiling the regex). The invariant the implementation must uphold is a hard bound on nest (reject once nesting exceeds a fixed limit) BEFORE recursing; the snippet shows the parameter being threaded through but no such gate."
+    },
+    {
+      "file": "corpus/eval/eval_0038_cwe19.c",
+      "lines": "31-36",
+      "code": "tree = create_tree (dfa, tree, branch, OP_ALT);\n      if (BE (tree == NULL, 0))\n\t{\n\t  *err = REG_ESPACE;\n\t  return NULL;\n\t}",
+      "explanation": "Memory leak on the allocation-failure path. When create_tree returns NULL (out of memory), tree is overwritten with NULL and the function returns after setting REG_ESPACE, but the previously accumulated left-hand `tree` and the just-parsed `branch` sub-trees are never freed (unlike the parse_branch error path at lines 22-25, which does call postorder/free_tree). Under memory pressure an attacker can steer allocation to fail here (a large pattern with many alternatives / nodes), leaking whole parse sub-trees per failed compile; repeated compiles amplify the leak. The invariant: on create_tree failure the code must release both `tree` and `branch` before returning. Impact is limited to leakage (CWE-401), not corruption, so severity is low — but it is a real residual defect."
+    },
+    {
+      "file": "corpus/eval/eval_0038_cwe19.c",
+      "lines": "21-26",
+      "code": "if (BE (*err != REG_NOERROR && branch == NULL, 0))\n\t    {\n\t      if (tree != NULL)\n\t\tpostorder (tree, free_tree, NULL);\n\t      return NULL;\n\t    }",
+      "explanation": "Error-detection asymmetry: the guard fires only when parse_branch set an error AND returned NULL. If a callee ever set *err != REG_NOERROR while still returning a non-NULL partial branch, this if is skipped; execution falls through to line 27 (OR the bkref map) and line 31 (create_tree over a tree built during an error state), and the loop can even continue fetching tokens with a stale error flag. The returned tree would then be built on partially-parsed, error-tainted input while *err is non-zero; whether the top-level caller cleans up correctly depends on it re-checking *err. This mirrors the check at lines 9-10 and relies on the contract 'error implies NULL result' holding for every parse_branch return — a contract the implementation must actually guarantee. Correctness/robustness issue (CWE-754 improper check of exceptional condition); low security impact but worth confirming."
+    },
+    {
+      "file": "corpus/eval/eval_0038_cwe19.c",
+      "lines": "5-5",
+      "code": "re_dfa_t *dfa = preg->buffer;",
+      "explanation": "Unchecked dereference of engine state. dfa is taken from preg->buffer and immediately dereferenced at line 7 (dfa->completed_bkref_map). If parse_reg_exp were ever reached with preg->buffer NULL or a half-initialized regex_t, this is a NULL/garbage-pointer dereference (CWE-476). In normal glibc flow preg->buffer is allocated by re_compile_internal before any parse routine runs, so this is not attacker-reachable through the pattern alone; it is an internal API-contract precondition rather than a live vulnerability. Dismissed as a finding but noted: the contract is that callers allocate the DFA before invoking the parser."
+    },
+    {
+      "file": "corpus/eval/eval_0038_cwe19.c",
+      "lines": "12-14",
+      "code": "while (token->type == OP_ALT)\n    {\n      fetch_token (token, regexp, syntax | RE_CARET_ANCHORS_HERE);",
+      "explanation": "Loop-termination dependency: the while loop only exits when the lookahead stops being OP_ALT, which requires fetch_token to make forward progress and eventually yield END_OF_RE at the end of the pattern buffer. This is iterative (not recursive), so long alternation chains cost linear time/heap for the OP_ALT node chain rather than stack — a large pattern is a resource-consumption concern, not memory corruption. The invariant is that fetch_token always advances the cursor and reports END_OF_RE at input exhaustion so the loop cannot spin on a non-advancing token. Dismissed as a distinct finding (subsumed by the general untrusted-pattern resource-consumption posture) but flagged for confirmation of fetch_token progress."
+    }
+  ],
+  "summary": "This is glibc's regex alternation parser parse_reg_exp() (a post-fix PrimeVul sample) and, as shown, it is defensively written: the parse_branch error path correctly frees the accumulated tree before returning. The only genuinely security-relevant contract is uncontrolled recursion depth — nest is threaded through but never capped in this routine, so an untrusted pattern with deep nesting can exhaust the stack (DoS); a secondary, low-severity residual leak exists on the create_tree out-of-memory path where `tree`/`branch` are not freed. No memory-corruption (overflow/UAF) primitive is present in this excerpt.",
+  "reviewed_anchors": [
+    {"anchor": "parse_reg_exp(re_string_t*, regex_t*, re_token_t*, reg_syntax_t, Idx nest, reg_errcode_t*) signature (lines 2-3)", "disposition": "finding", "reason": "The nest depth parameter is the anchor for the uncontrolled-recursion contract; threaded through to recursive callees with no cap shown."},
+    {"anchor": "re_dfa_t *dfa = preg->buffer; (line 5)", "disposition": "dismissed", "reason": "Internal API precondition; preg->buffer is allocated by re_compile_internal before parsing, not reachable NULL via the untrusted pattern."},
+    {"anchor": "bin_tree_t *tree, *branch = NULL; (line 6)", "disposition": "dismissed", "reason": "Local parse-tree pointers; branch is safely initialized NULL, no contract violated by their declaration."},
+    {"anchor": "bitset_word_t initial_bkref_map = dfa->completed_bkref_map; (line 7)", "disposition": "dismissed", "reason": "Back-reference visibility snapshot; a fixed-width scalar bitset, correctness (not memory-safety) mechanism for per-alternative bkref isolation."},
+    {"anchor": "parse_branch call (line 8)", "disposition": "finding", "reason": "Entry point of the mutual recursion (parse_branch -> parse_expression -> parse_sub_exp -> parse_reg_exp); anchors the stack-exhaustion risk."},
+    {"anchor": "BE(*err != REG_NOERROR && tree == NULL, 0) guard (line 9)", "disposition": "dismissed", "reason": "Correct early-return on error; nothing allocated yet to leak, no unsafe path."},
+    {"anchor": "while (token->type == OP_ALT) loop (line 12)", "disposition": "dismissed", "reason": "Iterative alternation handling; linear resource use, terminates on non-OP_ALT / END_OF_RE, no corruption. Subsumed by general untrusted-pattern resource posture."},
+    {"anchor": "fetch_token(token, regexp, syntax | RE_CARET_ANCHORS_HERE) (line 14)", "disposition": "dismissed", "reason": "Advances lookahead; loop termination depends on its forward progress, an implementation contract to confirm, not a defect in this file."},
+    {"anchor": "token terminal-condition test incl. nest==0 (lines 15-16)", "disposition": "dismissed", "reason": "Empty-alternative detection logic; correctly guards the empty '|' cases, no security contract."},
+    {"anchor": "accumulated_bkref_map save / completed_bkref_map reset (lines 18-19)", "disposition": "dismissed", "reason": "Back-reference bookkeeping; scalar bitset manipulation, correctness of DFA wiring only."},
+    {"anchor": "parse_branch call for sibling alternative (line 20)", "disposition": "finding", "reason": "Second recursion site; same uncontrolled-depth contract as line 8 (folded into the recursion finding)."},
+    {"anchor": "parse_branch error path: postorder(tree, free_tree, NULL); return NULL (lines 21-26)", "disposition": "finding", "reason": "Error-detection is conditioned on branch==NULL as well as *err set; anchors the error-check-asymmetry robustness finding (the free itself is the correct fixed behavior)."},
+    {"anchor": "dfa->completed_bkref_map |= accumulated_bkref_map; (line 27)", "disposition": "dismissed", "reason": "Merges per-alternative bkref maps; scalar OR, correctness only, no memory-safety exposure."},
+    {"anchor": "else branch = NULL; (lines 29-30)", "disposition": "dismissed", "reason": "Empty-alternative assignment; safe, models empty-string alternatives."},
+    {"anchor": "tree = create_tree(dfa, tree, branch, OP_ALT); + NULL check (lines 31-36)", "disposition": "finding", "reason": "On create_tree OOM failure the prior tree and branch sub-trees are not freed before returning REG_ESPACE — residual memory leak."},
+    {"anchor": "return tree; (line 38)", "disposition": "dismissed", "reason": "Normal success return; no contract issue."}
+  ],
+  "findings": [
+    {
+      "title": "Uncontrolled recursion depth on untrusted pattern (stack exhaustion DoS)",
+      "anchor": "parse_branch(regexp, preg, token, syntax, nest, err) with un-capped nest",
+      "file": "corpus/eval/eval_0038_cwe19.c",
+      "line": "8",
+      "code": "tree = parse_branch (regexp, preg, token, syntax, nest, err);",
+      "bug_class": "Uncontrolled recursion / stack exhaustion",
+      "cwe": "CWE-674",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "The parser must enforce a hard maximum on `nest` (reject the pattern with a syntax/space error once nesting exceeds a fixed bound) BEFORE recursing into a nested sub-expression, so recursion depth cannot scale with attacker-chosen nesting.",
+      "failure_mode": "parse_branch descends via parse_expression -> parse_sub_exp -> parse_reg_exp for each '(' group, incrementing nest but with no cap visible in this routine. A pattern with deep nesting, e.g. '((((((((((((((((....))))))))))))))))' or nested groups inside alternations, drives C call-stack growth proportional to nesting depth, overflowing the stack and crashing the process that compiles the untrusted regex (denial of service). No heap corruption, but a reliable remote/one-shot crash where patterns are attacker-controlled.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether re_compile_internal / parse_sub_exp enforce a nesting/recursion limit (a MAX-nest constant or equivalent) before the recursive call, and what the limit is."
+    },
+    {
+      "title": "Memory leak of parse sub-trees on create_tree allocation failure",
+      "anchor": "tree = create_tree (dfa, tree, branch, OP_ALT); if (BE (tree == NULL, 0)) { *err = REG_ESPACE; return NULL; }",
+      "file": "corpus/eval/eval_0038_cwe19.c",
+      "line": "31-36",
+      "code": "tree = create_tree (dfa, tree, branch, OP_ALT);\n      if (BE (tree == NULL, 0))\n\t{\n\t  *err = REG_ESPACE;\n\t  return NULL;\n\t}",
+      "bug_class": "Memory leak on out-of-memory error path",
+      "cwe": "CWE-401",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0038_cwe19.c (this function) plus create_tree in implementation (file not provided)",
+      "invariant": "When create_tree fails (returns NULL), the function must free the already-built left-hand `tree` and the newly parsed `branch` before returning REG_ESPACE, mirroring the postorder/free_tree cleanup used on the parse_branch error path at lines 22-25.",
+      "failure_mode": "Under memory pressure (a large or deeply structured pattern with many nodes/alternatives), create_tree's node allocation fails; tree is overwritten with NULL and the routine returns, orphaning both the prior `tree` and `branch` sub-trees with no free. Repeated failing compiles of untrusted patterns leak parser memory. Confirmation needed on whether create_tree itself consumes/frees its child arguments on failure (in glibc it does not), which would make this a genuine leak.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether create_tree frees its `left`/`right` arguments when its own allocation fails; if not, this error path leaks and needs a free of tree and branch before return."
+    },
+    {
+      "title": "Branch error check conditioned on NULL result as well as error flag",
+      "anchor": "if (BE (*err != REG_NOERROR && branch == NULL, 0))",
+      "file": "corpus/eval/eval_0038_cwe19.c",
+      "line": "21-26",
+      "code": "if (BE (*err != REG_NOERROR && branch == NULL, 0))\n\t    {\n\t      if (tree != NULL)\n\t\tpostorder (tree, free_tree, NULL);\n\t      return NULL;\n\t    }",
+      "bug_class": "Improper check of exceptional condition (error flag ignored when result non-NULL)",
+      "cwe": "CWE-754",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0038_cwe19.c (this function)",
+      "invariant": "Every parse_branch return path must satisfy 'error set implies NULL result' so that testing (*err != REG_NOERROR && branch == NULL) never lets an error-tainted, non-NULL partial branch slip through to create_tree and continued token consumption.",
+      "failure_mode": "If any callee sets *err while returning a non-NULL branch, the guard is skipped, line 27 merges bkref state, and line 31 builds an OP_ALT node over error-tainted input while *err stays non-zero; the loop may keep fetching tokens. Whether this causes incorrect compilation or is harmlessly re-caught depends on the caller re-checking *err. Same asymmetry appears at lines 9-10. Impact is correctness/robustness, not memory corruption.",
+      "cve_analog": "",
+      "what_to_confirm": "That parse_branch (and parse_expression beneath it) never return a non-NULL tree together with a non-REG_NOERROR *err; and that the top-level compile re-checks *err on return."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm there is a hard cap on `nest` (recursion depth) enforced before parse_sub_exp recurses into parse_reg_exp, and that exceeding it returns a clean error rather than crashing.",
+    "On the create_tree == NULL / REG_ESPACE path (lines 31-36), verify both `tree` and `branch` are freed (via postorder/free_tree) before returning, or that create_tree consumes them on failure.",
+    "Verify the invariant 'parse_branch sets *err ==> returns NULL' holds on every path, so the (*err && result==NULL) checks at lines 9-10 and 21 cannot leak an error-tainted non-NULL tree.",
+    "Confirm preg->buffer (dfa) is always non-NULL and fully initialized by re_compile_internal before parse_reg_exp is entered (line 5 dereference).",
+    "Check that the completed_bkref_map snapshot/reset/OR sequence (lines 7, 18-19, 27) correctly isolates back-reference completion per alternative and cannot mis-flag a back-reference as available across sibling branches.",
+    "Confirm fetch_token always advances the cursor and eventually yields END_OF_RE, so the while(OP_ALT) loop (line 12) cannot spin on a non-advancing token, and bound total alternatives/nodes for untrusted patterns."
+  ]
+}

@@ -1,0 +1,221 @@
+{
+  "subsystem": "Oniguruma regular-expression library optimizer. `concat_opt_exact_str` is a helper in the regex compiler's optimization pass (regcomp.c family) that accumulates the literal/prefix bytes of an 'exact string' optimization node (`OptStr`) so the matcher can fast-path a fixed byte prefix. It appends encoded characters copied from the source range [s, end) into the fixed-size `OptStr::s` byte buffer, tracking how many bytes were stored and whether the source was fully consumed.",
+  "provenance": "Identified by the Oniguruma-specific vocabulary: `OnigEncoding` (the library's encoding descriptor typedef), `UChar` (Oniguruma's unsigned-char alias), `enclen(enc, p)` (Oniguruma's macro/function returning the byte length of the multibyte character at `p` under encoding `enc`), the `OptStr` optimization-node struct, and the `OPT_EXACT_MAXLEN` compile-time cap on the exact-string buffer. The function name `concat_opt_exact_str` and constant `OPT_EXACT_MAXLEN` appear in Oniguruma's regcomp.c optimizer. The leading comment `/* sample: primevul_c_train_3215_fixed */` labels this a PrimeVul sample; I review the code blind on its merits regardless of that tag.",
+  "trust_boundary": "The compiler input is the regular-expression pattern text, which in most deployments (web servers, scripting-language regex engines, log processors) is attacker-controllable. The bytes in [s, end) are literal characters lifted from that pattern, and `enc` is the pattern's declared encoding — both attacker-influenceable. `to` is an internal `OptStr` accumulator owned by the compiler, but its `len` field is carried across many calls as the running write cursor, so a mis-accounted `len` from an earlier call is effectively hostile state. The critical hostile quantities are: the length of the source range (`end - s`), the per-character length returned by `enclen(enc, p)`, and the incoming `to->len`. The destination `to->s` is a FIXED-size buffer of `OPT_EXACT_MAXLEN` bytes, so every byte copied into it is a bounds-sensitive operation driven by attacker-controlled pattern length.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0009_cwe787.c",
+      "lines": "1-2",
+      "code": "/* sample: primevul_c_train_3215_fixed */\nconcat_opt_exact_str(OptStr* to, UChar* s, UChar* end, OnigEncoding enc)",
+      "explanation": "A source-provenance comment followed by the function definition header. The function has no visible return type on this line (the `static void` almost certainly sits on the truncated line above), and it returns nothing meaningful — it mutates `*to`. Parameters: `to` is the destination `OptStr` optimization node whose byte buffer `to->s` and cursor `to->len` are appended to; `s` and `end` bound the source byte range [s, end) to copy from (half-open, `end` is one-past-the-last valid byte); `enc` is the Oniguruma encoding descriptor used to measure multibyte character boundaries. The function's job is to concatenate as much of [s, end) as fits into the fixed exact-string buffer, on whole-character boundaries."
+    },
+    {
+      "file": "corpus/train/train_0009_cwe787.c",
+      "lines": "3-5",
+      "code": "{\n  int i, j, len;\n  UChar *p;",
+      "explanation": "Local state. `i` is the destination write cursor into `to->s` (a signed `int`), `j` is the inner byte-copy counter for one character, and `len` is the byte length of the current character as reported by the encoding. `p` is the source read pointer that walks from `s` toward `end`. Using signed `int` for `i` and `len` matters for the bounds reasoning below: any negative or overlarge value in `enclen` or `to->len` would be interpreted as a signed quantity in the comparisons that follow."
+    },
+    {
+      "file": "corpus/train/train_0009_cwe787.c",
+      "lines": "7",
+      "code": "for (i = to->len, p = s; p < end && i < OPT_EXACT_MAXLEN; ) {",
+      "explanation": "The outer loop initialization seeds the write cursor `i` from the CURRENT accumulated length `to->len` (this is an append, not an overwrite — earlier calls may already have filled part of `to->s`) and points `p` at the start of the source. The loop continues while there is source left (`p < end`) AND the destination cursor has not reached the buffer cap (`i < OPT_EXACT_MAXLEN`). This is the first of two bound checks; it prevents starting a new character once the buffer is already full. Note the loop has no increment clause — advancement of `p` and `i` happens inside the body."
+    },
+    {
+      "file": "corpus/train/train_0009_cwe787.c",
+      "lines": "8",
+      "code": "len = enclen(enc, p);",
+      "explanation": "Asks the encoding how many bytes the character beginning at `p` occupies. For UTF-8 this is 1–4, for other encodings up to the encoding's max character length. Crucially `enclen` is called with only `(enc, p)` and NOT an `end` argument, so it decides the character length from the lead byte (and possibly following bytes) without knowing how many bytes actually remain before `end`. The returned `len` is then used both to test buffer capacity and to size the copy."
+    },
+    {
+      "file": "corpus/train/train_0009_cwe787.c",
+      "lines": "9",
+      "code": "if (i + len >= OPT_EXACT_MAXLEN) break;",
+      "explanation": "The capacity guard: if writing this whole character (`len` bytes starting at cursor `i`) would reach or exceed the buffer cap, stop appending entirely. Because the test is `>=`, the loop only proceeds when `i + len < OPT_EXACT_MAXLEN`, i.e. `i + len <= OPT_EXACT_MAXLEN - 1`, so after copying at most `len` bytes the final index written is at most `OPT_EXACT_MAXLEN - 2` — strictly inside the buffer. This whole-character guard is what keeps the subsequent byte writes in bounds and is the security-critical line of the function."
+    },
+    {
+      "file": "corpus/train/train_0009_cwe787.c",
+      "lines": "10-11",
+      "code": "for (j = 0; j < len && p < end; j++)\n      to->s[i++] = *p++;",
+      "explanation": "The inner copy loop transfers the character byte-by-byte: it writes up to `len` bytes but stops early if the source pointer reaches `end`. Each iteration stores `*p` into `to->s[i]` and post-increments both cursors. Because of the line-9 guard, `i` stays within [old_i, old_i+len) ⊂ [0, OPT_EXACT_MAXLEN), so the writes are in bounds. The `p < end` sub-condition prevents reading source bytes past the supplied range during the copy, so a character whose declared `len` overruns the remaining source is truncated rather than over-read here."
+    },
+    {
+      "file": "corpus/train/train_0009_cwe787.c",
+      "lines": "14",
+      "code": "to->len = i;",
+      "explanation": "After the loops, the final write cursor is written back as the new accumulated length. This is the persistent state that seeds the next call's `i = to->len` (line 7). The correctness of every future append depends on `i` here never having exceeded `OPT_EXACT_MAXLEN`; the line-9 guard guarantees `i <= OPT_EXACT_MAXLEN - 1`, so `to->len` stays a valid buffer offset."
+    },
+    {
+      "file": "corpus/train/train_0009_cwe787.c",
+      "lines": "16-17",
+      "code": "if (p >= end)\n    to->reach_end = 1;",
+      "explanation": "Records whether the source range was fully consumed. If `p` reached `end`, the exact-string prefix captured the entire remaining literal, so `reach_end` is set — the optimizer uses this to know the exact string is complete/anchored rather than truncated by the buffer cap. If the loop stopped because of the capacity guard (line 9) with source still remaining, `p < end` and `reach_end` is left unset, correctly signaling a partial prefix."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0009_cwe787.c",
+      "lines": "7-11",
+      "code": "for (i = to->len, p = s; p < end && i < OPT_EXACT_MAXLEN; ) {\n    len = enclen(enc, p);\n    if (i + len >= OPT_EXACT_MAXLEN) break;\n    for (j = 0; j < len && p < end; j++)\n      to->s[i++] = *p++;\n  }",
+      "explanation": "This is the central attack surface: an attacker-length pattern drives byte writes `to->s[i++] = *p++` into the FIXED buffer `to->s[OPT_EXACT_MAXLEN]`, with `i` seeded from carried state `to->len`. This is precisely the class of bug (CWE-787 out-of-bounds write) the historical vulnerable form of this routine exhibited when the per-character capacity check was missing or used `>` instead of `>=`. In THIS revision the write is bounded: line 7 refuses to start a character once `i >= OPT_EXACT_MAXLEN`, and line 9's `i + len >= OPT_EXACT_MAXLEN` refuses to copy a character that would touch or pass the cap, so the maximum index written is `OPT_EXACT_MAXLEN - 2`. The safety therefore rests entirely on two implementation invariants the header/snippet cannot prove: (1) `OPT_EXACT_MAXLEN` must equal the declared size of `to->s`, and (2) `enclen` must never return a value that understates the bytes the copy will consume. If `sizeof(to->s) < OPT_EXACT_MAXLEN`, the guard permits an overflow; confirm the struct definition."
+    },
+    {
+      "file": "corpus/train/train_0009_cwe787.c",
+      "lines": "8",
+      "code": "len = enclen(enc, p);",
+      "explanation": "`enclen(enc, p)` is invoked without an `end`/limit argument, so for encodings whose length function inspects continuation bytes (or that trust a lead byte announcing a multi-byte sequence) it can read bytes at and beyond `end` while classifying the character at `p` when `p` is within `enc`'s max-char-length of `end`. That is an out-of-bounds READ (CWE-125) of the pattern buffer occurring before the line-10 `p < end` copy guard ever applies — the copy guard protects the write/copy, not the length probe. Newer Oniguruma APIs pass an end pointer (`enclen(enc, p, end)`) specifically to close this over-read. Confirm whether this `enclen` variant is end-aware or whether the caller guarantees a NUL/sentinel padding past `end`."
+    },
+    {
+      "file": "corpus/train/train_0009_cwe787.c",
+      "lines": "8-11",
+      "code": "len = enclen(enc, p);\n    if (i + len >= OPT_EXACT_MAXLEN) break;\n    for (j = 0; j < len && p < end; j++)\n      to->s[i++] = *p++;",
+      "explanation": "The capacity math on line 9 reserves `len` bytes, but the copy on line 10 stops at `min(len, end - p)`. This mismatch is benign for the WRITE bound (it copies fewer bytes than reserved) but it means the exact-string buffer can end mid-character when the declared `len` overruns the remaining source — a truncated/partial multibyte sequence stored as an 'exact' prefix, which can make the matcher's fast-path compare against a malformed byte string. More seriously, if `enclen` ever returns `0` or a negative value (encoding bug or a malformed lead byte mishandled by a custom encoding), line 9's `i + len >= OPT_EXACT_MAXLEN` may stay false forever while the inner loop copies nothing (`j < 0` is false), so `p` and `i` never advance and the outer loop spins forever — an unbounded loop / denial of service (CWE-835). The invariant is that `enclen` returns a strictly positive length within `enc`'s max; verify the encoding contract."
+    },
+    {
+      "file": "corpus/train/train_0009_cwe787.c",
+      "lines": "7",
+      "code": "for (i = to->len, p = s; p < end && i < OPT_EXACT_MAXLEN; ) {",
+      "explanation": "`i` is seeded from `to->len` and both are signed `int`. The bounds argument only holds if `to->len` is in [0, OPT_EXACT_MAXLEN] on entry. Since `to->len` is persistent state written back on line 14 and consumed here across calls, a corrupted or externally-set `to->len` (e.g. negative from an earlier arithmetic error, or already > OPT_EXACT_MAXLEN) would break the model: a negative `i` passes `i < OPT_EXACT_MAXLEN`, and `to->s[i++]` with negative `i` is an out-of-bounds write below the buffer (CWE-787). Within this function the write-back is guarded so `to->len` cannot become out of range HERE, but the contract that every producer of `to->len` keeps it in [0, OPT_EXACT_MAXLEN] is a whole-optimizer invariant worth confirming."
+    },
+    {
+      "file": "corpus/train/train_0009_cwe787.c",
+      "lines": "16-17",
+      "code": "if (p >= end)\n    to->reach_end = 1;",
+      "explanation": "Lower-severity logic hazard: `reach_end` is a monotonic sticky flag set to 1 but never cleared here. If a prior call set `reach_end` and a later call appends a character but is stopped by the capacity guard (line 9) with `p < end`, `reach_end` retains its stale 1 from before, over-claiming that the exact string reached the pattern end. That would let the optimizer treat a buffer-truncated prefix as a complete/anchored exact match and could produce incorrect (over-eager) matching, not memory unsafety. Confirm the caller resets `to->reach_end` appropriately between logical strings."
+    }
+  ],
+  "summary": "This is the bounds-checked (fixed) form of Oniguruma's `concat_opt_exact_str`: attacker-controlled pattern bytes are appended into the fixed `OptStr::s[OPT_EXACT_MAXLEN]` buffer, and the whole-character capacity guard `i + len >= OPT_EXACT_MAXLEN` (plus the outer `i < OPT_EXACT_MAXLEN`) keeps the writes in bounds, so the classic CWE-787 overflow is mitigated in the code shown. The residual, latent risks live in contracts the snippet cannot prove: `enclen(enc, p)` is called with no `end` limit (out-of-bounds read on malformed multibyte tails, CWE-125), the write-bound safety depends on `OPT_EXACT_MAXLEN == sizeof(to->s)` and on `enclen` returning a positive length (a zero/negative return spins the loop, CWE-835), and `to->len` must be kept in range by every caller.",
+  "reviewed_anchors": [
+    {
+      "anchor": "concat_opt_exact_str(OptStr* to, UChar* s, UChar* end, OnigEncoding enc) — function signature",
+      "disposition": "finding",
+      "reason": "Copies attacker-influenced pattern bytes from [s,end) into a fixed buffer; the whole security contract lives here."
+    },
+    {
+      "anchor": "to->s (fixed byte buffer of OPT_EXACT_MAXLEN) paired with to->len (length/cursor field)",
+      "disposition": "finding",
+      "reason": "Fixed-size buffer paired with a length field driving writes — per method must get a finding; overflow bound rests on OPT_EXACT_MAXLEN == sizeof(to->s)."
+    },
+    {
+      "anchor": "OPT_EXACT_MAXLEN size macro (lines 7, 9)",
+      "disposition": "finding",
+      "reason": "The only compile-time cap on the buffer; if it disagrees with sizeof(to->s) the guard permits overflow."
+    },
+    {
+      "anchor": "enclen(enc, p) (line 8)",
+      "disposition": "finding",
+      "reason": "Called with no end bound and its return sizes both the capacity check and the copy; source of OOB read and of loop/termination assumptions."
+    },
+    {
+      "anchor": "if (i + len >= OPT_EXACT_MAXLEN) break; (line 9)",
+      "disposition": "finding",
+      "reason": "The security-critical per-character capacity guard; correctness of the whole routine depends on this comparison (>= vs >, and len positivity)."
+    },
+    {
+      "anchor": "to->len as initial cursor i = to->len (line 7) and write-back to->len = i (line 14)",
+      "disposition": "finding",
+      "reason": "Persistent signed cursor carried across calls; negative/overlarge value breaks the bounds model."
+    },
+    {
+      "anchor": "inner copy loop to->s[i++] = *p++ with j < len && p < end (lines 10-11)",
+      "disposition": "finding",
+      "reason": "The actual write site; also introduces the len-vs-remaining-source truncation and no-progress conditions."
+    },
+    {
+      "anchor": "to->reach_end flag (lines 16-17)",
+      "disposition": "finding",
+      "reason": "Sticky one-way flag never cleared here; can over-claim completion — logic (not memory) issue, low severity."
+    },
+    {
+      "anchor": "local variables int i, j, len (line 4)",
+      "disposition": "dismissed",
+      "reason": "Signedness matters and is folded into the to->len / enclen findings; the declarations themselves carry no independent contract."
+    },
+    {
+      "anchor": "UChar *p; source read pointer (line 5)",
+      "disposition": "dismissed",
+      "reason": "Bounded by p < end in the copy loop; its only real hazard (enclen over-read) is captured under the enclen finding."
+    },
+    {
+      "anchor": "OnigEncoding enc parameter",
+      "disposition": "dismissed",
+      "reason": "Opaque encoding descriptor; not itself a buffer or length. Its influence is entirely via enclen, already a finding."
+    },
+    {
+      "anchor": "UChar* s, UChar* end source range parameters",
+      "disposition": "dismissed",
+      "reason": "Define the half-open input range; the range-length risk is realized through enclen over-read and copy truncation, already covered."
+    }
+  ],
+  "findings": [
+    {
+      "title": "OptStr exact-string buffer append: fixed-size to->s written under attacker-length pattern (CWE-787 contract)",
+      "anchor": "to->s[i++] = *p++; with cap OPT_EXACT_MAXLEN",
+      "file": "corpus/train/train_0009_cwe787.c",
+      "line": "7-11",
+      "code": "for (i = to->len, p = s; p < end && i < OPT_EXACT_MAXLEN; ) {\n    len = enclen(enc, p);\n    if (i + len >= OPT_EXACT_MAXLEN) break;\n    for (j = 0; j < len && p < end; j++)\n      to->s[i++] = *p++;\n  }",
+      "bug_class": "Out-of-bounds write into fixed buffer (guarded here; historical overflow class)",
+      "cwe": "CWE-787",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0009_cwe787.c (write site) plus the OptStr struct definition (file not provided)",
+      "invariant": "Every write index i must satisfy 0 <= i < sizeof(to->s), which requires OPT_EXACT_MAXLEN == sizeof(to->s) AND the per-character guard i + len >= OPT_EXACT_MAXLEN (>=, not >) to run before any byte is copied AND to->len entering in [0, OPT_EXACT_MAXLEN].",
+      "failure_mode": "With a long attacker pattern, characters are appended into to->s[OPT_EXACT_MAXLEN]. In this revision the outer i < OPT_EXACT_MAXLEN plus the line-9 i + len >= OPT_EXACT_MAXLEN break confine writes to index <= OPT_EXACT_MAXLEN-2, so no overflow occurs as shown. The overflow re-appears if OPT_EXACT_MAXLEN is larger than the real buffer, if the guard were relaxed to '>' (allowing i+len == OPT_EXACT_MAXLEN and a one-past-end write of the last byte), or if enclen understates len so the copy writes more bytes than reserved. Impact of the historical form is a heap/global out-of-bounds write during regex compilation of an untrusted pattern — memory corruption / potential RCE.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify the OptStr definition declares to->s as exactly OPT_EXACT_MAXLEN bytes, that no other writer sets to->len above OPT_EXACT_MAXLEN, and that the comparison remains '>=' rather than '>'."
+    },
+    {
+      "title": "enclen(enc, p) called with no end limit — out-of-bounds read on truncated multibyte tail",
+      "anchor": "len = enclen(enc, p);",
+      "file": "corpus/train/train_0009_cwe787.c",
+      "line": "8",
+      "code": "len = enclen(enc, p);",
+      "bug_class": "Out-of-bounds read (multibyte length probe past end)",
+      "cwe": "CWE-125",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided) — the enclen macro/encoding length function for this OnigEncoding",
+      "invariant": "Measuring the character length at p must not dereference any byte at or beyond end; either enclen must be given end and clamp, or the caller must guarantee readable padding past end.",
+      "failure_mode": "When p is within (max-char-len - 1) bytes of end and the final character is a truncated multibyte sequence, an enclen implementation that inspects continuation bytes reads past end — an out-of-bounds read of the pattern buffer. The line-10 'p < end' guard limits only the subsequent copy, not this length probe, so the over-read happens before any copy guard applies. Impact: information disclosure / crash while compiling an untrusted pattern; also the resulting oversized len can truncate a stored character mid-sequence.",
+      "cve_analog": "",
+      "what_to_confirm": "Check whether this enclen takes an end argument (e.g. enclen(enc, p, end)) or clamps to the buffer, and whether the pattern buffer is guaranteed NUL/sentinel padded beyond end."
+    },
+    {
+      "title": "Non-positive enclen return causes no-progress infinite loop (DoS)",
+      "anchor": "if (i + len >= OPT_EXACT_MAXLEN) break; ... for (j = 0; j < len && p < end; j++)",
+      "file": "corpus/train/train_0009_cwe787.c",
+      "line": "8-11",
+      "code": "len = enclen(enc, p);\n    if (i + len >= OPT_EXACT_MAXLEN) break;\n    for (j = 0; j < len && p < end; j++)\n      to->s[i++] = *p++;",
+      "bug_class": "Loop with unreachable exit (no forward progress)",
+      "cwe": "CWE-835",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0009_cwe787.c, contingent on the enclen contract in the implementation (file not provided)",
+      "invariant": "enclen must return a strictly positive byte length for every position p in [s, end) so that both the capacity guard advances and the inner loop copies at least one byte, guaranteeing p and i strictly increase each outer iteration.",
+      "failure_mode": "If enclen returns 0 (or a negative value) for a malformed lead byte in a custom/edge encoding, line 9's i + len >= OPT_EXACT_MAXLEN can stay false while the inner loop condition j < len is immediately false, so neither p nor i advances and the outer loop (p < end && i < OPT_EXACT_MAXLEN) never terminates — a hang / CPU denial of service during compilation of an untrusted pattern.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the encoding's mbc length function is guaranteed >= 1 for all inputs, or that the caller rejects/normalizes malformed lead bytes before this routine."
+    },
+    {
+      "title": "to->reach_end sticky flag never reset — over-claims complete exact string",
+      "anchor": "if (p >= end) to->reach_end = 1;",
+      "file": "corpus/train/train_0009_cwe787.c",
+      "line": "16-17",
+      "code": "if (p >= end)\n    to->reach_end = 1;",
+      "bug_class": "Stale state / incorrect logic flag",
+      "cwe": "CWE-665",
+      "severity": "info",
+      "where_it_lives": "corpus/train/train_0009_cwe787.c and its callers (file not provided)",
+      "invariant": "reach_end must reflect whether THIS accumulated exact string consumed its source to end; it must be cleared when a new logical string starts or when a call is cut short by the capacity guard with source remaining.",
+      "failure_mode": "The flag is only ever set to 1 here, never cleared. If a previous call set reach_end and a later append stops via the line-9 capacity break with p < end, reach_end stays 1 and the optimizer may treat a buffer-truncated prefix as a complete/anchored exact match, yielding incorrect (over-eager) match behavior — a correctness bug, not memory unsafety.",
+      "cve_analog": "",
+      "what_to_confirm": "Check that callers initialize/reset to->reach_end before reusing an OptStr and that a capacity-limited append leaves reach_end = 0."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm the OptStr struct declares s as exactly OPT_EXACT_MAXLEN bytes (OPT_EXACT_MAXLEN == sizeof(to->s)); any mismatch turns the line-9 guard into an overflow.",
+    "Confirm the capacity check uses '>=' (i + len >= OPT_EXACT_MAXLEN); a regression to '>' allows a one-past-end write.",
+    "Verify enclen here is end-aware (or the pattern buffer is padded past end) so measuring a truncated final multibyte character cannot read beyond end (CWE-125).",
+    "Verify enclen returns a strictly positive length for every position, so the outer loop always makes progress (no CWE-835 hang on len<=0).",
+    "Trace every producer/consumer of to->len across the optimizer to prove it stays in [0, OPT_EXACT_MAXLEN] before entering this function (guards negative/overlarge cursor).",
+    "Confirm callers reset to->reach_end between logical exact strings so a truncated append cannot inherit a stale reach_end = 1.",
+    "Check the len-vs-remaining-source case: when enclen(len) > end - p, ensure storing a partial character in to->s is acceptable to the matcher (no malformed 'exact' prefix used for comparison)."
+  ]
+}

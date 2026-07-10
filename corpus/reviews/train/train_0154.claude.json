@@ -1,0 +1,188 @@
+{
+  "subsystem": "GPAC libgpac bitstream reader. BS_ReadByte() is the low-level single-byte read primitive of the GF_BitStream abstraction, servicing both an in-memory buffer mode (GF_BITSTREAM_READ) and a FILE-backed streaming mode. It also implements NAL-unit emulation-prevention-byte removal (the 0x00 0x00 0x03 -> 0x00 0x00 sequence used by H.264/AVC/HEVC), so it sits directly on the demux/parse path that consumes attacker-supplied media containers and elementary streams.",
+  "provenance": "Identified from GPAC/libgpac naming conventions: the GF_BitStream type, the GF_BITSTREAM_READ mode enum, the u8/Bool/GF_FALSE typedefs, the gf_bs_load_byte()/gf_bs_seek()/gf_feof() helpers, and the GF_LOG(GF_LOG_ERROR, GF_LOG_CORE, ...) logging macro are all specific to GPAC's core bitstream module (src/utils/bitstream.c). The remove_emul_prevention_byte / nb_zeros logic is GPAC's NAL emulation-prevention handling. The banner comment 'primevul_c_train_2224_fixed' marks this as the patched variant of a PrimeVul dataset sample.",
+  "trust_boundary": "The bytes returned by this function originate from untrusted media input: bs->original[] is a buffer holding demuxed/elementary-stream bytes in READ mode, and bs->stream is a FILE the same untrusted data was read from in FILE mode. bs->size and bs->position are the parser's own bookkeeping, but the DATA bytes (res, and the peeked bs->original[bs->position] / the 'next' byte from gf_bs_load_byte) are fully attacker-controlled. The emulation-prevention path is reached whenever remove_emul_prevention_byte is set (NAL parsing), so a crafted stream chooses exactly when nb_zeros reaches 2 and a 0x03 byte appears at the buffer boundary. The EndOfStream callback (bs->EndOfStream) and bs->par are host-supplied, not attacker-supplied, but their contract matters for re-entrancy.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0154_cwe703.c",
+      "lines": "2-4",
+      "code": "static u8 BS_ReadByte(GF_BitStream *bs)\n{\n\tBool is_eos;",
+      "explanation": "Declares the internal single-byte read routine. It takes a pointer to the bitstream object bs and returns one unsigned 8-bit byte (u8). The local is_eos flag will later hold whether the FILE-backed stream is at end-of-file. The function is static (module-private) and is the workhorse called by higher-level gf_bs_read_* APIs. Everything downstream that reads a byte from a parsed media stream funnels through here."
+    },
+    {
+      "file": "corpus/train/train_0154_cwe703.c",
+      "lines": "5-11",
+      "code": "\tif (bs->bsmode == GF_BITSTREAM_READ) {\n\t\tu8 res;\n\t\tif (bs->position >= bs->size) {\n\t\t\tif (bs->EndOfStream) bs->EndOfStream(bs->par);\n\t\t\tif (!bs->overflow_state) bs->overflow_state = 1;\n\t\t\treturn 0;\n\t\t}",
+      "explanation": "The in-memory READ branch. bsmode == GF_BITSTREAM_READ means the data lives in a fixed buffer bs->original of length bs->size. The guard 'bs->position >= bs->size' is the primary bounds check: if the caller has already consumed the whole buffer, the function fires the optional EndOfStream(par) notification callback, sets a sticky overflow_state flag (only the first time), and returns 0 rather than reading past the buffer. This is the anti-over-read gate for READ mode; every array access below assumes position < size holds because this early-return did not fire."
+    },
+    {
+      "file": "corpus/train/train_0154_cwe703.c",
+      "lines": "12-12",
+      "code": "\t\tres = bs->original[bs->position++];",
+      "explanation": "Reads the current byte from the in-memory buffer and post-increments position. Because line 7 guaranteed position < size at entry, this single indexed read is in-bounds. After this line position may equal size (one past the last valid byte), which is legal as an index-to-read-next but not yet dereferenced."
+    },
+    {
+      "file": "corpus/train/train_0154_cwe703.c",
+      "lines": "14-21",
+      "code": "\t\tif (bs->remove_emul_prevention_byte) {\n\t\t\tif ((bs->nb_zeros==2) && (res==0x03) && (bs->position<bs->size) && (bs->original[bs->position]<0x04)) {\n\t\t\t\tbs->nb_zeros = 0;\n\t\t\t\tres = bs->original[bs->position++];\n\t\t\t}\n\t\t\tif (!res) bs->nb_zeros++;\n\t\t\telse bs->nb_zeros = 0;\n\t\t}",
+      "explanation": "NAL emulation-prevention-byte removal for the in-memory path. In H.264/HEVC bytestreams, an encoder inserts a 0x03 'emulation_prevention_three_byte' after two consecutive 0x00 bytes when the following byte is 0x00-0x03, so decoders must strip that 0x03 back out. Here, when the running zero counter nb_zeros has reached 2 and the byte just read (res) is 0x03, the code peeks the next byte to confirm it is < 0x04, and if so discards the 0x03 and returns the following byte instead (advancing position again). Crucially the condition includes 'bs->position < bs->size' BEFORE dereferencing bs->original[bs->position], and only re-reads original[position++] inside the branch where that bound was just proven true. The trailing nb_zeros bookkeeping increments the zero-run counter when the resulting byte is 0 and resets it otherwise, so the two-zeros-then-0x03 state machine stays correct across calls. This bounds check is the substance of the 'fixed' version: it is what prevents the boundary out-of-bounds read."
+    },
+    {
+      "file": "corpus/train/train_0154_cwe703.c",
+      "lines": "22-25",
+      "code": "\t\treturn res;\n\t}\n\tif (bs->cache_write)\n\t\tbs_flush_write_cache(bs);",
+      "explanation": "Returns the resolved byte for READ mode. Everything below runs only in the non-READ (FILE-backed) mode. As a first step there, if a write cache is pending it is flushed via bs_flush_write_cache(bs) to keep the file position coherent before a read is attempted on the same stream."
+    },
+    {
+      "file": "corpus/train/train_0154_cwe703.c",
+      "lines": "27-30",
+      "code": "\tis_eos = gf_feof(bs->stream);\n\t//cache not fully read, reset EOS\n\tif (bs->cache_read && (bs->cache_read_pos<bs->cache_read_size))\n\t\tis_eos = GF_FALSE;",
+      "explanation": "Determines end-of-stream for FILE mode. gf_feof(bs->stream) reports whether the underlying FILE hit EOF, but a read cache may still hold undelivered bytes: if a read cache is active and its consumed position (cache_read_pos) is still behind the cached size (cache_read_size), EOF is overridden to GF_FALSE so those buffered bytes are still returned. This reconciles the OS-level EOF with GPAC's own read-ahead buffer."
+    },
+    {
+      "file": "corpus/train/train_0154_cwe703.c",
+      "lines": "33-40",
+      "code": "\tif (!is_eos) {\n\t\tu8 res;\n\t\tBool loc_eos=GF_FALSE;\n\t\tassert(bs->position<=bs->size);\n\t\tbs->position++;\n\n\t\tres = gf_bs_load_byte(bs, &loc_eos);\n\t\tif (loc_eos) goto bs_eof;",
+      "explanation": "The FILE-mode read of a real byte. If not at EOS, it asserts the position invariant, advances position by one, and calls gf_bs_load_byte(bs, &loc_eos) to fetch the actual byte from the file/cache. loc_eos is an out-parameter that gf_bs_load_byte sets if it ran off the end while loading. If that out-of-data condition tripped, control jumps to the bs_eof label to run the standard overflow-notification path. Note the assert() is a debug-only invariant check, not a runtime guard in release builds."
+    },
+    {
+      "file": "corpus/train/train_0154_cwe703.c",
+      "lines": "42-55",
+      "code": "\t\tif (bs->remove_emul_prevention_byte) {\n\t\t\tif ((bs->nb_zeros==2) && (res==0x03) && (bs->position<bs->size)) {\n\t\t\t\tu8 next = gf_bs_load_byte(bs, &loc_eos);\n\t\t\t\tif (next < 0x04) {\n\t\t\t\t\tbs->nb_zeros = 0;\n\t\t\t\t\tres = next;\n\t\t\t\t\tbs->position++;\n\t\t\t\t} else {\n\t\t\t\t\tgf_bs_seek(bs, bs->position);\n\t\t\t\t}\n\t\t\t}\n\t\t\tif (!res) bs->nb_zeros++;\n\t\t\telse bs->nb_zeros = 0;\n\t\t}",
+      "explanation": "FILE-mode emulation-prevention handling, mirroring the in-memory logic but for a streaming source. When nb_zeros==2, res==0x03, and there is nominally another byte (position < size), it loads the following byte via gf_bs_load_byte into 'next'. Because a FILE-backed stream cannot cheaply peek, it reads the byte and then decides: if next < 0x04 it accepts the removal (drops the 0x03, keeps next as res, advances position); otherwise it un-reads by seeking back to the current position with gf_bs_seek(bs, bs->position). The same nb_zeros run-tracking follows. The structural difference from READ mode is that the value test (next < 0x04) happens AFTER the byte has already been consumed, requiring the seek-back rollback."
+    },
+    {
+      "file": "corpus/train/train_0154_cwe703.c",
+      "lines": "56-57",
+      "code": "\t\treturn res;\n\t}",
+      "explanation": "Returns the resolved byte for the FILE, non-EOS path. Falls through to the bs_eof handler only when is_eos was already true at line 33 (or via the goto at line 40)."
+    },
+    {
+      "file": "corpus/train/train_0154_cwe703.c",
+      "lines": "59-70",
+      "code": "bs_eof:\n\tif (bs->EndOfStream) {\n\t\tbs->EndOfStream(bs->par);\n\t\tif (!bs->overflow_state) bs->overflow_state = 1;\n\t} else {\n\t\tif (!bs->overflow_state) {\n\t\t\tbs->overflow_state = 1;\n\t\t\tGF_LOG(GF_LOG_ERROR, GF_LOG_CORE, (\"[BS] Attempt to overread bitstream\\n\"));\n\t\t}\n\t}\n\tassert(bs->position <= 1+bs->size);\n\treturn 0;",
+      "explanation": "The shared end-of-stream / overread handler. If an EndOfStream callback is registered it is invoked with bs->par and the sticky overflow_state flag is set; otherwise the code logs a single 'Attempt to overread bitstream' error (guarded by overflow_state so it logs only once). It finally asserts position <= size+1 (one-past-end is the maximum legal drift after the FILE-mode position++), and returns 0 to signal the byte could not be read. Callers are expected to consult overflow_state / the return contract to detect truncation."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0154_cwe703.c",
+      "lines": "14-18",
+      "code": "\t\tif (bs->remove_emul_prevention_byte) {\n\t\t\tif ((bs->nb_zeros==2) && (res==0x03) && (bs->position<bs->size) && (bs->original[bs->position]<0x04)) {\n\t\t\t\tbs->nb_zeros = 0;\n\t\t\t\tres = bs->original[bs->position++];\n\t\t\t}",
+      "explanation": "This is the historically dangerous spot and the reason this file is the 'fixed' variant. When the emulation-prevention state (nb_zeros==2, res==0x03) triggers on the very last byte of the buffer, position already equals size, so dereferencing bs->original[bs->position] would read one (or more) bytes past the end of the heap allocation — a classic out-of-bounds read (CWE-125) driven entirely by attacker-chosen stream content (place 00 00 03 at the exact buffer tail). The fix is the short-circuited 'bs->position < bs->size' clause evaluated BEFORE the array index, and the re-read on line 17 stays inside that proven-safe region. The residual contract the implementation must uphold is that bs->size is the true allocated length of bs->original (not a larger logical length), otherwise the guard is comparing against the wrong bound and the read escapes again."
+    },
+    {
+      "file": "corpus/train/train_0154_cwe703.c",
+      "lines": "44-48",
+      "code": "\t\t\t\tu8 next = gf_bs_load_byte(bs, &loc_eos);\n\t\t\t\tif (next < 0x04) {\n\t\t\t\t\tbs->nb_zeros = 0;\n\t\t\t\t\tres = next;\n\t\t\t\t\tbs->position++;\n\t\t\t\t} else {",
+      "explanation": "In the FILE-mode emulation path, gf_bs_load_byte(bs, &loc_eos) is called to fetch 'next' but its loc_eos out-parameter is never checked before 'next' is used. If the stream is exhausted at this point, gf_bs_load_byte typically returns 0 and sets loc_eos; 0 < 0x04 is true, so the code accepts a phantom byte (res = 0), advances position past the real end, and does NOT jump to bs_eof or set overflow_state. That is an improper-handling-of-exceptional-condition bug (CWE-703): a truncated stream is silently treated as containing a valid 0x00 payload byte, corrupting the parse and defeating the overread accounting that the assert at line 69 (position <= size+1) assumes. The 'position < size' check at line 43 mitigates the common case, but size may not exactly correspond to the file/cache truncation point when caches or seeks are involved, so loc_eos should still be honored here as it is on line 40."
+    },
+    {
+      "file": "corpus/train/train_0154_cwe703.c",
+      "lines": "8-10",
+      "code": "\t\t\tif (bs->EndOfStream) bs->EndOfStream(bs->par);\n\t\t\tif (!bs->overflow_state) bs->overflow_state = 1;\n\t\t\treturn 0;",
+      "explanation": "bs->EndOfStream is a host-registered callback invoked mid-function (also at line 61) while the code continues to dereference bs afterward (bs->overflow_state on line 9, and lines 62-69). If any EndOfStream handler frees or reallocates the GF_BitStream, or re-enters the reader on the same bs, the subsequent field writes are a use-after-free / re-entrancy hazard (CWE-416). The header/contract does not forbid this; safety depends on an unstated invariant that EndOfStream is a pure notification that never destroys or recursively drives the bitstream. This is a latent contract issue whose realization lives in whatever callback the embedder installs."
+    },
+    {
+      "file": "corpus/train/train_0154_cwe703.c",
+      "lines": "36-39",
+      "code": "\t\tassert(bs->position<=bs->size);\n\t\tbs->position++;\n\n\t\tres = gf_bs_load_byte(bs, &loc_eos);",
+      "explanation": "The only stated bound before the unconditional position++ and load is an assert(), which is compiled out under NDEBUG in release builds. If the position<=size invariant were ever violated by an upstream miscalculation, there would be no runtime rejection: position would advance further out of range and gf_bs_load_byte would be asked to fetch beyond the intended window, with the same weakness at line 69's assert. This is defense-in-depth: the correctness here rests on the is_eos logic at lines 27-33 rather than on the assert, so any change to that logic silently removes the guard. Treat the assert as documentation, not a check (CWE-617 reachable assertion / missing runtime validation)."
+    },
+    {
+      "file": "corpus/train/train_0154_cwe703.c",
+      "lines": "15-16",
+      "code": "\t\t\tif ((bs->nb_zeros==2) && (res==0x03) && (bs->position<bs->size) && (bs->original[bs->position]<0x04)) {\n\t\t\t\tbs->nb_zeros = 0;",
+      "explanation": "State-machine consistency risk rather than a memory bug: nb_zeros is persistent bitstream state shared across all calls and across the READ vs FILE code paths. The two branches implement the emulation-prevention peek differently (READ tests original[position]<0x04 as a non-consuming peek; FILE consumes then rolls back via seek), and both reset nb_zeros only inside the removal branch. If the emulation-prevention flag toggles mid-stream, or if a caller mixes modes on one bs, the zero-run counter can carry a stale value and cause a legitimate 0x03 to be wrongly stripped (or a real emulation byte kept), corrupting the decoded NAL payload. Impact is parse corruption, not overflow, but it feeds attacker-influenced desynchronization into downstream length fields."
+    }
+  ],
+  "summary": "This is the patched GPAC BS_ReadByte: the previously exploitable boundary out-of-bounds read in NAL emulation-prevention removal is now correctly gated by 'bs->position < bs->size' before dereferencing bs->original[bs->position] (line 15), and READ-mode array accesses are all bounded. Residual, lower-severity concerns remain: the FILE-mode second load (line 44) ignores the loc_eos exceptional condition (CWE-703), the EndOfStream callback is a latent re-entrancy/use-after-free contract, and the position bounds rely on debug-only asserts. Overall risk is low-to-medium given the primary fix is present.",
+  "reviewed_anchors": [
+    {"anchor": "BS_ReadByte(GF_BitStream *bs) signature (line 2)", "disposition": "dismissed", "reason": "Single opaque pointer parameter; no scalar length/count argument that could exceed a buffer at the call site."},
+    {"anchor": "bs->bsmode == GF_BITSTREAM_READ (line 5)", "disposition": "dismissed", "reason": "Mode selector enum; controls which branch runs, not attacker-supplied data influencing a bound."},
+    {"anchor": "bs->position >= bs->size guard (line 7)", "disposition": "dismissed", "reason": "Correct primary bounds gate for READ mode; early-returns before any dereference."},
+    {"anchor": "bs->EndOfStream(bs->par) callback (lines 8, 61)", "disposition": "finding", "reason": "Host callback fired mid-function while bs is dereferenced afterward -> latent re-entrancy / use-after-free contract."},
+    {"anchor": "bs->overflow_state sticky flag (lines 9, 62, 64-65)", "disposition": "dismissed", "reason": "Set-once overrun indicator; write is guarded and idempotent, no security contract beyond truncation signaling."},
+    {"anchor": "bs->original[bs->position++] read (line 12)", "disposition": "dismissed", "reason": "Bounded by the line-7 position<size guard; in-bounds single-byte read."},
+    {"anchor": "remove_emul_prevention_byte + nb_zeros==2 && res==0x03 peek (lines 14-18)", "disposition": "finding", "reason": "The boundary out-of-bounds-read site; correctness hinges on the added position<size clause and on size == true allocation length."},
+    {"anchor": "bs->nb_zeros run counter (lines 16,19-20,46,53-54)", "disposition": "finding", "reason": "Persistent cross-call state driving emulation-byte removal; stale/desynced value corrupts NAL parse."},
+    {"anchor": "bs->cache_write / bs_flush_write_cache(bs) (lines 24-25)", "disposition": "dismissed", "reason": "Write-cache flush for coherence; no attacker-controlled length reaches a fixed buffer here."},
+    {"anchor": "gf_feof(bs->stream) + cache_read_pos<cache_read_size (lines 27-30)", "disposition": "dismissed", "reason": "EOF reconciliation logic; state comparison, no memory access on untrusted length."},
+    {"anchor": "assert(bs->position<=bs->size) (line 36)", "disposition": "finding", "reason": "Bounds invariant enforced only by a debug-only assert before an unconditional position++ and load."},
+    {"anchor": "bs->position++ then gf_bs_load_byte(bs,&loc_eos) (lines 37-39)", "disposition": "dismissed", "reason": "loc_eos IS checked here (line 40 goto bs_eof); exceptional condition handled correctly at this call."},
+    {"anchor": "gf_bs_load_byte 'next' with unchecked loc_eos (lines 43-48)", "disposition": "finding", "reason": "Second FILE-mode load uses 'next' without honoring loc_eos -> phantom byte on truncated stream (CWE-703)."},
+    {"anchor": "gf_bs_seek(bs, bs->position) rollback (line 50)", "disposition": "dismissed", "reason": "Un-read seek for the non-emulation case; restores position, no unsafe arithmetic on untrusted data."},
+    {"anchor": "GF_LOG overread error (line 66)", "disposition": "dismissed", "reason": "Logs a static string; does not dereference a possibly-NULL handle field or format untrusted input."},
+    {"anchor": "assert(bs->position <= 1+bs->size) (line 69)", "disposition": "dismissed", "reason": "Debug-only postcondition; documents the one-past-end drift, no runtime effect in release."}
+  ],
+  "findings": [
+    {
+      "title": "FILE-mode emulation-prevention second read ignores end-of-stream (loc_eos)",
+      "anchor": "u8 next = gf_bs_load_byte(bs, &loc_eos); if (next < 0x04)",
+      "file": "corpus/train/train_0154_cwe703.c",
+      "line": "44-48",
+      "code": "\t\t\t\tu8 next = gf_bs_load_byte(bs, &loc_eos);\n\t\t\t\tif (next < 0x04) {\n\t\t\t\t\tbs->nb_zeros = 0;\n\t\t\t\t\tres = next;\n\t\t\t\t\tbs->position++;",
+      "bug_class": "Improper handling of exceptional condition (unchecked EOF on secondary read)",
+      "cwe": "CWE-703",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0154_cwe703.c (and gf_bs_load_byte in the implementation, file not provided)",
+      "invariant": "After every gf_bs_load_byte call the loc_eos out-parameter must be honored before the loaded byte is trusted, exactly as it is at line 40; a byte read past the true end must not be accepted as payload.",
+      "failure_mode": "On a truncated FILE-backed NAL stream where nb_zeros==2 and res==0x03 occur at the boundary, gf_bs_load_byte returns 0 and sets loc_eos, but loc_eos is not checked. 0 < 0x04 is true, so a phantom 0x00 byte is accepted (res=0), position is advanced past the real end, and neither bs_eof nor overflow_state is triggered. This silently injects a fabricated byte into the decoded NAL and defeats the overread accounting the line-69 assert relies on.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm gf_bs_load_byte's return value when loc_eos is set, and that no caller path other than line 40 checks it; add 'if (loc_eos) goto bs_eof;' (or reject) immediately after line 44 before using 'next'."
+    },
+    {
+      "title": "EndOfStream callback invoked while bitstream is still dereferenced (re-entrancy / UAF contract)",
+      "anchor": "if (bs->EndOfStream) bs->EndOfStream(bs->par);",
+      "file": "corpus/train/train_0154_cwe703.c",
+      "line": "8-9",
+      "code": "\t\t\tif (bs->EndOfStream) bs->EndOfStream(bs->par);\n\t\t\tif (!bs->overflow_state) bs->overflow_state = 1;",
+      "bug_class": "Use-after-free / callback re-entrancy",
+      "cwe": "CWE-416",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided) — depends on the embedder's EndOfStream handler",
+      "invariant": "The EndOfStream callback must be a pure notification that never frees, reallocates, or recursively re-enters the same GF_BitStream; the reader keeps writing bs->overflow_state (line 9) and other fields (lines 62-69) after the callback returns.",
+      "failure_mode": "If a host installs an EndOfStream handler that destroys the bitstream or triggers a nested read/close on the same bs (e.g. tearing down a demuxer on EOF), the subsequent bs->overflow_state = 1 and the line-59+ handler operate on freed memory, yielding a use-after-free reachable whenever an attacker can drive the stream to its exact overread boundary.",
+      "cve_analog": "",
+      "what_to_confirm": "Enumerate all EndOfStream callbacks registered in the codebase and confirm none free/reallocate/re-enter the bitstream; if the contract cannot be guaranteed, snapshot needed fields before the call and avoid touching bs afterward."
+    },
+    {
+      "title": "Boundary out-of-bounds read in emulation-prevention peek guarded only by size==allocation assumption",
+      "anchor": "(bs->position<bs->size) && (bs->original[bs->position]<0x04)",
+      "file": "corpus/train/train_0154_cwe703.c",
+      "line": "15-17",
+      "code": "\t\t\tif ((bs->nb_zeros==2) && (res==0x03) && (bs->position<bs->size) && (bs->original[bs->position]<0x04)) {\n\t\t\t\tbs->nb_zeros = 0;\n\t\t\t\tres = bs->original[bs->position++];",
+      "bug_class": "Out-of-bounds read (heap over-read at buffer boundary)",
+      "cwe": "CWE-125",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0154_cwe703.c",
+      "invariant": "bs->size must equal the true allocated length of bs->original[] so that the short-circuited 'bs->position < bs->size' clause actually bounds the dereference of bs->original[bs->position]; the value clause must never be evaluated when position >= size.",
+      "failure_mode": "This is the patched site: without the position<size clause (present here) a crafted stream placing 00 00 03 at the exact tail of bs->original would read one byte past the heap allocation. It is now correctly bounded; the only residual exposure is if size is a logical length larger than the physical allocation, which would re-open the over-read. Included per method step 3 because a fixed buffer paired with an index derived from parser state must carry an explicit finding.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify at all GF_BitStream construction sites that bs->size is set to the exact byte length of the bs->original allocation (not a padded or logical length), so the line-15 guard is sound."
+    },
+    {
+      "title": "Position bounds enforced only by debug-only assert before unconditional advance",
+      "anchor": "assert(bs->position<=bs->size); bs->position++;",
+      "file": "corpus/train/train_0154_cwe703.c",
+      "line": "36-37",
+      "code": "\t\tassert(bs->position<=bs->size);\n\t\tbs->position++;",
+      "bug_class": "Missing runtime validation (assertion compiled out under NDEBUG)",
+      "cwe": "CWE-617",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0154_cwe703.c",
+      "invariant": "position <= size must hold before the unconditional increment and load; in release builds this must be guaranteed by the is_eos logic (lines 27-33), not by the assert, which is removed under NDEBUG.",
+      "failure_mode": "If an upstream change or cache/seek inconsistency ever lets position exceed size on entry to the non-EOS branch, the assert provides no protection in production: position++ advances further and gf_bs_load_byte reads beyond the intended window. The current EOF reconciliation makes this unreachable in practice, so severity is low, but the guard is not defense-in-depth.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm that reaching line 36 with position > size is impossible given the cache/EOF logic; consider a real runtime check for release builds if the invariant is not otherwise enforced."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm bs->size equals the exact allocated length of bs->original at every GF_BitStream READ-mode construction site so the line-15 position<size guard truly bounds the array read.",
+    "Add a loc_eos check immediately after the line-44 gf_bs_load_byte('next') call and route to bs_eof instead of accepting a phantom byte on a truncated stream.",
+    "Audit every registered EndOfStream callback to prove it never frees, reallocates, or re-enters the same bitstream, since bs is dereferenced after the callback at lines 9 and 62-69.",
+    "Verify the is_eos reconciliation (lines 27-33) makes position > size unreachable at line 36 in release builds where the assert is compiled out.",
+    "Check that nb_zeros is reset consistently when remove_emul_prevention_byte toggles or when a bitstream is reused across READ/FILE modes, to avoid stale-state mis-stripping of 0x03 emulation bytes.",
+    "Validate that gf_bs_seek(bs, bs->position) at line 50 correctly restores the read position after a non-removed peek so no byte is skipped or double-counted."
+  ]
+}

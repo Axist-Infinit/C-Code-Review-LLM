@@ -1,0 +1,137 @@
+Files under review: corpus/train/train_0223_cwe190.cpp
+
+<<<BEGIN_UNTRUSTED_CODE>>>
+/* ===== FILE: corpus/train/train_0223_cwe190.cpp ===== */
+   1| /* sample: primevul_test_0045_fixed */
+   2|   void Compute(OpKernelContext *ctx) override {
+   3|     const Tensor *indices_t, *values_t, *shape_t, *dense_t;
+   4|     OP_REQUIRES_OK(ctx, ctx->input("sp_indices", &indices_t));
+   5|     OP_REQUIRES_OK(ctx, ctx->input("sp_values", &values_t));
+   6|     OP_REQUIRES_OK(ctx, ctx->input("sp_shape", &shape_t));
+   7|     OP_REQUIRES_OK(ctx, ctx->input("dense", &dense_t));
+   8| 
+   9|     // Validations.
+  10|     OP_REQUIRES(ctx, TensorShapeUtils::IsMatrix(indices_t->shape()),
+  11|                 errors::InvalidArgument(
+  12|                     "Input sp_indices should be a matrix but received shape: ",
+  13|                     indices_t->shape().DebugString()));
+  14|     OP_REQUIRES(ctx,
+  15|                 TensorShapeUtils::IsVector(values_t->shape()) &&
+  16|                     TensorShapeUtils::IsVector(shape_t->shape()),
+  17|                 errors::InvalidArgument(
+  18|                     "Inputs sp_values and sp_shape should be vectors "
+  19|                     "but received shapes: ",
+  20|                     values_t->shape().DebugString(), " and ",
+  21|                     shape_t->shape().DebugString()));
+  22|     OP_REQUIRES(
+  23|         ctx, TensorShapeUtils::IsVector(shape_t->shape()),
+  24|         errors::InvalidArgument("Input sp_shape must be a vector. Got: ",
+  25|                                 shape_t->shape().DebugString()));
+  26|     OP_REQUIRES(
+  27|         ctx, values_t->dim_size(0) == indices_t->dim_size(0),
+  28|         errors::InvalidArgument(
+  29|             "The first dimension of values and indices should match. (",
+  30|             values_t->dim_size(0), " vs. ", indices_t->dim_size(0), ")"));
+  31|     OP_REQUIRES(
+  32|         ctx, shape_t->shape().dim_size(0) == indices_t->shape().dim_size(1),
+  33|         errors::InvalidArgument(
+  34|             "Number of dimensions must match second dimension of indices. ",
+  35|             "Got ", shape_t->shape().dim_size(0),
+  36|             " dimensions, indices shape: ", indices_t->shape().DebugString()));
+  37|     OP_REQUIRES(ctx, shape_t->NumElements() > 0,
+  38|                 errors::InvalidArgument(
+  39|                     "The shape argument requires at least one element."));
+  40| 
+  41|     const auto indices_mat = indices_t->matrix<int64_t>();
+  42|     const auto shape_vec = shape_t->vec<int64_t>();
+  43|     TensorShape lhs_shape;
+  44|     OP_REQUIRES_OK(ctx, TensorShape::BuildTensorShape(shape_vec, &lhs_shape));
+  45|     const auto lhs_dims = BCast::FromShape(lhs_shape);
+  46|     const auto rhs_dims = BCast::FromShape(dense_t->shape());
+  47|     BCast b(lhs_dims, rhs_dims, false);  // false for keeping the same num dims.
+  48| 
+  49|     // True iff (size(lhs) >= size(rhs)) and all dims in lhs is greater or equal
+  50|     // to dims in rhs (from right to left).
+  51|     auto VecGreaterEq = [](ArraySlice<int64_t> lhs, ArraySlice<int64_t> rhs) {
+  52|       if (lhs.size() < rhs.size()) return false;
+  53|       for (size_t i = 0; i < rhs.size(); ++i) {
+  54|         if (lhs[lhs.size() - 1 - i] < rhs[rhs.size() - 1 - i]) return false;
+  55|       }
+  56|       return true;
+  57|     };
+  58|     OP_REQUIRES(ctx, VecGreaterEq(lhs_dims, rhs_dims) && b.IsValid(),
+  59|                 errors::InvalidArgument(
+  60|                     "SparseDenseBinaryOpShared broadcasts dense to sparse "
+  61|                     "only; got incompatible shapes: [",
+  62|                     absl::StrJoin(lhs_dims, ","), "] vs. [",
+  63|                     absl::StrJoin(rhs_dims, ","), "]"));
+  64| 
+  65|     Tensor *output_values = nullptr;
+  66|     Tensor dense_gathered;
+  67|     const int64_t nnz = indices_t->dim_size(0);
+  68|     OP_REQUIRES_OK(ctx,
+  69|                    ctx->allocate_output(0, TensorShape({nnz}), &output_values));
+  70|     OP_REQUIRES_OK(
+  71|         ctx, ctx->allocate_temp(DataTypeToEnum<T>::value, TensorShape({nnz}),
+  72|                                 &dense_gathered));
+  73|     bool op_is_div = false;
+  74|     if (absl::StrContains(ctx->op_kernel().type_string_view(), "Div")) {
+  75|       op_is_div = true;
+  76|     }
+  77|     // Pulls relevant entries from the dense side, with reshape and broadcasting
+  78|     // *of the dense side* taken into account.  Use a TensorRef to avoid blowing
+  79|     // up memory.
+  80|     //
+  81|     // We can directly use the sparse indices to look up dense side, because
+  82|     // "b.y_reshape()" and "b.y_bcast()" are guaranteed to have rank "ndims".
+  83|     auto dense_gathered_flat = dense_gathered.flat<T>();
+  84|     const int ndims = lhs_dims.size();
+  85|     switch (ndims) {
+  86| #define CASE(NDIM)                                                             \
+  87|   case NDIM: {                                                                 \
+  88|     TensorRef<Eigen::Tensor<const T, NDIM, Eigen::RowMajor>> rhs_ref =         \
+  89|         dense_t->shaped<T, NDIM>(b.y_reshape())                                \
+  90|             .broadcast(BCast::ToIndexArray<NDIM>(b.y_bcast()));                \
+  91|     Eigen::array<Eigen::DenseIndex, NDIM> idx;                                 \
+  92|     bool indices_valid = true;                                                 \
+  93|     for (int i = 0; i < nnz; ++i) {                                            \
+  94|       for (int d = 0; d < NDIM; ++d) {                                         \
+  95|         idx[d] = internal::SubtleMustCopy(indices_mat(i, d));                  \
+  96|         if (!FastBoundsCheck(idx[d], rhs_ref.dimension(d))) {                  \
+  97|           indices_valid = false;                                               \
+  98|         }                                                                      \
+  99|       }                                                                        \
+ 100|       OP_REQUIRES(                                                             \
+ 101|           ctx, indices_valid,                                                  \
+ 102|           errors::InvalidArgument("Provided indices are out-of-bounds w.r.t. " \
+ 103|                                   "dense side with broadcasted shape"));       \
+ 104|       dense_gathered_flat(i) = rhs_ref.coeff(idx);                             \
+ 105|       if (op_is_div) {                                                         \
+ 106|         OP_REQUIRES(ctx, dense_gathered_flat(i) != 0,                          \
+ 107|                     errors::InvalidArgument(                                   \
+ 108|                         "SparseDenseCwiseDiv cannot divide by zero,"           \
+ 109|                         "but input dense tensor contains zero "));             \
+ 110|       }                                                                        \
+ 111|     }                                                                          \
+ 112|     break;                                                                     \
+ 113|   }
+ 114| 
+ 115|       CASE(1);
+ 116|       CASE(2);
+ 117|       CASE(3);
+ 118|       CASE(4);
+ 119|       CASE(5);
+ 120|       default:
+ 121|         OP_REQUIRES(
+ 122|             ctx, false,
+ 123|             errors::InvalidArgument("Only tensors with ranks between 1 and 5 "
+ 124|                                     "are currently supported.  Tensor rank: ",
+ 125|                                     ndims));
+ 126| #undef CASE
+ 127|     }
+ 128| 
+ 129|     output_values->flat<T>().device(ctx->eigen_device<Device>()) =
+ 130|         values_t->flat<T>().binaryExpr(dense_gathered_flat,
+ 131|                                        typename Functor::func());
+ 132|   }
+<<<END_UNTRUSTED_CODE>>>

@@ -1,0 +1,285 @@
+{
+  "subsystem": "Vim editor — Normal/Visual-mode operator implementation. This is op_replace(), the function that implements the 'r' (replace) operator: it overwrites the characters covered by an operator's motion/visual selection with a single supplied character 'c'. It handles three cases: block-wise (visual-block) replace, MLINE/MCHAR (character/line motion) replace, and multibyte-aware replacement. It processes editor buffer text (curbuf/curwin) and the operator argument oap.",
+  "provenance": "Identified from Vim-internal naming and types: the oparg_T/block_def/pos_T/linenr_T/colnr_T typedefs, char_u pointers, the curbuf/curwin globals, ml_get_curline()/ml_replace()/ml_append(), u_save(), block_prep(), mb_char2len/mb_char2bytes/mb_char2cells function-pointer indirections, STRLEN/STRMOVE/vim_memset/mch_memmove/alloc macros, and constants REPLACE_CR_NCHAR/REPLACE_NL_NCHAR/CAR/NL/MAXCOL/CMOD_LOCKMARKS. This is ops.c:op_replace() from Vim. The banner comment 'sample: primevul_c_train_2777_vuln' confirms it is a PrimeVul C training sample.",
+  "trust_boundary": "The attacker-controlled input is the editor BUFFER CONTENTS and the operator geometry derived from user actions on that buffer. A malicious file opened in Vim (or content pasted / produced by an autocommand or macro) controls line lengths (oldlen), the byte content that drives has_mbyte/mb_ptr2len decoding, the width of the replacement character (mb_char2len/mb_char2cells of 'c'), and the visual-block geometry (start_vcol/end_vcol, textcol, textlen, startspaces/endspaces, is_short, is_MAX) computed by block_prep(). All the size arithmetic that sizes newp and after_p is derived from these attacker-influenceable quantities, so the allocation-vs-write accounting is the trust boundary: if the computed length 'n' does not equal the bytes actually written, a remote/opened-file input yields a heap overflow.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0040_cwe122.c",
+      "lines": "2-10",
+      "code": "op_replace(oparg_T *oap, int c)\n{\n    int\t\t\tn, numc;\n    int\t\t\tnum_chars;\n    char_u\t\t*newp, *oldp;\n    size_t\t\toldlen;\n    struct block_def\tbd;\n    char_u\t\t*after_p = NULL;\n    int\t\t\thad_ctrl_v_cr = FALSE;",
+      "explanation": "Function signature and locals. op_replace takes oap, a pointer to the operator argument (oparg_T) describing the affected region (start/end positions, motion_type, block_mode, vcols, inclusive flag, empty flag), and c, the replacement character code. n is a signed int holding the number of EXTRA bytes the new line needs versus the old; numc is the character/byte count of the replacement span; num_chars mirrors the character count before it is converted to a byte count. newp/oldp are the new and old line buffers (char_u = unsigned char). oldlen is the old line length. bd is a block_def scratch struct filled by block_prep() with the geometry of the block on the current line (textcol, textlen, startspaces, endspaces, start_char_vcols, end_char_vcols, is_short, is_oneChar, is_MAX, end_vcol, textstart). after_p is a second buffer used only when the replacement splits the line (CR/NL). had_ctrl_v_cr tracks whether a literal CR/NL was requested. Note that n, numc, num_chars are all signed 32-bit ints — the arithmetic that sizes the heap buffer is done in signed int, then cast to size_t at the alloc/memset sites."
+    },
+    {
+      "file": "corpus/train/train_0040_cwe122.c",
+      "lines": "12-13",
+      "code": "if ((curbuf->b_ml.ml_flags & ML_EMPTY ) || oap->empty)\n\treturn OK;\t    // nothing to do",
+      "explanation": "Early exit: if the buffer's memline is flagged empty, or the operator region is empty, there is nothing to replace and the function returns OK. This is a fast-path guard, not a security check on sizes."
+    },
+    {
+      "file": "corpus/train/train_0040_cwe122.c",
+      "lines": "15-24",
+      "code": "if (c == REPLACE_CR_NCHAR)\n    {\n\thad_ctrl_v_cr = TRUE;\n\tc = CAR;\n    }\n    else if (c == REPLACE_NL_NCHAR)\n    {\n\thad_ctrl_v_cr = TRUE;\n\tc = NL;\n    }",
+      "explanation": "Sentinel translation: the caller can pass the pseudo-codes REPLACE_CR_NCHAR / REPLACE_NL_NCHAR to mean 'insert a literal carriage return / newline' (entered as CTRL-V CR / CTRL-V NL). When seen, had_ctrl_v_cr is set TRUE and c is rewritten to the real control byte CAR (0x0D) or NL (0x0A). had_ctrl_v_cr later forces the literal-insert path (line 105) instead of the line-splitting path, so this flag changes which branch writes into newp."
+    },
+    {
+      "file": "corpus/train/train_0040_cwe122.c",
+      "lines": "26-31",
+      "code": "if (has_mbyte)\n\tmb_adjust_opend(oap);\n\n    if (u_save((linenr_T)(oap->start.lnum - 1),\n\t\t\t\t       (linenr_T)(oap->end.lnum + 1)) == FAIL)\n\treturn FAIL;",
+      "explanation": "If multibyte is active, mb_adjust_opend nudges oap->end so it does not fall in the middle of a multibyte character. Then u_save records the affected line range (start-1 .. end+1) for undo; if that allocation/bookkeeping fails, op_replace aborts with FAIL before mutating any line. This is the point after which the buffer will be modified."
+    },
+    {
+      "file": "corpus/train/train_0040_cwe122.c",
+      "lines": "36-44",
+      "code": "if (oap->block_mode)\n    {\n\tbd.is_MAX = (curwin->w_curswant == MAXCOL);\n\tfor ( ; curwin->w_cursor.lnum <= oap->end.lnum; ++curwin->w_cursor.lnum)\n\t{\n\t    curwin->w_cursor.col = 0;  // make sure cursor position is valid\n\t    block_prep(oap, &bd, curwin->w_cursor.lnum, TRUE);\n\t    if (bd.textlen == 0 && (!virtual_op || bd.is_MAX))\n\t\tcontinue;\t    // nothing to replace",
+      "explanation": "Block (visual-block) replace branch. bd.is_MAX records whether the block extends to the end of every line ($ in visual block). The loop iterates over every line from the current cursor line to oap->end.lnum. For each line it resets the cursor column and calls block_prep(oap, &bd, lnum, TRUE) which fills bd with this line's block geometry: textcol (byte offset where the block begins), textlen (bytes covered), startspaces/endspaces (virtual padding when the block edges split tabs/multibyte cells), is_short (the line is shorter than the block's right edge), etc. If nothing is covered (textlen 0 and not a virtual/$ block) the line is skipped."
+    },
+    {
+      "file": "corpus/train/train_0040_cwe122.c",
+      "lines": "51-67",
+      "code": "if (virtual_op && bd.is_short && *bd.textstart == NUL)\n\t    {\n\t\tpos_T vpos;\n\n\t\tvpos.lnum = curwin->w_cursor.lnum;\n\t\tgetvpos(&vpos, oap->start_vcol);\n\t\tbd.startspaces += vpos.coladd;\n\t\tn = bd.startspaces;\n\t    }\n\t    else\n\t\t// allow for pre spaces\n\t\tn = (bd.startspaces ? bd.start_char_vcols - 1 : 0);\n\n\t    // allow for post spp\n\t    n += (bd.endspaces\n\t\t    && !bd.is_oneChar\n\t\t    && bd.end_char_vcols > 0) ? bd.end_char_vcols - 1 : 0;",
+      "explanation": "Begins computing n, the number of extra bytes the rewritten line needs. If the block starts in virtual (past end-of-line) space, the initial coladd of the start virtual position is folded into startspaces and n is seeded from startspaces. Otherwise n accounts for the extra cells needed when the block's left edge splits a wide/tab character (start_char_vcols - 1). Then post-space accounting adds end_char_vcols - 1 when the right edge splits a character and the block is not a single character. Every term here is derived from block_prep()'s geometry, i.e. from attacker-controlled line content."
+    },
+    {
+      "file": "corpus/train/train_0040_cwe122.c",
+      "lines": "68-83",
+      "code": "// Figure out how many characters to replace.\n\t    numc = oap->end_vcol - oap->start_vcol + 1;\n\t    if (bd.is_short && (!virtual_op || bd.is_MAX))\n\t\tnumc -= (oap->end_vcol - bd.end_vcol) + 1;\n\n\t    // A double-wide character can be replaced only up to half the\n\t    // times.\n\t    if ((*mb_char2cells)(c) > 1)\n\t    {\n\t\tif ((numc & 1) && !bd.is_short)\n\t\t{\n\t\t    ++bd.endspaces;\n\t\t    ++n;\n\t\t}\n\t\tnumc = numc / 2;\n\t    }",
+      "explanation": "numc is set to the number of screen cells the block spans (end_vcol - start_vcol + 1). When the line is short (bd.is_short) and not a virtual/$ block, numc is reduced by the cells that fall past the line's actual end. If the replacement character is double-wide (mb_char2cells(c) > 1), a double-wide glyph can only fill half as many cells: if the count is odd and the line is not short, an extra end-space and extra byte are added, then numc is halved. numc is a signed int throughout; the is_short subtraction can drive it small or, if the geometry is inconsistent, non-positive."
+    },
+    {
+      "file": "corpus/train/train_0040_cwe122.c",
+      "lines": "85-89",
+      "code": "// Compute bytes needed, move character count to num_chars.\n\t    num_chars = numc;\n\t    numc *= (*mb_char2len)(c);\n\t    // oldlen includes textlen, so don't double count\n\t    n += numc - bd.textlen;",
+      "explanation": "num_chars keeps the CHARACTER count of the replacement span; numc is then converted to a BYTE count by multiplying by mb_char2len(c), the encoded length of the replacement character (1..4 for UTF-8, up to 2 for some encodings). Finally the extra-bytes total n is adjusted by numc - bd.textlen: the new bytes for the replacement minus the old bytes it displaces (textlen is already part of oldlen). This is the crux of the size computation: the heap buffer at line 93 is oldlen + 1 + n, so n MUST equal exactly the net byte growth of the line. Both numc (the multiply) and n are signed int, so a large block times a 4-byte char, or a negative numc, corrupts the size."
+    },
+    {
+      "file": "corpus/train/train_0040_cwe122.c",
+      "lines": "91-96",
+      "code": "oldp = ml_get_curline();\n\t    oldlen = STRLEN(oldp);\n\t    newp = alloc(oldlen + 1 + n);\n\t    if (newp == NULL)\n\t\tcontinue;\n\t    vim_memset(newp, NUL, (size_t)(oldlen + 1 + n));",
+      "explanation": "The current line is fetched (oldp) and measured (oldlen). newp is allocated with oldlen + 1 + n bytes (+1 for the terminating NUL), then zero-filled. This single allocation must be large enough for every subsequent write into newp: the leading textcol bytes, startspaces, the replacement bytes, endspaces, and the trailing tail copied from oldp. oldlen is size_t; n is int; the expression oldlen + 1 + n is evaluated in size_t (n promoted), so a negative n becomes a giant unsigned value only if it makes the sum wrap — but more directly, a too-small n undersizes the buffer relative to what is written below."
+    },
+    {
+      "file": "corpus/train/train_0040_cwe122.c",
+      "lines": "97-101",
+      "code": "// copy up to deleted part\n\t    mch_memmove(newp, oldp, (size_t)bd.textcol);\n\t    oldp += bd.textcol + bd.textlen;\n\t    // insert pre-spaces\n\t    vim_memset(newp + bd.textcol, ' ', (size_t)bd.startspaces);",
+      "explanation": "The prefix of the line before the block (textcol bytes) is copied verbatim into newp. oldp is then advanced past the block (textcol + textlen) so it points at the tail that survives the replacement. startspaces blanks are written at newp+textcol. After this, newp holds textcol + startspaces bytes and the write cursor conceptually sits at newp + textcol + startspaces (though the code recomputes the position with STRLEN below)."
+    },
+    {
+      "file": "corpus/train/train_0040_cwe122.c",
+      "lines": "105-114",
+      "code": "if (had_ctrl_v_cr || (c != '\\r' && c != '\\n'))\n\t    {\n\t\tif (has_mbyte)\n\t\t{\n\t\t    n = (int)STRLEN(newp);\n\t\t    while (--num_chars >= 0)\n\t\t\tn += (*mb_char2bytes)(c, newp + n);\n\t\t}\n\t\telse\n\t\t    vim_memset(newp + STRLEN(newp), c, (size_t)numc);",
+      "explanation": "This branch performs the actual replacement write when we are inserting a literal CR/NL (had_ctrl_v_cr) or a normal (non CR/NL) character. In the multibyte case, n is reused as a running byte offset seeded from STRLEN(newp) (the current logical end of newp, which relies on the earlier writes containing no embedded NUL), then num_chars characters are encoded one at a time via mb_char2bytes(c, newp+n), each advancing n by the encoded length. In the single-byte case, numc bytes of c are memset at newp+STRLEN(newp). The write count here (num_chars characters * mb_char2len(c) bytes, or numc bytes) must match the numc byte budget folded into n at line 89 — the safety of the whole function depends on those two accountings agreeing."
+    },
+    {
+      "file": "corpus/train/train_0040_cwe122.c",
+      "lines": "115-122",
+      "code": "if (!bd.is_short)\n\t\t{\n\t\t    // insert post-spaces\n\t\t    vim_memset(newp + STRLEN(newp), ' ', (size_t)bd.endspaces);\n\t\t    // copy the part after the changed part\n\t\t    STRMOVE(newp + STRLEN(newp), oldp);\n\t\t}\n\t    }",
+      "explanation": "When the block is not short, endspaces trailing blanks are written at the current end of newp, and then the surviving tail of the old line (oldp, already advanced past the block) is copied with STRMOVE, which appends the NUL-terminated remainder. Each write recomputes the destination via STRLEN(newp), so the writes chain off the assumption that prior writes left a correctly NUL-terminated, exactly-sized buffer. The total of textcol + startspaces + replacement + endspaces + strlen(tail) + 1 must be <= oldlen + 1 + n."
+    },
+    {
+      "file": "corpus/train/train_0040_cwe122.c",
+      "lines": "123-129",
+      "code": "else\n\t    {\n\t\t// Replacing with \\r or \\n means splitting the line.\n\t\tafter_p = alloc(oldlen + 1 + n - STRLEN(newp));\n\t\tif (after_p != NULL)\n\t\t    STRMOVE(after_p, oldp);\n\t    }",
+      "explanation": "When the replacement is a bare CR/NL that was NOT entered literally, the line is split: the portion after the change goes into a fresh buffer after_p. after_p is sized oldlen + 1 + n - STRLEN(newp) — the remaining budget after the newp prefix — and the tail is STRMOVE'd in. This size expression subtracts STRLEN(newp) from oldlen+1+n; if STRLEN(newp) ever exceeds oldlen+1+n (i.e. newp was already overfilled) the size_t subtraction wraps to a huge value."
+    },
+    {
+      "file": "corpus/train/train_0040_cwe122.c",
+      "lines": "130-138",
+      "code": "// replace the line\n\t    ml_replace(curwin->w_cursor.lnum, newp, FALSE);\n\t    if (after_p != NULL)\n\t    {\n\t\tml_append(curwin->w_cursor.lnum++, after_p, 0, FALSE);\n\t\tappended_lines_mark(curwin->w_cursor.lnum, 1L);\n\t\toap->end.lnum++;\n\t\tvim_free(after_p);\n\t    }",
+      "explanation": "newp becomes the new content of the current line via ml_replace (which takes ownership of newp). If the line was split, after_p is inserted as a new following line with ml_append, the cursor line advances, appended_lines_mark updates marks, oap->end.lnum is bumped so the loop still terminates at the (now shifted) end, and after_p is freed. The loop then continues to the next line."
+    },
+    {
+      "file": "corpus/train/train_0040_cwe122.c",
+      "lines": "141-155",
+      "code": "else\n    {\n\t/*\n\t * MCHAR and MLINE motion replace.\n\t */\n\tif (oap->motion_type == MLINE)\n\t{\n\t    oap->start.col = 0;\n\t    curwin->w_cursor.col = 0;\n\t    oap->end.col = (colnr_T)STRLEN(ml_get(oap->end.lnum));\n\t    if (oap->end.col)\n\t\t--oap->end.col;\n\t}\n\telse if (!oap->inclusive)\n\t    dec(&(oap->end));",
+      "explanation": "Non-block branch: character-wise (MCHAR) or line-wise (MLINE) replace. For MLINE the whole lines are affected, so start.col is 0 and end.col is set to the last byte of the end line (STRLEN - 1). For an exclusive MCHAR motion, the end position is decremented so the loop treats it as inclusive. This normalises oap->end to the last byte that should be overwritten."
+    },
+    {
+      "file": "corpus/train/train_0040_cwe122.c",
+      "lines": "157-172",
+      "code": "while (LTOREQ_POS(curwin->w_cursor, oap->end))\n\t{\n\t    n = gchar_cursor();\n\t    if (n != NUL)\n\t    {\n\t\tint new_byte_len = (*mb_char2len)(c);\n\t\tint old_byte_len = mb_ptr2len(ml_get_cursor());\n\n\t\tif (new_byte_len > 1 || old_byte_len > 1)\n\t\t{\n\t\t    // This is slow, but it handles replacing a single-byte\n\t\t    // with a multi-byte and the other way around.\n\t\t    if (curwin->w_cursor.lnum == oap->end.lnum)\n\t\t\toap->end.col += new_byte_len - old_byte_len;\n\t\t    replace_character(c);\n\t\t}",
+      "explanation": "The character-wise loop runs while the cursor is at or before oap->end. gchar_cursor() reads the character under the cursor; if it is not a NUL (end-of-line), the code compares the byte length of the replacement (new_byte_len) and the existing character (old_byte_len). When either is multibyte, replace_character(c) does an in-place replace that may grow/shrink the line, and — only on the end line — oap->end.col is adjusted by the byte-length delta so the loop bound tracks the shifting end. This adjustment is signed and can move oap->end.col up or down."
+    },
+    {
+      "file": "corpus/train/train_0040_cwe122.c",
+      "lines": "173-191",
+      "code": "else\n\t\t{\n\t\t    if (n == TAB)\n\t\t    {\n\t\t\tint end_vcol = 0;\n\n\t\t\tif (curwin->w_cursor.lnum == oap->end.lnum)\n\t\t\t{\n\t\t\t    // oap->end has to be recalculated when\n\t\t\t    // the tab breaks\n\t\t\t    end_vcol = getviscol2(oap->end.col,\n\t\t\t\t\t\t\t     oap->end.coladd);\n\t\t\t}\n\t\t\tcoladvance_force(getviscol());\n\t\t\tif (curwin->w_cursor.lnum == oap->end.lnum)\n\t\t\t    getvpos(&oap->end, end_vcol);\n\t\t    }\n\t\t    PBYTE(curwin->w_cursor, c);\n\t\t}",
+      "explanation": "Single-byte-to-single-byte replace path. If the character under the cursor is a TAB, replacing it can change how many columns follow, so the end virtual column is captured, coladvance_force expands the tab into spaces at the current visual column, and on the end line oap->end is recomputed from the saved end_vcol. Then PBYTE overwrites the single byte at the cursor with c. PBYTE is an in-place single-byte poke into the existing line buffer."
+    },
+    {
+      "file": "corpus/train/train_0040_cwe122.c",
+      "lines": "193-220",
+      "code": "else if (virtual_op && curwin->w_cursor.lnum == oap->end.lnum)\n\t    {\n\t\tint virtcols = oap->end.coladd;\n\n\t\tif (curwin->w_cursor.lnum == oap->start.lnum\n\t\t\t&& oap->start.col == oap->end.col && oap->start.coladd)\n\t\t    virtcols -= oap->start.coladd;\n\n\t\t// oap->end has been trimmed so it's effectively inclusive;\n\t\t// as a result an extra +1 must be counted so we don't\n\t\t// trample the NUL byte.\n\t\tcoladvance_force(getviscol2(oap->end.col, oap->end.coladd) + 1);\n\t\tcurwin->w_cursor.col -= (virtcols + 1);\n\t\tfor (; virtcols >= 0; virtcols--)\n\t\t{\n\t\t    if ((*mb_char2len)(c) > 1)\n\t\t       replace_character(c);\n\t\t    else\n\t\t\tPBYTE(curwin->w_cursor, c);\n\t\t   if (inc(&curwin->w_cursor) == -1)\n\t\t       break;\n\t\t}\n\t    }\n\n\t    // Advance to next character, stop at the end of the file.\n\t    if (inc_cursor() == -1)\n\t\tbreak;\n\t}",
+      "explanation": "The gchar_cursor()==NUL virtual-edit case: when the cursor sits in virtual space past the physical end of the end line and 'virtualedit' is active, virtcols counts how many virtual columns to fill. coladvance_force materialises real spaces up to end column +1, the cursor is backed up, and a loop writes c into each of virtcols+1 positions (via replace_character for wide chars, PBYTE otherwise), advancing with inc(). inc_cursor advances to the next character each outer iteration, breaking at end-of-file. This path pokes bytes into a line just extended by coladvance_force."
+    },
+    {
+      "file": "corpus/train/train_0040_cwe122.c",
+      "lines": "223-234",
+      "code": "curwin->w_cursor = oap->start;\n    check_cursor();\n    changed_lines(oap->start.lnum, oap->start.col, oap->end.lnum + 1, 0L);\n\n    if ((cmdmod.cmod_flags & CMOD_LOCKMARKS) == 0)\n    {\n\t// Set \"'[\" and \"']\" marks.\n\tcurbuf->b_op_start = oap->start;\n\tcurbuf->b_op_end = oap->end;\n    }\n\n    return OK;",
+      "explanation": "Epilogue: the cursor is moved to the operator start, check_cursor() clamps it into a valid position, changed_lines() notifies the display/undo machinery of the modified line range, and unless CMOD_LOCKMARKS is set the '[ and '] change marks are updated to the operated region. The function returns OK. No further size validation happens here; any overflow has already occurred in the block-mode buffer writes above."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0040_cwe122.c",
+      "lines": "85-96",
+      "code": "num_chars = numc;\n\t    numc *= (*mb_char2len)(c);\n\t    // oldlen includes textlen, so don't double count\n\t    n += numc - bd.textlen;\n\n\t    oldp = ml_get_curline();\n\t    oldlen = STRLEN(oldp);\n\t    newp = alloc(oldlen + 1 + n);",
+      "explanation": "This is the central heap-buffer-overflow surface (CWE-122/CWE-787). The heap buffer newp is sized oldlen + 1 + n, where n is the accumulated 'extra bytes' figure. n is built entirely from block_prep() geometry (startspaces, endspaces, start_char_vcols, end_char_vcols, textlen) and from numc, all of which are derived from attacker-controlled line content and the width of the replacement character c. The invariant the implementation MUST uphold is: n == exact net byte growth == (bytes actually written into newp on lines 98-120) - oldlen. If any of the correction terms is wrong for a particular combination of is_short / virtual_op / double-wide c / tab-splitting, the replacement writes on lines 107-120 (mb_char2bytes loop, memset of numc bytes, endspaces, STRMOVE tail) exceed oldlen+1+n and corrupt the heap. Because numc is later multiplied by up to 4 and used as the replacement byte budget while the mb path independently writes num_chars characters, the two accountings must match exactly. A file whose block geometry makes n underestimate the real write is a remote heap overflow with the process opening the file. The 'CHECK FOR ALLOCATED SPACE' comment at line 102 in the original source is a direct authorial signal that this budget is fragile."
+    },
+    {
+      "file": "corpus/train/train_0040_cwe122.c",
+      "lines": "68-89",
+      "code": "numc = oap->end_vcol - oap->start_vcol + 1;\n\t    if (bd.is_short && (!virtual_op || bd.is_MAX))\n\t\tnumc -= (oap->end_vcol - bd.end_vcol) + 1;\n\t    ...\n\t\tnumc = numc / 2;\n\t    ...\n\t    num_chars = numc;\n\t    numc *= (*mb_char2len)(c);\n\t    n += numc - bd.textlen;",
+      "explanation": "Signed integer over/underflow feeding the size (CWE-190/CWE-191). numc, num_chars and n are 32-bit signed ints. numc starts as a vcol span (attacker can make a visual block span a very wide, tab/multibyte-inflated region) and is then multiplied by mb_char2len(c) (up to 4). A sufficiently wide block times a 4-byte replacement character can overflow the signed multiply at line 87, producing a negative or wrapped numc; n += numc - bd.textlen then computes a wrong (too small or negative) budget, undersizing alloc while the character-driven write loop at lines 110-111 still runs num_chars iterations. Conversely the is_short subtraction at line 71 can drive numc small/negative for a short line. The implementation must clamp/validate that numc stays non-negative and that oldlen+1+n cannot wrap or shrink below the bytes to be written; there is no such guard here."
+    },
+    {
+      "file": "corpus/train/train_0040_cwe122.c",
+      "lines": "107-114",
+      "code": "if (has_mbyte)\n\t\t{\n\t\t    n = (int)STRLEN(newp);\n\t\t    while (--num_chars >= 0)\n\t\t\tn += (*mb_char2bytes)(c, newp + n);\n\t\t}\n\t\telse\n\t\t    vim_memset(newp + STRLEN(newp), c, (size_t)numc);",
+      "explanation": "Out-of-bounds write via mismatched replacement accounting (CWE-787). In the multibyte branch, exactly num_chars characters are encoded, each consuming mb_char2len(c) bytes, so this writes num_chars * mb_char2len(c) bytes. In the single-byte branch, numc bytes are written. The buffer budget reserved for the replacement is the numc term folded into n at line 89 (= num_chars * mb_char2len(c) after the multiply). If num_chars was NOT halved consistently with the double-wide adjustment (lines 77-86 halve numc/num_chars only when mb_char2cells(c)>1), or if is_short trimming changed one but not the byte budget, the encoded bytes overrun newp. The write destination is recomputed as newp + STRLEN(newp) each time, so it also assumes no earlier write embedded a NUL and that startspaces/prefix left the length exactly where the budget expects — any drift compounds into an overflow. The implementation must guarantee the replacement write length equals the reserved numc bytes."
+    },
+    {
+      "file": "corpus/train/train_0040_cwe122.c",
+      "lines": "126-128",
+      "code": "after_p = alloc(oldlen + 1 + n - STRLEN(newp));\n\t\tif (after_p != NULL)\n\t\t    STRMOVE(after_p, oldp);",
+      "explanation": "Unsigned size underflow on the split-line buffer (CWE-191). The size expression oldlen + 1 + n - STRLEN(newp) is evaluated in size_t. It assumes STRLEN(newp) <= oldlen + 1 + n, i.e. that the newp writes stayed within budget. If the earlier replacement path already overfilled newp (per the previous findings), STRLEN(newp) exceeds oldlen+1+n and the subtraction wraps to a near-SIZE_MAX allocation request — which either fails (after_p NULL, benign) or, on a wrong-but-in-range value, yields an after_p too small for the STRMOVE tail copy, a second heap overflow. The implementation must ensure newp's length never exceeds its own allocation before computing this remaining size, and should reject the split when the remainder would be non-positive."
+    },
+    {
+      "file": "corpus/train/train_0040_cwe122.c",
+      "lines": "165-170",
+      "code": "if (new_byte_len > 1 || old_byte_len > 1)\n\t\t{\n\t\t    // This is slow, but it handles replacing a single-byte\n\t\t    // with a multi-byte and the other way around.\n\t\t    if (curwin->w_cursor.lnum == oap->end.lnum)\n\t\t\toap->end.col += new_byte_len - old_byte_len;\n\t\t    replace_character(c);",
+      "explanation": "Loop-bound corruption in the character-wise path (CWE-125/CWE-787, latent in replace_character). When replacing a single-byte char with a multibyte one (or vice-versa) on the end line, oap->end.col is shifted by the signed delta new_byte_len - old_byte_len to keep the loop bound aligned with the growing/shrinking line. If this delta accounting diverges from what replace_character() actually does to the line length, the LTOREQ_POS(curwin->w_cursor, oap->end) loop guard at line 157 can walk the cursor past the true end of the line, causing gchar_cursor()/PBYTE to read or poke bytes beyond the line buffer. The implementation must keep oap->end.col consistent with the actual byte length change replace_character applies, and replace_character itself must bound its in-place growth."
+    },
+    {
+      "file": "corpus/train/train_0040_cwe122.c",
+      "lines": "204-211",
+      "code": "coladvance_force(getviscol2(oap->end.col, oap->end.coladd) + 1);\n\t\tcurwin->w_cursor.col -= (virtcols + 1);\n\t\tfor (; virtcols >= 0; virtcols--)\n\t\t{\n\t\t    if ((*mb_char2len)(c) > 1)\n\t\t       replace_character(c);\n\t\t    else\n\t\t\tPBYTE(curwin->w_cursor, c);",
+      "explanation": "Virtual-edit fill loop write bound (CWE-787, latent). In the virtualedit end-of-line case, coladvance_force materialises spaces out to end col +1, the cursor is backed up by virtcols+1, and the loop pokes c into virtcols+1 positions. virtcols comes from oap->end.coladd (how far into virtual space the block extends), attacker-influenceable via a crafted visual selection with 'virtualedit'. If coladvance_force did not actually extend the line by enough real bytes to cover virtcols+1 pokes (e.g. the +1 fencepost interacts badly with multibyte c using replace_character which changes length mid-loop), PBYTE writes past the line buffer. The implementation must guarantee the materialised line is at least as long as the number of poke iterations, and that replace_character's length changes are re-accounted inside the loop."
+    }
+  ],
+  "summary": "This is Vim's op_replace() operator implementation. The dominant risk is a heap-based buffer overflow (CWE-122/CWE-787) in the visual-block replace path: the destination line buffer newp is sized alloc(oldlen + 1 + n) where the extra-bytes figure n is computed from block geometry and the replacement character width using signed int arithmetic, and the subsequent replacement/space/tail writes must match that budget exactly. Any drift between the budget and the bytes actually written — via double-wide/is_short/virtual_op corrections, signed overflow of numc *= mb_char2len(c), or the size_t underflow at the split-line after_p allocation — corrupts the heap when opening or editing crafted content. The character-wise path adds latent out-of-bounds pokes when byte-length deltas or virtualedit fills are mis-accounted.",
+  "reviewed_anchors": [
+    {"anchor": "op_replace(oparg_T *oap, int c)", "disposition": "dismissed", "reason": "Function signature; oap and c drive all downstream sizing but the signature itself carries no bug — the risk is in the body arithmetic."},
+    {"anchor": "int n, numc; int num_chars (line 4-5)", "disposition": "finding", "reason": "Signed-int size accumulators multiplied and subtracted to size the heap buffer; over/underflow surface (CWE-190/191)."},
+    {"anchor": "size_t oldlen (line 7)", "disposition": "dismissed", "reason": "Correctly typed length of existing line via STRLEN; not itself attacker-forgeable beyond real line length."},
+    {"anchor": "struct block_def bd (line 8)", "disposition": "finding", "reason": "All of textcol/textlen/startspaces/endspaces/is_short/end_vcol feed the size computation; the correctness of newp's size depends on these fields being self-consistent."},
+    {"anchor": "char_u *after_p (line 9)", "disposition": "finding", "reason": "Split-line buffer sized oldlen+1+n-STRLEN(newp); size_t underflow if newp overfilled (CWE-191)."},
+    {"anchor": "REPLACE_CR_NCHAR / REPLACE_NL_NCHAR / had_ctrl_v_cr (lines 15-24,105)", "disposition": "dismissed", "reason": "Sentinel-to-control-byte translation and branch selector; changes which write path runs but adds no distinct overflow of its own beyond those already flagged."},
+    {"anchor": "u_save(...) (lines 29-30)", "disposition": "dismissed", "reason": "Undo checkpoint with FAIL guard before mutation; correct defensive use, no finding."},
+    {"anchor": "numc = oap->end_vcol - oap->start_vcol + 1 (line 69)", "disposition": "finding", "reason": "Attacker-controlled vcol span seeds the byte budget; combined with the multiply at line 87 it is the integer-overflow source."},
+    {"anchor": "numc -= (oap->end_vcol - bd.end_vcol) + 1 (line 71)", "disposition": "finding", "reason": "is_short correction can drive numc small/negative, undersizing the allocation while the write loop still runs."},
+    {"anchor": "numc *= (*mb_char2len)(c) (line 87)", "disposition": "finding", "reason": "Signed multiply by 1..4 can overflow for wide blocks, corrupting the size budget (CWE-190)."},
+    {"anchor": "n += numc - bd.textlen (line 89)", "disposition": "finding", "reason": "Defines the extra-bytes budget for alloc; the exact invariant that must equal net byte growth."},
+    {"anchor": "newp = alloc(oldlen + 1 + n) (line 93)", "disposition": "finding", "reason": "The heap allocation whose size must cover all subsequent writes; central overflow anchor (CWE-122/787)."},
+    {"anchor": "mch_memmove/vim_memset prefix+startspaces (lines 98,101)", "disposition": "dismissed", "reason": "Prefix and pre-space writes are bounded by textcol/startspaces which are part of the budget; covered by the newp size finding, not distinct."},
+    {"anchor": "mb_char2bytes replacement loop (lines 109-111)", "disposition": "finding", "reason": "Writes num_chars encoded chars into newp+n; must match the reserved numc bytes or overflows (CWE-787)."},
+    {"anchor": "vim_memset(newp + STRLEN(newp), c, numc) (line 114)", "disposition": "finding", "reason": "Single-byte replacement write of numc bytes at a STRLEN-derived offset; part of the budget-vs-write mismatch."},
+    {"anchor": "endspaces memset + STRMOVE tail (lines 118,120)", "disposition": "dismissed", "reason": "Trailing writes bounded by endspaces and the surviving tail; correctness follows from the same newp budget already flagged, not a distinct class."},
+    {"anchor": "after_p = alloc(oldlen + 1 + n - STRLEN(newp)) (line 126)", "disposition": "finding", "reason": "size_t subtraction underflows if STRLEN(newp) > oldlen+1+n (CWE-191)."},
+    {"anchor": "ml_replace/ml_append/vim_free(after_p) (lines 131-137)", "disposition": "dismissed", "reason": "Ownership transfer of newp and free of after_p are balanced; no double-free or leak visible in shown code."},
+    {"anchor": "oap->end.col adjustments (lines 150-155,170,188)", "disposition": "finding", "reason": "Loop-bound is mutated by byte-length deltas; if inconsistent with actual line length the char-wise loop can step OOB (CWE-125/787)."},
+    {"anchor": "PBYTE(curwin->w_cursor, c) (lines 190,211)", "disposition": "dismissed", "reason": "In-place single-byte poke; its safety depends on the loop bound (flagged separately), so not a distinct anchor."},
+    {"anchor": "virtualedit fill loop (lines 204-214)", "disposition": "finding", "reason": "Pokes virtcols+1 bytes into a coladvance_force-extended line; fencepost/multibyte mid-loop growth can overrun (CWE-787)."},
+    {"anchor": "changed_lines/marks epilogue (lines 223-232)", "disposition": "dismissed", "reason": "Post-processing notifications and mark updates; no untrusted-size handling."}
+  ],
+  "findings": [
+    {
+      "title": "Heap buffer overflow in visual-block replace: newp size budget can be smaller than bytes written",
+      "anchor": "newp = alloc(oldlen + 1 + n) with n from block geometry",
+      "file": "corpus/train/train_0040_cwe122.c",
+      "line": "89-120",
+      "code": "n += numc - bd.textlen;\n\n\t    oldp = ml_get_curline();\n\t    oldlen = STRLEN(oldp);\n\t    newp = alloc(oldlen + 1 + n);",
+      "bug_class": "Heap-based buffer overflow (allocation size vs write-length mismatch)",
+      "cwe": "CWE-122",
+      "severity": "critical",
+      "where_it_lives": "corpus/train/train_0040_cwe122.c",
+      "invariant": "n (the extra-bytes figure) must equal exactly the net byte growth of the line, so that oldlen + 1 + n >= textcol + startspaces + (num_chars * mb_char2len(c) or numc) + endspaces + strlen(tail) + 1 for every combination of is_short, virtual_op, double-wide c, and tab-splitting.",
+      "failure_mode": "A crafted buffer/visual-block geometry makes the correction terms (startspaces/endspaces/start_char_vcols/end_char_vcols/is_short adjustments and the numc*mb_char2len budget) understate the true write length. The replacement writes at lines 109-120 (mb_char2bytes loop, memset of numc bytes, endspaces, STRMOVE tail) then run past oldlen+1+n, overwriting adjacent heap allocations. Impact: heap corruption leading to crash or potential code execution when a victim opens/edits attacker-controlled content.",
+      "cve_analog": "",
+      "what_to_confirm": "Reconstruct, for is_short and non-is_short lines with single-byte, double-wide, and 4-byte replacement characters, that the sum of every write into newp is <= oldlen+1+n; confirm block_prep guarantees the geometry fields used in n are mutually consistent with textlen."
+    },
+    {
+      "title": "Signed integer overflow in replacement byte budget numc *= mb_char2len(c)",
+      "anchor": "numc *= (*mb_char2len)(c); n += numc - bd.textlen",
+      "file": "corpus/train/train_0040_cwe122.c",
+      "line": "87-89",
+      "code": "numc *= (*mb_char2len)(c);\n\t    // oldlen includes textlen, so don't double count\n\t    n += numc - bd.textlen;",
+      "bug_class": "Integer overflow/underflow feeding an allocation size",
+      "cwe": "CWE-190",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0040_cwe122.c",
+      "invariant": "numc (a vcol span, attacker-widenable) multiplied by mb_char2len(c) (1..4) must not overflow signed int, and must remain non-negative, before being folded into the allocation size n.",
+      "failure_mode": "A very wide visual block (large end_vcol - start_vcol, inflated by tabs/wide chars) times a 4-byte replacement character overflows the signed 32-bit multiply, yielding a negative or wrapped numc. n += numc - bd.textlen then produces a too-small or negative budget, so alloc(oldlen+1+n) is undersized while the character-count-driven write loop at lines 110-111 still executes num_chars iterations, overflowing newp. The is_short subtraction at line 71 can independently drive numc negative.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether numc can be made large enough (or negative) before line 87/89; check for any clamp on numc/num_chars and whether alloc rejects wrapped size_t values."
+    },
+    {
+      "title": "Replacement write length may not match reserved numc bytes (mb vs single-byte)",
+      "anchor": "mb_char2bytes loop / vim_memset(newp + STRLEN(newp), c, numc)",
+      "file": "corpus/train/train_0040_cwe122.c",
+      "line": "107-114",
+      "code": "if (has_mbyte)\n\t\t{\n\t\t    n = (int)STRLEN(newp);\n\t\t    while (--num_chars >= 0)\n\t\t\tn += (*mb_char2bytes)(c, newp + n);\n\t\t}\n\t\telse\n\t\t    vim_memset(newp + STRLEN(newp), c, (size_t)numc);",
+      "bug_class": "Out-of-bounds write (write count vs reserved budget mismatch)",
+      "cwe": "CWE-787",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0040_cwe122.c",
+      "invariant": "The bytes emitted here (num_chars * mb_char2len(c) in the mb branch, numc in the single-byte branch) must equal the numc byte budget folded into n at line 89, and the destination newp+STRLEN(newp) must leave room for endspaces and the tail.",
+      "failure_mode": "The double-wide handling (lines 77-86) halves numc/num_chars only when mb_char2cells(c)>1, and is_short trimming adjusts numc; if either changes the write count without an identical change to the reserved budget, the encode loop or memset writes more bytes than reserved. Because each write recomputes the offset via STRLEN(newp), an embedded NUL or off-by-one prefix also mislocates writes, compounding into an overflow.",
+      "cve_analog": "",
+      "what_to_confirm": "That num_chars*mb_char2len(c) == numc == the value added to n for every path (double-wide, is_short, virtual_op), and that STRLEN(newp) at each write equals the intended cursor."
+    },
+    {
+      "title": "size_t underflow sizing the split-line buffer after_p",
+      "anchor": "after_p = alloc(oldlen + 1 + n - STRLEN(newp))",
+      "file": "corpus/train/train_0040_cwe122.c",
+      "line": "126",
+      "code": "after_p = alloc(oldlen + 1 + n - STRLEN(newp));",
+      "bug_class": "Unsigned integer underflow to huge allocation / undersized buffer",
+      "cwe": "CWE-191",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0040_cwe122.c",
+      "invariant": "STRLEN(newp) must be <= oldlen + 1 + n before this subtraction; the remaining size must be positive and large enough for the STRMOVE tail copy.",
+      "failure_mode": "If newp was overfilled by the earlier replacement path, STRLEN(newp) exceeds oldlen+1+n and this size_t subtraction wraps toward SIZE_MAX, either failing the alloc (benign) or, on a wrong in-range value, producing an after_p too small for STRMOVE(after_p, oldp), a second heap overflow. Reached only on the CR/NL line-split branch.",
+      "cve_analog": "",
+      "what_to_confirm": "That STRLEN(newp) can never exceed oldlen+1+n at line 126, and that a non-positive remainder is rejected before allocating/copying."
+    },
+    {
+      "title": "Character-wise loop bound can walk past line end via byte-length delta",
+      "anchor": "oap->end.col += new_byte_len - old_byte_len; loop while LTOREQ_POS(curwin->w_cursor, oap->end)",
+      "file": "corpus/train/train_0040_cwe122.c",
+      "line": "165-170",
+      "code": "if (new_byte_len > 1 || old_byte_len > 1)\n\t\t{\n\t\t    if (curwin->w_cursor.lnum == oap->end.lnum)\n\t\t\toap->end.col += new_byte_len - old_byte_len;\n\t\t    replace_character(c);",
+      "bug_class": "Out-of-bounds read/write via miscomputed loop bound",
+      "cwe": "CWE-125",
+      "severity": "medium",
+      "where_it_lives": "implementation (replace_character not provided); loop in corpus/train/train_0040_cwe122.c",
+      "invariant": "oap->end.col after the += delta must remain a valid byte index into the (post-replace) end line, consistent with the actual length change replace_character applies.",
+      "failure_mode": "When replacing single-byte with multibyte (or vice versa) on the end line, oap->end.col is shifted by the signed byte delta to track the growing/shrinking line. If this bookkeeping diverges from replace_character's real effect, the LTOREQ_POS loop guard lets the cursor advance past the true end of line, so gchar_cursor/PBYTE on subsequent iterations read or poke out of bounds.",
+      "cve_analog": "",
+      "what_to_confirm": "That replace_character changes the line length by exactly new_byte_len - old_byte_len and that oap->end stays within the modified line for all subsequent iterations."
+    },
+    {
+      "title": "Virtualedit end-of-line fill loop may poke past the extended line",
+      "anchor": "for (; virtcols >= 0; virtcols--) { ... PBYTE / replace_character }",
+      "file": "corpus/train/train_0040_cwe122.c",
+      "line": "204-214",
+      "code": "coladvance_force(getviscol2(oap->end.col, oap->end.coladd) + 1);\n\t\tcurwin->w_cursor.col -= (virtcols + 1);\n\t\tfor (; virtcols >= 0; virtcols--)\n\t\t{\n\t\t    if ((*mb_char2len)(c) > 1)\n\t\t       replace_character(c);\n\t\t    else\n\t\t\tPBYTE(curwin->w_cursor, c);\n\t\t   if (inc(&curwin->w_cursor) == -1)\n\t\t       break;\n\t\t}",
+      "bug_class": "Out-of-bounds write in virtual-edit fill",
+      "cwe": "CWE-787",
+      "severity": "medium",
+      "where_it_lives": "implementation (coladvance_force/replace_character not provided); loop in corpus/train/train_0040_cwe122.c",
+      "invariant": "coladvance_force must have materialised at least virtcols+1 real byte positions, and any length change from replace_character inside the loop must be re-accounted so PBYTE/inc stay within the line.",
+      "failure_mode": "With 'virtualedit' and a block extending into virtual space, virtcols (from oap->end.coladd) controls how many positions are filled. The +1 fencepost plus replace_character growing the line mid-loop for a multibyte c can make the loop poke bytes beyond what coladvance_force actually allocated, overrunning the line buffer. inc() breaking on -1 is the only backstop.",
+      "cve_analog": "",
+      "what_to_confirm": "That the line is guaranteed at least virtcols+1 writable bytes after coladvance_force, and that mixing replace_character (length-changing) with PBYTE inside the loop cannot desynchronise the cursor from the buffer end."
+    }
+  ],
+  "audit_checklist": [
+    "Prove alloc(oldlen + 1 + n) at line 93 covers the exact sum of all writes into newp (prefix textcol, startspaces, replacement bytes, endspaces, tail STRMOVE, NUL) for is_short and non-is_short lines with single-byte, double-wide, and 4-byte replacement chars.",
+    "Bound numc: ensure oap->end_vcol - oap->start_vcol + 1 and the subsequent numc *= mb_char2len(c) cannot overflow signed int or go negative (lines 69,71,87).",
+    "Confirm the mb replacement loop (num_chars * mb_char2len(c) bytes, lines 110-111) and single-byte memset (numc bytes, line 114) write exactly the numc budget folded into n at line 89.",
+    "Verify STRLEN(newp) <= oldlen + 1 + n before the after_p size subtraction at line 126, and reject a non-positive remainder before STRMOVE.",
+    "Check that oap->end.col adjustments (lines 150-155,170,188,204-205) keep the character-wise loop bound inside the actual (post-replace) line for every iteration.",
+    "Confirm coladvance_force extends the line by at least virtcols+1 writable bytes before the fill loop at lines 206-214, accounting for replace_character length changes mid-loop.",
+    "Validate that block_prep() guarantees textcol/textlen/startspaces/endspaces/is_short are mutually consistent with the real line length used as oldlen."
+  ]
+}

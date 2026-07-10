@@ -1,0 +1,236 @@
+{
+  "subsystem": "Tor client SOCKS/entry-connection handling. This is connection_ap_handshake_rewrite_and_attach() from the onion-proxy (client) edge-connection code (src/core/or/connection_edge.c). It takes a fully-received SOCKS request from a local application, runs the address-rewrite/address-map machinery, validates the requested destination (hostname, IP, .exit, or .onion), enforces per-port traffic policy, and finally either answers immediately, rejects, or attaches the stream to a circuit.",
+  "provenance": "Identified by naming and API surface: entry_connection_t/origin_circuit_t/crypt_path_t types, socks_request_t, connection_mark_unattached_ap, END_STREAM_REASON_* enums, tor_addr_t/tor_addr_parse, safe_str_client()/escaped(), routerset_t, node_get_by_nickname, and the ONION_V3_HOSTNAME/EXIT_HOSTNAME hostname_type_t enum are all Tor internal identifiers. The banner comment 'sample: primevul_c_train_2859_fixed' and the .exit/onion handling pin it to Tor's connection_edge.c. It is a client-side function that processes application-supplied SOCKS target addresses.",
+  "trust_boundary": "The untrusted input is socks->address, socks->port, socks->command, socks->socks_version and rr.orig_address, all derived from a SOCKS request produced by whatever local application connects to Tor's SOCKS port. In Tor's threat model the destination string is fully attacker/user controlled and frequently sensitive (it is the site the user is trying to reach). The address is copied and logged repeatedly here, so the two hostile properties are (a) its content as a potential injection/overflow vector into fixed buffers and (b) its sensitivity as data that must be scrubbed before it reaches logs or the control port. conn->chosen_exit_name and conn->entry_cfg flags are set from it.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/eval/eval_0054_cwe532.c",
+      "lines": "2-10",
+      "code": "connection_ap_handshake_rewrite_and_attach(entry_connection_t *conn,\n                                           origin_circuit_t *circ,\n                                           crypt_path_t *cpath)\n{\n  socks_request_t *socks = conn->socks_request;\n  const or_options_t *options = get_options();\n  connection_t *base_conn = ENTRY_TO_CONN(conn);\n  time_t now = time(NULL);\n  rewrite_result_t rr;",
+      "explanation": "Entry point for turning a received SOCKS request into an attached stream. conn is the entry (client-side) connection carrying the SOCKS state; circ is an optional pre-chosen circuit to attach to; cpath an optional crypt path. It caches the socks_request_t (which holds the attacker-supplied address/port/command), fetches the global options, derives the generic connection_t via ENTRY_TO_CONN, records the current time, and declares a rewrite_result_t rr that will receive the outcome of address rewriting. socks->address is the central untrusted string for the rest of the function."
+    },
+    {
+      "file": "corpus/eval/eval_0054_cwe532.c",
+      "lines": "15-27",
+      "code": "memset(&rr, 0, sizeof(rr));\n  connection_ap_handshake_rewrite(conn,&rr);\n\n  if (rr.should_close) {\n    /* connection_ap_handshake_rewrite told us to close the connection:\n     * either because it sent back an answer, or because it sent back an\n     * error */\n    connection_mark_unattached_ap(conn, rr.end_reason);\n    if (END_STREAM_REASON_DONE == (rr.end_reason & END_STREAM_REASON_MASK))\n      return 0;\n    else\n      return -1;\n  }",
+      "explanation": "rr is zero-initialized then filled by connection_ap_handshake_rewrite, which applies the address map / automap / rewrite rules to socks->address and reports whether the connection should be terminated. If rr.should_close is set the stream is marked unattached with rr.end_reason, and the function returns 0 when the masked reason is END_STREAM_REASON_DONE (a clean, already-answered case) or -1 otherwise. The END_STREAM_REASON_MASK strips flag bits before comparing the base reason."
+    },
+    {
+      "file": "corpus/eval/eval_0054_cwe532.c",
+      "lines": "29-31",
+      "code": "const time_t map_expires = rr.map_expires;\n  const int automap = rr.automap;\n  const addressmap_entry_source_t exit_source = rr.exit_source;",
+      "explanation": "Three results of the rewrite are hoisted into const locals: map_expires (when a cached resolve answer expires), automap (whether the address was virtual-mapped from a .onion/automap range), and exit_source (the provenance of any .exit suffix — AUTOMAP, DNS, TRACKEXIT, NONE, etc.). exit_source is a security-relevant provenance tag used below to refuse dangerous .exit sources."
+    },
+    {
+      "file": "corpus/eval/eval_0054_cwe532.c",
+      "lines": "35-44",
+      "code": "hostname_type_t addresstype;\n  if (!parse_extended_hostname(socks->address, &addresstype)) {\n    control_event_client_status(LOG_WARN, \"SOCKS_BAD_HOSTNAME HOSTNAME=%s\",\n                                escaped(socks->address));\n    if (addresstype == BAD_HOSTNAME) {\n      conn->socks_request->socks_extended_error_code = SOCKS5_HS_BAD_ADDRESS;\n    }\n    connection_mark_unattached_ap(conn, END_STREAM_REASON_TORPROTOCOL);\n    return -1;\n  }",
+      "explanation": "parse_extended_hostname classifies socks->address (normal, .exit, .onion v2/v3, or bad) and rewrites it in place by stripping recognized suffixes, returning the type via addresstype. On failure it emits a SOCKS_BAD_HOSTNAME control-port event carrying escaped(socks->address) — note escaped() only C-escapes the string, it does NOT apply SafeLogging scrubbing — sets the SOCKS5 extended error code for a bad address, marks the stream unattached, and rejects. This is the first of several control events that carry the raw destination string."
+    },
+    {
+      "file": "corpus/eval/eval_0054_cwe532.c",
+      "lines": "52-86",
+      "code": "if (addresstype == EXIT_HOSTNAME) {\n    /* If StrictNodes is not set, then .exit overrides ExcludeNodes but\n     * not ExcludeExitNodes. */\n    routerset_t *excludeset = options->StrictNodes ?\n      options->ExcludeExitNodesUnion_ : options->ExcludeExitNodes;\n    const node_t *node = NULL;\n\n    /* If this .exit was added by an AUTOMAP, then it came straight from\n     * a user.  That's not safe. */\n    if (exit_source == ADDRMAPSRC_AUTOMAP) {",
+      "explanation": "When the address is a .exit form, the code selects which exclusion set to honour based on StrictNodes, then screens the provenance of the .exit. If exit_source is ADDRMAPSRC_AUTOMAP (lines 61-72) it refuses because an automapped .exit came straight from a user and is unsafe; if it is ADDRMAPSRC_DNS or ADDRMAPSRC_NONE (lines 76-86) it refuses as an impossible source and logs an LD_BUG. Each rejection path uses safe_str_client() in the log_warn but escaped() in the parallel control_event_client_status. These are provenance gates preventing an attacker from steering a stream to an arbitrary chosen exit."
+    },
+    {
+      "file": "corpus/eval/eval_0054_cwe532.c",
+      "lines": "88-116",
+      "code": "tor_assert(!automap);\n\n    /* Now, find the character before the .(name) part.\n     * (The \".exit\" part got stripped off by \"parse_extended_hostname\").\n     *\n     * We're going to put the exit name into conn->chosen_exit_name, and\n     * look up a node correspondingly. */\n    char *s = strrchr(socks->address,'.');\n    if (s) {\n      /* The address was of the form \"(stuff).(name).exit */\n      if (s[1] != '\\0') {\n        /* Looks like a real .exit one. */\n        conn->chosen_exit_name = tor_strdup(s+1);\n        node = node_get_by_nickname(conn->chosen_exit_name, 0);\n\n        if (exit_source == ADDRMAPSRC_TRACKEXIT) {\n          /* We 5 tries before it expires the addressmap */\n          conn->chosen_exit_retries = TRACKHOSTEXITS_RETRIES;\n        }\n        *s = 0;\n      } else {",
+      "explanation": "After asserting the address is not automapped, it locates the last '.' in the (already .exit-stripped) address. If a dot exists and is not trailing, the substring after it is the chosen exit nickname: conn->chosen_exit_name = tor_strdup(s+1) heap-copies it, node_get_by_nickname looks the relay up, TRACKEXIT sources get a retry budget (TRACKHOSTEXITS_RETRIES), and *s = 0 truncates socks->address to the part before the exit name. The else branch (lines 108-116) handles the malformed '(stuff)..exit' case with a scrubbed log_warn plus an escaped() control event and a rejection."
+    },
+    {
+      "file": "corpus/eval/eval_0054_cwe532.c",
+      "lines": "117-127",
+      "code": "} else {\n      /* It looks like they just asked for \"foo.exit\".  That's a special\n       * form that means (foo's address).foo.exit. */\n\n      conn->chosen_exit_name = tor_strdup(socks->address);\n      node = node_get_by_nickname(conn->chosen_exit_name, 0);\n      if (node) {\n        *socks->address = 0;\n        node_get_address_string(node, socks->address, sizeof(socks->address));\n      }\n    }",
+      "explanation": "If there was no interior dot, the whole address is treated as an exit nickname ('foo.exit'). chosen_exit_name is duplicated from socks->address, the node is resolved, and if found the address buffer is cleared and rewritten with the node's own address string. node_get_address_string is passed sizeof(socks->address) as its bound, which is only correct because socks_request_t.address is a fixed-size char array (MAX_SOCKS_ADDR_LEN) rather than a pointer — the write is size-limited, so this copy is safe as written."
+    },
+    {
+      "file": "corpus/eval/eval_0054_cwe532.c",
+      "lines": "129-148",
+      "code": "/* Now make sure that the chosen exit exists... */\n    if (!node) {\n      log_warn(LD_APP,\n               \"Unrecognized relay in exit address '%s.exit'. Refusing.\",\n               safe_str_client(socks->address));\n      connection_mark_unattached_ap(conn, END_STREAM_REASON_TORPROTOCOL);\n      return -1;\n    }\n    /* ...and make sure that it isn't excluded. */\n    if (routerset_contains_node(excludeset, node)) {\n      log_warn(LD_APP,\n               \"Excluded relay in exit address '%s.exit'. Refusing.\",\n               safe_str_client(socks->address));\n      connection_mark_unattached_ap(conn, END_STREAM_REASON_TORPROTOCOL);\n      return -1;\n    }",
+      "explanation": "Two final .exit gates: reject if the named relay does not exist in the node list, and reject if it is in the previously computed exclusion set (ExcludeExitNodes / ExcludeExitNodesUnion_). Both logs correctly scrub the address with safe_str_client. These enforce the operator's node-exclusion policy for user-chosen exits."
+    },
+    {
+      "file": "corpus/eval/eval_0054_cwe532.c",
+      "lines": "151-166",
+      "code": "if (addresstype != ONION_V3_HOSTNAME && addresstype != ONION_V2_HOSTNAME) {\n    /* Not a hidden-service request.  It's either a hostname or an IP,\n     * possibly with a .exit that we stripped off.  We're going to check\n     * if we're allowed to connect/resolve there, and then launch the\n     * appropriate request. */\n\n    /* Check for funny characters in the address. */\n    if (address_is_invalid_destination(socks->address, 1)) {\n      control_event_client_status(LOG_WARN, \"SOCKS_BAD_HOSTNAME HOSTNAME=%s\",\n                                  escaped(socks->address));\n      log_warn(LD_APP,\n               \"Destination '%s' seems to be an invalid hostname. Failing.\",\n               safe_str_client(socks->address));\n      connection_mark_unattached_ap(conn, END_STREAM_REASON_TORPROTOCOL);\n      return -1;\n    }",
+      "explanation": "The large branch for non-onion targets. It first calls address_is_invalid_destination (the '1' asks it to reject bad characters) to screen for malformed hostnames, and on failure emits both an escaped() control event and a scrubbed log_warn, then rejects. Note the asymmetry once more: the log path scrubs the hostname, the control-event path does not."
+    },
+    {
+      "file": "corpus/eval/eval_0054_cwe532.c",
+      "lines": "178-220",
+      "code": "/* First, check if all non-onion traffic is disabled */\n    if (!conn->entry_cfg.dns_request && !conn->entry_cfg.ipv4_traffic\n        && !conn->entry_cfg.ipv6_traffic) {\n        log_warn(LD_APP, \"Refusing to connect to non-hidden-service hostname \"\n                 \"or IP address %s because Port has OnionTrafficOnly set (or \"\n                 \"NoDNSRequest, NoIPv4Traffic, and NoIPv6Traffic).\",\n                 safe_str_client(socks->address));\n        connection_mark_unattached_ap(conn, END_STREAM_REASON_ENTRYPOLICY);\n        return -1;\n    }\n\n    /* Then check if we have a hostname or IP address, and whether DNS or\n     * the IP address family are permitted.  Reject if not. */\n    tor_addr_t dummy_addr;\n    int socks_family = tor_addr_parse(&dummy_addr, socks->address);",
+      "explanation": "Per-port traffic policy enforcement. If OnionTrafficOnly (no DNS, no IPv4, no IPv6) is set, non-onion targets are refused with an ENTRYPOLICY reason. Otherwise tor_addr_parse is used to classify socks->address: it returns -1 for a hostname (needs DNS), AF_INET for an IPv4 literal, AF_INET6 for IPv6. Lines 194-220 then reject when the relevant capability (dns_request / ipv4_traffic / ipv6_traffic) is disabled for this listener, with an unreachable-assert fallback for any other family."
+    },
+    {
+      "file": "corpus/eval/eval_0054_cwe532.c",
+      "lines": "225-239",
+      "code": "if (socks->command == SOCKS_COMMAND_RESOLVE) {\n      tor_addr_t answer;\n      /* Reply to resolves immediately if we can. */\n      if (tor_addr_parse(&answer, socks->address) >= 0) {/* is it an IP? */\n        /* remember _what_ is supposed to have been resolved. */\n        strlcpy(socks->address, rr.orig_address, sizeof(socks->address));\n        connection_ap_handshake_socks_resolved_addr(conn, &answer, -1,\n                                                    map_expires);\n        connection_mark_unattached_ap(conn,\n                                END_STREAM_REASON_DONE |\n                                END_STREAM_REASON_FLAG_ALREADY_SOCKS_REPLIED);\n        return 0;\n      }\n      tor_assert(!automap);\n      rep_hist_note_used_resolve(now); /* help predict this next time */",
+      "explanation": "For a RESOLVE command where the address is already an IP literal, the code answers the resolve immediately: it restores the original pre-rewrite address into socks->address via strlcpy(..., rr.orig_address, sizeof(socks->address)) (a size-bounded copy), sends the resolved answer back over SOCKS, marks the stream done with the ALREADY_SOCKS_REPLIED flag, and returns. Otherwise it notes usage statistics and continues. rep_hist_note_used_resolve feeds Tor's predictive-circuit heuristics."
+    },
+    {
+      "file": "corpus/eval/eval_0054_cwe532.c",
+      "lines": "240-292",
+      "code": "} else if (socks->command == SOCKS_COMMAND_CONNECT) {\n      /* Now see if this is a connect request that we can reject immediately */\n\n      tor_assert(!automap);\n      /* Don't allow connections to port 0. */\n      if (socks->port == 0) {\n        log_notice(LD_APP,\"Application asked to connect to port 0. Refusing.\");\n        connection_mark_unattached_ap(conn, END_STREAM_REASON_TORPROTOCOL);\n        return -1;\n      }",
+      "explanation": "The CONNECT path. Port 0 is refused outright. Lines 254-292 then, when ClientRejectInternalAddresses is set and there is no begindir/chosen-exit/circuit override, detect local or internal destination addresses (tor_addr_hostname_is_local, tor_addr_is_internal) and reject them with a PRIVATE_ADDR reason, using per-interval rate-limited warnings (RATELIM_INIT with WARN_INTRVL_LOOP=300 for transparent proxy loops, WARN_INTRVL_PRIV=300 otherwise). The rate_limit_log return string m is heap-allocated and freed with tor_free after logging. Both log messages scrub the address with safe_str_client."
+    },
+    {
+      "file": "corpus/eval/eval_0054_cwe532.c",
+      "lines": "298-357",
+      "code": "{\n        tor_addr_t addr;\n        /* XXX Duplicate call to tor_addr_parse. */\n        if (tor_addr_parse(&addr, socks->address) >= 0) {\n          /* If we reach this point, it's an IPv4 or an IPv6 address. */\n          sa_family_t family = tor_addr_family(&addr);\n\n          if ((family == AF_INET && ! conn->entry_cfg.ipv4_traffic) ||\n              (family == AF_INET6 && ! conn->entry_cfg.ipv6_traffic)) {",
+      "explanation": "Literal-IP special handling for CONNECT. It re-parses the address, and for a real IP applies family/version constraints: reject a family the listener forbids (lines 305-312), reject an IPv6 target over SOCKS4 (313-318), reject any SOCKS4 request when IPv4 is forbidden (319-327), and otherwise narrow conn->entry_cfg.ipv4_traffic/ipv6_traffic to tell the exit which family is wanted. Lines 345-355 additionally refuse connecting to a known relay's OR/Dir port (nodelist_reentry_contains) to prevent Tor-over-Tor loops, with a scrubbed warning."
+    },
+    {
+      "file": "corpus/eval/eval_0054_cwe532.c",
+      "lines": "360-403",
+      "code": "if (socks->socks_version == 4)\n        conn->entry_cfg.ipv6_traffic = 0;\n\n      /* Still handling CONNECT. Now, check for exit enclaves.  (Which we\n       * don't do on BEGIN_DIR, or when there is a chosen exit.)\n       */\n      if (!conn->use_begindir && !conn->chosen_exit_name && !circ) {\n        /* see if we can find a suitable enclave exit */\n        const node_t *r =\n          router_find_exact_exit_enclave(socks->address, socks->port);\n        if (r) {",
+      "explanation": "Remaining CONNECT steps: force IPv4-only answers for SOCKS4, optionally pick an enclave exit for the target (router_find_exact_exit_enclave), setting conn->chosen_exit_name to the relay's hex identity (hex_str(r->identity, DIGEST_LEN)) and marking it optional. Then consider_plaintext_ports warns/rejects dangerous plaintext ports (lines 387-389) and rep_hist_note_used_port records the port for prediction. Lines 397-403 handle RESOLVE_PTR (statistics only) and assert against any other command via tor_fragile_assert."
+    },
+    {
+      "file": "corpus/eval/eval_0054_cwe532.c",
+      "lines": "409-433",
+      "code": "base_conn->state = AP_CONN_STATE_CIRCUIT_WAIT;\n\n    /* If we were given a circuit to attach to, try to attach. Otherwise,\n     * try to find a good one and attach to that. */\n    int rv;\n    if (circ) {\n      rv = connection_ap_handshake_attach_chosen_circuit(conn, circ, cpath);\n    } else {\n      /* We'll try to attach it at the next event loop, or whenever\n       * we call connection_ap_attach_pending() */\n      connection_ap_mark_as_pending_circuit(conn);\n      rv = 0;\n    }",
+      "explanation": "After all validation for non-onion targets passes, the connection transitions to AP_CONN_STATE_CIRCUIT_WAIT and is attached: if a circuit was supplied it attaches directly via connection_ap_handshake_attach_chosen_circuit (with the crypt path), otherwise it is queued for attachment at the next event loop. Lines 427-433 translate a negative rv into a marked/unattached failure returning -1, else return 0 (waiting/attached both OK)."
+    },
+    {
+      "file": "corpus/eval/eval_0054_cwe532.c",
+      "lines": "434-463",
+      "code": "} else {\n    /* If we get here, it's a request for a .onion address! */\n\n    /* We don't support v2 onions anymore. Log a warning and bail. */\n    if (addresstype == ONION_V2_HOSTNAME) {\n      static bool log_once = false;\n      if (!log_once) {",
+      "explanation": "The .onion branch. ONION_V2_HOSTNAME is refused (v2 onions are deprecated) with a one-time global warning, an escaped() control event carrying the address, and the SOCKS5_HS_BAD_ADDRESS extended error. Otherwise the address is asserted to be ONION_V3_HOSTNAME and (non-automapped) and handed to connection_ap_handle_onion for the hidden-service rendezvous flow. The trailing return 0 at line 463 is documented as unreachable."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/eval/eval_0054_cwe532.c",
+      "lines": "37-38",
+      "code": "control_event_client_status(LOG_WARN, \"SOCKS_BAD_HOSTNAME HOSTNAME=%s\",\n                                escaped(socks->address));",
+      "explanation": "Every SOCKS_BAD_HOSTNAME control event (lines 37-38, 67-68, 82-83, 112-113, 159-160, 448-449) carries escaped(socks->address). escaped() only C-escapes the string for safe printing; unlike safe_str_client() it does NOT honour the SafeLogging option, so the full raw destination hostname the user tried to reach is written verbatim into the control-port event stream. Any controller, and anything that persists control-port output to disk, therefore records the sensitive destination even when the operator enabled SafeLogging — which the parallel log_warn calls on the very same code paths deliberately scrub. This is the CWE-532 information-exposure contract for this function: an attacker who can read the control event log (or a controller with weaker trust than the tor process) learns the exact addresses the user requested. Whether this is acceptable depends on the control-port trust model (controllers such as Tor Browser legitimately need the hostname), so the fix must ensure control-event exposure is intended and that the control channel is at least as trusted as the address is sensitive."
+    },
+    {
+      "file": "corpus/eval/eval_0054_cwe532.c",
+      "lines": "100-100",
+      "code": "conn->chosen_exit_name = tor_strdup(s+1);",
+      "explanation": "conn->chosen_exit_name is assigned a fresh tor_strdup allocation at lines 100 and 121 (and later 379-380) without first freeing any previous value. If this field can already be non-NULL when the function runs (e.g. a re-entered or re-driven handshake, or a rewrite path that set it earlier), the prior allocation leaks (CWE-401). This is a latent, implementation-level concern: the shown code never frees chosen_exit_name before overwriting it, so the invariant 'chosen_exit_name is NULL on entry to each assignment' must hold. Confirm the caller guarantees it or add a tor_free before the strdup."
+    },
+    {
+      "file": "corpus/eval/eval_0054_cwe532.c",
+      "lines": "125-125",
+      "code": "node_get_address_string(node, socks->address, sizeof(socks->address));",
+      "explanation": "Both this write and the strlcpy at line 230 bound their copy with sizeof(socks->address). That is correct ONLY if socks_request_t.address is a fixed-size array member (in Tor it is char address[MAX_SOCKS_ADDR_LEN]). If the struct ever changed address to a pointer, sizeof would silently become the pointer size (4/8) and both copies would truncate or, for a wrong-sized destination, become an out-of-bounds write (CWE-787). No overflow exists as written; the finding is the fragile contract: the safety of these copies depends entirely on address remaining a fixed array of the assumed size. Confirm the declaration and that MAX_SOCKS_ADDR_LEN is large enough for node_get_address_string output."
+    },
+    {
+      "file": "corpus/eval/eval_0054_cwe532.c",
+      "lines": "88-88",
+      "code": "tor_assert(!automap);",
+      "explanation": "There are several tor_assert(!automap) / tor_assert(addresstype == ONION_V3_HOSTNAME) calls (lines 88, 238, 243, 458-459) plus tor_fragile_assert at 402. tor_assert aborts the process on failure. These encode invariants that the rewrite stage is supposed to guarantee (an automapped address should never reach a .exit or literal-IP path). If any invariant is violated by a crafted address-map state, the assert becomes a remote-ish denial of service (CWE-617): a single request crashes the client. The invariant to uphold is that connection_ap_handshake_rewrite can never emit automap=true together with EXIT_HOSTNAME/literal-IP/ONION_V3 classification; confirm no reachable rewrite path produces that combination."
+    },
+    {
+      "file": "corpus/eval/eval_0054_cwe532.c",
+      "lines": "36-36",
+      "code": "if (!parse_extended_hostname(socks->address, &addresstype)) {",
+      "explanation": "parse_extended_hostname mutates socks->address in place (stripping .exit/.onion suffixes) and the code afterwards relies on strrchr/*s=0/strlcpy operating within the same fixed buffer. The implementation (not shown) must keep the string NUL-terminated and within MAX_SOCKS_ADDR_LEN while editing it; any off-by-one or missing terminator there would turn the subsequent strrchr(socks->address,'.') and *s=0 (line 107) into an out-of-bounds read/write (CWE-125/CWE-787). This is latent in the not-provided parser but the caller here trusts its output implicitly. Confirm parse_extended_hostname never leaves address unterminated or over-length."
+    }
+  ],
+  "summary": "This is the client-side Tor SOCKS entry-attach function; it validates an attacker-supplied destination and attaches the stream. It is largely well-defended: every plain log message scrubs the address with safe_str_client(), and both in-place copies into socks->address are size-bounded with sizeof(). The residual security contract is CWE-532 information exposure — the SOCKS_BAD_HOSTNAME control-port events emit the raw, unscrubbed hostname via escaped() regardless of SafeLogging — plus latent implementation contracts around chosen_exit_name leakage, the fixed-array assumption behind sizeof(socks->address), and abort-on-invariant tor_assert calls.",
+  "reviewed_anchors": [
+    {"anchor": "connection_ap_handshake_rewrite_and_attach(entry_connection_t*, origin_circuit_t*, crypt_path_t*) signature (2-4)", "disposition": "dismissed", "reason": "Entry signature; all params internal Tor objects, no buffer/length contract itself."},
+    {"anchor": "socks = conn->socks_request (6); socks->address/port/command (untrusted source)", "disposition": "finding", "reason": "socks->address is the attacker-controlled, sensitive string driving logging and copies."},
+    {"anchor": "rewrite_result_t rr + memset(&rr,0,sizeof(rr)) (10,15)", "disposition": "dismissed", "reason": "Zero-initialized result struct; sizeof over a local struct is correct."},
+    {"anchor": "rr.should_close / rr.end_reason & END_STREAM_REASON_MASK (18-26)", "disposition": "dismissed", "reason": "Enum/flag masking on a trusted result; no bound or overflow."},
+    {"anchor": "rr.map_expires / rr.automap / rr.exit_source (29-31)", "disposition": "dismissed", "reason": "Provenance/state values consumed by later gates; used correctly (automap feeds asserts, flagged separately)."},
+    {"anchor": "parse_extended_hostname(socks->address, &addresstype) (36)", "disposition": "finding", "reason": "In-place mutation of the untrusted buffer; downstream strrchr/*s=0 depend on its termination/length invariant."},
+    {"anchor": "control_event_client_status(..., escaped(socks->address)) (37-38,67-68,82-83,112-113,159-160,448-449)", "disposition": "finding", "reason": "Raw unscrubbed hostname sent to control port bypassing SafeLogging — CWE-532."},
+    {"anchor": "SOCKS5_HS_BAD_ADDRESS extended error code (40,453)", "disposition": "dismissed", "reason": "Constant error code stored in a struct field; no data-flow risk."},
+    {"anchor": "excludeset = StrictNodes ? ExcludeExitNodesUnion_ : ExcludeExitNodes (55-56)", "disposition": "dismissed", "reason": "Policy pointer selection; correctly enforced at line 138."},
+    {"anchor": "exit_source == ADDRMAPSRC_AUTOMAP / DNS / NONE / TRACKEXIT gates (61,76,103)", "disposition": "dismissed", "reason": "Provenance checks that reject unsafe .exit sources; behave as intended."},
+    {"anchor": "tor_assert(!automap) / tor_assert(addresstype==ONION_V3) / tor_fragile_assert (88,238,243,402,458-459)", "disposition": "finding", "reason": "Abort-on-invariant; a violated rewrite invariant crashes the process (CWE-617 DoS)."},
+    {"anchor": "s = strrchr(socks->address,'.'); *s = 0 (95,107)", "disposition": "dismissed", "reason": "NUL-check via if(s) and s[1] before deref; write stays inside the buffer given proper termination (covered by parse anchor)."},
+    {"anchor": "conn->chosen_exit_name = tor_strdup(...) (100,121,379-380)", "disposition": "finding", "reason": "Overwrites the field without freeing a prior value — potential memory leak (CWE-401)."},
+    {"anchor": "node_get_by_nickname(conn->chosen_exit_name,0) (101,122)", "disposition": "dismissed", "reason": "Lookup on a heap-duped string; result NULL-checked at line 130."},
+    {"anchor": "conn->chosen_exit_retries = TRACKHOSTEXITS_RETRIES (105)", "disposition": "dismissed", "reason": "Constant assignment to an int field; no risk."},
+    {"anchor": "node_get_address_string(node, socks->address, sizeof(socks->address)) (125)", "disposition": "finding", "reason": "Size-bounded write whose safety relies on address being a fixed array of assumed size."},
+    {"anchor": "routerset_contains_node(excludeset, node) (138)", "disposition": "dismissed", "reason": "Exclusion check; enforces policy, no memory contract."},
+    {"anchor": "address_is_invalid_destination(socks->address, 1) (158)", "disposition": "dismissed", "reason": "Input sanitizer that rejects bad hostnames; defensive, not a risk itself."},
+    {"anchor": "entry_cfg.dns_request/ipv4_traffic/ipv6_traffic policy gates (179-217,305-335)", "disposition": "dismissed", "reason": "Boolean policy flags gating traffic; logic checks, no overflow."},
+    {"anchor": "tor_addr_parse(&dummy_addr/&answer/&addr, socks->address) (192,228,261,301)", "disposition": "dismissed", "reason": "Parses into a fixed tor_addr_t; return code checked; no caller-supplied length."},
+    {"anchor": "strlcpy(socks->address, rr.orig_address, sizeof(socks->address)) (230)", "disposition": "dismissed", "reason": "Size-bounded copy; covered by the fixed-array contract of the node_get_address_string finding."},
+    {"anchor": "socks->port == 0 / socks->port usage (245,346,372,388,395)", "disposition": "dismissed", "reason": "Scalar port value validated (reject 0); no buffer contract."},
+    {"anchor": "RATELIM_INIT(WARN_INTRVL_LOOP=300) / WARN_INTRVL_PRIV=300 + rate_limit_log/tor_free(m) (266-287)", "disposition": "dismissed", "reason": "Rate-limited logging; heap string m is freed on every branch, no leak."},
+    {"anchor": "network_reentry_is_allowed() / nodelist_reentry_contains(&addr, socks->port) (345-346)", "disposition": "dismissed", "reason": "Tor-over-Tor loop guard; policy check on parsed addr."},
+    {"anchor": "hex_str(r->identity, DIGEST_LEN) (380)", "disposition": "dismissed", "reason": "Fixed DIGEST_LEN hex of a relay identity; constant length, trusted source."},
+    {"anchor": "consider_plaintext_ports(conn, socks->port) (388)", "disposition": "dismissed", "reason": "Dangerous-port policy check; returns -1 to reject, handled."},
+    {"anchor": "AP_CONN_STATE_CIRCUIT_WAIT + attach/mark-pending (409-421)", "disposition": "dismissed", "reason": "State transition and attach dispatch; rv checked, failure marks connection."},
+    {"anchor": "ONION_V2_HOSTNAME reject (log_once) / connection_ap_handle_onion (438-460)", "disposition": "dismissed", "reason": "v2 deprecation reject and v3 handoff; escaped()-in-control-event exposure already captured by the CWE-532 finding."}
+  ],
+  "findings": [
+    {
+      "title": "Raw destination hostname exposed to control port, bypassing SafeLogging",
+      "anchor": "control_event_client_status(LOG_WARN, \"SOCKS_BAD_HOSTNAME HOSTNAME=%s\", escaped(socks->address))",
+      "file": "corpus/eval/eval_0054_cwe532.c",
+      "line": "37-38",
+      "code": "control_event_client_status(LOG_WARN, \"SOCKS_BAD_HOSTNAME HOSTNAME=%s\",\n                                escaped(socks->address));",
+      "bug_class": "Insertion of sensitive information (destination hostname) into log/event stream",
+      "cwe": "CWE-532",
+      "severity": "medium",
+      "where_it_lives": "corpus/eval/eval_0054_cwe532.c (control_event emission) and the control-port/log implementation (file not provided)",
+      "invariant": "Any sink that records the user's requested destination must scrub it under SafeLogging exactly as the log_warn paths do with safe_str_client(); escaped() must not be the only sanitizer for a sensitive address on a channel that can be persisted or read by a less-trusted party.",
+      "failure_mode": "On every bad-hostname / bad-address path (lines 37-38, 67-68, 82-83, 112-113, 159-160, 448-449) the SOCKS_BAD_HOSTNAME control event emits escaped(socks->address), i.e. the full raw hostname the user tried to reach. escaped() does not honour SafeLogging, so unlike the sibling log_warn calls (which use safe_str_client) the sensitive destination is written verbatim to the control-port event stream. A controller, or anyone reading persisted control output, learns exact browsing destinations even when the operator enabled SafeLogging.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm whether control-event exposure of the raw hostname is intended for this event type and whether the control channel is guaranteed at least as trusted as the address is sensitive; if not, route the address through safe_str_client() or a scrubbing helper before emitting the event, and verify no control-port sink is logged to disk unscrubbed."
+    },
+    {
+      "title": "Fixed-array assumption behind sizeof(socks->address)-bounded copies",
+      "anchor": "node_get_address_string(node, socks->address, sizeof(socks->address))",
+      "file": "corpus/eval/eval_0054_cwe532.c",
+      "line": "125",
+      "code": "node_get_address_string(node, socks->address, sizeof(socks->address));",
+      "bug_class": "Out-of-bounds write if sizeof no longer measures the destination buffer",
+      "cwe": "CWE-787",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0054_cwe532.c (line 125 and strlcpy at line 230); socks_request_t definition (file not provided)",
+      "invariant": "socks_request_t.address must remain a fixed-size char array of at least the length node_get_address_string / strlcpy can produce, so that sizeof(socks->address) is the true byte capacity of the destination.",
+      "failure_mode": "Both the node_get_address_string write (line 125) and strlcpy(socks->address, rr.orig_address, sizeof(socks->address)) (line 230) use sizeof(socks->address) as the bound. This is correct only while address is a fixed array. If the struct member became a pointer, sizeof would evaluate to the pointer width (4/8 bytes) and either truncate the address or, for a mismatched buffer, permit an out-of-bounds write of relay/original-address data. No overflow exists as written — this flags the fragile contract, not a live bug.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify socks_request_t.address is declared as char address[MAX_SOCKS_ADDR_LEN] (or similar fixed array) and that MAX_SOCKS_ADDR_LEN is large enough for node_get_address_string output; add a compile-time assertion that sizeof(socks->address) is the array size."
+    },
+    {
+      "title": "conn->chosen_exit_name overwritten without freeing prior allocation",
+      "anchor": "conn->chosen_exit_name = tor_strdup(s+1)",
+      "file": "corpus/eval/eval_0054_cwe532.c",
+      "line": "100",
+      "code": "conn->chosen_exit_name = tor_strdup(s+1);",
+      "bug_class": "Memory leak on overwrite of an owning pointer",
+      "cwe": "CWE-401",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0054_cwe532.c (lines 100, 121, 379-380); ownership of chosen_exit_name in the caller (file not provided)",
+      "invariant": "conn->chosen_exit_name must be NULL (or already freed) before each assignment, or each assignment must tor_free the previous value, so the owning pointer is never overwritten while it still holds an allocation.",
+      "failure_mode": "chosen_exit_name is assigned a fresh tor_strdup at lines 100, 121 and 379-380 with no preceding tor_free. If the field is ever already populated when the function runs — a re-driven/re-entered handshake or a rewrite path that set it earlier — the previous heap string leaks. Impact is a small, potentially attacker-influenced memory leak (repeatable per request), not memory corruption.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm chosen_exit_name is guaranteed NULL on entry to each assignment (caller resets it or connection is fresh); otherwise add tor_free(conn->chosen_exit_name) before each tor_strdup."
+    },
+    {
+      "title": "Abort-on-invariant tor_assert on attacker-adjacent state",
+      "anchor": "tor_assert(!automap)",
+      "file": "corpus/eval/eval_0054_cwe532.c",
+      "line": "88",
+      "code": "tor_assert(!automap);",
+      "bug_class": "Reachable assertion / process abort (denial of service)",
+      "cwe": "CWE-617",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0054_cwe532.c (lines 88, 238, 243, 458-459; tor_fragile_assert at 402); connection_ap_handshake_rewrite (file not provided)",
+      "invariant": "The rewrite stage must never classify an automapped address as EXIT_HOSTNAME, a literal IP for RESOLVE/CONNECT, or ONION_V3 — i.e. the (automap, addresstype) combinations these asserts forbid must be unreachable for any crafted address-map/SOCKS input.",
+      "failure_mode": "If a crafted address-map state or SOCKS input drives the rewrite to emit automap=true together with a .exit/literal-IP/onion-v3 classification, one of the tor_assert calls fires and aborts the whole tor process, terminating all circuits for a single request. This is a fatal-assertion DoS whose reachability depends on the not-shown rewrite logic upholding the invariant.",
+      "cve_analog": "",
+      "what_to_confirm": "Trace connection_ap_handshake_rewrite to prove no reachable path sets rr.automap while producing EXIT_HOSTNAME / literal-IP / ONION_V3 classification; consider a non-fatal reject instead of tor_assert on these paths."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm whether SOCKS_BAD_HOSTNAME control events are meant to carry the raw (escaped-only) hostname, and whether the control channel is trusted enough for it; otherwise scrub with safe_str_client() before emitting.",
+    "Verify socks_request_t.address is a fixed char array and MAX_SOCKS_ADDR_LEN exceeds node_get_address_string output, so sizeof()-bounded copies at lines 125 and 230 are safe.",
+    "Confirm conn->chosen_exit_name is NULL before each tor_strdup at lines 100/121/379-380, or add tor_free to avoid the leak.",
+    "Prove the (automap, addresstype) combinations asserted at lines 88/238/243/458-459 are unreachable, so no crafted request can trigger a fatal tor_assert DoS.",
+    "Audit parse_extended_hostname to ensure it always leaves socks->address NUL-terminated and within MAX_SOCKS_ADDR_LEN so strrchr/*s=0 (95-107) stay in bounds.",
+    "Check that every log site touching socks->address uses safe_str_client (it does in the shown code) and that no new log line reintroduces the raw address."
+  ]
+}

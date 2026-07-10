@@ -1,0 +1,162 @@
+{
+  "subsystem": "nanopb (Protocol Buffers for embedded systems) decoder — specifically pb_release_union_field(), the helper in pb_decode.c that releases the previously-set member of a protobuf 'oneof'/union field before a newly-arriving member of that same oneof is decoded into the shared union storage. Its job is to free the old member's heap allocation (for POINTER-type fields) so that switching which oneof member is active does not leak the prior allocation, then leave the union in a clean state for the incoming member.",
+  "provenance": "Identified as nanopb by its distinctive API surface: the pb_istream_t stream type, the pb_field_iter_t field-iterator, the pb_size_t tag type, and the helper calls pb_field_iter_find(), pb_release_single_field(), the PB_ATYPE()/PB_ATYPE_POINTER access-type macros, and the PB_RETURN_ERROR() error macro — all part of nanopb's public/internal API. The inline comments 'Previous which_ value' / 'New which_ value' (lines 5-6) name nanopb's oneof discriminator field which_<oneofname>, confirming this is oneof/union release logic. The sample banner (line 1, 'primevul_c_validation_0071_fixed') and the corpus filename (train_0201_cwe763.c) indicate this is the fixed variant of a CWE-763 (release of invalid pointer) sample.",
+  "trust_boundary": "The untrusted input is the wire-format protobuf message being decoded through `stream`, plus the state of the destination message struct that nanopb decodes into. The critical hostile value here is old_tag = *(pb_size_t*)field->pSize (line 5): it is read from the which_ discriminator inside the destination message memory, not freshly parsed. When decoding merges into a pre-existing / partially-populated / caller-supplied struct, the which_ discriminator and the union payload are attacker-influenced or application-supplied and can be inconsistent (a set discriminator over uninitialized or mismatched union bytes). The invariant that the union payload actually matches the discriminator is NOT re-established by this function; it is assumed. field->tag (new_tag) originates from the just-parsed wire tag and is likewise attacker-controlled.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0201_cwe763.c",
+      "lines": "2-6",
+      "code": "static bool pb_release_union_field(pb_istream_t *stream, pb_field_iter_t *field)\n{\n    pb_field_iter_t old_field = *field;\n    pb_size_t old_tag = *(pb_size_t*)field->pSize; /* Previous which_ value */\n    pb_size_t new_tag = field->tag; /* New which_ value */",
+      "explanation": "A file-local (static) helper returning bool (true=ok, false=error already recorded on stream). It receives `stream` (the decode stream, used only for error reporting here) and `field`, a pb_field_iter_t positioned at the NEW oneof member currently being decoded. Line 4 takes a full by-value copy of the iterator into old_field so the function can reposition that copy to a different member without disturbing the caller's iterator. Line 5 reads old_tag by casting field->pSize to pb_size_t* and dereferencing it: for a oneof, pSize points at the message's which_ discriminator, so this recovers the tag of whichever member was previously stored in the union. Line 6 caches new_tag = field->tag, the tag of the member about to be decoded. The union storage is shared by all members, so before writing the new member nanopb must decide whether the old member needs to be freed."
+    },
+    {
+      "file": "corpus/train/train_0201_cwe763.c",
+      "lines": "8-12",
+      "code": "    if (old_tag == 0)\n        return true; /* Ok, no old data in union */\n\n    if (old_tag == new_tag)\n        return true; /* Ok, old data is of same type => merge */",
+      "explanation": "Two fast-path exits. Line 8-9: a which_ value of 0 means no member has been set yet (nanopb reserves 0 for 'unset'), so there is nothing to release and the function returns success. Line 11-12: if the previously-stored member has the same tag as the incoming one, the two are the same oneof member and nanopb intentionally merges (decodes on top of the existing allocation rather than freeing and reallocating), so again nothing is released. Only when old_tag is non-zero AND differs from new_tag does the function proceed to actually release the previous member — this is the case where the active union member is being switched to a different type."
+    },
+    {
+      "file": "corpus/train/train_0201_cwe763.c",
+      "lines": "14-17",
+      "code": "    /* Release old data. The find can fail if the message struct contains\n     * invalid data. */\n    if (!pb_field_iter_find(&old_field, old_tag))\n        PB_RETURN_ERROR(stream, \"invalid union tag\");",
+      "explanation": "To release the old member correctly, nanopb needs the field descriptor for old_tag (its type, size, and access type), not the descriptor of the new member. pb_field_iter_find(&old_field, old_tag) repositions the copied iterator onto the field whose tag equals old_tag. The comment acknowledges this can fail 'if the message struct contains invalid data'. If old_tag does not name any field in this message, find returns false and PB_RETURN_ERROR records 'invalid union tag' on the stream and returns false. Importantly, this only validates that old_tag corresponds to a KNOWN field number in the descriptor set — it does not and cannot validate that the union storage actually holds a live, correctly-typed value for that field."
+    },
+    {
+      "file": "corpus/train/train_0201_cwe763.c",
+      "lines": "19",
+      "code": "    pb_release_single_field(&old_field);",
+      "explanation": "With old_field now describing the previously-active member, pb_release_single_field frees it. For a POINTER access-type field this dereferences the union storage as a pointer (*old_field.pField) and free()s that allocation, recursively releasing nested submessage/string/bytes/repeated allocations as the descriptor dictates. Because the union storage is shared, old_field.pField and the new field's pField alias the same memory location, just interpreted under different field descriptors. This is the single security-critical operation in the function: it hands attacker-influenced memory (interpreted per old_tag) to the deallocator."
+    },
+    {
+      "file": "corpus/train/train_0201_cwe763.c",
+      "lines": "21-27",
+      "code": "    if (PB_ATYPE(field->type) == PB_ATYPE_POINTER)\n    {\n        /* Initialize the pointer to NULL to make sure it is valid\n         * even in case of error return. */\n        *(void**)field->pField = NULL;\n        field->pData = NULL;\n    }",
+      "explanation": "After the old member is freed, and only when the NEW field's access type is PB_ATYPE_POINTER, the shared union storage is cleared: *(void**)field->pField = NULL zeroes the pointer word in the union so the freshly-decoded member starts from a NULL (not dangling) pointer, and field->pData = NULL updates the iterator's cached data pointer to match. The comment states the intent: leave a valid NULL even if a later error occurs, preventing a subsequent free of a now-freed pointer. Note the reset uses field (the new iterator), not old_field — correct, because both alias the same union offset and the new member is what will be decoded next. For non-pointer access types (STATIC/CALLBACK) there is no owned allocation, so no reset is needed."
+    },
+    {
+      "file": "corpus/train/train_0201_cwe763.c",
+      "lines": "29-30",
+      "code": "    return true;\n}",
+      "explanation": "Success: the previous oneof member has been released and (for pointer fields) the union pointer has been re-initialized to NULL, ready for the new member to be decoded into the shared storage. The function is a pure side-effecting cleanup step invoked from nanopb's oneof-decoding path."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0201_cwe763.c",
+      "lines": "5",
+      "code": "    pb_size_t old_tag = *(pb_size_t*)field->pSize; /* Previous which_ value */",
+      "explanation": "old_tag is not parsed from the wire under bounds checks; it is read straight out of the destination message's which_ discriminator via a raw cast-and-dereference of field->pSize. Everything downstream (which field descriptor is selected at line 16, which pointer is freed at line 19) is driven by this value. If the caller decodes into a struct that was not zero-initialized, or into one whose which_ was set without the corresponding union member being validly populated, old_tag becomes a stale/attacker-influenced selector. The invariant the implementation depends on — but does not enforce here — is that a non-zero which_ always accompanies a fully-initialized union member of exactly that type. There is also a latent NULL/misalignment concern: pSize is assumed non-NULL and correctly aligned for pb_size_t; a malformed field iterator would make this a NULL/unaligned read (CWE-476)."
+    },
+    {
+      "file": "corpus/train/train_0201_cwe763.c",
+      "lines": "16-19",
+      "code": "    if (!pb_field_iter_find(&old_field, old_tag))\n        PB_RETURN_ERROR(stream, \"invalid union tag\");\n\n    pb_release_single_field(&old_field);",
+      "explanation": "The only guard before the free is pb_field_iter_find validating that old_tag names a KNOWN field. It does not verify that the union actually contains a live, properly-typed allocation for that field. If the destination struct has which_ set to a valid field number but the union storage holds uninitialized stack/heap garbage (e.g. the struct was memset to non-zero, or only the discriminator was assigned by application code, or a prior partial decode left it inconsistent), pb_release_single_field at line 19 will interpret those garbage bytes as a heap pointer and free() them. That is a release of an invalid/arbitrary pointer (CWE-763): depending on the bytes it is a crash, a heap-metadata corruption, or an attacker-directed free that can be escalated to arbitrary write. The invariant: the destination message MUST be zero-initialized (via nanopb's _init_zero / _init_default) so that any non-zero which_ is backed by a genuinely allocated member; when that contract is broken this line frees garbage."
+    },
+    {
+      "file": "corpus/train/train_0201_cwe763.c",
+      "lines": "14-19",
+      "code": "    /* Release old data. The find can fail if the message struct contains\n     * invalid data. */\n    if (!pb_field_iter_find(&old_field, old_tag))\n        PB_RETURN_ERROR(stream, \"invalid union tag\");\n\n    pb_release_single_field(&old_field);",
+      "explanation": "Type-confusion angle (CWE-843): the union is a single block of storage overlaid by many differently-typed members. old_tag (the discriminator) and the actual bytes in the union can disagree — the find validates the discriminator but the release interprets the SHARED bytes strictly according to old_tag's descriptor. If the bytes were last written as a different oneof member (e.g. a scalar/bytes member) but which_ says old_tag is a POINTER submessage, pb_release_single_field will treat non-pointer bytes as a pointer and recurse into free()/nested release under the wrong layout. This is the same class of failure that motivated hardening nanopb's oneof release path: the discriminator must be trusted to describe the payload, and nothing here re-establishes that trust for attacker-supplied structs."
+    },
+    {
+      "file": "corpus/train/train_0201_cwe763.c",
+      "lines": "21-26",
+      "code": "    if (PB_ATYPE(field->type) == PB_ATYPE_POINTER)\n    {\n        /* Initialize the pointer to NULL to make sure it is valid\n         * even in case of error return. */\n        *(void**)field->pField = NULL;\n        field->pData = NULL;",
+      "explanation": "The post-release NULL reset is gated on the NEW field being PB_ATYPE_POINTER. This is the fix that prevents a later double-free of the just-freed union pointer, but it is asymmetric: it keys off the new member's access type, not the old member's. In a correctly-typed oneof all members of a given oneof share the same access type, so this holds; but if that assumption is violated (mixed access types, or the union just freed a pointer while the incoming field is non-pointer), the freed pointer word in the union is left dangling rather than NULLed, and a subsequent release or the application reading the union could double-free or use-after-free (CWE-416/CWE-415). The invariant: after freeing a pointer member the shared union pointer slot must be NULLed unconditionally; here it is only NULLed when the incoming member is itself a pointer type."
+    },
+    {
+      "file": "corpus/train/train_0201_cwe763.c",
+      "lines": "17",
+      "code": "        PB_RETURN_ERROR(stream, \"invalid union tag\");",
+      "explanation": "PB_RETURN_ERROR writes the error string into stream (typically stream->errmsg) before returning false. If this helper is ever reached with a NULL stream (or a stream whose error slot is not writable), the macro dereferences it and crashes at the log/error site (CWE-476). This is a low-severity, latent robustness concern rather than a primary attack primitive, but it means the 'invalid union tag' path is only safe if stream is guaranteed non-NULL by every caller."
+    }
+  ],
+  "summary": "This nanopb oneof-release helper frees the previously-active union member (line 19) based solely on the which_ discriminator read out of destination-struct memory (line 5), validating only that the discriminator names a known field (line 16) — not that the union holds a live, correctly-typed allocation. Against a non-zero-initialized or inconsistent destination struct this is a release of an invalid/type-confused pointer (CWE-763/CWE-843), an attacker-directable free. The POINTER-gated NULL reset (lines 21-26) is the mitigation that prevents an immediate double-free, but it is asymmetric on the new member's access type; overall risk hinges on the caller upholding nanopb's zero-initialization contract.",
+  "reviewed_anchors": [
+    {"anchor": "static bool pb_release_union_field(pb_istream_t *stream, pb_field_iter_t *field) — signature (line 2)", "disposition": "dismissed", "reason": "Internal cleanup helper; risk lives in the body, not the signature shape."},
+    {"anchor": "pb_field_iter_t old_field = *field; (line 4)", "disposition": "dismissed", "reason": "By-value copy so repositioning does not corrupt caller's iterator — correct and safe."},
+    {"anchor": "pb_size_t old_tag = *(pb_size_t*)field->pSize; (line 5)", "disposition": "finding", "reason": "Attacker-influenced discriminator read from destination memory; drives the free at line 19 and a raw pSize deref."},
+    {"anchor": "pb_size_t new_tag = field->tag; (line 6)", "disposition": "dismissed", "reason": "Used only for the equality comparison at line 11; not itself a memory-access driver."},
+    {"anchor": "if (old_tag == 0) return true; (lines 8-9)", "disposition": "dismissed", "reason": "Correct unset-guard; prevents releasing when no member is set."},
+    {"anchor": "if (old_tag == new_tag) return true; (lines 11-12)", "disposition": "dismissed", "reason": "Correct merge fast-path; avoids freeing storage that will be re-decoded in place."},
+    {"anchor": "if (!pb_field_iter_find(&old_field, old_tag)) (line 16)", "disposition": "finding", "reason": "Only validates that old_tag is a known field, not that the union payload matches/was initialized — the type-confusion gate."},
+    {"anchor": "PB_RETURN_ERROR(stream, \"invalid union tag\"); (line 17)", "disposition": "finding", "reason": "Macro dereferences stream to record the error; NULL/invalid stream crashes at the error site (latent, low)."},
+    {"anchor": "pb_release_single_field(&old_field); (line 19)", "disposition": "finding", "reason": "The security-critical free of union storage interpreted per old_tag; releases an invalid pointer if the destination struct is not properly initialized."},
+    {"anchor": "if (PB_ATYPE(field->type) == PB_ATYPE_POINTER) (line 21)", "disposition": "finding", "reason": "Gates the NULL reset on the NEW member's access type; asymmetric if old/new access types differ."},
+    {"anchor": "*(void**)field->pField = NULL; (line 25)", "disposition": "finding", "reason": "Double-free mitigation clearing the union pointer; only runs on the POINTER branch, hence the asymmetry concern."},
+    {"anchor": "field->pData = NULL; (line 26)", "disposition": "dismissed", "reason": "Keeps iterator cache consistent with the union reset at line 25; no independent contract."},
+    {"anchor": "return true; (line 29)", "disposition": "dismissed", "reason": "Success return; no security contract."}
+  ],
+  "findings": [
+    {
+      "title": "Release of invalid/uninitialized union pointer driven by discriminator read from destination memory",
+      "anchor": "pb_release_single_field(&old_field); driven by old_tag = *(pb_size_t*)field->pSize",
+      "file": "corpus/train/train_0201_cwe763.c",
+      "line": "5,19",
+      "code": "pb_size_t old_tag = *(pb_size_t*)field->pSize; /* Previous which_ value */\n...\n    pb_release_single_field(&old_field);",
+      "bug_class": "Release of invalid pointer / free of uninitialized pointer",
+      "cwe": "CWE-763",
+      "severity": "high",
+      "where_it_lives": "implementation (file not provided) — pb_release_single_field() in nanopb pb_decode.c",
+      "invariant": "A non-zero which_ discriminator (old_tag) must always be accompanied by a fully-initialized union member of exactly that field's type; the destination message must be zero-initialized (nanopb _init_zero/_init_default) before decode so any non-zero discriminator is backed by a real allocation.",
+      "failure_mode": "When decoding into a struct that is not zero-initialized (or whose which_ was set by application code without validly populating the union, or left inconsistent by a prior partial decode), old_tag names a valid field but the union holds garbage. pb_release_single_field then interprets those bytes as a heap pointer and free()s them, yielding a crash, heap corruption, or attacker-directed free that can escalate to arbitrary write. pb_field_iter_find only proves the tag is known, not that the payload is a live allocation.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm every caller passes a zero-initialized destination struct, and check whether pb_release_single_field performs any NULL/validity check on *pField before free (nanopb frees NULL safely but not arbitrary bytes); confirm no code path sets which_ without initializing the union member."
+    },
+    {
+      "title": "Discriminator/payload type confusion — find validates tag existence, not that union bytes match the type",
+      "anchor": "if (!pb_field_iter_find(&old_field, old_tag)) ... pb_release_single_field(&old_field);",
+      "file": "corpus/train/train_0201_cwe763.c",
+      "line": "16-19",
+      "code": "if (!pb_field_iter_find(&old_field, old_tag))\n        PB_RETURN_ERROR(stream, \"invalid union tag\");\n\n    pb_release_single_field(&old_field);",
+      "bug_class": "Type confusion between union discriminator and union payload",
+      "cwe": "CWE-843",
+      "severity": "high",
+      "where_it_lives": "implementation (file not provided) — pb_release_single_field() interprets shared union storage per old_tag's descriptor",
+      "invariant": "The which_ discriminator must faithfully describe the type currently stored in the shared union; the release descriptor selected by old_tag must match the actual layout of the bytes in the union.",
+      "failure_mode": "The union overlays many differently-typed members on one storage block. If the bytes were last written as one member type but old_tag selects a different (e.g. POINTER submessage) descriptor, pb_release_single_field reads/free()s/recurses under the wrong layout — treating non-pointer bytes as a pointer or misreading nested lengths. The find at line 16 validates only that old_tag is a known field number, providing no guarantee the payload matches, so a corrupt/attacker-influenced discriminator produces a type-confused release.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify that nanopb guarantees which_ and the union payload cannot diverge across all decode/merge/error paths, and that pb_release_single_field cannot be reached with a descriptor mismatched to the bytes (e.g. after an earlier failed/partial oneof decode)."
+    },
+    {
+      "title": "Asymmetric NULL reset — union pointer only cleared when the new member is POINTER type",
+      "anchor": "if (PB_ATYPE(field->type) == PB_ATYPE_POINTER) { *(void**)field->pField = NULL; field->pData = NULL; }",
+      "file": "corpus/train/train_0201_cwe763.c",
+      "line": "21-26",
+      "code": "if (PB_ATYPE(field->type) == PB_ATYPE_POINTER)\n    {\n        /* Initialize the pointer to NULL to make sure it is valid\n         * even in case of error return. */\n        *(void**)field->pField = NULL;\n        field->pData = NULL;",
+      "bug_class": "Dangling pointer / potential double-free (free without unconditional pointer reset)",
+      "cwe": "CWE-416",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided) — subsequent release/decode of the same union storage",
+      "invariant": "After pb_release_single_field frees a POINTER union member, the shared union pointer slot must be NULLed unconditionally so no later release or read observes a dangling pointer.",
+      "failure_mode": "The reset is gated on the NEW field's access type (field->type at line 21), not the freed member's. If the freed member was a pointer but the incoming member is not PB_ATYPE_POINTER (mixed/inconsistent oneof access types), the just-freed pointer word is left dangling in the union; a later pb_release_union_field call, message-wide release, or application read could double-free or use-after-free it. In well-formed uniform oneofs this cannot occur, so severity is medium/latent rather than critical.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm nanopb guarantees all members of a oneof share the same PB_ATYPE, so keying the reset on the new member's access type is always equivalent to keying it on the freed member's; otherwise the reset should be unconditional after a pointer free."
+    },
+    {
+      "title": "Error macro dereferences possibly-NULL stream at the 'invalid union tag' site",
+      "anchor": "PB_RETURN_ERROR(stream, \"invalid union tag\");",
+      "file": "corpus/train/train_0201_cwe763.c",
+      "line": "17",
+      "code": "PB_RETURN_ERROR(stream, \"invalid union tag\");",
+      "bug_class": "NULL pointer dereference at error/log site",
+      "cwe": "CWE-476",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided) — PB_RETURN_ERROR macro expansion (stream->errmsg assignment)",
+      "invariant": "stream must be non-NULL and its error slot writable whenever pb_release_union_field can hit the find-failure path.",
+      "failure_mode": "PB_RETURN_ERROR records the message into stream (e.g. stream->errmsg) before returning false; if invoked with a NULL or invalid stream, the macro dereferences it and crashes precisely on the malformed-input path that reaches the 'invalid union tag' branch, turning an input-validation error into a NULL-deref DoS.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify all callers of pb_release_union_field guarantee a non-NULL stream, and that PB_RETURN_ERROR in this build actually dereferences stream rather than tolerating NULL."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm every decode entry point requires/enforces a zero-initialized destination struct (which_==0 and union==0) so a non-zero old_tag is always backed by a real, correctly-typed allocation before line 19 frees it.",
+    "In pb_release_single_field, verify it NULL-checks *pField (or otherwise tolerates non-pointers) and cannot free arbitrary/garbage bytes when the union was uninitialized.",
+    "Prove which_ discriminator and union payload can never diverge across all merge/error/partial-decode paths (rules out the CWE-843 type-confusion release at lines 16-19).",
+    "Confirm all members of any given oneof share the same PB_ATYPE so the POINTER-gated reset at lines 21-26 always clears a freed pointer; otherwise make the union NULL-reset unconditional after a pointer free.",
+    "Check that pb_field_iter_find with an out-of-range/duplicate old_tag cannot reposition old_field onto a wrongly-sized descriptor that over-reads the union during release.",
+    "Ensure all callers pass a non-NULL stream so PB_RETURN_ERROR at line 17 cannot NULL-deref on the invalid-tag path.",
+    "Verify field->pSize is always a valid, aligned pointer to the which_ field before the raw cast-deref at line 5."
+  ]
+}

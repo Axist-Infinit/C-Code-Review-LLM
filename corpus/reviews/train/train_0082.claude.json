@@ -1,0 +1,146 @@
+{
+  "subsystem": "A daemon PID-file writer: the helper function writepid() opens a pidfile by path, writes the running process's PID as a decimal string, and closes it. This is the routine a long-running server calls at startup (typically after fork/daemonize) to record its PID so init scripts, monitoring, or a later shutdown can find and signal the process.",
+  "provenance": "No SPDX tag or copyright is present in the shown fragment. Identification is by naming and idiom: the function name writepid(), the log_err(\"...: %s\", strerror(errno)) logging convention, and the pidfile/pid_t vocabulary match the utility code of NLnet Labs DNS daemons (NSD / Unbound) and closely-related UNIX daemon codebases. The synthetic filename banner (corpus/train/train_0082_cwe59.c) and the leading comment \"/* sample: primevul_c_validation_0401_vuln */\" mark it as a PrimeVul-derived C sample; that label is metadata about the corpus, not a security assertion I rely on — the code is judged on its merits.",
+  "trust_boundary": "Two inputs cross a trust boundary. (1) The pidfile PATH string: even when it comes from a config file or compile-time default (e.g. /var/run/nsd.pid, /tmp/foo.pid), the DIRECTORY it lives in is frequently world- or group-writable (/tmp, /var/run) and the daemon frequently runs as root. An unprivileged local attacker who can create entries in that directory controls what the last path component resolves to. (2) The filesystem object at that path at open time: fopen(pidfile,\"w\") follows symbolic links and hard links, so the attacker, not the daemon, decides which inode gets truncated and written. The pid value itself is process-local and not attacker-controlled. This is a local privilege/integrity boundary, not a network one.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0082_cwe59.c",
+      "lines": "1-4",
+      "code": "/* sample: primevul_c_validation_0401_vuln */\nwritepid (const char* pidfile, pid_t pid)\n{\n\tFILE* f;",
+      "explanation": "Line 1 is a corpus provenance comment and carries no logic. Line 2 declares the function writepid taking two parameters: pidfile, a const char* holding the filesystem path of the PID file to (over)write, and pid, a pid_t (the numeric process id to record). Note the signature has NO return type before the function name, so under pre-C99 rules the return type defaults to int (implicit-int), yet every control path returns nothing — a mismatch discussed under risks. Line 4 declares f, a stdio FILE* stream handle that will refer to the opened pidfile. The caller is expected to pass a path the daemon is entitled to write and its own PID; the function performs no validation of either."
+    },
+    {
+      "file": "corpus/train/train_0082_cwe59.c",
+      "lines": "6-10",
+      "code": "if ((f = fopen(pidfile, \"w\")) ==  NULL ) {\n\t\tlog_err(\"cannot open pidfile %s: %s\", \n\t\t\tpidfile, strerror(errno));\n\t\treturn;\n\t}",
+      "explanation": "This block opens the pidfile for writing. fopen(pidfile, \"w\") maps to open() with O_WRONLY|O_CREAT|O_TRUNC and default permissions: it CREATES the file if absent, and if it already exists it TRUNCATES it to zero length before writing. Critically, mode \"w\" performs a name-based open that FOLLOWS symbolic links and opens existing hard-linked inodes — there is no O_NOFOLLOW, no O_EXCL, and no directory-safety check. On failure (returns NULL) the code logs the errno-derived reason via log_err and returns early, leaving no file open. On success f is a valid stream to whatever inode the path resolved to. This single call is the entire trust decision for the function."
+    },
+    {
+      "file": "corpus/train/train_0082_cwe59.c",
+      "lines": "11-14",
+      "code": "if(fprintf(f, \"%lu\\n\", (unsigned long)pid) < 0) {\n\t\tlog_err(\"cannot write to pidfile %s: %s\", \n\t\t\tpidfile, strerror(errno));\n\t}",
+      "explanation": "The PID is formatted as an unsigned long decimal followed by a newline and written to the stream. The cast (unsigned long)pid normalizes pid_t (a signed integer type) to a width matching the %lu conversion; for normal positive PIDs this is correct and portable. The return value of fprintf is checked: a negative result signals an output error, which is logged. Note that fprintf writes into stdio's userspace buffer, so a negative return here catches only errors detected at buffering time; a real disk/quota write error may not surface until the buffer is flushed. On the error path the code merely logs and falls through — it does not return, so execution continues to the close below."
+    },
+    {
+      "file": "corpus/train/train_0082_cwe59.c",
+      "lines": "15-16",
+      "code": "fclose(f);\n}",
+      "explanation": "fclose flushes stdio's buffer, closes the underlying file descriptor, and releases the FILE object. This is the point at which buffered PID bytes are actually pushed to the kernel, so it is also where deferred write errors (ENOSPC, EDQUOT, EIO) are reported — via fclose's return value. That return value is discarded, so any error that only manifests at flush/close time is silently lost. Line 16 closes the function body; every path (open-fail return, write-fail fall-through, success) reaches here or the earlier return, so the descriptor is not leaked."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0082_cwe59.c",
+      "lines": "6",
+      "code": "if ((f = fopen(pidfile, \"w\")) ==  NULL ) {",
+      "explanation": "Symbolic-link following (CWE-59). fopen(pidfile,\"w\") opens by name and follows symlinks. If the pidfile lives in an attacker-writable directory (classic cases: /tmp, /var/run before it is locked down) and the daemon runs with elevated privileges, a local attacker pre-creates a symlink at the pidfile path pointing at a victim file (e.g. /etc/passwd, /etc/shadow, a config file, or a device node). When the privileged daemon starts, the \"w\" open follows the link and TRUNCATES the victim to zero, then writes the PID line into it — an arbitrary-file corruption / privilege-escalation primitive driven entirely by the attacker's choice of link target. The implementation MUST refuse to follow untrusted links: open the final component with O_NOFOLLOW (or openat + O_NOFOLLOW relative to a fd for the directory), or ensure the containing directory is not attacker-writable, before writing."
+    },
+    {
+      "file": "corpus/train/train_0082_cwe59.c",
+      "lines": "6",
+      "code": "if ((f = fopen(pidfile, \"w\")) ==  NULL ) {",
+      "explanation": "TOCTOU race and hard-link abuse (CWE-367 / CWE-59). Even if a separate lstat check were added, fopen re-resolves the name, so a check-then-open pattern races: the attacker swaps a benign file for a symlink between the check and the open. Mode \"w\" also cannot express O_EXCL, so it happily writes to a pre-existing attacker-planted HARD link to a victim inode (which no symlink check catches). The safe contract is a single atomic open of the leaf with O_NOFOLLOW (and, where creation semantics allow, O_EXCL/O_CREAT on a private directory), never a name-based open of a path whose parent directory the attacker can populate."
+    },
+    {
+      "file": "corpus/train/train_0082_cwe59.c",
+      "lines": "6",
+      "code": "if ((f = fopen(pidfile, \"w\")) ==  NULL ) {",
+      "explanation": "Unconditional truncation of an existing target (CWE-59 impact / CWE-73 external control of filename). The \"w\" mode truncates before any validation that the object is really the daemon's own regular pidfile. If pidfile (via config, command line, or a stale/attacker-influenced value) names an existing important regular file, that file's contents are destroyed even absent a symlink. The invariant is that the destination must be verified to be the intended pidfile (right owner, regular file, not a link) before O_TRUNC destroys data — the code performs no such check."
+    },
+    {
+      "file": "corpus/train/train_0082_cwe59.c",
+      "lines": "15",
+      "code": "fclose(f);",
+      "explanation": "Unchecked fclose return hides write failures (CWE-252 / CWE-391). Because fprintf writes into a stdio buffer, the negative-return check on line 11 does not reliably detect out-of-space (ENOSPC), quota (EDQUOT), or I/O errors — those are commonly reported only when the buffer is flushed by fclose. Discarding fclose's return value means the daemon can believe it wrote a valid pidfile when the file is actually empty or truncated, causing downstream tools (init scripts, watchdogs) to fail to locate or signal the process. The implementation should check fclose() (or fflush() then fsync() then close()) and log/propagate an error on failure."
+    },
+    {
+      "file": "corpus/train/train_0082_cwe59.c",
+      "lines": "2",
+      "code": "writepid (const char* pidfile, pid_t pid)",
+      "explanation": "Missing return type / implicit-int (CWE-704, portability/correctness). The definition omits a return type, so the function defaults to returning int under older C, yet no path returns a value; callers that (incorrectly) inspect a return get an indeterminate value, and the compiler cannot warn about missing prototypes. This is not directly exploitable but is a code-hygiene and diagnostic-suppression issue: it hides the fact that write/open failures are swallowed (the function returns void-ish with no success/failure signal), so callers cannot react to a failed pidfile write. The contract should be an explicit type (void, or better int returning success/failure) with a prototype in scope."
+    }
+  ],
+  "summary": "A privileged daemon's pidfile writer opens the target with fopen(pidfile,\"w\"), a name-based, symlink-following, truncating open with no O_NOFOLLOW/O_EXCL and no directory-safety or object-type check. In an attacker-writable directory this is a classic local symlink/hard-link file-clobber and privilege-escalation primitive (CWE-59). Secondary issues: buffered write errors are missed because fclose's return is unchecked, and the function has no explicit return type or success/failure signal.",
+  "reviewed_anchors": [
+    {"anchor": "writepid(const char* pidfile, pid_t pid) — function signature (line 2)", "disposition": "finding", "reason": "No return type (implicit-int) and no success/failure return channel; callers cannot detect a failed pidfile write."},
+    {"anchor": "pidfile parameter (const char*)", "disposition": "finding", "reason": "Externally influenced filename used directly in a truncating, link-following open — CWE-59/CWE-73 surface."},
+    {"anchor": "pid parameter (pid_t) / (unsigned long)pid cast (line 11)", "disposition": "dismissed", "reason": "Process-local value; the (unsigned long) cast correctly matches %lu for normal PIDs and carries no attacker-controlled or overflow risk."},
+    {"anchor": "FILE* f local (line 4)", "disposition": "dismissed", "reason": "Local stream handle; freed on every path via fclose or the early return, no leak."},
+    {"anchor": "fopen(pidfile, \"w\") (line 6)", "disposition": "finding", "reason": "Symlink/hard-link following plus unconditional O_TRUNC with no O_NOFOLLOW/O_EXCL — the central vulnerability."},
+    {"anchor": "log_err(\"cannot open pidfile %s: %s\", pidfile, strerror(errno)) (lines 7-8)", "disposition": "dismissed", "reason": "Fixed format string with pidfile/errno passed as data arguments (not as the format), so no format-string injection; benign error logging."},
+    {"anchor": "return; on open failure (line 9)", "disposition": "dismissed", "reason": "Correctly bails without touching an unopened stream; no double-close or use of NULL f."},
+    {"anchor": "fprintf(f, \"%lu\\n\", (unsigned long)pid) (line 11)", "disposition": "dismissed", "reason": "Return value is checked; the format is a constant with a matching argument. Its only weakness (buffered errors) is captured by the fclose finding."},
+    {"anchor": "log_err(\"cannot write to pidfile %s: %s\", ...) (lines 12-13)", "disposition": "dismissed", "reason": "Constant format string, safe argument use; logs but does not return, which is benign here."},
+    {"anchor": "fclose(f) (line 15)", "disposition": "finding", "reason": "Return value discarded; deferred flush errors (ENOSPC/EDQUOT/EIO) go undetected, so an empty/truncated pidfile can be reported as success."}
+  ],
+  "findings": [
+    {
+      "title": "Symlink/hard-link following on privileged pidfile write (arbitrary file truncate/clobber)",
+      "anchor": "fopen(pidfile, \"w\")",
+      "file": "corpus/train/train_0082_cwe59.c",
+      "line": "6",
+      "code": "if ((f = fopen(pidfile, \"w\")) ==  NULL ) {",
+      "bug_class": "Link following / insecure file open (name-based open, follows symlink, O_TRUNC, no O_NOFOLLOW/O_EXCL)",
+      "cwe": "CWE-59",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0082_cwe59.c (open call is here; exploit realized in the daemon's file-system environment)",
+      "invariant": "The pidfile leaf must be opened without following untrusted links and without blindly truncating a foreign object: use open() with O_NOFOLLOW (and O_CREAT|O_EXCL or openat() relative to a trusted, non-attacker-writable directory fd), verifying the resolved inode is a regular file owned by the daemon before writing.",
+      "failure_mode": "A local attacker who can create entries in the pidfile's directory (e.g. /tmp or a world/group-writable /var/run) plants a symlink (or hard link) at the pidfile path pointing at a victim file such as /etc/passwd or a daemon config. When the privileged daemon starts, fopen(pidfile,\"w\") follows the link and truncates the victim to zero, then writes the PID line into it — arbitrary file corruption and potential privilege escalation, with the target chosen entirely by the attacker.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm where pidfile's directory lives at runtime and its permissions, that the daemon runs privileged, and that no O_NOFOLLOW/O_EXCL/openat or post-open lstat+fstat owner/type check guards this fopen."
+    },
+    {
+      "title": "TOCTOU race and hard-link bypass in pidfile open",
+      "anchor": "fopen(pidfile, \"w\")",
+      "file": "corpus/train/train_0082_cwe59.c",
+      "line": "6",
+      "code": "if ((f = fopen(pidfile, \"w\")) ==  NULL ) {",
+      "bug_class": "Time-of-check/time-of-use race; hard-link write not caught by symlink checks",
+      "cwe": "CWE-367",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0082_cwe59.c",
+      "invariant": "File safety must be established atomically with the open (single O_NOFOLLOW open of the leaf inside a trusted directory), never via a separate check on a name that is re-resolved by fopen; hard links must be defeated by opening only in a directory the attacker cannot populate.",
+      "failure_mode": "Even if a lstat pre-check were added, fopen re-resolves the path, so an attacker swaps a benign file for a symlink between check and open. Mode \"w\" cannot use O_EXCL, so a pre-planted hard link to a victim inode is opened and truncated with no link indirection for any symlink check to catch.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether any check-then-open pattern exists around this call and whether the containing directory is writable by non-daemon users (enabling hard-link planting)."
+    },
+    {
+      "title": "Buffered write errors lost because fclose return is unchecked",
+      "anchor": "fclose(f)",
+      "file": "corpus/train/train_0082_cwe59.c",
+      "line": "15",
+      "code": "fclose(f);",
+      "bug_class": "Unchecked return value / incomplete error handling on flush-close",
+      "cwe": "CWE-252",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0082_cwe59.c",
+      "invariant": "All output errors must be detected: check fclose() (or fflush()+fsync()+close()) and treat a nonzero/EOF result as a failed pidfile write, since stdio may defer ENOSPC/EDQUOT/EIO until flush.",
+      "failure_mode": "fprintf writes into stdio's buffer, so the line-11 check misses errors that only occur at flush; discarding fclose's return means a full disk or quota-exceeded condition yields an empty/truncated pidfile while writepid reports no problem, causing watchdogs or shutdown scripts to fail to locate the process.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether callers rely on the pidfile being valid and whether close-time errors are surfaced anywhere; confirm fclose result is intentionally ignored."
+    },
+    {
+      "title": "Missing return type and no success/failure signal from writepid",
+      "anchor": "writepid(const char* pidfile, pid_t pid)",
+      "file": "corpus/train/train_0082_cwe59.c",
+      "line": "2",
+      "code": "writepid (const char* pidfile, pid_t pid)",
+      "bug_class": "Implicit-int / weak function contract (errors swallowed, not returned)",
+      "cwe": "CWE-704",
+      "severity": "info",
+      "where_it_lives": "corpus/train/train_0082_cwe59.c",
+      "invariant": "The function should have an explicit return type and a prototype in scope; ideally it should return a success/failure status so callers can react when the pidfile could not be opened or written.",
+      "failure_mode": "With no declared return type the function defaults to int under older C yet returns no value, suppressing prototype diagnostics; more importantly it gives callers no way to learn that fopen or the write failed, so a daemon can proceed believing its PID was recorded when it was not.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether a prototype exists elsewhere, what type callers assume, and whether any caller needs to know the pidfile write failed."
+    }
+  ],
+  "audit_checklist": [
+    "Locate the runtime directory of every pidfile path passed to writepid and confirm it is NOT writable by unprivileged/other-group users (defeats symlink and hard-link planting).",
+    "Replace fopen(pidfile,\"w\") with an O_NOFOLLOW open (openat relative to a trusted directory fd, plus O_CREAT|O_EXCL or a post-open fstat verifying regular file + expected owner) before any truncation.",
+    "Confirm the daemon's privilege level at the time writepid runs (root vs dropped privileges) to gauge symlink-attack impact.",
+    "Check fclose()/fflush()/fsync() return values so ENOSPC/EDQUOT/EIO on flush are detected and reported, not silently dropped.",
+    "Give writepid an explicit return type and a success/failure return, and ensure callers act on a failed pidfile write.",
+    "Verify the pidfile is removed/handled safely on shutdown and that a stale attacker-controlled pidfile cannot redirect a later kill/signal."
+  ]
+}

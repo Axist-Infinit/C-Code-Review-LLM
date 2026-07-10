@@ -1,0 +1,158 @@
+{
+  "subsystem": "QEMU audio backend — the OSS (Open Sound System) playback path. oss_write() is the HWVoiceOut->write callback that drains PCM audio the guest has queued and either copies it into an mmap'd DMA emulation buffer (hw->buf_emul) or write(2)s it to the OSS device file descriptor. It is the leaf that moves guest-produced audio samples out to the host sound device.",
+  "provenance": "Identified from the QEMU audio subsystem naming: the HWVoiceOut / OSSVoiceOut hardware-voice types, the OSSVoiceOut downcast idiom, the hw->buf_emul / hw->pos_emul / hw->size_emul mmap-emulation fields (defined in audio/audio_int.h), and the oss_logerr / oss_get_available_bytes / advance helpers all belong to QEMU's audio/ossaudio.c. The banner comment /* sample: primevul_c_train_2847_fixed */ marks this as the post-fix revision of a PrimeVul C sample; the file tag names CWE-369 (divide-by-zero).",
+  "trust_boundary": "The guest VM drives the emulated sound card. The guest chooses the audio format/geometry (which sizes the emulation buffer) and produces the PCM stream and the number of bytes to play, so the amount `len` and the buffer-geometry state (hw->size_emul, hw->pos_emul) are ultimately guest-influenced host state. The mmap branch trusts that hw->size_emul is a non-zero power/size reflecting a real allocation of hw->buf_emul; if setup left size_emul == 0 (mmap disabled/failed, or a zero-sized geometry the guest negotiated) the modulo on line 16 divides by zero. The source pointer `buf` and length come from the audio core; the destination geometry is the security-relevant contract.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0305_cwe369.c",
+      "lines": "2-5",
+      "code": "static size_t oss_write(HWVoiceOut *hw, void *buf, size_t len)\n{\n    OSSVoiceOut *oss = (OSSVoiceOut *) hw;\n    size_t pos;",
+      "explanation": "The HWVoiceOut->write backend entry point. It receives the generic hardware-voice handle `hw`, a pointer `buf` to the PCM bytes to emit, and the byte count `len`. Line 4 downcasts the base HWVoiceOut to the OSS-specific OSSVoiceOut, which is legal because QEMU embeds HWVoiceOut as the first member of OSSVoiceOut so the pointers alias. `pos` (declared here, used later) tracks how many bytes were actually written in the non-mmap path. The function returns the number of bytes consumed, which the audio core uses to advance its ring buffer."
+    },
+    {
+      "file": "corpus/train/train_0305_cwe369.c",
+      "lines": "7-11",
+      "code": "if (oss->mmapped) {\n        size_t total_len;\n        len = MIN(len, oss_get_available_bytes(oss));\n\n        total_len = len;",
+      "explanation": "Selects the memory-mapped DMA path when the OSS device was opened with mmap support. Line 9 clamps the requested `len` down to the number of bytes currently free in the device's mmap region as reported by oss_get_available_bytes(oss) — this MIN() is the fix that prevents writing more than the device can currently accept. Line 11 snapshots the clamped amount into total_len so the function can report the full (pre-drain) count back to the caller even after the loop decrements `len` to zero."
+    },
+    {
+      "file": "corpus/train/train_0305_cwe369.c",
+      "lines": "12-19",
+      "code": "while (len) {\n            size_t to_copy = MIN(len, hw->size_emul - hw->pos_emul);\n            memcpy(hw->buf_emul + hw->pos_emul, buf, to_copy);\n\n            hw->pos_emul = (hw->pos_emul + to_copy) % hw->size_emul;\n            buf += to_copy;\n            len -= to_copy;\n        }",
+      "explanation": "The ring-copy loop into the emulation buffer. Each iteration computes to_copy as the smaller of the remaining `len` and the distance from the current write cursor pos_emul to the end of the buffer size_emul (line 13) — this is the classic 'don't copy past the physical end, wrap instead' pattern. Line 14 memcpy's to_copy bytes from `buf` into hw->buf_emul at offset pos_emul. Line 16 advances the write cursor modulo size_emul so it wraps back to 0 at the end of the ring. Lines 17-18 advance the source pointer and decrement the remaining count. The loop repeats until all clamped bytes have been placed, wrapping at most once because to_copy is capped at the tail distance."
+    },
+    {
+      "file": "corpus/train/train_0305_cwe369.c",
+      "lines": "20-21",
+      "code": "return total_len;\n    }",
+      "explanation": "After the ring copy completes, the mmap path returns total_len — the full number of bytes accepted into the emulation buffer (the pre-loop snapshot), telling the audio core how much of its queue was consumed. Control never falls through to the write(2) path when mmapped is set."
+    },
+    {
+      "file": "corpus/train/train_0305_cwe369.c",
+      "lines": "23-35",
+      "code": "pos = 0;\n    while (len) {\n        ssize_t bytes_written;\n        void *pcm = advance(buf, pos);\n\n        bytes_written = write(oss->fd, pcm, len);\n        if (bytes_written < 0) {\n            if (errno != EAGAIN) {\n                oss_logerr(errno, \"failed to write %zu bytes\\n\",\n                           len);\n            }\n            return pos;\n        }",
+      "explanation": "The non-mmap fallback: write the PCM straight to the OSS device fd. pos accumulates bytes successfully written. Each iteration computes pcm = advance(buf, pos) — a pointer into buf offset by the bytes already emitted — and calls write(oss->fd, pcm, len) with the remaining count. bytes_written is a signed ssize_t so it can carry the -1 error return. On error (line 29) it logs via oss_logerr unless errno is EAGAIN (a transient 'device busy' that is intentionally silent) and returns pos, the count actually drained so far."
+    },
+    {
+      "file": "corpus/train/train_0305_cwe369.c",
+      "lines": "37-44",
+      "code": "pos += bytes_written;\n        if (bytes_written < len) {\n            break;\n        }\n        len -= bytes_written;\n    }\n    return pos;\n}",
+      "explanation": "On a successful write, pos advances by bytes_written (line 37). If the kernel accepted fewer than the requested `len` bytes (a short write, line 38) the loop breaks — the device is momentarily full and the caller will retry later. Otherwise line 41 subtracts the fully-written amount and loops to push the remainder. The function finally returns pos, the total bytes handed to the OS. Note the comparison on line 38 mixes signed bytes_written with unsigned `len`, though at that point bytes_written is guaranteed >= 0 by the earlier check."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0305_cwe369.c",
+      "lines": "16",
+      "code": "hw->pos_emul = (hw->pos_emul + to_copy) % hw->size_emul;",
+      "explanation": "This is the central hazard and the reason the sample is tagged CWE-369. The modulo divides by hw->size_emul. If the emulation buffer was never successfully sized — size_emul == 0 (mmap allocation failed, the buffer was torn down, or the guest negotiated a zero/degenerate geometry) — the `% 0` on a size_t triggers integer division-by-zero, which raises SIGFPE and crashes the QEMU process: a guest-triggerable host denial of service. The clamp on line 9 does not save this path: if oss_get_available_bytes returns non-zero while size_emul is 0, `len` stays non-zero, the loop body runs, and line 16 faults on the very first iteration. The implementation MUST guarantee that the mmap branch is only reachable when buf_emul is a live allocation with size_emul > 0 (i.e. mmapped implies a validated, non-zero-sized region), or must guard `if (!hw->size_emul) return 0;` before entering the loop."
+    },
+    {
+      "file": "corpus/train/train_0305_cwe369.c",
+      "lines": "13",
+      "code": "size_t to_copy = MIN(len, hw->size_emul - hw->pos_emul);",
+      "explanation": "Unsigned pointer-arithmetic hazard. size_emul and pos_emul are size_t; the subtraction hw->size_emul - hw->pos_emul underflows to a near-SIZE_MAX value if the invariant pos_emul <= size_emul is ever violated (e.g. a stale pos_emul left over from a larger prior geometry, or size_emul == 0 with pos_emul == 0 giving 0). The MIN(len, ...) normally caps to_copy at the remaining `len`, so a huge underflowed operand is masked — but that safety depends entirely on `len` itself being bounded to the true free space in buf_emul by line 9. If size_emul == pos_emul == 0 the subtraction is 0, to_copy becomes 0, and with len still non-zero the loop would spin without progress — except line 16 divides by zero first and crashes. The implementation must maintain 0 <= pos_emul < size_emul at all times so this distance is a valid, in-range tail length."
+    },
+    {
+      "file": "corpus/train/train_0305_cwe369.c",
+      "lines": "14",
+      "code": "memcpy(hw->buf_emul + hw->pos_emul, buf, to_copy);",
+      "explanation": "The destination write. Its safety rests on two contracts the header/setup must uphold: (1) hw->buf_emul actually points at an allocation of exactly hw->size_emul bytes, and (2) pos_emul + to_copy <= size_emul so the copy stays inside that allocation. to_copy is bounded by the tail distance on line 13, so given a correct, consistent (buf_emul, size_emul, pos_emul) triple this cannot overflow the destination. The residual risk is a mismatch between size_emul and the real allocation length of buf_emul (out-of-bounds write, CWE-787) or buf_emul == NULL (NULL-pointer memcpy, CWE-476, though to_copy would be 0 in the degenerate size_emul==0 case). This is why size_emul is the crucial invariant: it governs both the divide on line 16 and the bound here."
+    },
+    {
+      "file": "corpus/train/train_0305_cwe369.c",
+      "lines": "9",
+      "code": "len = MIN(len, oss_get_available_bytes(oss));",
+      "explanation": "This clamp is the fix that bounds how much is copied into the mmap region, so its correctness is load-bearing. If oss_get_available_bytes over-reports (returns more than the free space in buf_emul, e.g. because it derives its answer from the OSS device's play_ptr/GETOSPACE rather than from buf_emul's own geometry), then `len` can exceed the room between pos_emul and size_emul across wraps, and the loop could write more total bytes than the ring holds before pos_emul is re-synced — an out-of-bounds write. The implementation must ensure the available-bytes accounting is consistent with buf_emul/size_emul, not just with the kernel's DMA pointer."
+    },
+    {
+      "file": "corpus/train/train_0305_cwe369.c",
+      "lines": "38",
+      "code": "if (bytes_written < len) {",
+      "explanation": "Signed/unsigned comparison hygiene. bytes_written is ssize_t and `len` is size_t; C promotes bytes_written to unsigned for the comparison. Here it is benign because the earlier `if (bytes_written < 0)` guard guarantees bytes_written >= 0 at this point, so the unsigned reinterpretation preserves its value. It is worth confirming, however, that no future edit removes that guard — without it a negative bytes_written would compare as a huge unsigned value and mis-drive the short-write logic (CWE-195/CWE-697)."
+    }
+  ],
+  "summary": "A guest-facing QEMU OSS audio write path whose one sharp, latent defect is a division-by-zero: line 16 computes pos_emul modulo hw->size_emul with no guarantee that size_emul is non-zero, so any state where the mmap emulation buffer is unsized (size_emul == 0) turns a normal audio write into a SIGFPE host crash — a guest-triggerable denial of service (CWE-369). Secondary risks (unsigned tail-distance underflow on line 13, and the buf_emul/size_emul consistency the memcpy on line 14 and the clamp on line 9 depend on) all reduce to the same invariant that the mmap region must be a live, correctly-sized allocation. The bounds clamp on line 9 is the real fix and looks correct for buffer overflow, but it does not close the divide-by-zero.",
+  "reviewed_anchors": [
+    {"anchor": "oss_write(HWVoiceOut *hw, void *buf, size_t len) — signature", "disposition": "dismissed", "reason": "Return-by-value size_t drain count; parameters themselves carry no overflow contract beyond len, handled by line 9 clamp."},
+    {"anchor": "OSSVoiceOut *oss = (OSSVoiceOut *) hw; (line 4)", "disposition": "dismissed", "reason": "Standard QEMU first-member downcast; type-safe because HWVoiceOut is embedded at offset 0 of OSSVoiceOut."},
+    {"anchor": "oss->mmapped (line 7)", "disposition": "dismissed", "reason": "Boolean branch selector; its danger is expressed through the size_emul contract it gates, captured in the line-16 finding."},
+    {"anchor": "len = MIN(len, oss_get_available_bytes(oss)); (line 9)", "disposition": "finding", "reason": "Load-bearing bounds clamp; safety of the memcpy depends on this being consistent with buf_emul geometry."},
+    {"anchor": "hw->size_emul - hw->pos_emul (line 13)", "disposition": "finding", "reason": "Unsigned size_t subtraction that underflows if pos_emul > size_emul; masked by MIN(len,...) but part of the size_emul invariant."},
+    {"anchor": "memcpy(hw->buf_emul + hw->pos_emul, buf, to_copy); (line 14)", "disposition": "finding", "reason": "Destination write bounded only by the buf_emul/size_emul/pos_emul consistency contract."},
+    {"anchor": "(hw->pos_emul + to_copy) % hw->size_emul (line 16)", "disposition": "finding", "reason": "Modulo by size_emul with no non-zero guard — division-by-zero (CWE-369), the primary defect."},
+    {"anchor": "write(oss->fd, pcm, len) / advance(buf, pos) (lines 26-28)", "disposition": "dismissed", "reason": "POSIX write of a bounded-and-offset region; pos <= total len so advance stays in-bounds; short/error returns handled."},
+    {"anchor": "bytes_written < 0 / EAGAIN handling (lines 29-35)", "disposition": "dismissed", "reason": "Correct error and transient-busy handling; returns bytes drained so far."},
+    {"anchor": "if (bytes_written < len) (line 38)", "disposition": "dismissed", "reason": "Signed/unsigned comparison is benign because bytes_written is guaranteed >= 0 by the prior check; noted for hygiene only."}
+  ],
+  "findings": [
+    {
+      "title": "Division-by-zero on hw->size_emul in the mmap ring wrap",
+      "anchor": "(hw->pos_emul + to_copy) % hw->size_emul",
+      "file": "corpus/train/train_0305_cwe369.c",
+      "line": "16",
+      "code": "hw->pos_emul = (hw->pos_emul + to_copy) % hw->size_emul;",
+      "bug_class": "Integer division-by-zero (modulo by zero) — SIGFPE / DoS",
+      "cwe": "CWE-369",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0305_cwe369.c (and the QEMU audio/ossaudio.c implementation it models)",
+      "invariant": "The mmap branch (oss->mmapped) must only be entered when hw->buf_emul is a live allocation and hw->size_emul > 0; equivalently the loop must guard against size_emul == 0 before the modulo (and before the line-13 subtraction).",
+      "failure_mode": "When hw->size_emul == 0 — mmap setup failed, the emulation buffer was released, or a degenerate zero-sized geometry was negotiated — the `% hw->size_emul` performs an unsigned division by zero on the first loop iteration, raising SIGFPE and terminating the QEMU process. Because the loop is only entered when the line-9 clamp leaves len != 0, a non-zero oss_get_available_bytes with size_emul == 0 is sufficient to trigger it, giving the guest a host-side denial of service.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm every code path that sets oss->mmapped = true also establishes hw->size_emul > 0 and buf_emul non-NULL, and that teardown clears mmapped atomically with size_emul; otherwise add an explicit `if (!hw->size_emul) return 0;` (or return len) before the loop."
+    },
+    {
+      "title": "Unsigned underflow of the ring tail distance size_emul - pos_emul",
+      "anchor": "hw->size_emul - hw->pos_emul",
+      "file": "corpus/train/train_0305_cwe369.c",
+      "line": "13",
+      "code": "size_t to_copy = MIN(len, hw->size_emul - hw->pos_emul);",
+      "bug_class": "Unsigned integer underflow feeding a copy length",
+      "cwe": "CWE-191",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0305_cwe369.c (QEMU audio/ossaudio.c)",
+      "invariant": "0 <= hw->pos_emul < hw->size_emul must hold on entry to every iteration so the subtraction yields a valid in-range tail length.",
+      "failure_mode": "If pos_emul ever exceeds size_emul (stale cursor after a geometry shrink, or size_emul == 0), the size_t subtraction wraps to a value near SIZE_MAX. The MIN(len, ...) normally caps to_copy back down to the remaining len, so this is not itself an overflow primitive as written — but that mitigation is only as good as the line-9 clamp bounding len to the true free space. The degenerate case size_emul == pos_emul == 0 yields to_copy = 0 and, with len still non-zero, a non-progressing loop, though the line-16 divide-by-zero faults first.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify pos_emul is always reduced modulo size_emul (it is, on line 16, when size_emul > 0) and is reset whenever size_emul changes, so pos_emul <= size_emul is a maintained invariant rather than an assumption."
+    },
+    {
+      "title": "Emulation-buffer memcpy bounded only by buf_emul/size_emul consistency",
+      "anchor": "memcpy(hw->buf_emul + hw->pos_emul, buf, to_copy);",
+      "file": "corpus/train/train_0305_cwe369.c",
+      "line": "14",
+      "code": "memcpy(hw->buf_emul + hw->pos_emul, buf, to_copy);",
+      "bug_class": "Out-of-bounds write / NULL-pointer memcpy (contract-dependent)",
+      "cwe": "CWE-787",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "hw->buf_emul must point at a live allocation of exactly hw->size_emul bytes, and pos_emul + to_copy <= size_emul must hold, so the copy stays inside the mapped region; buf_emul must be non-NULL whenever the loop runs.",
+      "failure_mode": "Given the correct triple (buf_emul, size_emul, pos_emul), to_copy is bounded by the line-13 tail distance and this copy is safe. The residual risk is a mismatch: if size_emul overstates the true allocation length of buf_emul, or buf_emul is NULL/stale while size_emul is non-zero, the memcpy writes past the end of (or into a freed/NULL) buffer — a host memory corruption reachable from guest audio traffic. This finding is latent: the arithmetic here is correct, the danger is the setup contract in the code not shown.",
+      "cve_analog": "",
+      "what_to_confirm": "Trace where buf_emul and size_emul are assigned (the mmap/allocation path) and confirm they are always updated together and torn down together, so size_emul never outlives or exceeds the real buf_emul mapping."
+    },
+    {
+      "title": "Correctness of the available-bytes clamp gating the ring copy",
+      "anchor": "len = MIN(len, oss_get_available_bytes(oss));",
+      "file": "corpus/train/train_0305_cwe369.c",
+      "line": "9",
+      "code": "len = MIN(len, oss_get_available_bytes(oss));",
+      "bug_class": "Insufficient input validation (over-reported free space)",
+      "cwe": "CWE-20",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "oss_get_available_bytes(oss) must never report more bytes than can be safely written into buf_emul given its size and current pos_emul; the returned bound must be consistent with the buf_emul ring, not merely with the kernel DMA pointer.",
+      "failure_mode": "This MIN() is the fix that stops the write from overrunning the mmap region, so its accuracy is security-critical. If oss_get_available_bytes over-reports free space (e.g. it reflects the OSS device's GETOSPACE/play_ptr rather than the buf_emul geometry), `len` stays larger than the ring can hold and the loop can write more total bytes than the buffer across wraps before the cursor re-syncs, producing an out-of-bounds write. As shown, the clamp looks correct; the risk lives in the helper's implementation.",
+      "cve_analog": "",
+      "what_to_confirm": "Inspect oss_get_available_bytes to confirm it computes free space from the same buf_emul/size_emul/pos_emul state this loop advances, and cannot return a value exceeding size_emul."
+    }
+  ],
+  "audit_checklist": [
+    "Guarantee hw->size_emul > 0 (and buf_emul non-NULL) on every path that sets oss->mmapped, or add an explicit size_emul==0 guard before the loop, to eliminate the line-16 divide-by-zero.",
+    "Confirm pos_emul is maintained strictly less than size_emul and reset whenever the geometry changes, so the line-13 subtraction never underflows.",
+    "Trace buf_emul and size_emul allocation/teardown to prove size_emul always equals the real buf_emul mapping length and both change atomically.",
+    "Audit oss_get_available_bytes to ensure it cannot over-report free space relative to the buf_emul ring, keeping the line-9 clamp sound.",
+    "Verify the `if (bytes_written < 0)` guard remains ahead of the signed/unsigned comparison on line 38 so short-write handling stays correct.",
+    "Confirm advance(buf, pos) never produces a pointer past buf + original_len in the non-mmap path."
+  ]
+}

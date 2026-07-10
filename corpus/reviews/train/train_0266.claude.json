@@ -1,0 +1,262 @@
+{
+  "subsystem": "GPAC AVC/H.264 Sequence Parameter Set (SPS) bitstream parser. The function gf_avc_read_sps_bs_internal() decodes a raw H.264 (and SVC subset) SPS NAL unit from a GF_BitStream into a GF_AVCState/AVC_SPS structure, reading Exp-Golomb (ue/se) and fixed-width syntax elements per ISO/IEC 14496-10, including profile/level, chroma format, scaling lists, picture-order-count parameters, picture dimensions, cropping, VUI parameters, and SVC seq_parameter_set_svc_extension.",
+  "provenance": "Identified from GPAC-specific naming and API: the gf_* prefix, GF_BitStream/AVCState/AVC_SPS types, the gf_bs_read_ue_log/gf_bs_read_se_log/gf_bs_read_int_log bit-reader helpers, GF_SVC_SSPS_ID_SHIFT, GF_LOG(GF_LOG_CODING, ...) with the \"[avc-h264]\" tag, avc_hevc_sar table, and the '/*sample: primevul_c_train_2034_fixed*/' header. This is the media_tools/av_parsers.c AVC SPS reader from GPAC. The '_fixed' suffix indicates a patched variant; several classic overflow sites here carry explicit guards.",
+  "trust_boundary": "The SPS NAL payload behind the GF_BitStream 'bs' is fully attacker-controlled: it arrives from a demuxed media file or an RTP/network elementary stream. Every gf_bs_read_ue_log / gf_bs_read_se_log / gf_bs_read_int_log return value (sps_id, chroma_format_idc, poc_cycle_length, mb_width/mb_height, the four crop offsets, aspect_ratio_idc, vui_ext_num_entries_minus1, etc.) is hostile and can take any value the syntax element width permits (ue Exp-Golomb can decode to very large 32-bit values). The destination AVC_SPS lives in avc->sps[], a fixed 32-entry array. The parser is the trust boundary: it must bound every index and count before it indexes an array or computes a size.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0266_cwe415.c",
+      "lines": "2-7",
+      "code": "static s32 gf_avc_read_sps_bs_internal(GF_BitStream *bs, AVCState *avc, u32 subseq_sps, u32 *vui_flag_pos, u32 nal_hdr)\n{\n\tAVC_SPS *sps;\n\ts32 mb_width, mb_height, sps_id = -1;\n\tu32 profile_idc, level_idc, pcomp, i, chroma_format_idc, cl = 0, cr = 0, ct = 0, cb = 0, luma_bd, chroma_bd;\n\tu8 separate_colour_plane_flag = 0;",
+      "explanation": "Entry point. 'bs' is the bit source holding the untrusted SPS payload; 'avc' is the decoder state whose sps[] array will be filled; 'subseq_sps' is non-zero when parsing an SVC Subset-SPS (which shifts the sps_id namespace); 'vui_flag_pos' optionally receives the bit offset of the VUI-present flag; 'nal_hdr' non-zero means the 1-byte NAL header was already consumed. Local 'sps' is a pointer into avc->sps[]. 'sps_id' is initialized to -1 (the error sentinel and return value). The crop offsets cl/cr/ct/cb are pre-zeroed so the later unconditional stores at lines 168-171 are defined even when frame_cropping_flag is 0. separate_colour_plane_flag is defaulted to 0."
+    },
+    {
+      "file": "corpus/train/train_0266_cwe415.c",
+      "lines": "9-15",
+      "code": "\tif (!vui_flag_pos) {\n\t\tgf_bs_enable_emulation_byte_removal(bs, GF_TRUE);\n\t}\n\n\tif (!bs) {\n\t\treturn -1;\n\t}",
+      "explanation": "If the caller does not want the VUI bit position back, the reader is switched into emulation-prevention-byte removal mode (stripping 0x03 from 00 00 03 sequences) by calling gf_bs_enable_emulation_byte_removal(bs, GF_TRUE). Only afterward is 'bs' checked for NULL. The ordering means 'bs' is passed to a function before the NULL guard runs; safety depends on that helper tolerating a NULL handle."
+    },
+    {
+      "file": "corpus/train/train_0266_cwe415.c",
+      "lines": "17-29",
+      "code": "\tif (!nal_hdr) {\n\t\tgf_bs_read_int_log(bs, 1, \"forbidden_zero_bit\");\n\t\tgf_bs_read_int_log(bs, 2, \"nal_ref_idc\");\n\t\tgf_bs_read_int_log(bs, 5, \"nal_unit_type\");\n\t}\n\tprofile_idc = gf_bs_read_int_log(bs, 8, \"profile_idc\");\n\n\tpcomp = gf_bs_read_int_log(bs, 8, \"profile_compatibility\");\n\t/*sanity checks*/\n\tif (pcomp & 0x3)\n\t\treturn -1;\n\n\tlevel_idc = gf_bs_read_int_log(bs, 8, \"level_idc\");",
+      "explanation": "When the NAL header was not pre-consumed, the 8 header bits are read and discarded. Then the three fixed 8-bit fields profile_idc, profile_compatibility (pcomp), and level_idc are read. A sanity check rejects the SPS if the low two constraint bits of pcomp are set (reserved-must-be-zero), returning -1 early. These are the coarse validation gates before the id and profile-dependent parsing."
+    },
+    {
+      "file": "corpus/train/train_0266_cwe415.c",
+      "lines": "34-42",
+      "code": "\tsps_id = gf_bs_read_ue_log(bs, \"sps_id\") + GF_SVC_SSPS_ID_SHIFT * subseq_sps;\n\tif ((sps_id < 0) || (sps_id >= 32)) {\n\t\treturn -1;\n\t}\n\n\tluma_bd = chroma_bd = 0;\n\tsps = &avc->sps[sps_id];\n\tchroma_format_idc = sps->ChromaArrayType = 1;\n\tsps->state |= subseq_sps ? AVC_SUBSPS_PARSED : AVC_SPS_PARSED;",
+      "explanation": "The SPS id is decoded as an Exp-Golomb ue value and, for a subset SPS, offset by GF_SVC_SSPS_ID_SHIFT so base and subset ids share the 0..31 space without collision. The guard '(sps_id < 0) || (sps_id >= 32)' is the critical bounds check that keeps the subsequent 'sps = &avc->sps[sps_id]' inside the fixed 32-entry array: a huge ue decodes either to a large positive value (caught by >= 32) or, if it exceeds INT_MAX, to negative (caught by < 0). chroma_format_idc and sps->ChromaArrayType default to 1 (4:2:0). sps->state records that this slot has now been parsed (AVC_SPS_PARSED or AVC_SUBSPS_PARSED), marking the object as populated/reused."
+    },
+    {
+      "file": "corpus/train/train_0266_cwe415.c",
+      "lines": "45-59",
+      "code": "\tswitch (profile_idc) {\n\tcase 100:\n\tcase 110:\n\tcase 122:\n\tcase 244:\n\tcase 44:\n\t\t/*sanity checks: note1 from 7.4.2.1.1 of iso/iec 14496-10-N11084*/\n\t\tif (pcomp & 0xE0)\n\t\t\treturn -1;\n\tcase 83:\n\tcase 86:\n\tcase 118:\n\tcase 128:\n\t\tchroma_format_idc = gf_bs_read_ue_log(bs, \"chroma_format_idc\");\n\t\tsps->ChromaArrayType = chroma_format_idc;",
+      "explanation": "High/SVC/MVC profiles carry extra chroma and scaling syntax. The case labels 100/110/122/244/44 fall through (deliberately, no break) after an additional pcomp constraint check into the 83/86/118/128 block, where chroma_format_idc is read as ue and copied into sps->ChromaArrayType. Note chroma_format_idc is used only as a stored value and in later branch comparisons, never as an array index, so a large value is a semantic rather than a memory hazard here."
+    },
+    {
+      "file": "corpus/train/train_0266_cwe415.c",
+      "lines": "60-89",
+      "code": "\t\tif (chroma_format_idc == 3) {\n\t\t\tseparate_colour_plane_flag = gf_bs_read_int_log(bs, 1, \"separate_colour_plane_flag\");\n\t\t\tif (separate_colour_plane_flag) sps->ChromaArrayType = 0;\n\t\t}\n\t\tluma_bd = gf_bs_read_ue_log(bs, \"luma_bit_depth\");\n\t\tchroma_bd = gf_bs_read_ue_log(bs, \"chroma_bit_depth\");\n\t\t/*qpprime_y_zero_transform_bypass_flag = */ gf_bs_read_int_log(bs, 1, \"qpprime_y_zero_transform_bypass_flag\");\n\t\t/*seq_scaling_matrix_present_flag*/\n\t\tif (gf_bs_read_int_log(bs, 1, \"seq_scaling_matrix_present_flag\")) {\n\t\t\tu32 k;\n\t\t\tfor (k = 0; k < 8; k++) {\n\t\t\t\tif (gf_bs_read_int_log_idx(bs, 1, \"seq_scaling_list_present_flag\", k)) {\n\t\t\t\t\tu32 z, last = 8, next = 8;\n\t\t\t\t\tu32 sl = k < 6 ? 16 : 64;\n\t\t\t\t\tfor (z = 0; z < sl; z++) {\n\t\t\t\t\t\tif (next) {\n\t\t\t\t\t\t\ts32 delta = gf_bs_read_se(bs);\n\t\t\t\t\t\t\tnext = (last + delta + 256) % 256;\n\t\t\t\t\t\t}\n\t\t\t\t\t\tlast = next ? next : last;\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t\tbreak;\n\t\t}",
+      "explanation": "For 4:4:4 (chroma_format_idc==3) a separate_colour_plane_flag is read and, when set, forces ChromaArrayType to 0. luma/chroma bit-depth deltas are read. If seq_scaling_matrix_present_flag is set, up to 8 scaling lists are consumed: for each present list the code reads 'sl' (16 or 64) se-coded deltas, updating next=(last+delta+256)%256. These loops have fixed compile-time bounds (8, then 16/64) and write to no buffer, so they only consume bitstream bits; they cannot overflow memory."
+    },
+    {
+      "file": "corpus/train/train_0266_cwe415.c",
+      "lines": "92-99",
+      "code": "\tsps->profile_idc = profile_idc;\n\tsps->level_idc = level_idc;\n\tsps->prof_compat = pcomp;\n\tsps->log2_max_frame_num = gf_bs_read_ue_log(bs, \"log2_max_frame_num\") + 4;\n\tsps->poc_type = gf_bs_read_ue_log(bs, \"poc_type\");\n\tsps->chroma_format = chroma_format_idc;\n\tsps->luma_bit_depth_m8 = luma_bd;\n\tsps->chroma_bit_depth_m8 = chroma_bd;",
+      "explanation": "The parsed profile/level/compat and the chroma/bit-depth values are committed to the sps struct. log2_max_frame_num is the ue value plus 4 (the syntax carries the minus-4 form); poc_type is read for the following branch. These are plain scalar stores with no bounds implication beyond the stored values being attacker-influenced."
+    },
+    {
+      "file": "corpus/train/train_0266_cwe415.c",
+      "lines": "101-119",
+      "code": "\tif (sps->poc_type == 0) {\n\t\tsps->log2_max_poc_lsb = gf_bs_read_ue_log(bs, \"log2_max_poc_lsb\") + 4;\n\t}\n\telse if (sps->poc_type == 1) {\n\t\tsps->delta_pic_order_always_zero_flag = gf_bs_read_int_log(bs, 1, \"delta_pic_order_always_zero_flag\");\n\t\tsps->offset_for_non_ref_pic = gf_bs_read_se_log(bs, \"offset_for_non_ref_pic\");\n\t\tsps->offset_for_top_to_bottom_field = gf_bs_read_se_log(bs, \"offset_for_top_to_bottom_field\");\n\t\tsps->poc_cycle_length = gf_bs_read_ue_log(bs, \"poc_cycle_length\");\n\t\tif (sps->poc_cycle_length > GF_ARRAY_LENGTH(sps->offset_for_ref_frame)) {\n\t\t\tsps->poc_cycle_length = 255;\n\t\t\tGF_LOG(GF_LOG_ERROR, GF_LOG_CODING, (\"[avc-h264] offset_for_ref_frame overflow from poc_cycle_length\\n\"));\n\t\t\treturn -1;\n\t\t}\n\t\tfor (i = 0; i < sps->poc_cycle_length; i++)\n\t\t\tsps->offset_for_ref_frame[i] = gf_bs_read_se_log_idx(bs, \"offset_for_ref_frame\", i);\n\t}\n\tif (sps->poc_type > 2) {\n\t\treturn -1;\n\t}",
+      "explanation": "For poc_type 1, poc_cycle_length is decoded as ue and drives the loop that fills the fixed array sps->offset_for_ref_frame[]. The guard 'poc_cycle_length > GF_ARRAY_LENGTH(sps->offset_for_ref_frame)' is the fix for the classic write-past-array overflow here: if the count exceeds the array capacity the function logs and returns -1 before the loop. Because the test uses '>' (not '>='), a count exactly equal to the capacity is allowed, and the loop 'i < poc_cycle_length' writes indices 0..capacity-1, which is in-bounds. poc_type > 2 is rejected as reserved."
+    },
+    {
+      "file": "corpus/train/train_0266_cwe415.c",
+      "lines": "120-131",
+      "code": "\tsps->max_num_ref_frames = gf_bs_read_ue_log(bs, \"max_num_ref_frames\");\n\tsps->gaps_in_frame_num_value_allowed_flag = gf_bs_read_int_log(bs, 1, \"gaps_in_frame_num_value_allowed_flag\");\n\tmb_width = gf_bs_read_ue_log(bs, \"pic_width_in_mbs_minus1\") + 1;\n\tmb_height = gf_bs_read_ue_log(bs, \"pic_height_in_map_units_minus1\") + 1;\n\n\tsps->frame_mbs_only_flag = gf_bs_read_int_log(bs, 1, \"frame_mbs_only_flag\");\n\n\tsps->width = mb_width * 16;\n\tsps->height = (2 - sps->frame_mbs_only_flag) * mb_height * 16;",
+      "explanation": "The picture size in macroblocks is decoded (minus-1 form, so +1) into signed mb_width/mb_height, then multiplied by 16 (and by 1 or 2 for field height) to form pixel dimensions stored in sps->width/height. mb_width/mb_height are unbounded ue values; the products are not range-checked here, so hostile dimensions propagate into the SPS and any downstream sizing/allocation that multiplies width*height."
+    },
+    {
+      "file": "corpus/train/train_0266_cwe415.c",
+      "lines": "133-167",
+      "code": "\tif (gf_bs_read_int_log(bs, 1, \"frame_cropping_flag\")) {\n\t\tint CropUnitX, CropUnitY, SubWidthC = -1, SubHeightC = -1;\n\n\t\tif (chroma_format_idc == 1) {\n\t\t\tSubWidthC = 2; SubHeightC = 2;\n\t\t}\n\t\telse if (chroma_format_idc == 2) {\n\t\t\tSubWidthC = 2; SubHeightC = 1;\n\t\t}\n\t\telse if ((chroma_format_idc == 3) && (separate_colour_plane_flag == 0)) {\n\t\t\tSubWidthC = 1; SubHeightC = 1;\n\t\t}\n\n\t\tif (sps->ChromaArrayType == 0) {\n\t\t\tassert(SubWidthC == -1);\n\t\t\tCropUnitX = 1;\n\t\t\tCropUnitY = 2 - sps->frame_mbs_only_flag;\n\t\t}\n\t\telse {\n\t\t\tCropUnitX = SubWidthC;\n\t\t\tCropUnitY = SubHeightC * (2 - sps->frame_mbs_only_flag);\n\t\t}\n\n\t\tcl = gf_bs_read_ue_log(bs, \"frame_crop_left_offset\");\n\t\tcr = gf_bs_read_ue_log(bs, \"frame_crop_right_offset\");\n\t\tct = gf_bs_read_ue_log(bs, \"frame_crop_top_offset\");\n\t\tcb = gf_bs_read_ue_log(bs, \"frame_crop_bottom_offset\");\n\n\t\tsps->width -= CropUnitX * (cl + cr);\n\t\tsps->height -= CropUnitY * (ct + cb);\n\t\tcl *= CropUnitX;\n\t\tcr *= CropUnitX;\n\t\tct *= CropUnitY;\n\t\tcb *= CropUnitY;\n\t}",
+      "explanation": "When frame_cropping_flag is set, the four crop offsets are decoded as ue (attacker-controlled, unbounded) and scaled by CropUnitX/CropUnitY (derived from chroma format). The crop is then subtracted from sps->width/height. There is no check that CropUnitX*(cl+cr) is smaller than the current width (or height for the vertical case), so the subtraction can drive the dimensions negative/wrap. The assert(SubWidthC == -1) documents the invariant that ChromaArrayType==0 implies no chroma subsampling was set; asserts are typically compiled out in release, so it is documentation, not a runtime guard."
+    },
+    {
+      "file": "corpus/train/train_0266_cwe415.c",
+      "lines": "168-177",
+      "code": "\tsps->crop.left = cl;\n\tsps->crop.right = cr;\n\tsps->crop.top = ct;\n\tsps->crop.bottom = cb;\n\n\tif (vui_flag_pos) {\n\t\t*vui_flag_pos = (u32)gf_bs_get_bit_offset(bs);\n\t}\n\t/*vui_parameters_present_flag*/\n\tsps->vui_parameters_present_flag = gf_bs_read_int_log(bs, 1, \"vui_parameters_present_flag\");",
+      "explanation": "The (possibly zero) crop values are committed to sps->crop. If the caller requested it, the current bit offset — the position of the VUI-present flag — is written back through vui_flag_pos (used by rewriters that patch VUI in place). Then vui_parameters_present_flag is read to decide whether the VUI block follows."
+    },
+    {
+      "file": "corpus/train/train_0266_cwe415.c",
+      "lines": "178-193",
+      "code": "\tif (sps->vui_parameters_present_flag) {\n\t\tsps->vui.aspect_ratio_info_present_flag = gf_bs_read_int_log(bs, 1, \"aspect_ratio_info_present_flag\");\n\t\tif (sps->vui.aspect_ratio_info_present_flag) {\n\t\t\ts32 aspect_ratio_idc = gf_bs_read_int_log(bs, 8, \"aspect_ratio_idc\");\n\t\t\tif (aspect_ratio_idc == 255) {\n\t\t\t\tsps->vui.par_num = gf_bs_read_int_log(bs, 16, \"aspect_ratio_num\");\n\t\t\t\tsps->vui.par_den = gf_bs_read_int_log(bs, 16, \"aspect_ratio_den\");\n\t\t\t}\n\t\t\telse if (aspect_ratio_idc < GF_ARRAY_LENGTH(avc_hevc_sar) ) {\n\t\t\t\tsps->vui.par_num = avc_hevc_sar[aspect_ratio_idc].w;\n\t\t\t\tsps->vui.par_den = avc_hevc_sar[aspect_ratio_idc].h;\n\t\t\t}\n\t\t\telse {\n\t\t\t\tGF_LOG(GF_LOG_WARNING, GF_LOG_CODING, (\"[avc-h264] Unknown aspect_ratio_idc: your video may have a wrong aspect ratio. Contact the GPAC team!\\n\"));\n\t\t\t}\n\t\t}",
+      "explanation": "VUI aspect ratio: aspect_ratio_idc is read as 8 bits into a signed s32 (so 0..255, never negative). Extended-SAR (255) reads explicit 16-bit numerator/denominator; otherwise the idc indexes the constant avc_hevc_sar[] table but only after the bounds check 'aspect_ratio_idc < GF_ARRAY_LENGTH(avc_hevc_sar)'. Out-of-range idc just logs a warning. This lookup is correctly guarded."
+    },
+    {
+      "file": "corpus/train/train_0266_cwe415.c",
+      "lines": "194-240",
+      "code": "\t\tsps->vui.overscan_info_present_flag = gf_bs_read_int_log(bs, 1, \"overscan_info_present_flag\");\n\t\tif (sps->vui.overscan_info_present_flag)\n\t\t\tgf_bs_read_int_log(bs, 1, \"overscan_appropriate_flag\");\n\n\t\t/* default values */\n\t\tsps->vui.video_format = 5;\n\t\tsps->vui.colour_primaries = 2;\n\t\tsps->vui.transfer_characteristics = 2;\n\t\tsps->vui.matrix_coefficients = 2;\n\t\t/* now read values if possible */\n\t\tsps->vui.video_signal_type_present_flag = gf_bs_read_int_log(bs, 1, \"video_signal_type_present_flag\");\n\t\tif (sps->vui.video_signal_type_present_flag) {\n\t\t\tsps->vui.video_format = gf_bs_read_int_log(bs, 3, \"video_format\");\n\t\t\tsps->vui.video_full_range_flag = gf_bs_read_int_log(bs, 1, \"video_full_range_flag\");\n\t\t\tsps->vui.colour_description_present_flag = gf_bs_read_int_log(bs, 1, \"colour_description_present_flag\");\n\t\t\tif (sps->vui.colour_description_present_flag) {\n\t\t\t\tsps->vui.colour_primaries = gf_bs_read_int_log(bs, 8, \"colour_primaries\");\n\t\t\t\tsps->vui.transfer_characteristics = gf_bs_read_int_log(bs, 8, \"transfer_characteristics\");\n\t\t\t\tsps->vui.matrix_coefficients = gf_bs_read_int_log(bs, 8, \"matrix_coefficients\");\n\t\t\t}\n\t\t}\n\n\t\tif (gf_bs_read_int_log(bs, 1, \"chroma_location_info_present_flag\")) {\n\t\t\tgf_bs_read_ue_log(bs, \"chroma_sample_location_type_top_field\");\n\t\t\tgf_bs_read_ue_log(bs, \"chroma_sample_location_type_bottom_field\");\n\t\t}\n\n\t\tsps->vui.timing_info_present_flag = gf_bs_read_int_log(bs, 1, \"timing_info_present_flag\");\n\t\tif (sps->vui.timing_info_present_flag) {\n\t\t\tsps->vui.num_units_in_tick = gf_bs_read_int_log(bs, 32, \"num_units_in_tick\");\n\t\t\tsps->vui.time_scale = gf_bs_read_int_log(bs, 32, \"time_scale\");\n\t\t\tsps->vui.fixed_frame_rate_flag = gf_bs_read_int_log(bs, 1, \"fixed_frame_rate_flag\");\n\t\t}\n\n\t\tsps->vui.nal_hrd_parameters_present_flag = gf_bs_read_int_log(bs, 1, \"nal_hrd_parameters_present_flag\");\n\t\tif (sps->vui.nal_hrd_parameters_present_flag)\n\t\t\tavc_parse_hrd_parameters(bs, &sps->vui.hrd);\n\n\t\tsps->vui.vcl_hrd_parameters_present_flag = gf_bs_read_int_log(bs, 1, \"vcl_hrd_parameters_present_flag\");\n\t\tif (sps->vui.vcl_hrd_parameters_present_flag)\n\t\t\tavc_parse_hrd_parameters(bs, &sps->vui.hrd);\n\n\t\tif (sps->vui.nal_hrd_parameters_present_flag || sps->vui.vcl_hrd_parameters_present_flag)\n\t\t\tsps->vui.low_delay_hrd_flag = gf_bs_read_int_log(bs, 1, \"low_delay_hrd_flag\");\n\n\t\tsps->vui.pic_struct_present_flag = gf_bs_read_int_log(bs, 1, \"pic_struct_present_flag\");\n\t}",
+      "explanation": "The remaining VUI fields are read: overscan, colour/video signal description (with sensible defaults preset), chroma sample location, timing info (32-bit num_units_in_tick/time_scale), and HRD parameters delegated to avc_parse_hrd_parameters() for the NAL and/or VCL cases. All fields are fixed-width or bounded flag-gated reads into scalar struct members; the HRD sub-parse is a separate function (not shown) and carries its own contract."
+    },
+    {
+      "file": "corpus/train/train_0266_cwe415.c",
+      "lines": "243-311",
+      "code": "\tif (subseq_sps) {\n\t\tif ((profile_idc == 83) || (profile_idc == 86)) {\n\t\t\tu8 extended_spatial_scalability_idc;\n\t\t\t/*parsing seq_parameter_set_svc_extension*/\n\n\t\t\tgf_bs_read_int_log(bs, 1, \"inter_layer_deblocking_filter_control_present_flag\");\n\t\t\textended_spatial_scalability_idc = gf_bs_read_int_log(bs, 2, \"extended_spatial_scalability_idc\");\n\t\t\t...\n\t\t\tif (gf_bs_read_int_log(bs, 1, \"svc_vui_parameters_present\")) {\n\t\t\t\tu32 vui_ext_num_entries_minus1 = gf_bs_read_ue_log(bs, \"vui_ext_num_entries_minus1\");\n\n\t\t\t\tfor (i = 0; i <= vui_ext_num_entries_minus1; i++) {\n\t\t\t\t\t...\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t\telse if ((profile_idc == 118) || (profile_idc == 128)) {\n\t\t\tGF_LOG(GF_LOG_INFO, GF_LOG_CODING, (\"[avc-h264] MVC parsing not implemented - skipping parsing end of Subset SPS\\n\"));\n\t\t\treturn sps_id;\n\t\t}\n\n\t\tif (gf_bs_read_int_log(bs, 1, \"additional_extension2\")) {\n\t\t\tGF_LOG(GF_LOG_WARNING, GF_LOG_CODING, (\"[avc-h264] skipping parsing end of Subset SPS (additional_extension2)\\n\"));\n\t\t\treturn sps_id;\n\t\t}\n\t}\n\treturn sps_id;",
+      "explanation": "For a subset SPS on SVC profiles 83/86 the seq_parameter_set_svc_extension is parsed: chroma-phase flags gated on ChromaArrayType, extended spatial scalability offsets, and an optional SVC VUI block whose entry count comes from vui_ext_num_entries_minus1. The inner loop iterates 'i <= vui_ext_num_entries_minus1' consuming per-entry flags/timing bits but writing to no array. MVC profiles 118/128 are logged and skipped. The function finally returns sps_id (the parsed slot index) or the -1 sentinel on any earlier rejection."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0266_cwe415.c",
+      "lines": "156-162",
+      "code": "\t\tcl = gf_bs_read_ue_log(bs, \"frame_crop_left_offset\");\n\t\tcr = gf_bs_read_ue_log(bs, \"frame_crop_right_offset\");\n\t\tct = gf_bs_read_ue_log(bs, \"frame_crop_top_offset\");\n\t\tcb = gf_bs_read_ue_log(bs, \"frame_crop_bottom_offset\");\n\n\t\tsps->width -= CropUnitX * (cl + cr);\n\t\tsps->height -= CropUnitY * (ct + cb);",
+      "explanation": "The four crop offsets cl/cr/ct/cb are attacker-controlled unbounded Exp-Golomb ue values. CropUnitX*(cl+cr) is subtracted from sps->width and CropUnitY*(ct+cb) from sps->height with no check that the crop is smaller than the current dimension. An attacker who sets a crop offset larger than width/(2*CropUnitX) drives sps->width negative or, if width is an unsigned type, wraps it to a near-4-billion value. The bogus dimensions then flow into any downstream code that allocates or iterates buffers sized from sps->width*sps->height, turning this into an integer-underflow -> oversized-allocation / out-of-bounds primitive. Invariant the implementation must uphold: reject the SPS when CropUnitX*(cl+cr) >= width (and the height analog) before subtracting, per H.264 constraint that cropping must leave a positive picture."
+    },
+    {
+      "file": "corpus/train/train_0266_cwe415.c",
+      "lines": "122-128",
+      "code": "\tmb_width = gf_bs_read_ue_log(bs, \"pic_width_in_mbs_minus1\") + 1;\n\tmb_height = gf_bs_read_ue_log(bs, \"pic_height_in_map_units_minus1\") + 1;\n\n\tsps->frame_mbs_only_flag = gf_bs_read_int_log(bs, 1, \"frame_mbs_only_flag\");\n\n\tsps->width = mb_width * 16;\n\tsps->height = (2 - sps->frame_mbs_only_flag) * mb_height * 16;",
+      "explanation": "mb_width/mb_height are decoded ue values +1 into signed s32 with no upper bound. gf_bs_read_ue can return values near 2^31, so mb_width*16 and (2-flag)*mb_height*16 overflow the signed int computation (undefined behavior) and store a garbage/negative dimension into sps->width/height. Even at benign values a maliciously large macroblock count produces enormous pixel dimensions. The impact is the same as the crop case: downstream allocation/loop sizing off sps->width/height. Invariant: bound pic_width_in_mbs_minus1 / pic_height_in_map_units_minus1 to the level's MaxFS limit (or at least ensure width*height cannot overflow) before computing dimensions."
+    },
+    {
+      "file": "corpus/train/train_0266_cwe415.c",
+      "lines": "9-15",
+      "code": "\tif (!vui_flag_pos) {\n\t\tgf_bs_enable_emulation_byte_removal(bs, GF_TRUE);\n\t}\n\n\tif (!bs) {\n\t\treturn -1;\n\t}",
+      "explanation": "The NULL check on 'bs' is placed AFTER 'bs' is already passed to gf_bs_enable_emulation_byte_removal() at line 10. If a caller ever invokes this with bs==NULL and vui_flag_pos==NULL, the helper is entered with a NULL handle before the guard runs; unless that helper independently null-checks its argument, this is a NULL-pointer dereference and crash at the very start of parsing. Invariant: validate bs != NULL before any use. This is latent — the crash lives partly in gf_bs_enable_emulation_byte_removal (not shown) — but the ordering here is the defect."
+    },
+    {
+      "file": "corpus/train/train_0266_cwe415.c",
+      "lines": "40-40",
+      "code": "\tsps = &avc->sps[sps_id];",
+      "explanation": "The bounds check on sps_id (lines 35-37) protects the index, but 'avc' itself is never validated for NULL. If a caller passes avc==NULL (e.g. an error path that forgot to allocate the AVCState), 'avc->sps[sps_id]' dereferences NULL plus the sps_id*sizeof(AVC_SPS) offset, crashing. This is a caller-contract NULL dereference, latent in this function. Invariant: the caller must always supply a valid AVCState; defensively the parser could reject avc==NULL alongside the bs check."
+    },
+    {
+      "file": "corpus/train/train_0266_cwe415.c",
+      "lines": "108-115",
+      "code": "\t\tsps->poc_cycle_length = gf_bs_read_ue_log(bs, \"poc_cycle_length\");\n\t\tif (sps->poc_cycle_length > GF_ARRAY_LENGTH(sps->offset_for_ref_frame)) {\n\t\t\tsps->poc_cycle_length = 255;\n\t\t\tGF_LOG(GF_LOG_ERROR, GF_LOG_CODING, (\"[avc-h264] offset_for_ref_frame overflow from poc_cycle_length\\n\"));\n\t\t\treturn -1;\n\t\t}\n\t\tfor (i = 0; i < sps->poc_cycle_length; i++)\n\t\t\tsps->offset_for_ref_frame[i] = gf_bs_read_se_log_idx(bs, \"offset_for_ref_frame\", i);",
+      "explanation": "This is the historically vulnerable site: an unbounded ue poc_cycle_length drives writes into the fixed array sps->offset_for_ref_frame[]. In the shown '_fixed' code the guard 'poc_cycle_length > GF_ARRAY_LENGTH(...)' correctly rejects over-length counts before the loop, so no out-of-bounds write occurs. The residual thing to confirm is the boundary: because the comparison is '>' rather than '>=', a count exactly equal to GF_ARRAY_LENGTH is permitted and the loop writes indices 0..LENGTH-1 — in-bounds only if GF_ARRAY_LENGTH() reports the true element count of offset_for_ref_frame and the array is declared with that many slots (not LENGTH-1). Invariant: GF_ARRAY_LENGTH must equal the real capacity; if the array were declared one element short this would be an off-by-one write (CWE-787). As shown, this is correctly bounded."
+    },
+    {
+      "file": "corpus/train/train_0266_cwe415.c",
+      "lines": "272-297",
+      "code": "\t\t\t\tu32 vui_ext_num_entries_minus1 = gf_bs_read_ue_log(bs, \"vui_ext_num_entries_minus1\");\n\n\t\t\t\tfor (i = 0; i <= vui_ext_num_entries_minus1; i++) {",
+      "explanation": "vui_ext_num_entries_minus1 is an attacker-controlled ue with no upper bound, and the loop runs 'i <= vui_ext_num_entries_minus1'. A value near 2^32-1 makes the loop iterate billions of times, each iteration reading several bits; once the bitstream is exhausted the reads return 0/EOF but the loop still spins to completion, causing a denial-of-service (CPU exhaustion / hang). Note the loop writes to no array, so it is not a memory-safety bug, only an unbounded-work bug. Also, using '<=' means vui_ext_num_entries_minus1 == 0xFFFFFFFF would make 'i <= ...' never terminate via wraparound of the u32 counter. Invariant: cap vui_ext_num_entries_minus1 to a sane maximum before looping."
+    },
+    {
+      "file": "corpus/train/train_0266_cwe415.c",
+      "lines": "40-42",
+      "code": "\tsps = &avc->sps[sps_id];\n\tchroma_format_idc = sps->ChromaArrayType = 1;\n\tsps->state |= subseq_sps ? AVC_SUBSPS_PARSED : AVC_SPS_PARSED;",
+      "explanation": "The function re-parses into avc->sps[sps_id] in place and only OR-sets a parsed flag; it does not check whether this slot was already populated. If AVC_SPS holds heap-owned pointers that the surrounding subsystem allocates/frees keyed on the parsed flag, re-submitting an SPS with the same sps_id (or an SVC subset colliding via GF_SVC_SSPS_ID_SHIFT) can lead the caller to free or reallocate a buffer that a stale reference still points at — the double-free/use-after-free class implied by the sample name. Nothing in THIS function frees memory, so the defect, if any, lives in the caller/owner of AVC_SPS. Invariant to confirm: ownership of any pointer members of AVC_SPS on SPS re-parse — that overwriting a previously-parsed slot cannot orphan or double-free an owned allocation."
+    }
+  ],
+  "summary": "This is GPAC's AVC/H.264 SPS bitstream parser in its patched ('_fixed') form: the two classic memory-corruption sites — the avc->sps[] index (sps_id) and the offset_for_ref_frame[] write count (poc_cycle_length) — now carry explicit bounds guards and are correctly protected. The remaining risks are lower-severity and largely latent in callers/implementation: unchecked integer underflow of sps->width/height from attacker crop offsets and macroblock counts (CWE-191/190), a NULL-check-after-use ordering on 'bs', an unvalidated 'avc' pointer, an unbounded SVC VUI loop (DoS), and an SPS-slot re-parse contract whose double-free safety depends on the AVC_SPS owner.",
+  "reviewed_anchors": [
+    {"anchor": "gf_avc_read_sps_bs_internal(GF_BitStream*, AVCState*, u32 subseq_sps, u32 *vui_flag_pos, u32 nal_hdr) — signature, line 2", "disposition": "finding", "reason": "avc parameter dereferenced at line 40 without NULL validation"},
+    {"anchor": "gf_bs_enable_emulation_byte_removal(bs, GF_TRUE) called at line 10 before the bs NULL check at line 13", "disposition": "finding", "reason": "use-before-null-check ordering, latent NULL deref"},
+    {"anchor": "if (!bs) return -1; — line 13-15", "disposition": "finding", "reason": "guard exists but runs after first use of bs at line 10"},
+    {"anchor": "pcomp sanity checks (pcomp & 0x3 line 26; pcomp & 0xE0 line 52)", "disposition": "dismissed", "reason": "reserved-bit rejection on a fixed 8-bit field; no buffer or index involved"},
+    {"anchor": "sps_id = gf_bs_read_ue_log(...) + GF_SVC_SSPS_ID_SHIFT * subseq_sps; — line 34", "disposition": "finding", "reason": "attacker-controlled array index into avc->sps[32]; paired with a bounds guard"},
+    {"anchor": "if ((sps_id < 0) || (sps_id >= 32)) return -1; — line 35-37", "disposition": "dismissed", "reason": "correct bounds guard; catches both large-positive and INT_MAX-wrap-negative ue values"},
+    {"anchor": "sps = &avc->sps[sps_id]; — line 40 (fixed 32-entry array)", "disposition": "finding", "reason": "index guarded, but base pointer avc not NULL-checked"},
+    {"anchor": "chroma_format_idc = gf_bs_read_ue_log(...) — line 58", "disposition": "dismissed", "reason": "stored value / branch selector only, never used as an array index"},
+    {"anchor": "separate_colour_plane_flag (u8) — line 7,61", "disposition": "dismissed", "reason": "single-bit flag; only selects branches, no memory contract"},
+    {"anchor": "seq scaling list loops (k<8, z<sl where sl=16/64) — line 75-88", "disposition": "dismissed", "reason": "compile-time fixed bounds; writes to no buffer, only consumes bits"},
+    {"anchor": "sps->poc_cycle_length = gf_bs_read_ue_log(...) — line 108", "disposition": "finding", "reason": "attacker count driving writes into fixed array offset_for_ref_frame[]; must get a finding (buffer+count pair)"},
+    {"anchor": "if (sps->poc_cycle_length > GF_ARRAY_LENGTH(sps->offset_for_ref_frame)) ... return -1; — line 109-113", "disposition": "dismissed", "reason": "correct capacity guard; '>' allows exactly-full which is in-bounds"},
+    {"anchor": "for (i=0; i<poc_cycle_length; i++) sps->offset_for_ref_frame[i] = ... — line 114-115", "disposition": "dismissed", "reason": "write is bounded by the line-109 guard"},
+    {"anchor": "mb_width/mb_height = gf_bs_read_ue_log(...) + 1; sps->width/height = *16 — line 122-128", "disposition": "finding", "reason": "unbounded ue counts multiplied without overflow check"},
+    {"anchor": "frame crop offsets cl/cr/ct/cb and subtraction sps->width/height -= ... — line 156-162", "disposition": "finding", "reason": "unchecked underflow of dimensions from attacker crop offsets"},
+    {"anchor": "assert(SubWidthC == -1); — line 147", "disposition": "dismissed", "reason": "debug assert, typically compiled out; documentation not a runtime guard"},
+    {"anchor": "aspect_ratio_idc < GF_ARRAY_LENGTH(avc_hevc_sar) then avc_hevc_sar[aspect_ratio_idc] — line 186-188", "disposition": "dismissed", "reason": "table lookup correctly bounds-checked; idc read as 8-bit so never negative"},
+    {"anchor": "sps->vui.num_units_in_tick / time_scale = gf_bs_read_int_log(bs,32,...) — line 223-224", "disposition": "dismissed", "reason": "fixed 32-bit scalar stores; no index/size contract"},
+    {"anchor": "avc_parse_hrd_parameters(bs, &sps->vui.hrd) — line 230,234", "disposition": "dismissed", "reason": "delegated sub-parser (not shown); carries its own contract"},
+    {"anchor": "vui_ext_num_entries_minus1 loop for(i=0; i<=...; i++) — line 272-274", "disposition": "finding", "reason": "unbounded ue drives loop count; DoS and <= wrap risk, no array write"},
+    {"anchor": "sps->state |= AVC_SPS_PARSED / AVC_SUBSPS_PARSED; in-place re-parse — line 42", "disposition": "finding", "reason": "SPS slot reuse contract; latent double-free/UAF if AVC_SPS owns heap pointers"},
+    {"anchor": "return sps_id; sentinel/index return — line 302,307,310", "disposition": "dismissed", "reason": "returns validated slot index or -1; caller must treat -1 as error"}
+  ],
+  "findings": [
+    {
+      "title": "Integer underflow of picture dimensions from unchecked frame-crop offsets",
+      "anchor": "sps->width -= CropUnitX * (cl + cr); sps->height -= CropUnitY * (ct + cb);",
+      "file": "corpus/train/train_0266_cwe415.c",
+      "line": "156-162",
+      "code": "\t\tcl = gf_bs_read_ue_log(bs, \"frame_crop_left_offset\");\n\t\tcr = gf_bs_read_ue_log(bs, \"frame_crop_right_offset\");\n\t\tct = gf_bs_read_ue_log(bs, \"frame_crop_top_offset\");\n\t\tcb = gf_bs_read_ue_log(bs, \"frame_crop_bottom_offset\");\n\n\t\tsps->width -= CropUnitX * (cl + cr);\n\t\tsps->height -= CropUnitY * (ct + cb);",
+      "bug_class": "Integer underflow of size field (unchecked subtraction)",
+      "cwe": "CWE-191",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0266_cwe415.c (and implementation consuming sps->width/height, file not provided)",
+      "invariant": "The scaled crop CropUnitX*(cl+cr) must be strictly less than sps->width (and CropUnitY*(ct+cb) < sps->height) before subtracting; the SPS must be rejected otherwise.",
+      "failure_mode": "An attacker sets frame_crop_left/right (or top/bottom) offsets so that CropUnitX*(cl+cr) exceeds the current sps->width. The subtraction underflows: if sps->width is unsigned it wraps to a near-2^32 value, if signed it goes negative. The corrupted dimension propagates to downstream buffer sizing/allocation, enabling an oversized allocation or out-of-bounds indexing when frames are decoded.",
+      "cve_analog": "",
+      "what_to_confirm": "The declared type of sps->width/height and whether any caller validates them; add a 'crop >= dimension -> reject' guard before the subtraction."
+    },
+    {
+      "title": "Integer overflow computing width/height from unbounded macroblock counts",
+      "anchor": "mb_width = gf_bs_read_ue_log(...) + 1; sps->width = mb_width * 16;",
+      "file": "corpus/train/train_0266_cwe415.c",
+      "line": "122-128",
+      "code": "\tmb_width = gf_bs_read_ue_log(bs, \"pic_width_in_mbs_minus1\") + 1;\n\tmb_height = gf_bs_read_ue_log(bs, \"pic_height_in_map_units_minus1\") + 1;\n\n\tsps->frame_mbs_only_flag = gf_bs_read_int_log(bs, 1, \"frame_mbs_only_flag\");\n\n\tsps->width = mb_width * 16;\n\tsps->height = (2 - sps->frame_mbs_only_flag) * mb_height * 16;",
+      "bug_class": "Integer overflow (unbounded count multiplied)",
+      "cwe": "CWE-190",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0266_cwe415.c (and downstream sizing, file not provided)",
+      "invariant": "pic_width_in_mbs_minus1 and pic_height_in_map_units_minus1 must be bounded (e.g. to the profile/level MaxFS) so mb_width*16 and mb_height*16 (and their product) cannot overflow the signed int arithmetic.",
+      "failure_mode": "gf_bs_read_ue can decode values near 2^31; +1 and *16 (times 2 for interlaced height) overflow the signed s32/int computation (undefined behavior) and store a garbage or negative dimension into sps->width/height. Any later allocation sized from width*height is then wrong, giving an oversized or undersized buffer.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether macroblock counts are clamped anywhere before the multiply; add a level-based upper bound on mb_width/mb_height."
+    },
+    {
+      "title": "SPS slot re-parsed in place without ownership check (latent double-free/UAF)",
+      "anchor": "sps->state |= subseq_sps ? AVC_SUBSPS_PARSED : AVC_SPS_PARSED;",
+      "file": "corpus/train/train_0266_cwe415.c",
+      "line": "40-42",
+      "code": "\tsps = &avc->sps[sps_id];\n\tchroma_format_idc = sps->ChromaArrayType = 1;\n\tsps->state |= subseq_sps ? AVC_SUBSPS_PARSED : AVC_SPS_PARSED;",
+      "bug_class": "Double free / use-after-free on object re-parse",
+      "cwe": "CWE-416",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided) — owner/allocator of AVC_SPS members",
+      "invariant": "Re-parsing avc->sps[sps_id] must not orphan or double-free any heap-owned pointer members of a previously parsed AVC_SPS; ownership must be reset/freed exactly once per slot.",
+      "failure_mode": "The function overwrites avc->sps[sps_id] in place and only OR-sets a parsed flag; it neither detects a prior parse nor frees prior contents. If AVC_SPS holds owned allocations that the surrounding code frees/reallocates based on the parsed flag, submitting two SPS NALs with the same sps_id (or an SVC subset colliding via GF_SVC_SSPS_ID_SHIFT) can cause the owner to free the same buffer twice or use a freed one. This is the CWE-415/416 class implied by the sample name; no free occurs in this function itself.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether AVC_SPS contains heap pointers and how the caller handles a repeated sps_id; confirm the parsed-flag path cannot double-free."
+    },
+    {
+      "title": "Unbounded SVC VUI-extension loop (denial of service)",
+      "anchor": "for (i = 0; i <= vui_ext_num_entries_minus1; i++)",
+      "file": "corpus/train/train_0266_cwe415.c",
+      "line": "272-274",
+      "code": "\t\t\t\tu32 vui_ext_num_entries_minus1 = gf_bs_read_ue_log(bs, \"vui_ext_num_entries_minus1\");\n\n\t\t\t\tfor (i = 0; i <= vui_ext_num_entries_minus1; i++) {",
+      "bug_class": "Uncontrolled loop bound / resource exhaustion",
+      "cwe": "CWE-834",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0266_cwe415.c",
+      "invariant": "vui_ext_num_entries_minus1 must be capped to a reasonable maximum before iterating.",
+      "failure_mode": "vui_ext_num_entries_minus1 is an attacker-controlled ue with no upper bound. A large value makes the loop iterate up to billions of times consuming bits (EOF reads return 0), causing CPU exhaustion / hang. Because the condition is 'i <= vui_ext_num_entries_minus1' on a u32, a value of 0xFFFFFFFF makes the counter wrap and the loop never terminates. No memory is written, so this is DoS only.",
+      "cve_analog": "",
+      "what_to_confirm": "Add a sane cap on vui_ext_num_entries_minus1 (or use a wider counter / '<' logic) to guarantee termination."
+    },
+    {
+      "title": "'bs' passed to helper before its NULL check",
+      "anchor": "gf_bs_enable_emulation_byte_removal(bs, GF_TRUE); ... if (!bs) return -1;",
+      "file": "corpus/train/train_0266_cwe415.c",
+      "line": "9-15",
+      "code": "\tif (!vui_flag_pos) {\n\t\tgf_bs_enable_emulation_byte_removal(bs, GF_TRUE);\n\t}\n\n\tif (!bs) {\n\t\treturn -1;\n\t}",
+      "bug_class": "NULL pointer dereference (use before validation)",
+      "cwe": "CWE-476",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0266_cwe415.c (crash may surface inside gf_bs_enable_emulation_byte_removal, file not provided)",
+      "invariant": "'bs' must be validated non-NULL before it is used by any helper.",
+      "failure_mode": "When called with bs==NULL and vui_flag_pos==NULL, gf_bs_enable_emulation_byte_removal(bs, ...) at line 10 receives a NULL handle before the line-13 guard runs. If that helper dereferences the handle it crashes; the intended -1 rejection is unreachable. Requires a caller that can pass NULL bs, so severity is low.",
+      "cve_analog": "",
+      "what_to_confirm": "Move the 'if (!bs) return -1;' check above the emulation-removal call, or confirm the helper tolerates NULL."
+    },
+    {
+      "title": "AVCState pointer dereferenced without NULL validation",
+      "anchor": "sps = &avc->sps[sps_id];",
+      "file": "corpus/train/train_0266_cwe415.c",
+      "line": "40",
+      "code": "\tsps = &avc->sps[sps_id];",
+      "bug_class": "NULL pointer dereference (unvalidated parameter)",
+      "cwe": "CWE-476",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0266_cwe415.c",
+      "invariant": "The caller must always supply a valid AVCState; ideally the parser rejects avc==NULL like it does bs==NULL.",
+      "failure_mode": "sps_id is bounds-checked but 'avc' is not. A caller passing avc==NULL (e.g. an allocation-failure path) makes '&avc->sps[sps_id]' compute NULL + sps_id*sizeof(AVC_SPS) and the subsequent field stores dereference it, crashing. Contract/latent bug depending on all callers.",
+      "cve_analog": "",
+      "what_to_confirm": "That every caller guarantees avc != NULL; add a defensive check."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm the declared type of sps->width/height and add a guard rejecting crops where CropUnitX*(cl+cr) >= width (and the height analog) before the subtraction at lines 161-162.",
+    "Bound pic_width_in_mbs_minus1 / pic_height_in_map_units_minus1 (lines 122-123) to the profile/level MaxFS so width*16, height*16, and width*height cannot overflow.",
+    "Verify GF_ARRAY_LENGTH(sps->offset_for_ref_frame) equals the true declared capacity so the '>' guard at line 109 leaves the loop at line 114-115 fully in-bounds (no off-by-one).",
+    "Inspect the owner of AVC_SPS: determine whether it holds heap-allocated members and whether re-parsing the same sps_id (line 40-42) can double-free or leak them; enforce parse-once or free-before-reparse semantics.",
+    "Cap vui_ext_num_entries_minus1 (line 272) and confirm the loop cannot spin on EOF or wrap when the value is 0xFFFFFFFF.",
+    "Move the bs NULL check ahead of gf_bs_enable_emulation_byte_removal (lines 9-13) and add an avc NULL check before line 40.",
+    "Confirm gf_bs_read_ue_log's return type/width and that assigning it to s32 sps_id cannot bypass the (sps_id < 0 || sps_id >= 32) guard for any decodable value.",
+    "Review avc_parse_hrd_parameters (lines 230,234) for its own bounds handling of HRD cpb_cnt loops."
+  ]
+}

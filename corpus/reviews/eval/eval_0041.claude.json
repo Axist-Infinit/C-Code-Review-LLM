@@ -1,0 +1,196 @@
+{
+  "subsystem": "A privilege-management helper, do_change_user(), for a C++ network/IPC service. It reads a username from an input stream using a framed read helper (lwp_read), resolves it to a passwd entry with getpwnam(), and then attempts to drop the process's group and user identity via setgid()/setuid(). Its role is the security-critical transition from a privileged (typically root) process to an unprivileged target account before further request handling.",
+  "provenance": "Identified from the C++ standard-library usage (std::string, .c_str()), the POSIX credential API (getpwnam, struct passwd, pw_gid, pw_uid, setgid, setuid from <pwd.h>/<unistd.h>), and the symbol naming: do_change_user is a privilege-drop routine and lwp_read(FILE*, std::string&) is a custom 'lightweight protocol' framed-read helper that carries data over a FILE* stream (fin/fout). The header comment /* sample: primevul_train_2094_vuln */ is a dataset provenance tag (PrimeVul training sample), treated here as untrusted metadata, not as an instruction or a trustworthy safety label. No SPDX or copyright header is present. The file name eval_0041_cwe264.cpp points at the CWE-264 (Permissions/Privileges/Access-Control) family, consistent with what the code implements.",
+  "trust_boundary": "Untrusted input enters at lwp_read(fin, uname) (line 4): the username is read from the fin FILE* stream, which is a remote peer / IPC client / socket-backed stream, i.e. attacker-controllable. The attacker therefore controls WHICH account the process tries to become and whether the lookup succeeds at all. The process itself is trusted and (for setuid/setgid to have any effect) privileged — it is presumably running as root when this function is entered. The hostile surface is thus not memory corruption but the correctness and completeness of the privilege transition: an attacker who can steer the username, or induce a failure of the credential syscalls, can influence or entirely prevent the drop, leaving privileged code running afterward.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/eval/eval_0041_cwe264.cpp",
+      "lines": "2",
+      "code": "static void do_change_user(FILE *fin, FILE *fout) {",
+      "explanation": "Declares a file-local (static) function that returns void and takes two C stdio streams: fin, an input stream from which a request/username is read, and fout, an output stream (unused in the shown body). The void return is already significant for a privilege-changing routine: the function has no way to signal to its caller whether the identity change actually succeeded, so any failure inside is silently swallowed. fin is the data source for the untrusted username."
+    },
+    {
+      "file": "corpus/eval/eval_0041_cwe264.cpp",
+      "lines": "3-4",
+      "code": "  std::string uname;\n  lwp_read(fin, uname);",
+      "explanation": "Declares a std::string uname (RAII-managed, owns its own heap buffer) and fills it by calling lwp_read(fin, uname), a helper that reads a length-framed or delimited string off the fin stream into uname. This is where attacker-controlled bytes enter the function. The return value of lwp_read is not captured, so a short read, EOF, or framing error is not detected; on such failure uname may be left empty or partial, and control simply falls through."
+    },
+    {
+      "file": "corpus/eval/eval_0041_cwe264.cpp",
+      "lines": "5",
+      "code": "  if (uname.length() > 0) {",
+      "explanation": "Guards the rest of the routine on the username being non-empty. If uname is empty (including the case where lwp_read failed and produced nothing), the entire body is skipped and NO privilege drop occurs. This is the first of several early-exit paths that leave the process at its original (privileged) identity."
+    },
+    {
+      "file": "corpus/eval/eval_0041_cwe264.cpp",
+      "lines": "6",
+      "code": "    struct passwd *pw = getpwnam(uname.c_str());",
+      "explanation": "Resolves the username to a passwd database entry via getpwnam(), passing uname.c_str() (a pointer into the live, unmodified uname string — a correct, non-dangling use since uname outlives the call and getpwnam consumes it immediately). getpwnam returns a pointer to a static, non-reentrant internal buffer, or NULL if the name is unknown or on error. The attacker fully controls the lookup key, hence which account (and therefore which uid/gid) the process will attempt to assume."
+    },
+    {
+      "file": "corpus/eval/eval_0041_cwe264.cpp",
+      "lines": "7",
+      "code": "    if (pw) {",
+      "explanation": "Only proceeds if getpwnam returned a non-NULL entry. If the attacker supplies a username that does not exist in the passwd database (or getpwnam fails, e.g. errno set), pw is NULL and the body is skipped — again performing NO drop and continuing at the original privilege level. This correctly avoids a NULL dereference of pw, but the failure handling (do nothing, stay privileged) is the dangerous part."
+    },
+    {
+      "file": "corpus/eval/eval_0041_cwe264.cpp",
+      "lines": "8-10",
+      "code": "      if (pw->pw_gid) {\n        setgid(pw->pw_gid);\n      }",
+      "explanation": "If the resolved entry's primary group id is non-zero, calls setgid(pw->pw_gid) to change the process's group identity. Ordering is correct in principle (group is changed before user, so the privilege to call setgid is not yet surrendered), but the return value of setgid is discarded and the call is skipped entirely when pw_gid == 0. Notably, supplementary group memberships (from the process's original identity, e.g. root's groups) are NOT dropped here — there is no setgroups()/initgroups() call."
+    },
+    {
+      "file": "corpus/eval/eval_0041_cwe264.cpp",
+      "lines": "11-13",
+      "code": "      if (pw->pw_uid) {\n        setuid(pw->pw_uid);\n      }",
+      "explanation": "If the resolved entry's user id is non-zero, calls setuid(pw->pw_uid) to change the real/effective/saved user id to the target account, permanently dropping privileges when the process was root. As with setgid, the return value is ignored and the call is skipped when pw_uid == 0. This is the final and most security-critical step: everything about whether the process is still root afterward depends on this call actually succeeding, which the code never checks."
+    },
+    {
+      "file": "corpus/eval/eval_0041_cwe264.cpp",
+      "lines": "14-16",
+      "code": "    }\n  }\n}",
+      "explanation": "Closes the pw, length, and function scopes. After the function returns, the caller resumes processing the request on fin/fout. Because the function returns void and never verified any syscall result, the caller has no signal about the resulting identity and proceeds as if the drop succeeded — the core assumption this routine fails to guarantee."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/eval/eval_0041_cwe264.cpp",
+      "lines": "11-13",
+      "code": "      if (pw->pw_uid) {\n        setuid(pw->pw_uid);\n      }",
+      "explanation": "The return value of setuid() is not checked. setuid() can fail while leaving the caller fully privileged — most importantly with EAGAIN when the target uid is at or over its RLIMIT_NPROC process limit, a condition an attacker can deliberately engineer by pre-spawning processes as the target user before triggering this code path. If setuid returns -1 and the code ignores it (as here), the process CONTINUES executing subsequent request handling as root. The invariant an implementation must uphold is: after a privilege drop, verify the drop actually happened (check setuid's return, and ideally re-assert with getuid()/getresuid() that the privileged ids are gone) and abort/exit on any failure. Impact: full privilege retention (root) on attacker-influenced failure. CWE-252 / CWE-273."
+    },
+    {
+      "file": "corpus/eval/eval_0041_cwe264.cpp",
+      "lines": "8-10",
+      "code": "      if (pw->pw_gid) {\n        setgid(pw->pw_gid);\n      }",
+      "explanation": "The return value of setgid() is likewise unchecked. If setgid fails, the process keeps its original (root) group identity even though setuid may then drop the user id — an inconsistent, partially-privileged state. Because setgid is attempted before setuid, a caller could not even retry group changes after setuid succeeds (the privilege to do so is gone). The implementation must check setgid's result and fail closed. Impact: retained group-0/root group privileges enabling access to root-group-owned resources. CWE-252 / CWE-273."
+    },
+    {
+      "file": "corpus/eval/eval_0041_cwe264.cpp",
+      "lines": "8-13",
+      "code": "      if (pw->pw_gid) {\n        setgid(pw->pw_gid);\n      }\n      if (pw->pw_uid) {\n        setuid(pw->pw_uid);\n      }",
+      "explanation": "Supplementary (secondary) groups are never dropped. When a root process changes to an unprivileged user it must call setgroups() (or initgroups(uname, pw_gid)) to clear/replace the inherited supplementary group list BEFORE setuid; otherwise the target process retains membership in all of root's supplementary groups (commonly wheel, disk, shadow, sudo, etc.). This code performs setgid + setuid only, so after the 'drop' the process still holds root's supplementary group memberships and the access they grant. The invariant: a complete privilege drop is initgroups()/setgroups() -> setgid() -> setuid(), each checked. Impact: privilege escalation / unauthorized file and device access via leftover group memberships. CWE-273 / CWE-250."
+    },
+    {
+      "file": "corpus/eval/eval_0041_cwe264.cpp",
+      "lines": "5-7",
+      "code": "  if (uname.length() > 0) {\n    struct passwd *pw = getpwnam(uname.c_str());\n    if (pw) {",
+      "explanation": "The privilege drop is entirely conditional on attacker-controlled data, and every failure branch fails OPEN (stays privileged). An attacker who sends an empty username (or induces lwp_read to fail, since its return is unchecked at line 4), or a username that does not resolve in the passwd database, causes getpwnam to return NULL, so both setgid and setuid are skipped and the process continues as root. Thus a client can suppress the drop simply by choosing an invalid username. The invariant: a privilege-dropping service must fail CLOSED — if it cannot positively establish the intended unprivileged identity, it must abort rather than proceed privileged. Impact: trivial, attacker-triggered bypass of the entire privilege reduction. CWE-273 / CWE-20."
+    },
+    {
+      "file": "corpus/eval/eval_0041_cwe264.cpp",
+      "lines": "8-13",
+      "code": "      if (pw->pw_gid) {\n        setgid(pw->pw_gid);\n      }\n      if (pw->pw_uid) {\n        setuid(pw->pw_uid);\n      }",
+      "explanation": "The if (pw->pw_gid) / if (pw->pw_uid) guards silently skip the credential change whenever the target's id is 0. If the passwd database maps the requested (attacker-chosen) name to uid 0 or gid 0 — e.g. an aliased root account, or a misconfigured entry — the corresponding setgid/setuid is not merely a no-op but is skipped, and the process remains root without any error. More broadly, guarding the drop on 'id != 0' conflates 'id happens to be zero' with 'nothing to do', which is unsafe reasoning in a privilege boundary. The implementation should unconditionally set the intended ids (or explicitly refuse to drop to uid/gid 0) and verify the result. Impact: unexpected retention of root uid/gid for id-0 targets. CWE-273."
+    },
+    {
+      "file": "corpus/eval/eval_0041_cwe264.cpp",
+      "lines": "4",
+      "code": "  lwp_read(fin, uname);",
+      "explanation": "The result of lwp_read is discarded, so a truncated/failed read or a hostile frame is not detected. Beyond feeding the fail-open path above, if lwp_read has any internal length/parsing contract (framed reads over an untrusted FILE*), a caller that ignores its status cannot distinguish 'read this username' from 'read nothing / read garbage'. This is a latent contract issue in the read helper's implementation (not shown): its length handling against the destination must be sound, and its return value must be checked here. Impact ranges from the fail-open bypass to whatever the helper does on malformed input. CWE-252 / CWE-20 (latent, implementation not provided)."
+    }
+  ],
+  "summary": "This is a root-to-user privilege-drop routine driven by an attacker-controlled username, and it is unsafe in several independent ways: it ignores the return values of setgid() and setuid() (so an attacker-inducible failure, e.g. RLIMIT_NPROC exhaustion, leaves the process running as root), it never drops supplementary groups (initgroups/setgroups), and every input-validation branch fails OPEN — an unknown or empty username skips the drop entirely. A privileged service using this function can be trivially kept at root privilege by a remote client. These are CWE-264-family privilege-management defects, not memory-safety bugs.",
+  "reviewed_anchors": [
+    { "anchor": "do_change_user(FILE *fin, FILE *fout) signature (line 2)", "disposition": "finding", "reason": "void return gives no way to report drop failure to the caller; fin is the untrusted input source." },
+    { "anchor": "FILE *fout parameter (line 2)", "disposition": "dismissed", "reason": "Unused in the shown body; no security contract in this code (potential dead parameter only)." },
+    { "anchor": "std::string uname (line 3)", "disposition": "dismissed", "reason": "RAII-managed local buffer; std::string owns/frees its own storage, no fixed-size overflow surface here." },
+    { "anchor": "lwp_read(fin, uname) (line 4)", "disposition": "finding", "reason": "Untrusted-input entry point; return value unchecked, feeding fail-open logic; latent read-helper contract." },
+    { "anchor": "uname.length() > 0 guard (line 5)", "disposition": "finding", "reason": "Empty-username early exit is a fail-open path that skips the entire privilege drop." },
+    { "anchor": "getpwnam(uname.c_str()) (line 6)", "disposition": "finding", "reason": "Attacker controls the lookup key and can force NULL (unknown user) to bypass the drop; .c_str() use itself is safe." },
+    { "anchor": ".c_str() on uname (line 6)", "disposition": "dismissed", "reason": "Called on a live, named, unmodified std::string and consumed immediately by getpwnam — no dangling pointer (CWE-416 does not apply)." },
+    { "anchor": "if (pw) guard (line 7)", "disposition": "finding", "reason": "Correctly avoids NULL deref, but the NULL branch does nothing and stays privileged (fail-open)." },
+    { "anchor": "if (pw->pw_gid) guard (line 8)", "disposition": "finding", "reason": "Skips setgid when gid==0; conditions the group drop on attacker-influenced data." },
+    { "anchor": "setgid(pw->pw_gid) (line 9)", "disposition": "finding", "reason": "Return value unchecked; failure leaves original group identity." },
+    { "anchor": "if (pw->pw_uid) guard (line 11)", "disposition": "finding", "reason": "Skips setuid when uid==0; can leave process as root for id-0 targets." },
+    { "anchor": "setuid(pw->pw_uid) (line 12)", "disposition": "finding", "reason": "Return value unchecked; attacker-inducible failure leaves the process running as root." },
+    { "anchor": "Absence of setgroups()/initgroups()", "disposition": "finding", "reason": "Supplementary groups from the original (root) identity are never dropped." },
+    { "anchor": "setgid-before-setuid ordering (lines 9,12)", "disposition": "dismissed", "reason": "Ordering is correct: group id is changed before user id, so setgid is attempted while still privileged." }
+  ],
+  "findings": [
+    {
+      "title": "setuid() return value ignored — process stays root if the drop fails",
+      "anchor": "setuid(pw->pw_uid)",
+      "file": "corpus/eval/eval_0041_cwe264.cpp",
+      "line": "11-13",
+      "code": "      if (pw->pw_uid) {\n        setuid(pw->pw_uid);\n      }",
+      "bug_class": "Unchecked return value on privilege drop (privilege retention)",
+      "cwe": "CWE-252",
+      "severity": "critical",
+      "where_it_lives": "corpus/eval/eval_0041_cwe264.cpp",
+      "invariant": "After calling setuid() to drop privileges, the code MUST check its return value and MUST verify (e.g. via getuid()/getresuid()) that the privileged uid is gone, aborting the process on any failure — the drop must fail closed.",
+      "failure_mode": "setuid() can return -1 without dropping privileges, notably EAGAIN when the target uid is at its RLIMIT_NPROC limit — a state an attacker can create by pre-spawning processes as the target user. Because the result is discarded, execution continues and all subsequent request handling runs as root, yielding full privilege retention / escalation.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm no caller checks a status from do_change_user (it returns void) and that setuid's -1 return is never inspected; confirm the process is root when this runs and continues handling fin/fout afterward."
+    },
+    {
+      "title": "Supplementary groups never dropped (no setgroups/initgroups before setuid)",
+      "anchor": "setgid(pw->pw_gid) / setuid(pw->pw_uid) with no setgroups()",
+      "file": "corpus/eval/eval_0041_cwe264.cpp",
+      "line": "8-13",
+      "code": "      if (pw->pw_gid) {\n        setgid(pw->pw_gid);\n      }\n      if (pw->pw_uid) {\n        setuid(pw->pw_uid);\n      }",
+      "bug_class": "Incomplete privilege drop (retained supplementary groups)",
+      "cwe": "CWE-273",
+      "severity": "high",
+      "where_it_lives": "corpus/eval/eval_0041_cwe264.cpp",
+      "invariant": "A root-to-user transition must reset the supplementary group list via initgroups(uname, pw_gid) or setgroups(0, NULL) BEFORE setgid()/setuid(), and check its result; otherwise the target retains the privileged process's group memberships.",
+      "failure_mode": "The process keeps root's inherited supplementary groups (e.g. wheel, disk, shadow, sudo) after the 'drop', so the nominally-unprivileged user can still read/write resources owned by those groups — a privilege escalation despite the uid change.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm no initgroups()/setgroups() call precedes this block anywhere in the drop path, and that the process starts with root's supplementary groups."
+    },
+    {
+      "title": "Privilege drop fails open on invalid/empty/unknown username",
+      "anchor": "if (uname.length() > 0) { struct passwd *pw = getpwnam(uname.c_str()); if (pw) {",
+      "file": "corpus/eval/eval_0041_cwe264.cpp",
+      "line": "5-7",
+      "code": "  if (uname.length() > 0) {\n    struct passwd *pw = getpwnam(uname.c_str());\n    if (pw) {",
+      "bug_class": "Fail-open privilege management on attacker-controlled input",
+      "cwe": "CWE-273",
+      "severity": "high",
+      "where_it_lives": "corpus/eval/eval_0041_cwe264.cpp",
+      "invariant": "If the intended unprivileged identity cannot be positively established (empty name, failed read, unknown user), the routine must abort/exit rather than continue — a privilege-dropping service must fail closed.",
+      "failure_mode": "An attacker sends an empty or nonexistent username over fin; getpwnam returns NULL (or the length guard fails), so setgid/setuid are skipped and the process keeps running as root. The attacker thereby disables the entire privilege reduction by choosing bad input.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the NULL-pw and empty-uname branches simply fall through with no error/exit, and that the caller proceeds to handle the request regardless."
+    },
+    {
+      "title": "setgid() return value ignored — group privilege may be retained",
+      "anchor": "setgid(pw->pw_gid)",
+      "file": "corpus/eval/eval_0041_cwe264.cpp",
+      "line": "8-10",
+      "code": "      if (pw->pw_gid) {\n        setgid(pw->pw_gid);\n      }",
+      "bug_class": "Unchecked return value on privilege drop (group privilege retention)",
+      "cwe": "CWE-252",
+      "severity": "high",
+      "where_it_lives": "corpus/eval/eval_0041_cwe264.cpp",
+      "invariant": "setgid()'s return value must be checked; if it fails the routine must abort, since a subsequent setuid() would surrender the ability to correct the group identity.",
+      "failure_mode": "If setgid fails and the code ignores it, the process retains its original (root) group identity while possibly changing uid, producing an inconsistent, partially-privileged state with root-group access.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm setgid's -1 return is never inspected and no re-verification of the gid occurs before setuid."
+    },
+    {
+      "title": "Credential change skipped when target uid/gid is 0",
+      "anchor": "if (pw->pw_gid) / if (pw->pw_uid) guards",
+      "file": "corpus/eval/eval_0041_cwe264.cpp",
+      "line": "8-13",
+      "code": "      if (pw->pw_gid) {\n        setgid(pw->pw_gid);\n      }\n      if (pw->pw_uid) {\n        setuid(pw->pw_uid);\n      }",
+      "bug_class": "Unsafe conditional on privilege boundary (implicit root retention)",
+      "cwe": "CWE-273",
+      "severity": "medium",
+      "where_it_lives": "corpus/eval/eval_0041_cwe264.cpp",
+      "invariant": "The routine should set the intended ids unconditionally (or explicitly refuse to drop to uid/gid 0), not skip the syscall merely because the id is 0; 'id == 0' must not be treated as 'nothing to do'.",
+      "failure_mode": "If the attacker-chosen username resolves to uid 0 or gid 0 (aliased/misconfigured root account), the guard skips setuid/setgid and the process silently remains root/root-group, with no error signalled.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm passwd entries reachable via getpwnam that map to uid 0 or gid 0, and that the guards cause the corresponding syscall to be skipped."
+    }
+  ],
+  "audit_checklist": [
+    "Check the return value of every setuid()/setgid() call and abort the process on failure; do not treat a void privilege-drop helper as guaranteed to have dropped.",
+    "Re-verify after dropping with getuid()/getgid()/getresuid()/getresgid() that the privileged ids are truly gone before handling any request.",
+    "Call initgroups(uname, pw_gid) or setgroups(0, NULL) BEFORE setgid()/setuid() to clear inherited supplementary groups; check its result.",
+    "Make the routine fail CLOSED: empty username, lwp_read failure, or getpwnam()==NULL must abort/exit, never continue at the original privilege level.",
+    "Do not gate setuid/setgid on 'id != 0'; either drop unconditionally to the resolved id or explicitly reject dropping to uid/gid 0.",
+    "Check the return value and length/framing contract of lwp_read(fin, uname) so a truncated or hostile read cannot silently yield an empty/garbage username.",
+    "Confirm the process's privilege level at entry (root) and that all post-drop request handling on fin/fout runs only after a verified, complete drop."
+  ]
+}

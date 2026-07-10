@@ -1,0 +1,185 @@
+{
+  "subsystem": "Linux kernel io_uring read/write path. io_rw_init_file() is the per-request setup routine that prepares the struct kiocb embedded in an io_kiocb before a buffered/direct read or write is submitted through the io_uring fast path. It validates the file's access mode, seeds the iocb flags, applies the userspace-supplied RWF_* flags, decides NOWAIT/async retry policy, and wires the correct completion callback for either the IOPOLL or the normal interrupt-driven completion mode.",
+  "provenance": "Identified by symbol and type names, not an SPDX/copyright banner. The signature io_rw_init_file(struct io_kiocb *req, fmode_t mode), the types struct io_kiocb / struct io_ring_ctx / struct kiocb, the helpers io_req_ffs_set, io_file_get_flags, iocb_flags, kiocb_set_rw_flags, io_file_supports_nowait, io_complete_rw / io_complete_rw_iopoll, and the constants REQ_F_SUPPORT_NOWAIT_BIT, REQ_F_NOWAIT, IORING_SETUP_IOPOLL, IOCB_NOWAIT/DIRECT/HIPRI/ALLOC_CACHE are all io_uring internals from fs/io_uring or io_uring/rw.c (kernel ~6.0-6.1 era, single-arg io_file_supports_nowait and two-arg kiocb_set_rw_flags). The leading comment '/* sample: primevul_c_test_0242_vuln */' is an out-of-band dataset tag, not source, and is ignored for the security judgement.",
+  "trust_boundary": "This runs in kernel context on behalf of a userspace io_uring submission (SQE). The hostile inputs are the values a user placed in the submission queue entry and ring setup: req->rw.flags (the RWF_* read/write flags copied verbatim from the SQE, line 16) and ctx->flags (the IORING_SETUP_* mask chosen at io_uring_setup time, line 29). req->file is a file the caller referenced by fd or fixed-file index; its f_mode/f_flags/f_op are kernel-trusted but the CHOICE of which file is attacker-directed. fmode_t mode is supplied by the trusted caller (READ vs WRITE). The security job of this function is to be the gate that (a) rejects a file not opened for the requested direction and (b) refuses inconsistent flag/opcode combinations before the I/O is dispatched.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0282_cwe94.c",
+      "lines": "2-7",
+      "code": "static int io_rw_init_file(struct io_kiocb *req, fmode_t mode)\n{\n\tstruct kiocb *kiocb = &req->rw.kiocb;\n\tstruct io_ring_ctx *ctx = req->ctx;\n\tstruct file *file = req->file;\n\tint ret;",
+      "explanation": "Function entry. req is the io_uring request object being prepared; mode is the required file access mode the caller expects (FMODE_READ for a read opcode, FMODE_WRITE for a write). kiocb is a pointer to the kernel I/O control block that lives INSIDE the request (req->rw.kiocb), i.e. it is not freshly zeroed here — it is a sub-object of a pooled/reused io_kiocb. ctx caches the owning ring context (needed for ctx->flags later). file is the target file object already attached to the request. ret holds error codes. Everything downstream mutates kiocb in place, so the pre-existing contents of that embedded kiocb matter."
+    },
+    {
+      "file": "corpus/train/train_0282_cwe94.c",
+      "lines": "9-10",
+      "code": "\tif (unlikely(!file || !(file->f_mode & mode)))\n\t\treturn -EBADF;",
+      "explanation": "The primary access-control gate. It rejects the request with -EBADF if there is no file at all, or if the file's f_mode does not contain the requested mode bit. This is what stops a read opcode from operating on a write-only fd and vice-versa: a file opened O_WRONLY has FMODE_WRITE but not FMODE_READ, so a read request (mode == FMODE_READ) fails here. This single check is the whole read/write permission enforcement for the fast path, so its correctness is security-critical. The NULL check also protects the file->... dereferences on lines 13, 15, 26, and 30 by short-circuiting when file is NULL."
+    },
+    {
+      "file": "corpus/train/train_0282_cwe94.c",
+      "lines": "12-13",
+      "code": "\tif (!io_req_ffs_set(req))\n\t\treq->flags |= io_file_get_flags(file) << REQ_F_SUPPORT_NOWAIT_BIT;",
+      "explanation": "If the request's 'fixed file flags' were not already computed (io_req_ffs_set(req) is false), the code derives file capability flags via io_file_get_flags(file) and folds them into req->flags. The result is left-shifted by REQ_F_SUPPORT_NOWAIT_BIT so the returned FFS_* capability bits (e.g. supports-NOWAIT, is-regular-file) land on the corresponding REQ_F_* positions in req->flags. This caches, per request, whether the underlying file can do async/NOWAIT I/O so later logic (line 26) and the retry machinery need not re-query the file. The exact bit layout of io_file_get_flags()'s return value versus the REQ_F_* flag space is the contract that makes this shift correct."
+    },
+    {
+      "file": "corpus/train/train_0282_cwe94.c",
+      "lines": "15-18",
+      "code": "\tkiocb->ki_flags = iocb_flags(file);\n\tret = kiocb_set_rw_flags(kiocb, req->rw.flags);\n\tif (unlikely(ret))\n\t\treturn ret;",
+      "explanation": "Line 15 initializes kiocb->ki_flags from the file's intrinsic iocb flags (e.g. O_DIRECT/O_APPEND/O_DSYNC translated into IOCB_* bits). This is a full assignment, so it discards any stale ki_flags left in the reused embedded kiocb. Line 16 then applies the userspace-supplied per-request flags: req->rw.flags is the RWF_* value copied from the SQE, and kiocb_set_rw_flags translates/validates it (RWF_HIPRI -> IOCB_HIPRI, RWF_NOWAIT -> IOCB_NOWAIT, RWF_DSYNC/SYNC/APPEND, etc.) and returns a negative errno for any unsupported or invalid bit. Lines 17-18 propagate that error immediately. This is the validation gate for the only fully attacker-controlled scalar in the function; all later flag tests (IOCB_NOWAIT, IOCB_HIPRI, IOCB_DIRECT) depend on kiocb_set_rw_flags having faithfully filtered req->rw.flags."
+    },
+    {
+      "file": "corpus/train/train_0282_cwe94.c",
+      "lines": "25-27",
+      "code": "\tif ((kiocb->ki_flags & IOCB_NOWAIT) ||\n\t    ((file->f_flags & O_NONBLOCK) && !io_file_supports_nowait(req)))\n\t\treq->flags |= REQ_F_NOWAIT;",
+      "explanation": "Decides whether the request must be treated as non-blocking. If the user asked for NOWAIT (IOCB_NOWAIT set via RWF_NOWAIT), or the file was opened O_NONBLOCK AND the file cannot support async retry (io_file_supports_nowait(req) is false), the request is marked REQ_F_NOWAIT. The comment on lines 20-24 explains the intent: O_NONBLOCK files that DO support async are still allowed to retry, but ones that don't must not block a worker. This governs whether the submission is attempted inline and whether -EAGAIN triggers async punt, i.e. it affects liveness/DoS behaviour rather than memory safety."
+    },
+    {
+      "file": "corpus/train/train_0282_cwe94.c",
+      "lines": "29-35",
+      "code": "\tif (ctx->flags & IORING_SETUP_IOPOLL) {\n\t\tif (!(kiocb->ki_flags & IOCB_DIRECT) || !file->f_op->iopoll)\n\t\t\treturn -EOPNOTSUPP;\n\n\t\tkiocb->ki_flags |= IOCB_HIPRI | IOCB_ALLOC_CACHE;\n\t\tkiocb->ki_complete = io_complete_rw_iopoll;\n\t\treq->iopoll_completed = 0;",
+      "explanation": "The IOPOLL branch, taken when the ring was created with IORING_SETUP_IOPOLL. Polled completion only works for direct I/O on files whose file_operations implement ->iopoll, so line 30 rejects with -EOPNOTSUPP unless the request is IOCB_DIRECT and file->f_op->iopoll is non-NULL. When accepted, line 33 marks the iocb as high-priority polled (IOCB_HIPRI) and cache-allocatable (IOCB_ALLOC_CACHE), line 34 installs the polled completion handler io_complete_rw_iopoll, and line 35 clears req->iopoll_completed so the reaping loop (io_do_iopoll) knows this request is outstanding. The completion handler chosen here must match the path that will later reap the request; a mismatch is a lifetime hazard."
+    },
+    {
+      "file": "corpus/train/train_0282_cwe94.c",
+      "lines": "37-42",
+      "code": "\t\tif (kiocb->ki_flags & IOCB_HIPRI)\n\t\t\treturn -EINVAL;\n\t\tkiocb->ki_complete = io_complete_rw;\n\t}\n\n\treturn 0;",
+      "explanation": "The non-IOPOLL branch. High-priority polling makes no sense without IORING_SETUP_IOPOLL, so if the user set RWF_HIPRI (which produced IOCB_HIPRI in kiocb->ki_flags) on a non-poll ring, the request is rejected with -EINVAL. Otherwise the standard interrupt/softirq completion handler io_complete_rw is installed. Line 42 returns success, meaning the kiocb is now fully initialized and the caller may dispatch the read/write. The symmetry between this branch and the IOPOLL branch (each installs exactly one ki_complete) is what keeps the completion path consistent."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0282_cwe94.c",
+      "lines": "16-18",
+      "code": "\tret = kiocb_set_rw_flags(kiocb, req->rw.flags);\n\tif (unlikely(ret))\n\t\treturn ret;",
+      "explanation": "req->rw.flags is fully attacker-controlled: it is the RWF_* field copied verbatim from a userspace SQE. The safety of every subsequent flag test in this function is delegated entirely to kiocb_set_rw_flags(): it must reject any unknown/reserved bit, must not let a privileged or unsupported flag survive into kiocb->ki_flags, and must set IOCB_NOWAIT/IOCB_HIPRI only for the sanctioned RWF_ inputs. If kiocb_set_rw_flags failed to mask an unexpected bit, the IOCB_HIPRI/IOCB_DIRECT decisions on lines 30/37 could be driven to an unintended branch. The visible code handles the error correctly (line 17-18), so the residual risk is a latent CWE-20 that lives in kiocb_set_rw_flags, not here — confirm that helper filters the full RWF_ space and errors on anything else."
+    },
+    {
+      "file": "corpus/train/train_0282_cwe94.c",
+      "lines": "9-10",
+      "code": "\tif (unlikely(!file || !(file->f_mode & mode)))\n\t\treturn -EBADF;",
+      "explanation": "This is the sole read-vs-write authorization check on the fast path. If mode is ever passed in wrong by a caller (e.g. a write opcode that reaches io_rw_init_file with FMODE_READ), or if a future opcode forgets to route through this gate, a file opened for only one direction could be used for the other — an access-control bypass (CWE-284/CWE-20) that lets userspace write to a read-only fd or read a write-only one. The invariant the whole subsystem must uphold is that every read path calls this with FMODE_READ and every write path with FMODE_WRITE, and that f_mode is the authoritative mode set at open() time. The check itself is correct; the hazard is contract adherence at the call sites."
+    },
+    {
+      "file": "corpus/train/train_0282_cwe94.c",
+      "lines": "33-35",
+      "code": "\t\tkiocb->ki_flags |= IOCB_HIPRI | IOCB_ALLOC_CACHE;\n\t\tkiocb->ki_complete = io_complete_rw_iopoll;\n\t\treq->iopoll_completed = 0;",
+      "explanation": "kiocb is the embedded sub-object of a pooled io_kiocb (line 4), so fields not explicitly reset here retain values from a prior request. This branch installs the polled completion handler and clears iopoll_completed, but the completion callback set here (io_complete_rw_iopoll) MUST match how the request is subsequently reaped: an IOPOLL request is completed by io_do_iopoll scanning ctx, not by an IRQ. If a request is prepared as IOPOLL here but is ever routed to the normal completion path (or vice-versa, if IOCB_HIPRI/ki_complete leaked from a reused kiocb into the wrong branch), the request can be completed twice or reaped on the wrong list, a use-after-free / double-completion class bug (CWE-416). The invariant: ctx->flags IOPOLL state, the ki_complete pointer, and the reaping loop must agree for the lifetime of the request, and every field the polled path relies on (including any stale kiocb->private) must be reinitialized before submission."
+    },
+    {
+      "file": "corpus/train/train_0282_cwe94.c",
+      "lines": "30-31",
+      "code": "\t\tif (!(kiocb->ki_flags & IOCB_DIRECT) || !file->f_op->iopoll)\n\t\t\treturn -EOPNOTSUPP;",
+      "explanation": "file->f_op is dereferenced to read ->iopoll. file is guaranteed non-NULL here (line 9 short-circuits) and VFS guarantees a valid f_op for any open file, so a NULL f_op deref is not reachable in practice — but this line is the ONLY thing preventing an IOPOLL request from being armed on a file whose backing filesystem/block device has no polling support. If this guard were weakened or removed, io_complete_rw_iopoll would be installed on a file the poll loop cannot drive, so the request would never be reaped by polling and could hang the ring (DoS) or be completed inconsistently. The invariant: never install the iopoll completion handler unless both IOCB_DIRECT is set and f_op->iopoll exists. Rated low because the check is present and correct as shown."
+    },
+    {
+      "file": "corpus/train/train_0282_cwe94.c",
+      "lines": "12-13",
+      "code": "\tif (!io_req_ffs_set(req))\n\t\treq->flags |= io_file_get_flags(file) << REQ_F_SUPPORT_NOWAIT_BIT;",
+      "explanation": "The shift assumes io_file_get_flags() returns a small set of capability bits whose positions, once shifted left by REQ_F_SUPPORT_NOWAIT_BIT, exactly overlay the intended REQ_F_* flags in req->flags and nothing else. If io_file_get_flags() ever returns a value with a bit outside the expected FFS_ range, the shift would set an unrelated REQ_F_* flag (flag-space corruption), silently changing request semantics such as fixed-file, async, or linkage handling. This is not a memory-safety bug in the shown code, but a fragile encoding contract: the invariant is that io_file_get_flags's return width plus REQ_F_SUPPORT_NOWAIT_BIT stays within the REQ_F_* bit field and maps only onto the NOWAIT/ISREG capability bits. Confirm the two definitions stay in lockstep."
+    }
+  ],
+  "summary": "Well-gated Linux io_uring read/write setup code with no memory-safety bug visible in the shown lines. The only fully attacker-controlled scalar (req->rw.flags) is validated by kiocb_set_rw_flags with the error propagated, and the file access mode is checked before use. The real security weight is in contracts the implementation must keep: the read/write mode gate must be reached on every path, the IOPOLL completion handler installed on a pooled/reused kiocb must match the reaping path (a use-after-free / double-completion class if it does not), and kiocb_set_rw_flags must reject every unsanctioned RWF_ bit. Findings are latent/contract-level, not overflows.",
+  "reviewed_anchors": [
+    {"anchor": "io_rw_init_file(struct io_kiocb *req, fmode_t mode) — signature, line 2", "disposition": "dismissed", "reason": "Entry point; both params come from trusted callers (mode) or are the request object itself; the security surface is inside, not in the signature shape."},
+    {"anchor": "struct kiocb *kiocb = &req->rw.kiocb; — line 4", "disposition": "finding", "reason": "kiocb is an embedded sub-object of a pooled io_kiocb, so stale state can survive across reuse; drives the IOPOLL completion-consistency finding."},
+    {"anchor": "struct io_ring_ctx *ctx = req->ctx; — line 5", "disposition": "dismissed", "reason": "Only used to read ctx->flags (IORING_SETUP_IOPOLL); a plain kernel-trusted pointer read, no unchecked arithmetic."},
+    {"anchor": "struct file *file = req->file; — line 6", "disposition": "dismissed", "reason": "NULL-checked at line 9 before every dereference; the file object itself is kernel-trusted."},
+    {"anchor": "if (unlikely(!file || !(file->f_mode & mode))) — line 9", "disposition": "finding", "reason": "Sole read/write access-control gate; correctness depends on callers passing the right mode — access-bypass class if a path skips it."},
+    {"anchor": "req->flags |= io_file_get_flags(file) << REQ_F_SUPPORT_NOWAIT_BIT; — line 13", "disposition": "finding", "reason": "Bit-shift encoding contract between io_file_get_flags() width and the REQ_F_* flag space; flag-space corruption if they diverge."},
+    {"anchor": "kiocb->ki_flags = iocb_flags(file); — line 15", "disposition": "dismissed", "reason": "Full assignment that overwrites any stale ki_flags with file-derived flags; defensive, no attacker input."},
+    {"anchor": "ret = kiocb_set_rw_flags(kiocb, req->rw.flags); — line 16", "disposition": "finding", "reason": "req->rw.flags is the only fully attacker-controlled scalar (RWF_* from the SQE); the entire flag-filtering trust is delegated to this helper."},
+    {"anchor": "if (unlikely(ret)) return ret; — line 17-18", "disposition": "dismissed", "reason": "Correct error propagation of the validation result; no defect."},
+    {"anchor": "if ((kiocb->ki_flags & IOCB_NOWAIT) || ((file->f_flags & O_NONBLOCK) && !io_file_supports_nowait(req))) — line 25-26", "disposition": "dismissed", "reason": "Non-blocking policy decision; affects retry/liveness only, not memory safety, and file is non-NULL here."},
+    {"anchor": "if (ctx->flags & IORING_SETUP_IOPOLL) — line 29", "disposition": "dismissed", "reason": "Branch selector on a ring-setup flag fixed at io_uring_setup; drives the IOPOLL findings but carries no standalone bug."},
+    {"anchor": "if (!(kiocb->ki_flags & IOCB_DIRECT) || !file->f_op->iopoll) — line 30", "disposition": "finding", "reason": "f_op dereference and the only guard preventing iopoll setup on a non-pollable file; low-severity NULL/consistency contract."},
+    {"anchor": "kiocb->ki_flags |= IOCB_HIPRI | IOCB_ALLOC_CACHE; / ki_complete = io_complete_rw_iopoll / iopoll_completed = 0 — line 33-35", "disposition": "finding", "reason": "Completion handler on a reused kiocb must match the reaping path; mismatch is a use-after-free / double-completion class (covered by the IOPOLL finding)."},
+    {"anchor": "if (kiocb->ki_flags & IOCB_HIPRI) return -EINVAL; — line 37-38", "disposition": "dismissed", "reason": "Correctly rejects HIPRI on a non-poll ring; a hardening check, not a defect."},
+    {"anchor": "kiocb->ki_complete = io_complete_rw; — line 39", "disposition": "dismissed", "reason": "Installs the standard completion handler in the non-IOPOLL branch; symmetric with line 34, no issue on its own."},
+    {"anchor": "return 0; — line 42", "disposition": "dismissed", "reason": "Success return after full initialization; no contract."}
+  ],
+  "findings": [
+    {
+      "title": "IOPOLL completion handler installed on a pooled/reused kiocb must match the reaping path (latent double-completion / UAF)",
+      "anchor": "kiocb->ki_flags |= IOCB_HIPRI | IOCB_ALLOC_CACHE; kiocb->ki_complete = io_complete_rw_iopoll; req->iopoll_completed = 0;",
+      "file": "corpus/train/train_0282_cwe94.c",
+      "line": "33-35",
+      "code": "\t\tkiocb->ki_flags |= IOCB_HIPRI | IOCB_ALLOC_CACHE;\n\t\tkiocb->ki_complete = io_complete_rw_iopoll;\n\t\treq->iopoll_completed = 0;",
+      "bug_class": "Object lifetime / completion-path mismatch (use-after-free / double completion)",
+      "cwe": "CWE-416",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "The ki_complete pointer set here, the IOCB_HIPRI/iopoll_completed state, and the loop that reaps the request (io_do_iopoll vs the IRQ/task-work completion) must agree for the request's entire lifetime; every kiocb field the polled path relies on (e.g. kiocb->private) must be reinitialized because kiocb is an embedded sub-object of a reused io_kiocb (line 4), not freshly zeroed.",
+      "failure_mode": "If a request is armed with io_complete_rw_iopoll but subsequently reaped or completed by the non-poll path (or stale IOCB_HIPRI/ki_complete from a reused kiocb steers a later request into the wrong branch), the request object can be completed twice or freed while still referenced by the poll loop, yielding a use-after-free or double CQE. Triggered by a userspace ring created with IORING_SETUP_IOPOLL submitting direct-I/O reads/writes and racing completion.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm that kiocb->private (and any other polled-path state) is reset before this branch runs, and that io_do_iopoll is the exclusive reaper for requests whose ki_complete is io_complete_rw_iopoll, with no path completing them via io_complete_rw."
+    },
+    {
+      "title": "Entire RWF_* filtering of attacker-controlled req->rw.flags is delegated to kiocb_set_rw_flags",
+      "anchor": "ret = kiocb_set_rw_flags(kiocb, req->rw.flags);",
+      "file": "corpus/train/train_0282_cwe94.c",
+      "line": "16-18",
+      "code": "\tret = kiocb_set_rw_flags(kiocb, req->rw.flags);\n\tif (unlikely(ret))\n\t\treturn ret;",
+      "bug_class": "Improper input validation of untrusted flag field",
+      "cwe": "CWE-20",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "kiocb_set_rw_flags must reject (return a negative errno for) every unknown or reserved bit in req->rw.flags and translate only the sanctioned RWF_* bits into IOCB_* flags, so that the IOCB_NOWAIT/IOCB_HIPRI/IOCB_DIRECT tests on lines 25/30/37 never see an unintended flag.",
+      "failure_mode": "req->rw.flags is copied verbatim from a userspace SQE. If the helper failed to mask an unexpected bit, that bit could survive into kiocb->ki_flags and steer the request into the wrong completion/branch or an unsupported I/O mode. The shown code correctly propagates the error, so the residual risk is entirely inside kiocb_set_rw_flags.",
+      "cve_analog": "",
+      "what_to_confirm": "Read kiocb_set_rw_flags and verify it validates the full RWF_ mask and returns -EINVAL/-EOPNOTSUPP on any bit it does not explicitly handle, rather than silently OR-ing user bits into ki_flags."
+    },
+    {
+      "title": "Read/write access is enforced only by the f_mode gate; every opcode path must reach it with the correct mode",
+      "anchor": "if (unlikely(!file || !(file->f_mode & mode)))",
+      "file": "corpus/train/train_0282_cwe94.c",
+      "line": "9-10",
+      "code": "\tif (unlikely(!file || !(file->f_mode & mode)))\n\t\treturn -EBADF;",
+      "bug_class": "Improper access control (read/write direction bypass)",
+      "cwe": "CWE-284",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "Every read opcode must invoke io_rw_init_file with mode == FMODE_READ and every write opcode with mode == FMODE_WRITE, and f_mode must remain the authoritative open-time access mask; this check is the only place the direction is enforced on the fast path.",
+      "failure_mode": "If a caller passes the wrong mode, or a new opcode dispatches I/O without routing through this gate, a file opened for one direction could be used for the other (e.g. writing through a read-only fd), an authorization bypass. Not reachable from the shown code alone, but the whole subsystem's correctness rests on this contract.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify all read and write submission paths call io_rw_init_file with the mode matching the opcode, and that no direct-I/O or fixed-file shortcut skips this check."
+    },
+    {
+      "title": "io_file_get_flags() result is left-shifted onto req->flags — fragile bit-encoding contract",
+      "anchor": "req->flags |= io_file_get_flags(file) << REQ_F_SUPPORT_NOWAIT_BIT;",
+      "file": "corpus/train/train_0282_cwe94.c",
+      "line": "12-13",
+      "code": "\tif (!io_req_ffs_set(req))\n\t\treq->flags |= io_file_get_flags(file) << REQ_F_SUPPORT_NOWAIT_BIT;",
+      "bug_class": "Flag-space corruption via mismatched bit encoding",
+      "cwe": "CWE-681",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "The set of bits io_file_get_flags() can return, once shifted left by REQ_F_SUPPORT_NOWAIT_BIT, must land exactly on the intended REQ_F_* capability bits (NOWAIT/ISREG) and never overlap any other REQ_F_* flag.",
+      "failure_mode": "If io_file_get_flags() ever returns a bit outside the expected FFS_ range, the shift sets an unrelated REQ_F_* flag, silently altering request semantics (fixed-file, async, linkage). No memory unsafety in the shown line, but a maintenance hazard where two definitions must stay in lockstep.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the width/values returned by io_file_get_flags() plus REQ_F_SUPPORT_NOWAIT_BIT stay within the REQ_F_* bitfield and map only onto the intended NOWAIT/ISREG bits."
+    },
+    {
+      "title": "file->f_op->iopoll dereference and sole guard against arming iopoll on a non-pollable file",
+      "anchor": "if (!(kiocb->ki_flags & IOCB_DIRECT) || !file->f_op->iopoll)",
+      "file": "corpus/train/train_0282_cwe94.c",
+      "line": "30-31",
+      "code": "\t\tif (!(kiocb->ki_flags & IOCB_DIRECT) || !file->f_op->iopoll)\n\t\t\treturn -EOPNOTSUPP;",
+      "bug_class": "NULL/consistency guard (missing-check class if removed)",
+      "cwe": "CWE-476",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "The iopoll completion handler must only be installed when both IOCB_DIRECT is set and file->f_op->iopoll is non-NULL; file is guaranteed non-NULL here by the line-9 check and VFS guarantees a valid f_op.",
+      "failure_mode": "If this guard were weakened, io_complete_rw_iopoll would be installed on a file the poll loop cannot drive, so the request would never be reaped by polling (ring hang / DoS) or be completed on an inconsistent path. As shown the guard is present and correct, so severity is low; noted because it is the linchpin of IOPOLL safety.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify no IOPOLL path installs io_complete_rw_iopoll without first passing this IOCB_DIRECT && f_op->iopoll check."
+    }
+  ],
+  "audit_checklist": [
+    "Read kiocb_set_rw_flags: confirm it rejects every non-sanctioned bit of req->rw.flags (RWF_* from the SQE) and never leaks user bits into kiocb->ki_flags.",
+    "Confirm every read submission path passes FMODE_READ and every write path FMODE_WRITE into io_rw_init_file, and that no opcode dispatches I/O bypassing the line-9 f_mode gate.",
+    "Verify the embedded kiocb (req->rw.kiocb) has all polled-path fields (kiocb->private, ki_complete, ki_flags) fully reinitialized on reuse so stale IOPOLL state cannot leak into a later request.",
+    "Confirm requests whose ki_complete is io_complete_rw_iopoll are reaped exclusively by io_do_iopoll and never completed via io_complete_rw (guard against double completion / UAF).",
+    "Check that io_file_get_flags()'s return encoding shifted by REQ_F_SUPPORT_NOWAIT_BIT maps only onto the intended REQ_F_* capability bits and cannot corrupt adjacent flags.",
+    "Confirm file->f_op is always valid at line 30 and that the IOCB_DIRECT && f_op->iopoll guard is the only route to installing the iopoll completion handler."
+  ]
+}

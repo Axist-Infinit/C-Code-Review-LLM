@@ -1,0 +1,156 @@
+Files under review: corpus/train/train_0354_cwe835.c
+
+<<<BEGIN_UNTRUSTED_CODE>>>
+/* ===== FILE: corpus/train/train_0354_cwe835.c ===== */
+   1| /* sample: primevul_c_test_0401_fixed */
+   2| static void gem_transmit(CadenceGEMState *s)
+   3| {
+   4|     uint32_t desc[DESC_MAX_NUM_WORDS];
+   5|     hwaddr packet_desc_addr;
+   6|     uint8_t     *p;
+   7|     unsigned    total_bytes;
+   8|     int q = 0;
+   9| 
+  10|     /* Do nothing if transmit is not enabled. */
+  11|     if (!(s->regs[GEM_NWCTRL] & GEM_NWCTRL_TXENA)) {
+  12|         return;
+  13|     }
+  14| 
+  15|     DB_PRINT("\n");
+  16| 
+  17|     /* The packet we will hand off to QEMU.
+  18|      * Packets scattered across multiple descriptors are gathered to this
+  19|      * one contiguous buffer first.
+  20|      */
+  21|     p = s->tx_packet;
+  22|     total_bytes = 0;
+  23| 
+  24|     for (q = s->num_priority_queues - 1; q >= 0; q--) {
+  25|         /* read current descriptor */
+  26|         packet_desc_addr = gem_get_tx_desc_addr(s, q);
+  27| 
+  28|         DB_PRINT("read descriptor 0x%" HWADDR_PRIx "\n", packet_desc_addr);
+  29|         address_space_read(&s->dma_as, packet_desc_addr,
+  30|                            MEMTXATTRS_UNSPECIFIED, desc,
+  31|                            sizeof(uint32_t) * gem_get_desc_len(s, false));
+  32|         /* Handle all descriptors owned by hardware */
+  33|         while (tx_desc_get_used(desc) == 0) {
+  34| 
+  35|             /* Do nothing if transmit is not enabled. */
+  36|             if (!(s->regs[GEM_NWCTRL] & GEM_NWCTRL_TXENA)) {
+  37|                 return;
+  38|             }
+  39|             print_gem_tx_desc(desc, q);
+  40| 
+  41|             /* The real hardware would eat this (and possibly crash).
+  42|              * For QEMU let's lend a helping hand.
+  43|              */
+  44|             if ((tx_desc_get_buffer(s, desc) == 0) ||
+  45|                 (tx_desc_get_length(desc) == 0)) {
+  46|                 DB_PRINT("Invalid TX descriptor @ 0x%" HWADDR_PRIx "\n",
+  47|                          packet_desc_addr);
+  48|                 break;
+  49|             }
+  50| 
+  51|             if (tx_desc_get_length(desc) > gem_get_max_buf_len(s, true) -
+  52|                                                (p - s->tx_packet)) {
+  53|                 qemu_log_mask(LOG_GUEST_ERROR, "TX descriptor @ 0x%" \
+  54|                          HWADDR_PRIx " too large: size 0x%x space 0x%zx\n",
+  55|                          packet_desc_addr, tx_desc_get_length(desc),
+  56|                          gem_get_max_buf_len(s, true) - (p - s->tx_packet));
+  57|                 gem_set_isr(s, q, GEM_INT_AMBA_ERR);
+  58|                 break;
+  59|             }
+  60| 
+  61|             /* Gather this fragment of the packet from "dma memory" to our
+  62|              * contig buffer.
+  63|              */
+  64|             address_space_read(&s->dma_as, tx_desc_get_buffer(s, desc),
+  65|                                MEMTXATTRS_UNSPECIFIED,
+  66|                                p, tx_desc_get_length(desc));
+  67|             p += tx_desc_get_length(desc);
+  68|             total_bytes += tx_desc_get_length(desc);
+  69| 
+  70|             /* Last descriptor for this packet; hand the whole thing off */
+  71|             if (tx_desc_get_last(desc)) {
+  72|                 uint32_t desc_first[DESC_MAX_NUM_WORDS];
+  73|                 hwaddr desc_addr = gem_get_tx_desc_addr(s, q);
+  74| 
+  75|                 /* Modify the 1st descriptor of this packet to be owned by
+  76|                  * the processor.
+  77|                  */
+  78|                 address_space_read(&s->dma_as, desc_addr,
+  79|                                    MEMTXATTRS_UNSPECIFIED, desc_first,
+  80|                                    sizeof(desc_first));
+  81|                 tx_desc_set_used(desc_first);
+  82|                 address_space_write(&s->dma_as, desc_addr,
+  83|                                     MEMTXATTRS_UNSPECIFIED, desc_first,
+  84|                                     sizeof(desc_first));
+  85|                 /* Advance the hardware current descriptor past this packet */
+  86|                 if (tx_desc_get_wrap(desc)) {
+  87|                     s->tx_desc_addr[q] = gem_get_tx_queue_base_addr(s, q);
+  88|                 } else {
+  89|                     s->tx_desc_addr[q] = packet_desc_addr +
+  90|                                          4 * gem_get_desc_len(s, false);
+  91|                 }
+  92|                 DB_PRINT("TX descriptor next: 0x%08x\n", s->tx_desc_addr[q]);
+  93| 
+  94|                 s->regs[GEM_TXSTATUS] |= GEM_TXSTATUS_TXCMPL;
+  95|                 gem_set_isr(s, q, GEM_INT_TXCMPL);
+  96| 
+  97|                 /* Handle interrupt consequences */
+  98|                 gem_update_int_status(s);
+  99| 
+ 100|                 /* Is checksum offload enabled? */
+ 101|                 if (s->regs[GEM_DMACFG] & GEM_DMACFG_TXCSUM_OFFL) {
+ 102|                     net_checksum_calculate(s->tx_packet, total_bytes, CSUM_ALL);
+ 103|                 }
+ 104| 
+ 105|                 /* Update MAC statistics */
+ 106|                 gem_transmit_updatestats(s, s->tx_packet, total_bytes);
+ 107| 
+ 108|                 /* Send the packet somewhere */
+ 109|                 if (s->phy_loop || (s->regs[GEM_NWCTRL] &
+ 110|                                     GEM_NWCTRL_LOCALLOOP)) {
+ 111|                     qemu_receive_packet(qemu_get_queue(s->nic), s->tx_packet,
+ 112|                                         total_bytes);
+ 113|                 } else {
+ 114|                     qemu_send_packet(qemu_get_queue(s->nic), s->tx_packet,
+ 115|                                      total_bytes);
+ 116|                 }
+ 117| 
+ 118|                 /* Prepare for next packet */
+ 119|                 p = s->tx_packet;
+ 120|                 total_bytes = 0;
+ 121|             }
+ 122| 
+ 123|             /* read next descriptor */
+ 124|             if (tx_desc_get_wrap(desc)) {
+ 125| 
+ 126|                 if (s->regs[GEM_DMACFG] & GEM_DMACFG_ADDR_64B) {
+ 127|                     packet_desc_addr = s->regs[GEM_TBQPH];
+ 128|                     packet_desc_addr <<= 32;
+ 129|                 } else {
+ 130|                     packet_desc_addr = 0;
+ 131|                 }
+ 132|                 packet_desc_addr |= gem_get_tx_queue_base_addr(s, q);
+ 133|             } else {
+ 134|                 packet_desc_addr += 4 * gem_get_desc_len(s, false);
+ 135|             }
+ 136|             DB_PRINT("read descriptor 0x%" HWADDR_PRIx "\n", packet_desc_addr);
+ 137|             address_space_read(&s->dma_as, packet_desc_addr,
+ 138|                                MEMTXATTRS_UNSPECIFIED, desc,
+ 139|                                sizeof(uint32_t) * gem_get_desc_len(s, false));
+ 140|         }
+ 141| 
+ 142|         if (tx_desc_get_used(desc)) {
+ 143|             s->regs[GEM_TXSTATUS] |= GEM_TXSTATUS_USED;
+ 144|             /* IRQ TXUSED is defined only for queue 0 */
+ 145|             if (q == 0) {
+ 146|                 gem_set_isr(s, 0, GEM_INT_TXUSED);
+ 147|             }
+ 148|             gem_update_int_status(s);
+ 149|         }
+ 150|     }
+ 151| }
+<<<END_UNTRUSTED_CODE>>>

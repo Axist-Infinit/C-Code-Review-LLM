@@ -1,0 +1,171 @@
+{
+  "subsystem": "Squid HTTP proxy-cache SNMP agent. This is snmpDecodePacket(), the entry point that turns an inbound SNMP UDP datagram (already read into rq->buf/rq->len) into a parsed SNMP PDU, applies the snmp_access ACL, and either schedules a response or tears everything down. It is the front door of Squid's embedded SNMP agent and runs against raw, remote, unauthenticated wire data.",
+  "provenance": "Identified from Squid-specific idioms: debugs(49, ...) — Squid debug section 49 is the SNMP subsystem; the SNMP API surface snmp_pdu_create, snmp_parse, snmp_coexist_V2toV1, snmp_free_pdu and SNMP_VERSION_1; the Squid ACL machinery ACLFilledChecklist / fastCheck() / allow_t / ACCESS_DENIED / ACCESS_ALLOWED and Config.accessList.snmp; and the Squid allocator wrapper xfree. The function name snmpDecodePacket and SnmpRequest type match Squid src/snmp_core.cc. The header comment `/* sample: primevul_train_2525_fixed */` marks this as the FIXED member of a PrimeVul train pair; per instructions this label and the in-code claim are treated as untrusted and the code is judged on its merits.",
+  "trust_boundary": "The trust boundary is the SNMP UDP socket. rq->buf and rq->len (aliased to local buf/len at lines 6-7) hold an attacker-supplied datagram from an arbitrary remote host; SNMP is UDP and trivially spoofable, so rq->from (the claimed source address) is also attacker-influenced. Everything the ASN.1/BER decoder snmp_parse touches at line 19 is hostile: the version, community string, request-id, and the entire varbind list are attacker-chosen. Config.accessList.snmp is trusted local configuration. The ACL check at line 27 is authorization, not input sanitization — snmp_parse has already consumed the whole untrusted buffer before any access decision is made, so any memory-safety bug in the parser is reachable pre-authorization.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0207_cwe772.cpp",
+      "lines": "2-8",
+      "code": "snmpDecodePacket(SnmpRequest * rq)\n{\n    struct snmp_pdu *PDU;\n    u_char *Community;\n    u_char *buf = rq->buf;\n    int len = rq->len;\n    allow_t allow = ACCESS_DENIED;",
+      "explanation": "The function receives a single SnmpRequest pointer rq that carries the already-received datagram and connection metadata. It declares two owning pointers that will hold heap resources: PDU (a struct snmp_pdu*, filled by the parser) and Community (a u_char* community string returned by the parser). It caches the untrusted packet payload and its length into locals buf and Community-source by reading rq->buf and rq->len. Note len is a signed int; if rq->len is ever negative or if the datagram length was mis-computed upstream, a negative length flows straight into snmp_parse at line 19. allow is initialized to ACCESS_DENIED, establishing a fail-closed default: unless the ACL explicitly returns ACCESS_ALLOWED the request will be rejected."
+    },
+    {
+      "file": "corpus/train/train_0207_cwe772.cpp",
+      "lines": "10-13",
+      "code": "    if (!Config.accessList.snmp) {\n        debugs(49, DBG_IMPORTANT, \"WARNING: snmp_access not configured. agent query DENIED from : \" << rq->from);\n        return;\n    }",
+      "explanation": "A guard: if the administrator never configured an snmp_access ACL, the agent refuses to answer and logs the denied source. Critically for resource accounting, this early return happens BEFORE any allocation (PDU is created at line 16, Community at line 19), so this path leaks nothing. This is the correct place for a fail-closed configuration gate; it also means a box with SNMP compiled-in but unconfigured will not run the parser at all."
+    },
+    {
+      "file": "corpus/train/train_0207_cwe772.cpp",
+      "lines": "15-16",
+      "code": "    debugs(49, 5, HERE << \"Called.\");\n    PDU = snmp_pdu_create(0);",
+      "explanation": "A trace log, then the first heap allocation: snmp_pdu_create(0) builds an empty SNMP PDU object to be populated by the parser. Its return value is stored in PDU and is NOT checked for NULL. From here on there is an owned resource that every subsequent exit path must release or transfer; this allocation is the anchor of the CWE-772 resource-release contract this sample is organized around."
+    },
+    {
+      "file": "corpus/train/train_0207_cwe772.cpp",
+      "lines": "17-19",
+      "code": "    /* Allways answer on SNMPv1 */\n    rq->session.Version = SNMP_VERSION_1;\n    Community = snmp_parse(&rq->session, PDU, buf, len);",
+      "explanation": "The session version is pinned to SNMP_VERSION_1 (the comment's typo 'Allways' is cosmetic). Then snmp_parse() is the heart of the function: it decodes the raw untrusted buffer buf of length len against the session, fills the previously allocated PDU with the request's varbinds/reqid, and returns a freshly allocated community-string buffer (or NULL on parse failure). This single call is where all attacker bytes are interpreted; it performs the ASN.1/BER length-prefixed decoding of nested SNMP structures. Community becomes the second owned heap resource. The pointer PDU passed here is the possibly-NULL result of line 16."
+    },
+    {
+      "file": "corpus/train/train_0207_cwe772.cpp",
+      "lines": "21-27",
+      "code": "    /* Check if we have explicit permission to access SNMP data.\n     * default (set above) is to deny all */\n    if (Community) {\n        ACLFilledChecklist checklist(Config.accessList.snmp, NULL, NULL);\n        checklist.src_addr = rq->from;\n        checklist.snmp_community = (char *) Community;\n        allow = checklist.fastCheck();",
+      "explanation": "If parsing succeeded (Community non-NULL), Squid builds an ACL checklist against the configured snmp_access list, seeding it with the source address rq->from and the parsed community string, and runs a synchronous fastCheck(). The community string is used as an authorization credential (SNMP community == cleartext password). allow receives ACCESS_ALLOWED or a denial. Note the checklist takes the community by pointer cast to char*, not by copy, so Community must remain valid at least until fastCheck returns."
+    },
+    {
+      "file": "corpus/train/train_0207_cwe772.cpp",
+      "lines": "29-33",
+      "code": "        if (allow == ACCESS_ALLOWED && (snmp_coexist_V2toV1(PDU))) {\n            rq->community = Community;\n            rq->PDU = PDU;\n            debugs(49, 5, \"snmpAgentParse: reqid=[\" << PDU->reqid << \"]\");\n            snmpConstructReponse(rq);",
+      "explanation": "The success path. It requires both that the ACL allowed the request AND that snmp_coexist_V2toV1(PDU) succeeds (a normalization that maps SNMPv2 constructs down to v1 so the v1-only agent can answer). On success, ownership of BOTH resources is transferred into the long-lived request object: rq->community = Community and rq->PDU = PDU. It then logs the attacker-chosen reqid (dereferencing PDU->reqid) and calls snmpConstructReponse(rq) to build and send the reply. After this transfer, rq is considered the owner of PDU and Community for the response lifecycle."
+    },
+    {
+      "file": "corpus/train/train_0207_cwe772.cpp",
+      "lines": "34-38",
+      "code": "        } else {\n            debugs(49, DBG_IMPORTANT, \"WARNING: SNMP agent query DENIED from : \" << rq->from);\n            snmp_free_pdu(PDU);\n        }\n        xfree(Community);",
+      "explanation": "The denied/incompatible path (ACL rejected, or snmp_coexist_V2toV1 failed): it logs the denial and frees the PDU with snmp_free_pdu(PDU). Then, unconditionally for the whole `if (Community)` block, xfree(Community) releases the community string. This dedented xfree runs for BOTH sub-branches — including the success branch above where Community was just assigned into rq->community at line 30. So in the success path Community is freed here even though rq->community still points at it."
+    },
+    {
+      "file": "corpus/train/train_0207_cwe772.cpp",
+      "lines": "40-43",
+      "code": "    } else {\n        debugs(49, DBG_IMPORTANT, \"WARNING: Failed SNMP agent query from : \" << rq->from);\n        snmp_free_pdu(PDU);\n    }",
+      "explanation": "The parse-failure path (Community == NULL): it logs and frees the PDU with snmp_free_pdu(PDU). No community string exists to free (it is NULL). This is the branch a malformed/truncated datagram takes, and it is precisely the branch whose missing snmp_free_pdu was the classic CWE-772 leak in the unfixed sibling; here the free is present, so a flood of unparseable packets does not leak PDUs."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0207_cwe772.cpp",
+      "lines": "19",
+      "code": "    Community = snmp_parse(&rq->session, PDU, buf, len);",
+      "explanation": "snmp_parse is the real remote attack surface: it decodes an entirely attacker-controlled BER/ASN.1 buffer (buf/len from a UDP datagram) BEFORE any authorization has occurred (the ACL at line 27 runs afterward). Any out-of-bounds read/write, unsigned length-vs-buffer underflow, or nested-length mishandling inside the ASN.1 length-prefixed decode is reachable pre-auth by an unauthenticated, spoofable packet. Squid's SNMP/ASN.1 stack has a documented history of exactly such parser memory-corruption bugs. len is additionally a signed int taken from rq->len (line 7): a negative or oversized length propagated into the decoder can defeat bound checks that assume a non-negative remaining count. The invariant the implementation must uphold is that snmp_parse bounds every internal length against the remaining buffer and never trusts an embedded length field to size a copy; this file cannot prove that because the parser body is not shown, making it a latent but high-value finding."
+    },
+    {
+      "file": "corpus/train/train_0207_cwe772.cpp",
+      "lines": "30-38",
+      "code": "            rq->community = Community;\n            rq->PDU = PDU;\n            debugs(49, 5, \"snmpAgentParse: reqid=[\" << PDU->reqid << \"]\");\n            snmpConstructReponse(rq);\n        } else {\n            debugs(49, DBG_IMPORTANT, \"WARNING: SNMP agent query DENIED from : \" << rq->from);\n            snmp_free_pdu(PDU);\n        }\n        xfree(Community);",
+      "explanation": "On the success branch Community is stored into the persistent request object (rq->community = Community, line 30) and then freed by the block-level xfree(Community) at line 38. After snmpDecodePacket returns, rq->community is a dangling pointer into freed heap while rq->PDU is still live and owned by rq. If any later stage of the response pipeline (or an asynchronous/queued continuation reached from snmpConstructReponse) reads rq->community — e.g. to echo the community back into the reply — it dereferences freed memory: a use-after-free / use-of-dangling-pointer whose contents an attacker partially controls via the parsed community string. The safe invariant is that ownership is transferred to rq XOR freed locally, never both; either drop the assignment on line 30, or do not xfree in the success branch. This is grounded in the shown code; whether it is actually exploited depends on whether rq->community is consumed only synchronously inside snmpConstructReponse before line 38, which must be confirmed."
+    },
+    {
+      "file": "corpus/train/train_0207_cwe772.cpp",
+      "lines": "16-19",
+      "code": "    PDU = snmp_pdu_create(0);\n    /* Allways answer on SNMPv1 */\n    rq->session.Version = SNMP_VERSION_1;\n    Community = snmp_parse(&rq->session, PDU, buf, len);",
+      "explanation": "snmp_pdu_create(0) is used without a NULL check. Under memory pressure a failed allocation yields PDU == NULL, which is then passed straight into snmp_parse (line 19) and, on the success path, dereferenced as PDU->reqid (line 32) and handed to snmp_coexist_V2toV1(PDU) (line 29). Depending on how snmp_parse handles a NULL pdu argument this is a NULL-pointer dereference (crash / remote DoS) triggerable whenever allocation fails. The invariant: check snmp_pdu_create's return and bail before parsing. Low severity because it requires allocation failure, but it is a real unchecked-return contract."
+    },
+    {
+      "file": "corpus/train/train_0207_cwe772.cpp",
+      "lines": "16",
+      "code": "    PDU = snmp_pdu_create(0);",
+      "explanation": "This allocation is the CWE-772 resource-release contract central to this sample. Every exit path after line 16 must free or transfer PDU: the success path transfers it via rq->PDU (line 31); the denied path frees it (line 36); the parse-failure path frees it (line 42); the only pre-allocation exit (line 12) precedes it. As shown, all four paths are covered, so the shown code does not leak PDU — the fix the header comment advertises is genuinely present. The residual risk is regression: any future early-return added between line 16 and the frees, or a new branch that neither frees nor assigns rq->PDU, silently re-introduces the leak. Because SNMP is a remote, unauthenticated, high-volume input, even a single leaking branch becomes a memory-exhaustion DoS primitive; the contract must be preserved, not just currently satisfied."
+    }
+  ],
+  "summary": "Squid SNMP agent entry point (snmpDecodePacket) that parses an unauthenticated, spoofable UDP datagram before authorizing it. As shown it correctly releases the PDU on every exit path (the CWE-772 leak the paired sample carried is fixed), but two real issues remain: the community string is both stored into the long-lived request (rq->community) and freed via xfree in the same block, leaving a dangling pointer (potential use-after-free), and the entire memory-safety of the pre-auth attacker-controlled decode rests on snmp_parse, which is not shown. Unchecked snmp_pdu_create return is a minor DoS.",
+  "reviewed_anchors": [
+    {"anchor": "snmpDecodePacket(SnmpRequest * rq) (line 2)", "disposition": "dismissed", "reason": "Function signature; rq is the container for untrusted data but the signature itself carries no bug — the risk is in what its fields feed."},
+    {"anchor": "struct snmp_pdu *PDU (line 4) / snmp_pdu_create(0) (line 16)", "disposition": "finding", "reason": "Owned heap resource; subject to the CWE-772 release contract and an unchecked-NULL return."},
+    {"anchor": "u_char *Community (line 5)", "disposition": "finding", "reason": "Owned heap resource that is both assigned to rq->community and xfree'd in the same block — dangling-pointer risk."},
+    {"anchor": "u_char *buf = rq->buf (line 6)", "disposition": "finding", "reason": "Attacker-controlled datagram pointer fed to snmp_parse — the untrusted input surface."},
+    {"anchor": "int len = rq->len (line 7)", "disposition": "finding", "reason": "Signed length from the request passed into the decoder; negative/oversized value could defeat parser bounds — folded into the snmp_parse finding."},
+    {"anchor": "allow_t allow = ACCESS_DENIED (line 8)", "disposition": "dismissed", "reason": "Fail-closed default; correct and beneficial security posture."},
+    {"anchor": "if (!Config.accessList.snmp) ... return; (lines 10-13)", "disposition": "dismissed", "reason": "Configuration gate before any allocation; no leak and correct fail-closed behavior."},
+    {"anchor": "rq->session.Version = SNMP_VERSION_1 (line 18)", "disposition": "dismissed", "reason": "Protocol version pinning; behavioral, not a memory-safety contract."},
+    {"anchor": "snmp_parse(&rq->session, PDU, buf, len) (line 19)", "disposition": "finding", "reason": "Pre-auth decode of fully attacker-controlled buffer; central latent memory-safety surface."},
+    {"anchor": "if (Community) (line 23)", "disposition": "dismissed", "reason": "NULL check that correctly distinguishes parse success/failure paths."},
+    {"anchor": "ACLFilledChecklist / checklist.snmp_community / fastCheck() (lines 24-27)", "disposition": "dismissed", "reason": "Authorization using the community as credential; uses Community by pointer only until fastCheck returns — no lifetime bug at this point."},
+    {"anchor": "snmp_coexist_V2toV1(PDU) (line 29)", "disposition": "dismissed", "reason": "Version-normalization gate on the parsed PDU; failure path correctly frees PDU."},
+    {"anchor": "rq->community = Community (line 30) + xfree(Community) (line 38)", "disposition": "finding", "reason": "Same pointer transferred to a long-lived object and freed in the same block — dangling pointer / UAF."},
+    {"anchor": "rq->PDU = PDU (line 31)", "disposition": "dismissed", "reason": "Legitimate ownership transfer to rq; PDU is correctly not freed on this path."},
+    {"anchor": "PDU->reqid (line 32)", "disposition": "dismissed", "reason": "Dereference of PDU which is non-NULL only if snmp_pdu_create succeeded; the NULL risk is captured under the snmp_pdu_create finding."},
+    {"anchor": "snmpConstructReponse(rq) (line 33)", "disposition": "dismissed", "reason": "Response builder; its own safety is out of scope, but it is the consumer to check for rq->community use-after-free."},
+    {"anchor": "snmp_free_pdu(PDU) (lines 36, 42)", "disposition": "dismissed", "reason": "Correct release on the two non-transfer paths; these are the frees that satisfy the CWE-772 contract."}
+  ],
+  "findings": [
+    {
+      "title": "Pre-authorization parse of attacker-controlled SNMP datagram (latent decoder memory-safety)",
+      "anchor": "Community = snmp_parse(&rq->session, PDU, buf, len);",
+      "file": "corpus/train/train_0207_cwe772.cpp",
+      "line": "19",
+      "code": "    Community = snmp_parse(&rq->session, PDU, buf, len);",
+      "bug_class": "Out-of-bounds read/write in ASN.1/BER length-prefixed decode of untrusted input",
+      "cwe": "CWE-125",
+      "severity": "high",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "snmp_parse must bound every embedded ASN.1 length/count against the remaining bytes of buf, reject a negative or over-long len before decoding, and never let an attacker length field size a copy or index beyond the buffer.",
+      "failure_mode": "A remote, unauthenticated, spoofable UDP datagram is fully decoded before the snmp_access ACL runs (line 27 is after line 19). A malformed varbind/community length or nested TLV that exceeds the buffer causes an out-of-bounds read (info leak/crash) or write (RCE) inside the parser. len is a signed int (line 7); a negative value slipping through can defeat remaining-length checks that assume non-negative.",
+      "cve_analog": "",
+      "what_to_confirm": "In snmp_parse and the underlying ASN.1 routines, that every parsed length is checked against the remaining buffer and that len<=0 is rejected up front; confirm rq->len cannot be negative or larger than the actual received bytes."
+    },
+    {
+      "title": "Community string stored into rq->community and then freed in the same block (dangling pointer)",
+      "anchor": "rq->community = Community; ... xfree(Community);",
+      "file": "corpus/train/train_0207_cwe772.cpp",
+      "line": "30-38",
+      "code": "            rq->community = Community;\n            rq->PDU = PDU;\n            debugs(49, 5, \"snmpAgentParse: reqid=[\" << PDU->reqid << \"]\");\n            snmpConstructReponse(rq);\n        } else {\n            debugs(49, DBG_IMPORTANT, \"WARNING: SNMP agent query DENIED from : \" << rq->from);\n            snmp_free_pdu(PDU);\n        }\n        xfree(Community);",
+      "bug_class": "Use of dangling pointer / use-after-free (double ownership)",
+      "cwe": "CWE-416",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0207_cwe772.cpp (assignment/free) and implementation (file not provided) (rq->community consumers)",
+      "invariant": "A heap pointer must be either transferred to the long-lived request object (rq->community) XOR freed locally, never both; after xfree(Community) no live pointer to that buffer may remain in rq.",
+      "failure_mode": "On the success path Community is assigned to rq->community (line 30) and then unconditionally freed by the block-scoped xfree(Community) at line 38, so on return rq->community references freed heap while rq->PDU is still live. Any later read of rq->community (e.g. echoing the community into an async response) dereferences freed, attacker-influenced memory.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether rq->community is ever read after snmpDecodePacket returns (including inside async continuations scheduled by snmpConstructReponse); if so this is an exploitable UAF and the assignment or the xfree must be removed."
+    },
+    {
+      "title": "Unchecked snmp_pdu_create() return dereferenced during parse and response",
+      "anchor": "PDU = snmp_pdu_create(0);",
+      "file": "corpus/train/train_0207_cwe772.cpp",
+      "line": "16",
+      "code": "    PDU = snmp_pdu_create(0);",
+      "bug_class": "NULL pointer dereference on allocation failure",
+      "cwe": "CWE-476",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0207_cwe772.cpp",
+      "invariant": "The result of snmp_pdu_create must be checked for NULL before it is passed to snmp_parse (line 19), dereferenced as PDU->reqid (line 32), or passed to snmp_coexist_V2toV1 (line 29).",
+      "failure_mode": "Under memory pressure snmp_pdu_create(0) returns NULL; PDU flows into snmp_parse and, on success, is dereferenced (PDU->reqid), crashing the process — a remote-triggerable DoS if an attacker can drive allocation failure.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether snmp_pdu_create can return NULL and whether snmp_parse safely tolerates a NULL pdu argument; add a NULL check with early return if not."
+    },
+    {
+      "title": "PDU resource-release contract across all exit paths (CWE-772 anchor — satisfied as shown)",
+      "anchor": "PDU = snmp_pdu_create(0); / snmp_free_pdu(PDU)",
+      "file": "corpus/train/train_0207_cwe772.cpp",
+      "line": "16",
+      "code": "    PDU = snmp_pdu_create(0);",
+      "bug_class": "Missing release of memory after effective lifetime (resource leak)",
+      "cwe": "CWE-772",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0207_cwe772.cpp",
+      "invariant": "Every path after the line-16 allocation must free PDU (snmp_free_pdu) or transfer it to rq->PDU; the same holds for the Community string. No new early-return may be added between allocation and release without also releasing.",
+      "failure_mode": "In the sibling/unfixed form, the parse-failure branch (Community == NULL) omitted snmp_free_pdu(PDU), so every malformed datagram leaked a PDU; a remote flood then exhausts memory (DoS). In the shown code all four paths (early return before allocation; success transfer; denied free; failure free) are covered, so no leak is present here — the finding documents the contract to guard against regression.",
+      "cve_analog": "",
+      "what_to_confirm": "That no compile-time-conditional or future branch between lines 16 and 43 exits without freeing or transferring PDU/Community, and that rq->PDU ownership is honored (freed exactly once) by the response path."
+    }
+  ],
+  "audit_checklist": [
+    "Verify snmp_parse bounds every embedded ASN.1 length/count against the remaining buffer and rejects len<=0 before decoding — this is the pre-auth remote attack surface.",
+    "Confirm rq->community is never read after snmpDecodePacket returns; if it is, the assignment at line 30 combined with xfree at line 38 is a use-after-free.",
+    "Check that snmp_pdu_create can or cannot return NULL, and add a NULL guard before snmp_parse / PDU->reqid if it can.",
+    "Confirm rq->len cannot be negative or larger than the bytes actually received into rq->buf.",
+    "Verify the response path treats rq->PDU as the sole owner and frees it exactly once (no double free with snmp_free_pdu here).",
+    "Ensure no future early-return is inserted between the line-16 allocation and the frees without releasing PDU/Community (regression guard on the CWE-772 fix)."
+  ]
+}

@@ -1,0 +1,206 @@
+{
+  "subsystem": "TensorFlow CTCLoss CPU OpKernel — the Compute() method of CTCLossOp<T>, which computes the Connectionist Temporal Classification (CTC) loss and its gradient from four input tensors (logits `inputs`, a sparse label set given as `labels_indices`/`labels_values`, and `sequence_length`). It validates shapes, materializes the sparse labels into per-batch label sequences, wires the logits/gradient tensors into per-timestep Eigen maps, and hands everything to ctc::CTCLossCalculator<T>::CalculateLoss.",
+  "provenance": "Identified from TensorFlow core kernel idioms: OP_REQUIRES / OP_REQUIRES_OK macros, OpKernelContext* ctx, ctx->input(...), TensorShapeUtils::IsVector/IsMatrix, FastBoundsCheck, sparse::SparseTensor::Create/IndicesValid/group, ctc::CTCLossCalculator<T>::CalculateLoss, DeviceBase::CpuWorkerThreads, and Eigen tensor<T,3>()/vec<T>()/matrix<int64>() accessors. The file banner is corpus/eval/eval_0059_cwe665.cpp and the header comment tags it `sample: primevul_train_2108_fixed`, i.e. a PrimeVul sample derived from the TensorFlow CTCLoss kernel, purportedly the post-fix (CWE-665-adjacent) revision.",
+  "trust_boundary": "All four inputs are tensors supplied by the caller of the op (tf.raw_ops.CTCLoss / a graph loaded from a saved model or a remote model-serving request). Both the SHAPES and the VALUES are attacker-controllable and untrusted. Hostile surfaces: the three dimensions of `inputs` (max_time, batch_size, num_classes), the values inside `labels_indices` (int64 row/column coordinates), the values inside `labels_values` (int32), and the int32 entries of `seq_len`. The kernel is the trust boundary between untrusted tensor data and the C++ ctc::CTCLossCalculator that indexes raw buffers, so every OP_REQUIRES here is a gate that must fully constrain those values before they are used for allocation, pointer arithmetic, or iteration bounds.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/eval/eval_0059_cwe665.cpp",
+      "lines": "2-10",
+      "code": "  void Compute(OpKernelContext* ctx) override {\n    const Tensor* inputs;\n    const Tensor* labels_indices;\n    const Tensor* labels_values;\n    const Tensor* seq_len;\n    OP_REQUIRES_OK(ctx, ctx->input(\"inputs\", &inputs));\n    OP_REQUIRES_OK(ctx, ctx->input(\"labels_indices\", &labels_indices));\n    OP_REQUIRES_OK(ctx, ctx->input(\"labels_values\", &labels_values));\n    OP_REQUIRES_OK(ctx, ctx->input(\"sequence_length\", &seq_len));",
+      "explanation": "The kernel entry point. It declares four const Tensor* handles and binds them to the op's named inputs via ctx->input(...). OP_REQUIRES_OK aborts the op (fills ctx with an error Status and returns) if any lookup fails. `inputs` are the logits, `labels_indices`/`labels_values` are the COO sparse encoding of the target labels, and `seq_len` is the per-batch valid sequence length. At this point nothing about the tensors' shapes or contents has been validated; the pointers merely reference caller-supplied data."
+    },
+    {
+      "file": "corpus/eval/eval_0059_cwe665.cpp",
+      "lines": "12-23",
+      "code": "    OP_REQUIRES(ctx, inputs->shape().dims() == 3,\n                errors::InvalidArgument(\"inputs is not a 3-Tensor\"));\n    OP_REQUIRES(ctx, TensorShapeUtils::IsVector(seq_len->shape()),\n                errors::InvalidArgument(\"sequence_length is not a vector\"));\n    OP_REQUIRES(ctx, TensorShapeUtils::IsMatrix(labels_indices->shape()),\n                errors::InvalidArgument(\"labels_indices is not a matrix\"));\n    OP_REQUIRES(ctx, labels_indices->dim_size(1) > 1,\n                errors::InvalidArgument(\n                    \"labels_indices second dimension must be >= 1. Received \",\n                    labels_indices->dim_size(1)));\n    OP_REQUIRES(ctx, TensorShapeUtils::IsVector(labels_values->shape()),\n                errors::InvalidArgument(\"labels_values is not a vector\"));",
+      "explanation": "Rank/shape validation. `inputs` must be rank 3 (time x batch x classes). `seq_len` must be a 1-D vector. `labels_indices` must be a 2-D matrix and, critically, its second dimension must be > 1 so that at least columns 0 and 1 exist — this guard is what makes the later access labels_indices_t(i, 1) at line 58 in-bounds (it protects the column index, not the row count). `labels_values` must be a vector. These are the shape gates before any element is dereferenced; the > 1 check is the notable hardening in this revision (a missing-column read would be an out-of-bounds read, CWE-125)."
+    },
+    {
+      "file": "corpus/eval/eval_0059_cwe665.cpp",
+      "lines": "25-35",
+      "code": "    const TensorShape& inputs_shape = inputs->shape();\n    const int64 max_time = inputs_shape.dim_size(0);\n    OP_REQUIRES(ctx, max_time != 0,\n                errors::InvalidArgument(\n                    \"Max time or first dimension of input cannot be 0.\"));\n    const int64 batch_size = inputs_shape.dim_size(1);\n    const int64 num_classes_raw = inputs_shape.dim_size(2);\n    OP_REQUIRES(\n        ctx, FastBoundsCheck(num_classes_raw, std::numeric_limits<int>::max()),\n        errors::InvalidArgument(\"num_classes cannot exceed max int\"));\n    const int num_classes = static_cast<const int>(num_classes_raw);",
+      "explanation": "The three logit dimensions are unpacked. max_time = dim 0, and is explicitly required to be non-zero (a zero max_time would produce an empty timestep loop and later degenerate math). batch_size = dim 1. num_classes_raw = dim 2, held as int64; FastBoundsCheck(num_classes_raw, INT_MAX) asserts 0 <= num_classes_raw < INT_MAX so the narrowing static_cast<int> at line 35 cannot overflow. Note the gate only bounds num_classes from ABOVE and against negativity of the raw dim; it does not require num_classes >= 1, so num_classes == 0 is still permitted here."
+    },
+    {
+      "file": "corpus/eval/eval_0059_cwe665.cpp",
+      "lines": "37-42",
+      "code": "    OP_REQUIRES(\n        ctx, batch_size == seq_len->dim_size(0),\n        errors::InvalidArgument(\"len(sequence_length) != batch_size.  \",\n                                \"len(sequence_length):  \", seq_len->dim_size(0),\n                                \" batch_size: \", batch_size));\n    auto seq_len_t = seq_len->vec<int32>();",
+      "explanation": "Cross-tensor consistency: the length of the sequence_length vector must equal batch_size (dim 1 of inputs). This ties the seq_len vector to the logits' batch axis so that indexing seq_len_t(b) for b in [0, batch_size) is in-bounds. seq_len_t is then obtained as an Eigen int32 vector view onto the tensor buffer."
+    },
+    {
+      "file": "corpus/eval/eval_0059_cwe665.cpp",
+      "lines": "44-52",
+      "code": "    OP_REQUIRES(ctx, labels_indices->dim_size(0) == labels_values->dim_size(0),\n                errors::InvalidArgument(\n                    \"labels_indices and labels_values must contain the \"\n                    \"same number of rows, but saw shapes: \",\n                    labels_indices->shape().DebugString(), \" vs. \",\n                    labels_values->shape().DebugString()));\n\n    OP_REQUIRES(ctx, batch_size != 0,\n                errors::InvalidArgument(\"batch_size must not be 0\"));",
+      "explanation": "The number of sparse-index rows (dim 0 of labels_indices) must equal the number of label values (dim 0 of labels_values); this pairs each (row,col) coordinate with a value in the COO encoding. Then batch_size is required non-zero, preventing a zero-size labels_t vector and a division/degenerate-loop hazard downstream. These two checks constrain the label bookkeeping before the SparseTensor is built."
+    },
+    {
+      "file": "corpus/eval/eval_0059_cwe665.cpp",
+      "lines": "54-59",
+      "code": "    // Figure out the maximum label length to use as sparse tensor dimension.\n    auto labels_indices_t = labels_indices->matrix<int64>();\n    int64 max_label_len = 0;\n    for (int i = 0; i < labels_indices->dim_size(0); i++) {\n      max_label_len = std::max(max_label_len, labels_indices_t(i, 1) + 1);\n    }",
+      "explanation": "labels_indices is viewed as an int64 matrix. The loop scans every row and takes the maximum of column-1 (the per-batch label position/time index) plus one, producing max_label_len — the length of the dense label axis. Column index 1 is safe because of the dim_size(1) > 1 gate at line 18. The VALUES read here, labels_indices_t(i, 1), are fully attacker-controlled int64s; the loop counter i is an int while dim_size(0) is an int64 (a signedness/width mismatch), and the expression `+ 1` is unguarded signed arithmetic on those hostile values."
+    },
+    {
+      "file": "corpus/eval/eval_0059_cwe665.cpp",
+      "lines": "61-71",
+      "code": "    TensorShape labels_shape({batch_size, max_label_len});\n    std::vector<int64> order{0, 1};\n    sparse::SparseTensor labels_sp;\n    OP_REQUIRES_OK(\n        ctx, sparse::SparseTensor::Create(*labels_indices, *labels_values,\n                                          labels_shape, order, &labels_sp));\n\n    Status labels_sp_valid = labels_sp.IndicesValid();\n    OP_REQUIRES(ctx, labels_sp_valid.ok(),\n                errors::InvalidArgument(\"label SparseTensor is not valid: \",\n                                        labels_sp_valid.error_message()));",
+      "explanation": "A dense shape {batch_size, max_label_len} is constructed and a SparseTensor is created from the indices/values/shape with dimension ordering {0,1}. IndicesValid() then verifies every stored index is within [0, dim) for its axis and that indices are ordered/non-duplicated per the `order`. This is the validation that rejects out-of-range or malformed coordinates. Note that labels_shape is built (line 61) BEFORE IndicesValid runs, so any pathology in max_label_len (from line 58) has already been baked into a TensorShape by this point."
+    },
+    {
+      "file": "corpus/eval/eval_0059_cwe665.cpp",
+      "lines": "73-85",
+      "code": "    typename ctc::CTCLossCalculator<T>::LabelSequences labels_t(batch_size);\n    for (const auto& g : labels_sp.group({0})) {  // iterate by batch\n      const int64 batch_indices = g.group()[0];\n      OP_REQUIRES(ctx, FastBoundsCheck(batch_indices, batch_size),\n                  errors::InvalidArgument(\"labels batch index must be between \",\n                                          0, \" and \", batch_size,\n                                          \" but saw: \", batch_indices));\n\n      auto values = g.values<int32>();\n      std::vector<int>* b_values = &labels_t[batch_indices];\n      b_values->resize(values.size());\n      for (int i = 0; i < values.size(); ++i) (*b_values)[i] = values(i);\n    }",
+      "explanation": "labels_t is a vector of batch_size label sequences. The code groups the sparse tensor by axis 0 (batch) and, for each group, reads the batch index from group()[0]. FastBoundsCheck(batch_indices, batch_size) asserts 0 <= batch_indices < batch_size before it is used to index labels_t[batch_indices] — this is the key gate preventing an out-of-bounds vector write from a hostile row coordinate. The group's int32 values are copied into the per-batch vector after resize(values.size()). The inner counter i is an int compared against values.size() (a size_t)."
+    },
+    {
+      "file": "corpus/eval/eval_0059_cwe665.cpp",
+      "lines": "87-96",
+      "code": "    OP_REQUIRES(ctx, static_cast<size_t>(batch_size) == labels_t.size(),\n                errors::InvalidArgument(\"len(labels) != batch_size.  \",\n                                        \"len(labels):  \", labels_t.size(),\n                                        \" batch_size: \", batch_size));\n\n    for (int64 b = 0; b < batch_size; ++b) {\n      OP_REQUIRES(\n          ctx, seq_len_t(b) <= max_time,\n          errors::InvalidArgument(\"sequence_length(\", b, \") <= \", max_time));\n    }",
+      "explanation": "Post-conditions before the heavy compute. labels_t.size() must equal batch_size (it was constructed with that size, so this mostly re-affirms invariants). Then for every batch b, seq_len_t(b) is required to be <= max_time. This upper-bounds each sequence length against the time axis so the calculator does not walk past max_time frames. Notably this check bounds seq_len only from ABOVE; there is no >= 0 lower bound on the attacker-controlled int32 seq_len_t(b)."
+    },
+    {
+      "file": "corpus/eval/eval_0059_cwe665.cpp",
+      "lines": "98-108",
+      "code": "    Tensor* loss = nullptr;\n    OP_REQUIRES_OK(ctx, ctx->allocate_output(\"loss\", seq_len->shape(), &loss));\n    auto loss_t = loss->vec<T>();\n\n    Tensor* gradient;\n    OP_REQUIRES_OK(ctx,\n                   ctx->allocate_output(\"gradient\", inputs_shape, &gradient));\n    auto gradient_t = gradient->tensor<T, 3>();\n    auto inputs_t = inputs->tensor<T, 3>();\n    std::vector<OutputMap> gradient_list_t;\n    std::vector<InputMap> input_list_t;",
+      "explanation": "Output allocation. The `loss` output is allocated with seq_len's shape (a batch_size vector) and viewed as loss_t. The `gradient` output is allocated with the full inputs_shape (time x batch x classes) and viewed as the 3-D gradient_t; inputs_t is the matching 3-D read view of the logits. Two empty vectors of per-timestep Eigen maps (OutputMap/InputMap) are declared to be populated next."
+    },
+    {
+      "file": "corpus/eval/eval_0059_cwe665.cpp",
+      "lines": "110-118",
+      "code": "    for (std::size_t t = 0; t < max_time; ++t) {\n      input_list_t.emplace_back(inputs_t.data() + t * batch_size * num_classes,\n                                batch_size, num_classes);\n      gradient_list_t.emplace_back(\n          gradient_t.data() + t * batch_size * num_classes, batch_size,\n          num_classes);\n    }\n\n    gradient_t.setZero();",
+      "explanation": "For each timestep t in [0, max_time), a batch_size x num_classes Eigen map is created over the logits buffer at offset t*batch_size*num_classes, and a matching map over the gradient buffer. This slices the flat [time*batch*classes] buffers into per-frame matrices. The offset t*batch_size*num_classes reconstructs the exact tensor stride, so it stays in-bounds provided the dimensions used here are the SAME ones that allocated the tensors (they are: inputs_shape). The loop variable t is std::size_t (unsigned) compared to int64 max_time. gradient_t is then zeroed."
+    },
+    {
+      "file": "corpus/eval/eval_0059_cwe665.cpp",
+      "lines": "120-129",
+      "code": "    // Assumption: the blank index is num_classes - 1\n    ctc::CTCLossCalculator<T> ctc_loss_calculator(num_classes - 1, 0);\n    DeviceBase::CpuWorkerThreads workers =\n        *ctx->device()->tensorflow_cpu_worker_threads();\n    OP_REQUIRES_OK(ctx, ctc_loss_calculator.CalculateLoss(\n                            seq_len_t, labels_t, input_list_t,\n                            preprocess_collapse_repeated_, ctc_merge_repeated_,\n                            ignore_longer_outputs_than_inputs_, &loss_t,\n                            &gradient_list_t, &workers));",
+      "explanation": "The CTCLossCalculator is constructed with blank_index = num_classes - 1 and output_delay 0. Worker threads are fetched from the device. CalculateLoss then consumes seq_len_t, the materialized labels_t, and the per-timestep input/gradient maps, plus the op's boolean attributes (preprocess_collapse_repeated_, ctc_merge_repeated_, ignore_longer_outputs_than_inputs_), writing into loss_t and gradient_list_t. This is where the validated (and any un-validated) values are actually used to index label sequences and logit frames — the implementation is not shown, so contracts it depends on (non-negative seq lengths, num_classes >= 1, label symbols < num_classes) are latent obligations."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/eval/eval_0059_cwe665.cpp",
+      "lines": "56-61",
+      "code": "    int64 max_label_len = 0;\n    for (int i = 0; i < labels_indices->dim_size(0); i++) {\n      max_label_len = std::max(max_label_len, labels_indices_t(i, 1) + 1);\n    }\n\n    TensorShape labels_shape({batch_size, max_label_len});",
+      "explanation": "labels_indices_t(i, 1) is an attacker-controlled int64. Two hazards: (1) if a column-1 value is INT64_MAX, `labels_indices_t(i, 1) + 1` is signed integer overflow (undefined behavior, CWE-190); (2) even short of that, a large positive value makes max_label_len huge, and it is used at line 61 to build TensorShape({batch_size, max_label_len}) BEFORE labels_sp.IndicesValid() (line 68) has a chance to reject the coordinate. TensorShape validates that the product of dims does not overflow; batch_size * max_label_len near INT64_MAX trips an internal CHECK and aborts the process — a remotely triggerable denial of service (a crafted model / tf.raw_ops.CTCLoss call). The safe invariant: bound labels_indices_t(i,1) to a sane non-negative range (and reject overflow of the +1 / the shape product) before constructing labels_shape, rather than relying on IndicesValid which runs only after the shape is built."
+    },
+    {
+      "file": "corpus/eval/eval_0059_cwe665.cpp",
+      "lines": "92-96",
+      "code": "    for (int64 b = 0; b < batch_size; ++b) {\n      OP_REQUIRES(\n          ctx, seq_len_t(b) <= max_time,\n          errors::InvalidArgument(\"sequence_length(\", b, \") <= \", max_time));\n    }",
+      "explanation": "seq_len_t(b) is an attacker-controlled int32 and is checked only against the UPPER bound max_time; there is no `seq_len_t(b) >= 0` gate. A negative sequence length passes this check (negative <= positive max_time) and is forwarded verbatim to CTCLossCalculator::CalculateLoss at line 124. Inside the calculator sequence lengths typically drive loop counts and frame indexing; a negative value can produce a huge unsigned loop bound or a negative offset, i.e. out-of-bounds read/write over the logit/gradient frames (CWE-20 / CWE-191, latent in the implementation not shown here). Invariant the implementation relies on: 0 <= seq_len_t(b) <= max_time for every batch. The kernel should reject negative sequence lengths here."
+    },
+    {
+      "file": "corpus/eval/eval_0059_cwe665.cpp",
+      "lines": "31-35",
+      "code": "    const int64 num_classes_raw = inputs_shape.dim_size(2);\n    OP_REQUIRES(\n        ctx, FastBoundsCheck(num_classes_raw, std::numeric_limits<int>::max()),\n        errors::InvalidArgument(\"num_classes cannot exceed max int\"));\n    const int num_classes = static_cast<const int>(num_classes_raw);",
+      "explanation": "num_classes is only bounded from above (< INT_MAX via FastBoundsCheck) and against a negative raw dim; it is NOT required to be >= 1. If inputs has a class dimension of 0, num_classes == 0 and at line 121 the calculator is constructed with blank index `num_classes - 1` == -1, and the per-timestep maps at lines 111/114 are batch_size x 0. A negative blank label index and zero-width class dimension are contract violations for CTCLossCalculator: label symbols are expected in [0, num_classes) and the blank must be a valid class. Depending on the implementation this yields bad indexing / degenerate math on hostile input (CWE-20, latent). Invariant: num_classes must be >= 1 (and, for CTC, typically >= 2 so a non-blank symbol exists)."
+    },
+    {
+      "file": "corpus/eval/eval_0059_cwe665.cpp",
+      "lines": "57-84",
+      "code": "    for (int i = 0; i < labels_indices->dim_size(0); i++) {\n      max_label_len = std::max(max_label_len, labels_indices_t(i, 1) + 1);\n    }",
+      "explanation": "Signedness/width hygiene: the loop counter i is a 32-bit signed int while the bound labels_indices->dim_size(0) is an int64 (the same pattern recurs at line 84, `for (int i = 0; i < values.size(); ++i)`, where values.size() is a size_t). For an input with more than INT_MAX (~2.1 billion) rows/values the int counter overflows — undefined behavior and potentially a non-terminating loop (CWE-190 / CWE-197). This requires an extremely large input tensor so it is lower severity than the value-driven issues above, but it is a genuine mismatch: the counter type should be the same width/signedness as the bound it is compared against."
+    }
+  ],
+  "summary": "This is the hardened (post-fix) TensorFlow CTCLoss CPU kernel: it carries extensive OP_REQUIRES shape/consistency gates, and the dim_size(1) > 1 check correctly makes the labels_indices_t(i,1) read in-bounds. The residual risks are all about VALUE ranges rather than shapes: max_label_len is computed from attacker-controlled int64 label coordinates with an unguarded `+1` and used to build a TensorShape before IndicesValid runs (integer-overflow / CHECK-fail DoS, CWE-190), and sequence lengths are bounded only from above (a negative seq_len reaches CalculateLoss, CWE-20), with a secondary num_classes==0 blank-index issue. No memory-corruption bug is directly visible in the shown code; the strongest findings are a DoS and latent implementation contracts.",
+  "reviewed_anchors": [
+    {"anchor": "Compute(OpKernelContext* ctx) — kernel entry signature", "disposition": "dismissed", "reason": "Standard OpKernel override; no contract of its own beyond the validation it performs."},
+    {"anchor": "ctx->input(\"inputs\"/\"labels_indices\"/\"labels_values\"/\"sequence_length\") (lines 7-10)", "disposition": "dismissed", "reason": "Named-input binding guarded by OP_REQUIRES_OK; failure returns cleanly."},
+    {"anchor": "inputs->shape().dims() == 3 (line 12)", "disposition": "dismissed", "reason": "Rank gate; enforces the 3-D contract before dim_size(0..2) are read."},
+    {"anchor": "TensorShapeUtils::IsVector(seq_len->shape()) (line 14)", "disposition": "dismissed", "reason": "Shape gate ensuring seq_len is 1-D; no residual risk."},
+    {"anchor": "TensorShapeUtils::IsMatrix(labels_indices->shape()) (line 16)", "disposition": "dismissed", "reason": "Shape gate ensuring labels_indices is 2-D."},
+    {"anchor": "labels_indices->dim_size(1) > 1 (line 18)", "disposition": "dismissed", "reason": "This is the fix that makes labels_indices_t(i, 1) in-bounds; correctly present."},
+    {"anchor": "TensorShapeUtils::IsVector(labels_values->shape()) (line 22)", "disposition": "dismissed", "reason": "Shape gate ensuring labels_values is 1-D."},
+    {"anchor": "max_time = inputs_shape.dim_size(0) + max_time != 0 gate (lines 26-29)", "disposition": "dismissed", "reason": "Zero-time gate present; non-zero enforced before use as loop bound / comparison."},
+    {"anchor": "batch_size = inputs_shape.dim_size(1) + batch_size != 0 gate (lines 30, 51-52)", "disposition": "dismissed", "reason": "Zero-batch gate present; also cross-checked against seq_len length and labels_t.size()."},
+    {"anchor": "num_classes_raw = dim_size(2) + FastBoundsCheck + static_cast<int> (lines 31-35)", "disposition": "finding", "reason": "Bounded above and against negativity but not required >= 1; num_classes==0 yields blank index -1 (see findings)."},
+    {"anchor": "batch_size == seq_len->dim_size(0) (lines 37-41)", "disposition": "dismissed", "reason": "Cross-tensor length check; makes seq_len_t(b) in-bounds for b in [0,batch_size)."},
+    {"anchor": "seq_len_t = seq_len->vec<int32>() (line 42)", "disposition": "finding", "reason": "int32 values are attacker-controlled and only upper-bounded later (missing >= 0 check; see findings)."},
+    {"anchor": "labels_indices->dim_size(0) == labels_values->dim_size(0) (line 44)", "disposition": "dismissed", "reason": "Pairs COO coordinates with values; consistency gate, safe."},
+    {"anchor": "labels_indices_t = labels_indices->matrix<int64>() (line 55)", "disposition": "dismissed", "reason": "Read view; safety depends on the value/overflow issue tracked under the max_label_len finding."},
+    {"anchor": "max_label_len loop + labels_indices_t(i, 1) + 1 (lines 56-59)", "disposition": "finding", "reason": "Unguarded signed +1 on attacker int64 and used to size a TensorShape before IndicesValid (CWE-190 / DoS)."},
+    {"anchor": "loop counter `int i` vs int64 dim_size(0) / size_t values.size() (lines 57, 84)", "disposition": "finding", "reason": "Signedness/width mismatch; overflow/UB for >INT_MAX iterations (low severity)."},
+    {"anchor": "TensorShape labels_shape({batch_size, max_label_len}) (line 61)", "disposition": "finding", "reason": "Shape product can overflow / CHECK-fail from hostile max_label_len (covered by finding 1)."},
+    {"anchor": "sparse::SparseTensor::Create(...) (lines 64-66)", "disposition": "dismissed", "reason": "Returns Status guarded by OP_REQUIRES_OK; construction itself is checked."},
+    {"anchor": "labels_sp.IndicesValid() (lines 68-71)", "disposition": "dismissed", "reason": "Validates coordinates against labels_shape; but runs AFTER the shape is built (see finding 1)."},
+    {"anchor": "labels_sp.group({0}) + batch_indices FastBoundsCheck (lines 74-79)", "disposition": "dismissed", "reason": "batch_indices bounded to [0,batch_size) before indexing labels_t[batch_indices]; write is protected."},
+    {"anchor": "b_values->resize(values.size()) + copy loop (lines 82-84)", "disposition": "dismissed", "reason": "Destination is resized to source size before copy; in-bounds (counter-width nit tracked separately)."},
+    {"anchor": "static_cast<size_t>(batch_size) == labels_t.size() (lines 87-90)", "disposition": "dismissed", "reason": "batch_size is non-negative (dim size) and non-zero; cast is safe, check re-affirms sizing."},
+    {"anchor": "seq_len_t(b) <= max_time loop (lines 92-96)", "disposition": "finding", "reason": "Upper bound only; no non-negative lower bound on seq_len (see findings)."},
+    {"anchor": "ctx->allocate_output(\"loss\"/\"gradient\", ...) (lines 99, 103-104)", "disposition": "dismissed", "reason": "Allocation guarded by OP_REQUIRES_OK; shapes derived from validated inputs."},
+    {"anchor": "per-timestep maps: inputs_t.data() + t * batch_size * num_classes (lines 110-115)", "disposition": "dismissed", "reason": "Offset reconstructs the exact allocated stride of inputs_shape/gradient; in-bounds by construction (t bounded by max_time)."},
+    {"anchor": "for (std::size_t t = 0; t < max_time; ++t) (line 110)", "disposition": "dismissed", "reason": "Unsigned t vs int64 max_time; max_time is a positive dim size so the comparison is well-defined here."},
+    {"anchor": "ctc::CTCLossCalculator<T> ctc_loss_calculator(num_classes - 1, 0) (line 121)", "disposition": "finding", "reason": "blank index num_classes-1 is -1 when num_classes==0 (folded into the num_classes finding)."},
+    {"anchor": "ctc_loss_calculator.CalculateLoss(...) (lines 124-128)", "disposition": "dismissed", "reason": "Implementation not shown; its latent contracts (non-negative seq_len, valid label symbols, num_classes>=1) are captured by the value-range findings."}
+  ],
+  "findings": [
+    {
+      "title": "Attacker-controlled label coordinate sizes TensorShape before validation (integer overflow / CHECK-fail DoS)",
+      "anchor": "max_label_len = std::max(max_label_len, labels_indices_t(i, 1) + 1); ... TensorShape labels_shape({batch_size, max_label_len});",
+      "file": "corpus/eval/eval_0059_cwe665.cpp",
+      "line": "56-61",
+      "code": "    int64 max_label_len = 0;\n    for (int i = 0; i < labels_indices->dim_size(0); i++) {\n      max_label_len = std::max(max_label_len, labels_indices_t(i, 1) + 1);\n    }\n\n    TensorShape labels_shape({batch_size, max_label_len});",
+      "bug_class": "Integer overflow / unvalidated size used to construct a tensor shape (remotely triggerable DoS)",
+      "cwe": "CWE-190",
+      "severity": "medium",
+      "where_it_lives": "corpus/eval/eval_0059_cwe665.cpp",
+      "invariant": "labels_indices_t(i,1) must be constrained to a non-negative, sane range and the resulting max_label_len (and batch_size*max_label_len) must be proven not to overflow BEFORE labels_shape is built; validation of coordinates must precede shape construction, not follow it.",
+      "failure_mode": "A crafted labels_indices with a column-1 value of INT64_MAX makes `+ 1` signed-overflow (UB); a merely very large value makes max_label_len huge, and TensorShape({batch_size, max_label_len}) at line 61 either overflows the dim product and trips an internal CHECK (process abort / DoS) or allocates absurd metadata. This happens before labels_sp.IndicesValid() at line 68 can reject the coordinate, so IndicesValid does not protect this line.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm whether TensorShape/SparseTensor::Create bound max_label_len or whether an out-of-range labels_indices(i,1) can reach line 61; add an explicit non-negative + overflow guard on labels_indices_t(i,1)+1 prior to constructing labels_shape."
+    },
+    {
+      "title": "sequence_length checked only against an upper bound — negative lengths reach the loss calculator",
+      "anchor": "OP_REQUIRES(ctx, seq_len_t(b) <= max_time, ...)",
+      "file": "corpus/eval/eval_0059_cwe665.cpp",
+      "line": "92-96",
+      "code": "    for (int64 b = 0; b < batch_size; ++b) {\n      OP_REQUIRES(\n          ctx, seq_len_t(b) <= max_time,\n          errors::InvalidArgument(\"sequence_length(\", b, \") <= \", max_time));\n    }",
+      "bug_class": "Missing input validation (missing non-negative lower bound on an untrusted length)",
+      "cwe": "CWE-20",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "Every seq_len_t(b) must satisfy 0 <= seq_len_t(b) <= max_time; sequence lengths drive per-batch frame loops inside CalculateLoss and must never be negative.",
+      "failure_mode": "seq_len_t(b) is an attacker-controlled int32. The check only rejects values greater than max_time; a negative value (e.g. -1) satisfies `<= max_time` and is passed to CTCLossCalculator::CalculateLoss at line 124. In the calculator a negative length used as a frame count / offset becomes a large unsigned loop bound or a negative index, i.e. out-of-bounds read/write over the logit and gradient buffers (latent in the unshown implementation).",
+      "cve_analog": "",
+      "what_to_confirm": "Verify how CalculateLoss uses each sequence length; confirm no >= 0 check exists elsewhere and add `seq_len_t(b) >= 0` to this gate."
+    },
+    {
+      "title": "num_classes not required >= 1 — blank index becomes -1 and class dimension can be zero",
+      "anchor": "FastBoundsCheck(num_classes_raw, std::numeric_limits<int>::max()) ... ctc::CTCLossCalculator<T> ctc_loss_calculator(num_classes - 1, 0)",
+      "file": "corpus/eval/eval_0059_cwe665.cpp",
+      "line": "31-35",
+      "code": "    const int64 num_classes_raw = inputs_shape.dim_size(2);\n    OP_REQUIRES(\n        ctx, FastBoundsCheck(num_classes_raw, std::numeric_limits<int>::max()),\n        errors::InvalidArgument(\"num_classes cannot exceed max int\"));\n    const int num_classes = static_cast<const int>(num_classes_raw);",
+      "bug_class": "Missing input validation (unconstrained lower bound feeding an index computation)",
+      "cwe": "CWE-20",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "num_classes must be >= 1 (>= 2 for a meaningful CTC alphabet) so that blank index = num_classes - 1 is a valid non-negative class and the per-timestep batch_size x num_classes maps are non-degenerate.",
+      "failure_mode": "FastBoundsCheck bounds num_classes only from above (< INT_MAX) and against a negative raw dim; num_classes == 0 is permitted. At line 121 the CTCLossCalculator is then constructed with blank index `num_classes - 1` == -1, and lines 111/114 build batch_size x 0 frame maps. A negative blank index and zero-width class axis violate the calculator's contract (label symbols expected in [0, num_classes)) and lead to degenerate or out-of-range indexing inside CalculateLoss.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm whether an inputs tensor with dim_size(2) == 0 can reach this kernel and how CTCLossCalculator handles blank index -1; add a num_classes >= 1 (or >= 2) requirement."
+    },
+    {
+      "title": "Signed 32-bit loop counters iterate over 64-bit / size_t tensor extents",
+      "anchor": "for (int i = 0; i < labels_indices->dim_size(0); i++) ... for (int i = 0; i < values.size(); ++i)",
+      "file": "corpus/eval/eval_0059_cwe665.cpp",
+      "line": "57-84",
+      "code": "    for (int i = 0; i < labels_indices->dim_size(0); i++) {\n      max_label_len = std::max(max_label_len, labels_indices_t(i, 1) + 1);\n    }",
+      "bug_class": "Integer overflow / signedness mismatch in loop counter",
+      "cwe": "CWE-190",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0059_cwe665.cpp",
+      "invariant": "A loop counter must have at least the width and signedness of the bound it is compared against (int64 dim_size / size_t values.size()) so it cannot overflow before reaching the bound.",
+      "failure_mode": "labels_indices->dim_size(0) is int64 and values.size() (line 84) is size_t, but both loops use a 32-bit signed `int i`. An input with more than INT_MAX rows/values overflows i (undefined behavior, possible non-terminating loop / wrong iteration count). This needs an enormous input tensor, so severity is low, but the counter types are objectively too narrow.",
+      "cve_analog": "",
+      "what_to_confirm": "Change the counters to int64/size_t to match the bounds; confirm no realistic input reaches INT_MAX rows on the target deployment."
+    }
+  ],
+  "audit_checklist": [
+    "Add a non-negative + overflow guard on labels_indices_t(i,1) (and on max_label_len and batch_size*max_label_len) BEFORE constructing TensorShape labels_shape at line 61 — do not rely on IndicesValid, which runs afterward.",
+    "Add a `seq_len_t(b) >= 0` lower-bound check alongside the existing `<= max_time` check (lines 92-96); trace how CalculateLoss uses sequence lengths to confirm negative values are otherwise unhandled.",
+    "Require num_classes >= 1 (ideally >= 2) so blank index num_classes-1 is a valid class and the per-timestep maps are non-degenerate (lines 31-35, 121).",
+    "Inside ctc::CTCLossCalculator<T>::CalculateLoss, verify that label symbols in labels_t are bounded to [0, num_classes) and that per-batch sequence lengths bound all logit/gradient frame indexing.",
+    "Widen the int loop counters at lines 57 and 84 to int64/size_t to match their int64/size_t bounds.",
+    "Confirm the pointer arithmetic inputs_t.data()/gradient_t.data() + t*batch_size*num_classes (lines 111-115) cannot overflow for the maximum allowed dimensions and always uses the same dims that allocated the tensors."
+  ]
+}

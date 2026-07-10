@@ -1,0 +1,134 @@
+{
+  "subsystem": "ItemStackMetadata::setString — the key/value metadata setter for item stacks in the Minetest/Luanti voxel game engine. It stores per-item string metadata and, as a side effect, refreshes the item's cached tool capabilities when the tool-capabilities key is written.",
+  "provenance": "Identified by the class and method names ItemStackMetadata::setString and the base class Metadata::setString, the TOOLCAP_KEY constant, and the updateToolCapabilities() side-effect helper — these are verbatim symbols from Minetest/Luanti's src/itemstackmetadata.cpp. The sample banner /* sample: primevul_validation_0144_vuln */ and the CWE-74 file name (eval_0064_cwe74.cpp) further mark this as an injection-class sample, but the code is judged on its merits below.",
+  "trust_boundary": "ItemStack metadata is attacker-controllable. In Minetest both the `name` and `var` strings reach this setter from untrusted sources: server-side Lua mods (ItemStackMetaRef:set_string), and — more importantly for a security review — item stacks deserialized from client network packets and from world/player save files. A remote client that can craft an item string therefore controls both arguments. The base Metadata layer serializes these pairs into a single flat string using reserved control-character delimiters, so the byte content of `name`/`var` crosses a trust boundary into a structured serialization format. The TOOLCAP_KEY value is additionally re-parsed as a structured tool-capabilities blob by updateToolCapabilities().",
+  "what_the_code_does": [
+    {
+      "file": "corpus/eval/eval_0064_cwe74.cpp",
+      "lines": "2-3",
+      "code": "bool ItemStackMetadata::setString(const std::string &name, const std::string &var)\n{",
+      "explanation": "Declares the override of setString for ItemStackMetadata. It takes two const-reference std::string parameters: `name`, the metadata key, and `var`, the value to store under that key. It returns a bool indicating whether the underlying store changed. Both parameters are passed by const reference (no copy) and are fully attacker-influenced: for item metadata they originate from Lua mod calls or from deserialized item strings received over the network or loaded from disk. Nothing in this signature constrains the byte content of either string — they may contain arbitrary bytes including embedded NULs and control characters."
+    },
+    {
+      "file": "corpus/eval/eval_0064_cwe74.cpp",
+      "lines": "4",
+      "code": "\tbool result = Metadata::setString(name, var);",
+      "explanation": "Delegates the actual storage to the base class Metadata::setString, capturing whether the value changed in `result`. This is where `name` and `var` are inserted into the metadata map and, ultimately, where they get serialized. In the Minetest Metadata/ItemStackMetadata implementation the key/value pairs are flattened into one string using reserved separator bytes (a start marker plus key/value and pair delimiters). Critically, this call passes `name` and `var` through verbatim — the shown code performs no escaping, length check, or character filtering before handing the raw strings to the serializer. An empty `var` is treated as a delete in the base class, but the byte content is otherwise trusted."
+    },
+    {
+      "file": "corpus/eval/eval_0064_cwe74.cpp",
+      "lines": "5-6",
+      "code": "\tif (name == TOOLCAP_KEY)\n\t\tupdateToolCapabilities();",
+      "explanation": "After storing, the setter checks whether the key just written is the special tool-capabilities key (TOOLCAP_KEY, a named constant defined elsewhere in the class, conventionally the string \"tool_capabilities\"). If so, it calls updateToolCapabilities(), which reads the freshly stored TOOLCAP_KEY value back out and parses it into a structured ToolCapabilities object (a deserialization step, typically JSON/serialized-format decode) that is cached on the item stack. This means writing this one key has a heavyweight side effect: attacker-controlled `var` is immediately re-parsed by a deserializer. The body of updateToolCapabilities() is not shown here; its parsing behavior is a contract the implementation must uphold."
+    },
+    {
+      "file": "corpus/eval/eval_0064_cwe74.cpp",
+      "lines": "7-8",
+      "code": "\treturn result;\n}",
+      "explanation": "Returns the change flag captured from the base setString. Note the return value reflects only whether the base store changed; it does not reflect success or failure of updateToolCapabilities(), which returns void here and can silently leave a stale or partially-updated capability cache if the parse fails. The function has no error path — malformed input to updateToolCapabilities() cannot be reported to the caller through this return."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/eval/eval_0064_cwe74.cpp",
+      "lines": "4",
+      "code": "\tbool result = Metadata::setString(name, var);",
+      "explanation": "Serialization / separator injection (the central risk, matching the CWE-74 marker). ItemStackMetadata serializes all key/value pairs into a single flat string delimited by reserved control characters (in Minetest: a leading start byte 0x01 and 0x02/0x03 key-value and pair delimiters). setString passes `name` and `var` to the serializer without escaping or rejecting those delimiter bytes. An attacker who can set metadata (via a Lua mod, or by crafting an item string that is deserialized) can embed the delimiter characters inside `name` or `var` to forge additional key/value pairs — for example smuggling a spoofed TOOLCAP_KEY entry through the value of an innocuous key, or overwriting/injecting keys they should not control. The round-trip serialize→deserialize then materializes attacker-chosen metadata entries that were never set through the API, which can escalate to privilege/behavior changes (e.g. forging tool capabilities). Invariant: setString MUST sanitize or escape any bytes that collide with the serialization delimiter set before storing, so that no `name`/`var` content can alter the structure of the serialized stream."
+    },
+    {
+      "file": "corpus/eval/eval_0064_cwe74.cpp",
+      "lines": "5-6",
+      "code": "\tif (name == TOOLCAP_KEY)\n\t\tupdateToolCapabilities();",
+      "explanation": "Deserialization of untrusted data (latent, in the implementation of updateToolCapabilities()). Storing the TOOLCAP_KEY key triggers an immediate re-parse of the attacker-controlled value into a ToolCapabilities object. Because `var` is untrusted, this feeds a deserializer directly from hostile input on every write of that key. If updateToolCapabilities() uses a permissive parser (JSON or the engine's serialize format) without bounding recursion, sizes, or field ranges, malformed input can cause excessive allocation, exceptions on a non-throwing path, or logic corruption of the cached capabilities used later in combat/dig calculations. It also enables the injection above to weaponize forged tool capabilities. Invariant: updateToolCapabilities() MUST treat the stored value as hostile — validate structure and bounds, and fail closed to a safe default capability set rather than propagating a partially parsed or attacker-shaped object."
+    },
+    {
+      "file": "corpus/eval/eval_0064_cwe74.cpp",
+      "lines": "7-8",
+      "code": "\treturn result;\n}",
+      "explanation": "Silent side-effect failure. updateToolCapabilities() is void and its result is discarded; the function returns only the base-store change flag. If the tool-capabilities parse fails or throws, the caller has no signal, and the item may be left with a stale cached capability object that disagrees with its stored string. This is a lower-severity robustness/error-handling gap rather than a memory-safety bug, but it means a malformed TOOLCAP_KEY value can desynchronize the cached state from the serialized state undetected. Invariant: the update side effect should either be infallible-by-construction (parse into a fresh object, swap only on success) or surface failure so callers can reject the write."
+    }
+  ],
+  "summary": "This 8-line metadata setter stores fully attacker-controllable `name`/`var` strings into a delimiter-based serialization format with no escaping (serialization/separator injection, CWE-74/CWE-91) and immediately re-parses the tool-capabilities value through a deserializer (latent untrusted-deserialization risk, CWE-502). The primary, concrete risk is metadata-structure injection via embedded delimiter bytes; memory safety depends on unshown implementation code.",
+  "reviewed_anchors": [
+    {
+      "anchor": "bool ItemStackMetadata::setString(const std::string &name, const std::string &var) (signature, line 2)",
+      "disposition": "finding",
+      "reason": "Both string parameters are attacker-controlled and flow unescaped into a delimiter-based serializer — the injection surface."
+    },
+    {
+      "anchor": "Metadata::setString(name, var) delegation (line 4)",
+      "disposition": "finding",
+      "reason": "Raw `name`/`var` reach the serializer here with no sanitization of reserved delimiter bytes."
+    },
+    {
+      "anchor": "TOOLCAP_KEY constant + `if (name == TOOLCAP_KEY)` (line 5)",
+      "disposition": "finding",
+      "reason": "Marks the value as a structured tool-capabilities blob that is re-parsed; gates untrusted-deserialization side effect. Constant itself is a fixed string comparison (safe), but the branch it guards is security-relevant."
+    },
+    {
+      "anchor": "updateToolCapabilities() side-effect call (line 6)",
+      "disposition": "finding",
+      "reason": "Deserializes attacker-controlled TOOLCAP_KEY value into a cached object; latent parser-robustness surface in unshown implementation."
+    },
+    {
+      "anchor": "bool result / return result (lines 4,7)",
+      "disposition": "finding",
+      "reason": "Return reflects only base-store change; discards updateToolCapabilities() outcome — silent side-effect failure / state desync."
+    }
+  ],
+  "findings": [
+    {
+      "title": "Metadata serialization / separator injection — name and value stored without escaping reserved delimiters",
+      "anchor": "Metadata::setString(name, var)",
+      "file": "corpus/eval/eval_0064_cwe74.cpp",
+      "line": "4",
+      "code": "bool result = Metadata::setString(name, var);",
+      "bug_class": "Injection into serialized data via unescaped delimiter characters (separator injection)",
+      "cwe": "CWE-74",
+      "severity": "high",
+      "where_it_lives": "implementation (file not provided) — base Metadata::setString and the ItemStackMetadata (de)serializer",
+      "invariant": "setString must escape, encode, or reject any byte in `name` or `var` that collides with the reserved serialization delimiter set (start/kv/pair separators), so no argument content can create, overwrite, or terminate serialized key/value entries.",
+      "failure_mode": "An attacker who can set item metadata (Lua mod, or a crafted item string deserialized from the network / a save file) embeds the reserved delimiter control bytes inside `name` or `var`. On serialize→deserialize round-trip these forge additional key/value pairs — e.g. injecting or overriding TOOLCAP_KEY (or other trusted keys) through the value of a benign key — producing metadata the victim never set. Impact ranges from state/logic spoofing to forged tool capabilities affecting gameplay integrity.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether Metadata::setString / the ItemStackMetadata serializer filters or escapes the delimiter bytes (start marker and key-value/pair separators) before storing, or whether raw `name`/`var` bytes are written into the flat serialized string verbatim."
+    },
+    {
+      "title": "Untrusted deserialization of tool-capabilities value on every TOOLCAP_KEY write",
+      "anchor": "if (name == TOOLCAP_KEY) updateToolCapabilities();",
+      "file": "corpus/eval/eval_0064_cwe74.cpp",
+      "line": "5-6",
+      "code": "if (name == TOOLCAP_KEY)\n\t\tupdateToolCapabilities();",
+      "bug_class": "Deserialization of untrusted data into a structured object without shown validation",
+      "cwe": "CWE-502",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided) — updateToolCapabilities()",
+      "invariant": "updateToolCapabilities() must treat the stored TOOLCAP_KEY string as hostile: bound recursion/size/field ranges during the parse and fail closed to a safe default capability set, never propagating a partially-parsed or attacker-shaped object.",
+      "failure_mode": "Writing the TOOLCAP_KEY key immediately re-parses attacker-controlled `var` through the tool-capabilities deserializer. Malformed or adversarial input can cause exceptions on a non-throwing path, excessive allocation/CPU, or a corrupted cached ToolCapabilities used later in dig/combat math — and, combined with the injection above, lets forged capabilities take effect.",
+      "cve_analog": "",
+      "what_to_confirm": "How updateToolCapabilities() parses the value (JSON vs engine serialize format), whether it validates bounds and handles parse failure by resetting to a safe default, and whether it can throw across this void, no-error-path call site."
+    },
+    {
+      "title": "Side-effect result discarded — stale capability cache on parse failure",
+      "anchor": "return result;",
+      "file": "corpus/eval/eval_0064_cwe74.cpp",
+      "line": "4-7",
+      "code": "bool result = Metadata::setString(name, var);\n\tif (name == TOOLCAP_KEY)\n\t\tupdateToolCapabilities();\n\treturn result;",
+      "bug_class": "Improper error handling of a security-relevant side effect",
+      "cwe": "CWE-20",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0064_cwe74.cpp (this function) and updateToolCapabilities() implementation",
+      "invariant": "The cached tool capabilities must stay consistent with the stored TOOLCAP_KEY string; a failed update must either be reported to the caller or leave the previous valid cache intact (build-then-swap).",
+      "failure_mode": "updateToolCapabilities() returns void and its outcome is ignored; the function returns only the base-store change flag. A malformed TOOLCAP_KEY value that fails to parse can desynchronize the cached ToolCapabilities from the serialized value with no signal to the caller, yielding stale/incorrect capabilities later.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether updateToolCapabilities() updates the cache atomically (only on successful parse) and whether the caller ever needs to know the update failed."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm the exact reserved delimiter bytes used by the ItemStackMetadata serializer and verify setString/Metadata::setString escapes or rejects them in BOTH `name` and `var` before storage.",
+    "Add a round-trip test: set a key whose name/value contains each delimiter byte, reserialize, deserialize, and assert no extra/forged key/value pairs appear.",
+    "Verify TOOLCAP_KEY cannot be spoofed via injection through another key's value.",
+    "Inspect updateToolCapabilities() for bounded parsing, exception safety across this void call, and fail-closed-to-default behavior on malformed input.",
+    "Ensure the tool-capabilities cache is updated build-then-swap so a failed parse leaves the prior valid capabilities intact.",
+    "Confirm the deserialization path (network item strings, save files) applies the same sanitization as the Lua setter — the trust boundary must not have a bypass."
+  ]
+}

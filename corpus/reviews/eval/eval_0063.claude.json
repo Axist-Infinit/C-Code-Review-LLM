@@ -1,0 +1,190 @@
+{
+  "subsystem": "Cyrus IMAP server annotation (metadata) storage. write_entry() is the low-level routine that persists a single annotation/METADATA entry (RFC 5257 ANNOTATE / RFC 5464 METADATA) into the annotations cyrusdb, handling create/update/delete, quota accounting, mailbox change-notification, and per-message modseq bumping. It is the write half of the annotate DB layer, called from the SETANNOTATION / SETMETADATA command paths and from internal reconstruct/replication code.",
+  "provenance": "Identified from Cyrus-specific identifiers rather than any SPDX tag (none present in the sample). The file banner is corpus/eval/eval_0063_cwe732.c and the opening comment is /* sample: primevul_c_test_0375_vuln */. The body is unmistakably Cyrus IMAP annotate.c: types annotate_db_t, struct buf / BUF_INITIALIZER, modseq_t, struct annotate_metadata; helpers _annotate_getdb, annotate_begin, make_key, read_old_value, make_entry, mailbox_annot_changed, annotate_putdb; the cyrusdb abstraction cyrusdb_store/cyrusdb_delete/CYRUSDB_CREATE/CYRUSDB_AGAIN; constants MAX_MAILBOX_PATH, IMAP_PERMISSION_DENIED, QUOTA_NUMRESOURCES/QUOTA_ANNOTSTORAGE/QUOTA_DIFFS_DONTCARE_INITIALIZER; and sync_log_annotation for replication.",
+  "trust_boundary": "Annotation values, entry names and target userids ultimately originate from authenticated-but-untrusted IMAP clients issuing SETANNOTATION/SETMETADATA, so entry, userid and value are attacker-influenced. The security-critical input here, however, is the maywrite argument: it is the ACL/authorization decision the CALLER computed for this write (does this principal have permission to write this annotation on this scope). The trust boundary that matters is whether write_entry actually consults that decision on EVERY path before it mutates the database. A second boundary is the mailbox pointer: when it is NULL the entry is a server/global (non-mailbox) annotation, a scope normally restricted to administrators. value is a caller-supplied struct buf * whose contents (len/s) reflect client data.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/eval/eval_0063_cwe732.c",
+      "lines": "2-10",
+      "code": "static int write_entry(struct mailbox *mailbox,\n                       unsigned int uid,\n                       const char *entry,\n                       const char *userid,\n                       const struct buf *value,\n                       int ignorequota,\n                       int silent,\n                       const struct annotate_metadata *mdata,\n                       int maywrite)",
+      "explanation": "The function signature. mailbox is the target mailbox or NULL for a server/global annotation; uid selects a per-message annotation (0 means the mailbox/global scope itself); entry is the annotation name and userid is the owning user (or NULL for a shared/prefix key); value is the new annotation payload as a struct buf (a length+pointer pair); ignorequota suppresses quota accounting; silent suppresses the change notification/modseq bump; mdata optionally overrides the modseq; and maywrite is the caller-computed authorization flag stating whether the requesting principal is permitted to perform this write. maywrite is the anchor of the whole security contract: the function is expected to refuse the write when maywrite is false."
+    },
+    {
+      "file": "corpus/eval/eval_0063_cwe732.c",
+      "lines": "12-18",
+      "code": "{\n    char key[MAX_MAILBOX_PATH+1];\n    int keylen, r;\n    annotate_db_t *d = NULL;\n    struct buf oldval = BUF_INITIALIZER;\n    const char *mboxname = mailbox ? mailbox->name : \"\";\n    modseq_t modseq = mdata ? mdata->modseq : 0;",
+      "explanation": "Local state. key is a fixed on-stack buffer sized MAX_MAILBOX_PATH+1 that will hold the composed database key; keylen and r are the key length and return code. d is the annotate DB handle, initialised NULL. oldval holds the previously stored value for comparison and quota diffing. mboxname is derived defensively: mailbox->name when mailbox is non-NULL, else the empty string \"\" — note this line already demonstrates the author knows mailbox may be NULL. modseq is seeded from mdata->modseq when mdata is provided, else 0; mdata is likewise NULL-guarded. Notably value is NOT NULL-guarded anywhere in this prologue even though mailbox and mdata are."
+    },
+    {
+      "file": "corpus/eval/eval_0063_cwe732.c",
+      "lines": "20-27",
+      "code": "    r = _annotate_getdb(mboxname, uid, CYRUSDB_CREATE, &d);\n    if (r)\n        return r;\n\n    /* must be in a transaction to modify the db */\n    annotate_begin(d);\n\n    keylen = make_key(mboxname, uid, entry, userid, key, sizeof(key));",
+      "explanation": "Opens (creating if necessary) the annotation database for this mailbox name and uid, returning early on error. annotate_begin(d) starts the write transaction. make_key() composes the lookup/store key into the fixed key buffer, being passed sizeof(key) as its bound, and returns the resulting key length into keylen. Because make_key receives the destination size it is responsible for staying inside key[]; the caller then trusts keylen as the authoritative length for all subsequent DB operations."
+    },
+    {
+      "file": "corpus/eval/eval_0063_cwe732.c",
+      "lines": "29-36",
+      "code": "    if (mailbox) {\n        struct annotate_metadata oldmdata;\n        r = read_old_value(d, key, keylen, &oldval, &oldmdata);\n        if (r) goto out;\n\n        /* if the value is identical, don't touch the mailbox */\n        if (oldval.len == value->len && (!value->len || !memcmp(oldval.s, value->s, value->len)))\n            goto out;",
+      "explanation": "This entire block is guarded by if (mailbox) — it only runs for mailbox-scoped annotations. It reads the previous value (oldval) and old metadata via read_old_value(d, key, keylen, ...), bailing on error. It then short-circuits when the new value equals the old one: the lengths must match and either both be empty or memcmp of value->len bytes must be zero, in which case it returns without touching the DB. This is the first point value is dereferenced (value->len, value->s)."
+    },
+    {
+      "file": "corpus/eval/eval_0063_cwe732.c",
+      "lines": "38-43",
+      "code": "        if (!ignorequota) {\n            quota_t qdiffs[QUOTA_NUMRESOURCES] = QUOTA_DIFFS_DONTCARE_INITIALIZER;\n            qdiffs[QUOTA_ANNOTSTORAGE] = value->len - (quota_t)oldval.len;\n            r = mailbox_quota_check(mailbox, qdiffs);\n            if (r) goto out;\n        }",
+      "explanation": "Still inside if (mailbox). Unless ignorequota is set, it builds a quota-diff vector and sets the ANNOTSTORAGE slot to the byte delta between the new and old value, value->len - (quota_t)oldval.len, then asks mailbox_quota_check whether the mailbox has room, bailing with the quota error on failure. value->len is a size_t (unsigned) and oldval.len is cast to quota_t (a signed 64-bit type), so this is a mixed signed/unsigned subtraction whose evaluation type and wrap behaviour matter when the annotation shrinks."
+    },
+    {
+      "file": "corpus/eval/eval_0063_cwe732.c",
+      "lines": "45-48",
+      "code": "        if (!maywrite) {\n            r = IMAP_PERMISSION_DENIED;\n            if (r) goto out;\n        }",
+      "explanation": "The authorization gate. When maywrite is false it sets r = IMAP_PERMISSION_DENIED (a non-zero IMAP error) and jumps to the cleanup label, so the write is refused. The inner if (r) is trivially always true because IMAP_PERMISSION_DENIED is non-zero, so this reliably denies. Crucially, this gate is textually INSIDE the if (mailbox) { ... } block opened at line 29 and closed at line 57 — it is only reached when mailbox is non-NULL. It also sits after the quota check and the DB read, not at the top of the function."
+    },
+    {
+      "file": "corpus/eval/eval_0063_cwe732.c",
+      "lines": "50-57",
+      "code": "        /* do the annot-changed here before altering the DB */\n        mailbox_annot_changed(mailbox, uid, entry, userid, &oldval, value, silent);\n\n        /* grab the message annotation modseq, if not overridden */\n        if (uid && !mdata) {\n            modseq = mailbox->i.highestmodseq;\n        }\n    }",
+      "explanation": "Closing the mailbox branch: it fires mailbox_annot_changed to record the change (unless silent) before the DB is mutated, and, for a per-message annotation (uid != 0) with no caller-supplied metadata, adopts the mailbox's highestmodseq as the annotation modseq. The closing brace on line 57 ends the if (mailbox) scope; everything below runs for BOTH mailbox and non-mailbox annotations."
+    },
+    {
+      "file": "corpus/eval/eval_0063_cwe732.c",
+      "lines": "59-71",
+      "code": "    /* zero length annotation is deletion.\n     * keep tombstones for message annotations */\n    if (!value->len && !uid) {\n\n#if DEBUG\n        syslog(LOG_ERR, \"write_entry: deleting key %s from %s\",\n                key_as_string(d, key, keylen), d->filename);\n#endif\n\n        do {\n            r = cyrusdb_delete(d->db, key, keylen, tid(d), /*force*/1);\n        } while (r == CYRUSDB_AGAIN);\n    }",
+      "explanation": "First of the two mutation paths, reached regardless of whether mailbox was NULL. A zero-length value on the mailbox/global scope (uid == 0) is treated as a deletion: it force-deletes the key from the DB, retrying on CYRUSDB_AGAIN. The optional DEBUG syslog dereferences d->filename and calls key_as_string. This cyrusdb_delete is a database mutation that occurs with no maywrite consultation on the non-mailbox path."
+    },
+    {
+      "file": "corpus/eval/eval_0063_cwe732.c",
+      "lines": "72-97",
+      "code": "    else {\n        struct buf data = BUF_INITIALIZER;\n        unsigned char flags = 0;\n        if (!value->len || value->s == NULL) {\n            flags |= ANNOTATE_FLAG_DELETED;\n        }\n        else {\n            // this is only here to allow cleanup of invalid values in the past...\n            // the calling of this API with a NULL \"userid\" is bogus, because that's\n            // supposed to be reserved for the make_key of prefixes - but there has\n            // been API abuse in the past, so some of these are in the wild.  *sigh*.\n            // Don't allow new ones to be written\n            if (!userid) goto out;\n        }\n        make_entry(&data, value, modseq, flags);\n\n#if DEBUG\n        syslog(LOG_ERR, \"write_entry: storing key %s (value: %s) to %s (modseq=\" MODSEQ_FMT \")\",\n                key_as_string(d, key, keylen), value->s, d->filename, modseq);\n#endif\n\n        do {\n            r = cyrusdb_store(d->db, key, keylen, data.s, data.len, tid(d));\n        } while (r == CYRUSDB_AGAIN);\n        buf_free(&data);\n    }",
+      "explanation": "The store path (per-message annotation, or a non-empty value). It builds an on-disk record with make_entry: an empty/NULL value is encoded as a tombstone via ANNOTATE_FLAG_DELETED, otherwise a real value is stored — but a real value with a NULL userid is rejected (goto out) as legacy API abuse. It then writes the record with cyrusdb_store and frees the temp buffer. Like the delete path, this store is reached on the non-mailbox path with no permission check having run."
+    },
+    {
+      "file": "corpus/eval/eval_0063_cwe732.c",
+      "lines": "99-107",
+      "code": "    if (!mailbox)\n        sync_log_annotation(\"\");\n\nout:\n    annotate_putdb(&d);\n    buf_free(&oldval);\n\n    return r;\n}",
+      "explanation": "Post-mutation bookkeeping and cleanup. For the non-mailbox (global) case it emits a replication sync-log entry for the annotation. The out label is the single cleanup exit: it releases the DB handle via annotate_putdb and frees oldval, then returns r. Every earlier goto out lands here, so cleanup is uniform. The if (!mailbox) here again confirms the code deliberately supports and handles the mailbox==NULL global-annotation case that the permission gate above did not cover."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/eval/eval_0063_cwe732.c",
+      "lines": "45-48",
+      "code": "        if (!maywrite) {\n            r = IMAP_PERMISSION_DENIED;\n            if (r) goto out;\n        }",
+      "explanation": "This is the central defect. The maywrite authorization gate is nested inside the if (mailbox) { ... } block (opened at line 29, closed at line 57), so it is evaluated ONLY when mailbox is non-NULL. For a server/global annotation the caller passes mailbox == NULL (mboxname is then \"\", line 17; the code explicitly special-cases !mailbox again at line 99). On that path control flows straight from make_key (line 27) past the skipped mailbox block to the mutation logic and executes cyrusdb_delete (line 69) or cyrusdb_store (line 94) with maywrite never consulted. An IMAP principal who lacks permission to write server/global annotations but can reach this routine with mailbox==NULL and maywrite==0 therefore gets their write/delete applied anyway. The invariant the implementation must uphold is: if maywrite is false the DB must not be mutated on ANY scope, mailbox or global. The fix is to evaluate the maywrite refusal unconditionally (ideally at the very top of the function, before any DB open/read/quota work), not inside the mailbox-only branch."
+    },
+    {
+      "file": "corpus/eval/eval_0063_cwe732.c",
+      "lines": "35-40",
+      "code": "        if (oldval.len == value->len && (!value->len || !memcmp(oldval.s, value->s, value->len)))\n            goto out;",
+      "explanation": "value is dereferenced (value->len, value->s) at lines 35, 40, 61 and 75 with no NULL check, even though the sibling pointers mailbox and mdata ARE NULL-guarded in the prologue (line 17-18). If any caller invokes write_entry with value == NULL, the first value->len read is a NULL-pointer dereference and the process (imapd/lmtpd worker) crashes. The invariant is that value must be a valid buf for every caller; because that is only a convention and not enforced here, a single non-conforming or attacker-steered caller path yields a remote-ish DoS. This is a latent contract bug: the fault would manifest in whichever caller passes NULL, not in this function's own arithmetic."
+    },
+    {
+      "file": "corpus/eval/eval_0063_cwe732.c",
+      "lines": "40",
+      "code": "            qdiffs[QUOTA_ANNOTSTORAGE] = value->len - (quota_t)oldval.len;",
+      "explanation": "value->len is an unsigned size_t while (quota_t)oldval.len is signed. Under the usual arithmetic conversions the subtraction is computed in the unsigned size_t domain when size_t has rank >= quota_t, so shrinking an annotation (value->len < oldval.len) produces a huge unsigned intermediate that is then converted to the signed quota_t destination — an implementation-defined/wraparound conversion rather than the intended small negative delta. On a normal two's-complement build it happens to land on the correct negative value, but relying on that is fragile and the mixed-sign expression is a genuine integer-conversion hazard for quota accounting (over- or under-counting annotation storage). The invariant is that qdiffs[QUOTA_ANNOTSTORAGE] must equal the true signed byte delta; compute it in a signed 64-bit type on both operands. Low severity: it affects quota accounting, not memory safety, and only on the mailbox path."
+    },
+    {
+      "file": "corpus/eval/eval_0063_cwe732.c",
+      "lines": "27",
+      "code": "    keylen = make_key(mboxname, uid, entry, userid, key, sizeof(key));",
+      "explanation": "keylen is an int taken from make_key and is used unchecked as the key length for read_old_value (line 31), cyrusdb_delete (line 69), cyrusdb_store (line 94) and the debug key_as_string calls. make_key is given sizeof(key) so it should bound the composed key inside key[MAX_MAILBOX_PATH+1], but if a very long entry/userid causes it to return a negative error sentinel or a truncated/incorrect length, that value flows directly into the DB layer as a buffer length. A negative keylen widened to the DB API's size parameter, or a length longer than the real key, is an out-of-bounds read primitive at the DB boundary. The invariant is that make_key must return a non-negative length that never exceeds the bytes it actually wrote, and the caller should reject keylen < 0. Latent/low without make_key's source, but worth confirming."
+    },
+    {
+      "file": "corpus/eval/eval_0063_cwe732.c",
+      "lines": "45-51",
+      "code": "        if (!maywrite) {\n            r = IMAP_PERMISSION_DENIED;\n            if (r) goto out;\n        }\n\n        /* do the annot-changed here before altering the DB */\n        mailbox_annot_changed(mailbox, uid, entry, userid, &oldval, value, silent);",
+      "explanation": "Even on the mailbox path where the gate DOES run, its placement is late: read_old_value (line 31) and mailbox_quota_check (line 41) execute before the permission decision, so an unauthorized caller can still probe existence of a value and elicit distinct quota-vs-permission error codes (a minor information disclosure / behavioural oracle), and the ordering makes it easy for a future edit to slip a mutation above the gate. The annot-changed side effect at line 51 correctly follows the gate here, but only by textual luck. Best practice and the safe invariant is to deny early, before any read or side effect. Low severity, defense-in-depth."
+    }
+  ],
+  "summary": "This is Cyrus IMAP write_entry(), the annotation-DB writer. Its dominant risk is an authorization gap: the maywrite permission check (lines 45-48) is nested inside the if (mailbox) branch, so server/global annotations (mailbox == NULL) reach cyrusdb_store/cyrusdb_delete with no permission check at all — a missing-authorization write/delete on a scope normally reserved to admins. Secondary latent issues are an unguarded value pointer dereference (NULL-deref DoS), a mixed signed/unsigned quota subtraction, and an unchecked keylen from make_key.",
+  "reviewed_anchors": [
+    {"anchor": "write_entry(...) signature, param int maywrite (line 10)", "disposition": "finding", "reason": "Authorization flag whose refusal is only enforced inside the mailbox branch; primary finding."},
+    {"anchor": "param struct mailbox *mailbox (line 2)", "disposition": "finding", "reason": "NULL mailbox selects the global-annotation path that bypasses the permission gate; part of the primary finding."},
+    {"anchor": "param const struct buf *value (line 6)", "disposition": "finding", "reason": "Dereferenced without a NULL guard unlike its siblings; NULL-deref DoS finding."},
+    {"anchor": "param const struct annotate_metadata *mdata (line 9)", "disposition": "dismissed", "reason": "NULL-guarded at line 18 (mdata ? mdata->modseq : 0) and again at line 54; only supplies modseq, no unsafe deref."},
+    {"anchor": "params uid / entry / userid / ignorequota / silent (lines 3-8)", "disposition": "dismissed", "reason": "Scalars/strings passed through to make_key/mailbox_annot_changed; userid NULL is explicitly handled at line 84, no direct memory contract here."},
+    {"anchor": "char key[MAX_MAILBOX_PATH+1] (line 13)", "disposition": "dismissed", "reason": "Fixed buffer, but make_key receives sizeof(key) as its bound so the copy is size-aware; the residual risk is the returned keylen, tracked separately."},
+    {"anchor": "keylen (int) from make_key(..., sizeof(key)) (line 27)", "disposition": "finding", "reason": "Used unchecked as the DB key length for read/store/delete; negative/oversized return is an OOB-read primitive at the DB boundary."},
+    {"anchor": "oldval.len == value->len && (!value->len || !memcmp(oldval.s, value->s, value->len)) (line 35)", "disposition": "finding", "reason": "First value dereference; covered by the value NULL-deref finding (memcmp reads value->len bytes from value->s)."},
+    {"anchor": "qdiffs[QUOTA_ANNOTSTORAGE] = value->len - (quota_t)oldval.len (line 40)", "disposition": "finding", "reason": "Mixed unsigned/signed subtraction; integer-conversion hazard for quota accounting."},
+    {"anchor": "mailbox_quota_check(mailbox, qdiffs) (line 41)", "disposition": "dismissed", "reason": "Quota gate; runs only on mailbox path and before the permission gate — noted as ordering weakness, no standalone memory contract."},
+    {"anchor": "mailbox_annot_changed(...) (line 51)", "disposition": "dismissed", "reason": "Change-notification side effect; occurs after the (mailbox-path) gate, no attacker-controlled buffer arithmetic here."},
+    {"anchor": "modseq = mailbox->i.highestmodseq (line 55)", "disposition": "dismissed", "reason": "Guarded by if (mailbox) via the enclosing branch and by uid && !mdata; mailbox is non-NULL here, no deref risk."},
+    {"anchor": "if (!value->len && !uid) delete path / cyrusdb_delete(d->db, key, keylen, tid(d), 1) (lines 61-69)", "disposition": "finding", "reason": "Mutation reachable on the non-mailbox path with no permission check; part of the primary authorization finding (and depends on value/keylen)."},
+    {"anchor": "if (!userid) goto out (line 84)", "disposition": "dismissed", "reason": "Correctly blocks writing real values with a NULL userid; a defensive check, not a defect."},
+    {"anchor": "make_entry(&data, value, modseq, flags) / cyrusdb_store(d->db, key, keylen, data.s, data.len, tid(d)) (lines 86-94)", "disposition": "finding", "reason": "Store mutation reachable on the non-mailbox path without a permission check; part of the primary authorization finding."},
+    {"anchor": "DEBUG syslog blocks dereferencing d->filename / value->s (lines 64-65, 89-90)", "disposition": "dismissed", "reason": "Compiled only under #if DEBUG; d is non-NULL past the getdb check, value->s risk is already captured by the value NULL-deref finding."},
+    {"anchor": "if (!mailbox) sync_log_annotation(\"\") (lines 99-100)", "disposition": "dismissed", "reason": "Replication log emit; benign, but confirms the mailbox==NULL path is intended and handled, reinforcing the primary finding."},
+    {"anchor": "out: annotate_putdb(&d); buf_free(&oldval) (lines 102-104)", "disposition": "dismissed", "reason": "Single uniform cleanup exit; d and oldval are always in a safe state, no double-free/leak observed."}
+  ],
+  "findings": [
+    {
+      "title": "Authorization (maywrite) check skipped for server/global annotations (mailbox == NULL)",
+      "anchor": "if (!maywrite) { r = IMAP_PERMISSION_DENIED; ... } nested inside if (mailbox)",
+      "file": "corpus/eval/eval_0063_cwe732.c",
+      "line": "45-48",
+      "code": "        if (!maywrite) {\n            r = IMAP_PERMISSION_DENIED;\n            if (r) goto out;\n        }",
+      "bug_class": "Missing authorization on a code path (permission gate scoped inside a conditional branch)",
+      "cwe": "CWE-862",
+      "severity": "high",
+      "where_it_lives": "corpus/eval/eval_0063_cwe732.c (and the SETANNOTATION/SETMETADATA callers in implementation, file not provided)",
+      "invariant": "If maywrite is false the routine must refuse and must not mutate the DB on ANY scope — mailbox-scoped OR server/global (mailbox == NULL). The permission decision must be evaluated unconditionally, ideally before any DB open/read/quota/side-effect work.",
+      "failure_mode": "The maywrite gate is textually inside the if (mailbox) block (opened line 29, closed line 57). When a caller writes a server/global annotation it passes mailbox == NULL (mboxname becomes \"\" at line 17, and !mailbox is special-cased again at line 99). On that path the whole mailbox block is skipped, so control flows from make_key (line 27) directly to the mutation logic and runs cyrusdb_delete (line 69) or cyrusdb_store (line 94) with maywrite never consulted. A principal lacking permission to write server/global annotations (maywrite == 0) has their write/delete applied anyway, allowing unauthorized creation, modification, or deletion of global annotations.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm that callers can reach write_entry with mailbox == NULL and maywrite == 0 for an unprivileged principal, and that no other authorization gate exists on the global-annotation path. The fix (and the way to confirm it is the intended vuln, sample tagged cwe732) is to move the !maywrite refusal out of the if (mailbox) branch to the top of the function so it covers both scopes."
+    },
+    {
+      "title": "Unguarded dereference of value pointer (NULL-deref DoS)",
+      "anchor": "value->len / value->s used without a NULL check on value",
+      "file": "corpus/eval/eval_0063_cwe732.c",
+      "line": "35",
+      "code": "        if (oldval.len == value->len && (!value->len || !memcmp(oldval.s, value->s, value->len)))",
+      "bug_class": "NULL pointer dereference",
+      "cwe": "CWE-476",
+      "severity": "medium",
+      "where_it_lives": "corpus/eval/eval_0063_cwe732.c (triggering caller in implementation, file not provided)",
+      "invariant": "value must be a valid struct buf * for every caller; if the API permits a NULL value it must be checked before the first dereference, exactly as mailbox and mdata are.",
+      "failure_mode": "Unlike mailbox and mdata (both NULL-guarded at lines 17-18), value is dereferenced without any guard at lines 35, 40, 61 and 75. A caller that passes value == NULL causes an immediate NULL read at value->len, crashing the imapd/lmtpd worker (denial of service). This is latent: it manifests in whichever caller violates the non-NULL contract.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether any reachable caller (including error/cleanup and replication paths) can pass value == NULL, and whether the struct buf API guarantees value is never NULL here."
+    },
+    {
+      "title": "Mixed signed/unsigned quota-storage subtraction",
+      "anchor": "qdiffs[QUOTA_ANNOTSTORAGE] = value->len - (quota_t)oldval.len",
+      "file": "corpus/eval/eval_0063_cwe732.c",
+      "line": "40",
+      "code": "            qdiffs[QUOTA_ANNOTSTORAGE] = value->len - (quota_t)oldval.len;",
+      "bug_class": "Integer signedness/conversion in size arithmetic",
+      "cwe": "CWE-191",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0063_cwe732.c",
+      "invariant": "The stored quota delta must equal the true signed byte difference (new - old); the subtraction should be performed with both operands in a signed 64-bit type before assignment to quota_t.",
+      "failure_mode": "value->len is unsigned size_t and (quota_t)oldval.len is signed. When the annotation shrinks (value->len < oldval.len) the subtraction is evaluated in the unsigned domain, producing a large intermediate that is then converted to the signed quota_t destination — an implementation-defined conversion. On typical two's-complement builds the result is the correct negative delta, but the code relies on that; on other representations or if types change, quota accounting for ANNOTSTORAGE can be corrupted (mis-charging storage).",
+      "cve_analog": "",
+      "what_to_confirm": "The concrete widths of size_t and quota_t on target builds, and whether shrinking annotations produce the intended negative delta into mailbox_quota_check."
+    },
+    {
+      "title": "Unchecked keylen from make_key used as DB key length",
+      "anchor": "keylen = make_key(mboxname, uid, entry, userid, key, sizeof(key))",
+      "file": "corpus/eval/eval_0063_cwe732.c",
+      "line": "27",
+      "code": "    keylen = make_key(mboxname, uid, entry, userid, key, sizeof(key));",
+      "bug_class": "Unvalidated length used as buffer bound (potential out-of-bounds read)",
+      "cwe": "CWE-125",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0063_cwe732.c (make_key implementation, file not provided)",
+      "invariant": "make_key must return a non-negative length that never exceeds the bytes actually written into key[], and the caller should reject keylen < 0 before using it as a DB key length.",
+      "failure_mode": "keylen (an int) is used directly as the key length for read_old_value (line 31), cyrusdb_delete (line 69) and cyrusdb_store (line 94) with no validation. If make_key returns a negative error sentinel or a length larger than the real key (e.g. on truncation with an overlong entry/userid), that value flows into the DB layer's length parameter, producing an out-of-bounds read of the key buffer. make_key is passed sizeof(key), so it is expected to bound itself, but the return value is trusted blindly.",
+      "cve_analog": "",
+      "what_to_confirm": "make_key's return-value contract: does it ever return negative, and is its returned length always <= the bytes written into key[MAX_MAILBOX_PATH+1]?"
+    }
+  ],
+  "audit_checklist": [
+    "Confirm the maywrite refusal is enforced on the mailbox == NULL (server/global) path — move the !maywrite check out of the if (mailbox) block to the top of write_entry so cyrusdb_store/cyrusdb_delete cannot run unauthorized.",
+    "Trace every caller of write_entry to verify which ones pass mailbox == NULL and maywrite == 0, and that a separate admin authorization check exists on the global-annotation path (or add one).",
+    "Add a NULL guard for value before its first dereference (line 35), matching the existing NULL guards on mailbox and mdata.",
+    "Verify make_key never returns a negative or over-length keylen, and reject keylen < 0 before using it in read_old_value/cyrusdb_store/cyrusdb_delete.",
+    "Recompute the quota delta at line 40 in a signed 64-bit type on both operands to avoid unsigned-domain evaluation when the annotation shrinks.",
+    "Confirm the permission decision precedes any side effect or information-revealing error (read_old_value, mailbox_quota_check) so unauthorized callers get a uniform denial rather than a quota/existence oracle."
+  ]
+}

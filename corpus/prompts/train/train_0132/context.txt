@@ -1,0 +1,133 @@
+Files under review: corpus/train/train_0132_cwe190.cpp
+
+<<<BEGIN_UNTRUSTED_CODE>>>
+/* ===== FILE: corpus/train/train_0132_cwe190.cpp ===== */
+   1| /* sample: primevul_train_2060_fixed */
+   2| TfLiteStatus Eval(TfLiteContext* context, TfLiteNode* node) {
+   3|   auto* params =
+   4|       reinterpret_cast<TfLiteEmbeddingLookupSparseParams*>(node->builtin_data);
+   5|   TfLiteTensor* output;
+   6|   TF_LITE_ENSURE_OK(context, GetOutputSafe(context, node, 0, &output));
+   7|   const TfLiteTensor* ids;
+   8|   TF_LITE_ENSURE_OK(context, GetInputSafe(context, node, 0, &ids));
+   9|   const TfLiteTensor* indices;
+  10|   TF_LITE_ENSURE_OK(context, GetInputSafe(context, node, 1, &indices));
+  11|   const TfLiteTensor* dense_shape;
+  12|   TF_LITE_ENSURE_OK(context, GetInputSafe(context, node, 2, &dense_shape));
+  13|   const TfLiteTensor* weights;
+  14|   TF_LITE_ENSURE_OK(context, GetInputSafe(context, node, 3, &weights));
+  15|   const TfLiteTensor* value;
+  16|   TF_LITE_ENSURE_OK(context, GetInputSafe(context, node, 4, &value));
+  17|   const size_t values_size = NumElements(value);
+  18| 
+  19|   const int lookup_rank = SizeOfDimension(indices, 1);
+  20|   const int embedding_rank = NumDimensions(value);
+  21|   const int num_lookups = SizeOfDimension(ids, 0);
+  22|   const int num_rows = SizeOfDimension(value, 0);
+  23| 
+  24|   // The last dimension gets replaced by the embedding.
+  25|   const int output_rank = (lookup_rank - 1) + (embedding_rank - 1);
+  26| 
+  27|   // Make sure that the actual dense shape of the sparse tensor represented by
+  28|   // (loopkup, indices, dense_shape) is consistent.
+  29|   TF_LITE_ENSURE_EQ(context, SizeOfDimension(dense_shape, 0), lookup_rank);
+  30| 
+  31|   // Resize output tensor.
+  32|   TfLiteIntArray* output_shape = TfLiteIntArrayCreate(output_rank);
+  33|   TF_LITE_ENSURE(context, output_shape != nullptr);
+  34|   int k = 0;
+  35|   size_t embedding_size = 1;
+  36|   size_t lookup_size = 1;
+  37|   for (int i = 0; i < lookup_rank - 1; i++, k++) {
+  38|     const size_t dim = dense_shape->data.i32[i];
+  39|     TF_LITE_ENSURE_MSG(
+  40|         context,
+  41|         MultiplyAndCheckOverflow(lookup_size, dim, &lookup_size) == kTfLiteOk,
+  42|         "Lookup size overflowed.");
+  43|     output_shape->data[k] = dim;
+  44|   }
+  45|   for (int i = 1; i < embedding_rank; i++, k++) {
+  46|     const size_t dim = SizeOfDimension(value, i);
+  47|     TF_LITE_ENSURE_MSG(context,
+  48|                        MultiplyAndCheckOverflow(embedding_size, dim,
+  49|                                                 &embedding_size) == kTfLiteOk,
+  50|                        "Embedding size overflowed.");
+  51|     output_shape->data[k] = dim;
+  52|   }
+  53|   TF_LITE_ENSURE_STATUS(context->ResizeTensor(context, output, output_shape));
+  54|   const size_t output_size = lookup_size * embedding_size;
+  55|   TfLiteTensorRealloc(output_size * sizeof(float), output);
+  56| 
+  57|   float* output_ptr = GetTensorData<float>(output);
+  58|   const float* weights_ptr = GetTensorData<float>(weights);
+  59|   const float* value_ptr = GetTensorData<float>(value);
+  60|   // Makes sure reallocation was successful.
+  61|   TF_LITE_ENSURE(context, output_ptr != nullptr);
+  62| 
+  63|   std::fill_n(output_ptr, output_size, 0.0f);
+  64| 
+  65|   // Keep track of the current bucket for aggregation/combination.
+  66|   int current_output_offset = 0;
+  67|   float current_total_weight = 0.0;
+  68|   float current_squares_weight = 0.0;
+  69|   int num_elements = 0;
+  70| 
+  71|   for (int i = 0; i < num_lookups; i++) {
+  72|     int idx = ids->data.i32[i];
+  73|     if (idx >= num_rows || idx < 0) {
+  74|       context->ReportError(context,
+  75|                            "Embedding Lookup Sparse: index out of bounds. "
+  76|                            "Got %d, and bounds are [0, %d]",
+  77|                            idx, num_rows - 1);
+  78|       return kTfLiteError;
+  79|     }
+  80| 
+  81|     // Check where we need to aggregate.
+  82|     const int example_indices_offset = i * lookup_rank;
+  83|     int output_bucket = 0;
+  84|     int stride = 1;
+  85|     for (int k = (lookup_rank - 1) - 1; k >= 0; k--) {
+  86|       output_bucket += indices->data.i32[example_indices_offset + k] * stride;
+  87|       stride *= dense_shape->data.i32[k];
+  88|     }
+  89|     const int output_offset = output_bucket * embedding_size;
+  90| 
+  91|     // If we are in a new aggregation bucket and the combiner is not the sum,
+  92|     // go back and finalize the result of the previous bucket.
+  93|     if (output_offset != current_output_offset) {
+  94|       FinalizeAggregation(params->combiner, num_elements, current_total_weight,
+  95|                           current_squares_weight, embedding_size,
+  96|                           &output_ptr[current_output_offset]);
+  97| 
+  98|       // Track next bucket.
+  99|       num_elements = 0;
+ 100|       current_total_weight = 0.0;
+ 101|       current_squares_weight = 0.0;
+ 102|       current_output_offset = output_offset;
+ 103|     }
+ 104| 
+ 105|     // Add element to aggregation.
+ 106|     ++num_elements;
+ 107|     const int example_embedding_offset = idx * embedding_size;
+ 108|     const float w = weights_ptr[i];
+ 109|     current_squares_weight += w * w;
+ 110|     current_total_weight += w;
+ 111|     for (int k = 0; k < embedding_size; k++) {
+ 112|       // only index if indices are valid
+ 113|       if (current_output_offset + k < 0) continue;
+ 114|       if (current_output_offset + k >= output_size) continue;
+ 115|       if (example_embedding_offset + k < 0) continue;
+ 116|       if (example_embedding_offset + k >= values_size) continue;
+ 117|       output_ptr[current_output_offset + k] +=
+ 118|           value_ptr[example_embedding_offset + k] * w;
+ 119|     }
+ 120|   }
+ 121| 
+ 122|   // Finalize last bucket.
+ 123|   FinalizeAggregation(params->combiner, num_elements, current_total_weight,
+ 124|                       current_squares_weight, embedding_size,
+ 125|                       &GetTensorData<float>(output)[current_output_offset]);
+ 126| 
+ 127|   return kTfLiteOk;
+ 128| }
+<<<END_UNTRUSTED_CODE>>>

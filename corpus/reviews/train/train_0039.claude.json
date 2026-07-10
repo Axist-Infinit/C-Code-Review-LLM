@@ -1,0 +1,243 @@
+{
+  "subsystem": "Ghostscript OKI IBM-compatible 9-pin dot-matrix printer device driver — the per-page raster output routine okiibm_print_page1(). It converts a rendered page bitmap into the printer's ESC/P-style graphics command stream (vertical-tab skips, 8x8 pixel-block transposition, and graphics runs), writing bytes to a gp_file print stream.",
+  "provenance": "Identified by naming and API surface: the function name okiibm_print_page1 and helper okiibm_output_run are the OKI IBM driver in Ghostscript's contrib/devices (gdevokii.c). The types gx_device_printer, gp_file, byte, and the calls gs_malloc/gs_free, gdev_mem_bytes_per_scan_line, gdev_prn_get_bits, gdev_prn_copy_scan_lines, gdev_prn_transpose_8x8, return_error(gs_error_*) are all Ghostscript/GhostPDL internal APIs. The header comment '/* sample: primevul_c_train_3032_fixed */' marks this as the post-fix revision of a PrimeVul C sample.",
+  "trust_boundary": "This routine runs inside the Ghostscript interpreter while rendering a document (PostScript/PDF/PCL). The attacker controls the input document, and a malicious document can set device parameters that reach this code: pdev->x_pixels_per_inch (x_dpi, the horizontal resolution), pdev->height, and the page geometry that feeds gdev_mem_bytes_per_scan_line (line_size). The raster bytes returned by gdev_prn_get_bits/gdev_prn_copy_scan_lines are derived from the document content. The init_string/init_length and end_string/end_length come from the driver's device definition (in-tree, less attacker-controlled) but still flow to gp_fwrite as sizes. The hostile fields are therefore x_dpi (array index), line_size and in_y_mult (allocation-size arithmetic), and lnum/height loop bounds.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0039_cwe120.c",
+      "lines": "2-4",
+      "code": "okiibm_print_page1(gx_device_printer *pdev, gp_file *prn_stream, int y_9pin_high,\n  const char *init_string, int init_length,\n  const char *end_string, int end_length)",
+      "explanation": "The entry point. pdev is the printer device whose raster is being emitted; prn_stream is the destination byte stream. y_9pin_high selects a double-density 9-pin mode (doubling the vertical multiplier). init_string/init_length is a byte blob written verbatim to reset/initialize the printer at the start, and end_string/end_length is written at the end. init_length and end_length are plain signed ints used later as gp_fwrite element counts, so their sign and magnitude are a contract the caller must honor."
+    },
+    {
+      "file": "corpus/train/train_0039_cwe120.c",
+      "lines": "6-9",
+      "code": "static const char graphics_modes_9[5] =\n        {\n        -1, 0 /*60*/, 1 /*120*/, -1, 3 /*240*/\n        };",
+      "explanation": "A fixed lookup table of 5 signed chars mapping a resolution bucket (x_dpi/60) to a printer graphics-mode code. Index 0 (0 dpi) and index 3 (180 dpi) are -1 meaning 'unsupported', while 60/120/240 dpi map to 0/1/3. This table is indexed by attacker-influenceable x_dpi at line 40, so its bounds are security-relevant."
+    },
+    {
+      "file": "corpus/train/train_0039_cwe120.c",
+      "lines": "11-25",
+      "code": "int in_y_mult;\n        int line_size;\n        int in_size;\n        byte *buf1;\n        byte *buf2;\n        byte *in;\n        byte *out;\n        int out_y_mult;\n        int x_dpi;\n        char start_graphics;\n        int first_pass;\n        int last_pass;\n        int y_passes;\n        int skip = 0, lnum = 0, pass, ypass;\n        int y_step = 0;",
+      "explanation": "Local state. line_size is the number of bytes in one device scan line; in_y_mult is 1 or 2; in_size is the total working-buffer size (all signed int). buf1/buf2 are the two heap scratch buffers, aliased through the in/out pointers which are swapped during the 9-pin shuffle. x_dpi holds the horizontal resolution, start_graphics the looked-up mode. skip/lnum/pass/ypass/y_step drive the row loop and vertical positioning. Every size and count here is a signed int, so overflow and negative values are the arithmetic hazards to watch."
+    },
+    {
+      "file": "corpus/train/train_0039_cwe120.c",
+      "lines": "27-30",
+      "code": "x_dpi = pdev->x_pixels_per_inch;\n        if (x_dpi / 60 >= sizeof(graphics_modes_9)/sizeof(graphics_modes_9[0])) {\n            return_error(gs_error_rangecheck);\n        }",
+      "explanation": "x_dpi is copied from the device's horizontal resolution. The guard rejects the page when x_dpi/60 would index past the end of the 5-element table (i.e. x_dpi >= 300). This is precisely the range check added by the 'fixed' revision to prevent an out-of-bounds table read at line 40. Note it checks only the UPPER bound: it compares against an unsigned sizeof-ratio (5) but does not reject negative x_dpi, so x_dpi/60 < 0 slips through."
+    },
+    {
+      "file": "corpus/train/train_0039_cwe120.c",
+      "lines": "31-34",
+      "code": "in_y_mult = (y_9pin_high ? 2 : 1);\n        line_size = gdev_mem_bytes_per_scan_line((gx_device *)pdev);\n        /* Note that in_size is a multiple of 8. */\n        in_size = line_size * (8 * in_y_mult);",
+      "explanation": "in_y_mult becomes 2 in 9-pin-high mode. line_size is the byte width of one scan line, computed from the device's pixel width and depth. in_size is line_size times 8 or 16 — the size of each scratch buffer. Because line_size, 8*in_y_mult, and in_size are all signed int, this multiplication can overflow for a large page width; the comment only asserts a multiple-of-8 property, not any bound."
+    },
+    {
+      "file": "corpus/train/train_0039_cwe120.c",
+      "lines": "35-44",
+      "code": "buf1 = (byte *)gs_malloc(pdev->memory, in_size, 1, \"okiibm_print_page(buf1)\");\n        buf2 = (byte *)gs_malloc(pdev->memory, in_size, 1, \"okiibm_print_page(buf2)\");\n        in = buf1;\n        out = buf2;\n        out_y_mult = 1;\n        start_graphics = graphics_modes_9[x_dpi / 60];\n        first_pass = (start_graphics == 3 ? 1 : 0);\n        last_pass = first_pass * 2;\n        y_passes = (y_9pin_high ? 2 : 1);\n        y_step = 0;",
+      "explanation": "Two scratch buffers of in_size bytes are allocated via the Ghostscript allocator. in/out alias them. start_graphics is looked up from graphics_modes_9 using the x_dpi/60 bucket (now bounded above by line 28). If the mode is 3 (240 dpi) the driver does 3 passes (first_pass=1, last_pass=2); otherwise a single pass. y_passes is 2 in high mode. Every later buffer access assumes in_size correctly reflects the true byte extent of buf1/buf2."
+    },
+    {
+      "file": "corpus/train/train_0039_cwe120.c",
+      "lines": "46-53",
+      "code": "/* Check allocations */\n        if ( buf1 == 0 || buf2 == 0 )\n        {\tif ( buf1 )\n                  gs_free(pdev->memory, (char *)buf1, in_size, 1, \"okiibm_print_page(buf1)\");\n                if ( buf2 )\n                  gs_free(pdev->memory, (char *)buf2, in_size, 1, \"okiibm_print_page(buf2)\");\n                return_error(gs_error_VMerror);\n        }",
+      "explanation": "Allocation failure handling: if either gs_malloc returned NULL, free whichever succeeded and return a VM-error. This correctly guards the malloc-NULL-dereference class (CWE-476) for both buffers, so the later dereferences of in/out are safe against allocation exhaustion. Note the check happens AFTER the graphics_modes_9 read at line 40, but that read does not depend on the buffers."
+    },
+    {
+      "file": "corpus/train/train_0039_cwe120.c",
+      "lines": "55-56",
+      "code": "/* Initialize the printer. */\n        gp_fwrite(init_string, 1, init_length, prn_stream);",
+      "explanation": "Writes init_length bytes of init_string to the print stream to initialize the printer. gp_fwrite's count argument is size_t; init_length is a signed int, so a negative init_length converts to an enormous size_t and would read far past init_string. This depends on the driver contract that init_length is a correct non-negative length of init_string."
+    },
+    {
+      "file": "corpus/train/train_0039_cwe120.c",
+      "lines": "59-76",
+      "code": "while ( lnum < pdev->height )\n        {\n                byte *in_data;\n                byte *inp;\n                byte *in_end;\n                byte *out_end = NULL;\n                int lcnt;\n\n                /* Copy 1 scan line and test for all zero. */\n                gdev_prn_get_bits(pdev, lnum, in, &in_data);\n                if ( in_data[0] == 0 &&\n                     !memcmp((char *)in_data, (char *)in_data + 1, line_size - 1)\n                   )\n                {\n                        lnum++;\n                        skip += 2 / in_y_mult;\n                        continue;\n                }",
+      "explanation": "The main loop iterates scan lines while lnum < pdev->height. gdev_prn_get_bits fetches one rendered scan line into buffer in and points in_data at it. The all-zero test reads in_data[0] and then memcmp(in_data, in_data+1, line_size-1) to check the whole line is blank; blank lines are skipped and accumulate a vertical 'skip' count. The memcmp length is line_size-1: if line_size is 0 this becomes -1, which converts to SIZE_MAX and reads far out of bounds."
+    },
+    {
+      "file": "corpus/train/train_0039_cwe120.c",
+      "lines": "85-101",
+      "code": "if ( skip & 1 )\n                {\n                        int n = 1 + (y_step == 0 ? 1 : 0);\n                        gp_fprintf(prn_stream, \"\\033J%c\", n);\n                        y_step = (y_step + n) % 3;\n                        skip -= 1;\n                }\n                skip = skip / 2 * 3;\n                while ( skip > 255 )\n                {\n                        gp_fputs(\"\\033J\\377\", prn_stream);\n                        skip -= 255;\n                }\n                if ( skip )\n                {\n                        gp_fprintf(prn_stream, \"\\033J%c\", skip);\n                }",
+      "explanation": "Vertical positioning: emit ESC J (line-feed) commands to advance the paper by the accumulated skip amount. Odd skip is handled with a small feed, then skip is rescaled (/2*3 = 1/144\" to 1/48\" steps), and while it exceeds 255 the maximum ESC J 0xFF feed is emitted repeatedly. The final residual skip (0..255) is emitted as a single %c byte. This block writes only to the print stream; no scratch-buffer memory is touched."
+    },
+    {
+      "file": "corpus/train/train_0039_cwe120.c",
+      "lines": "103-109",
+      "code": "/* Copy the the scan lines. */\n                lcnt = gdev_prn_copy_scan_lines(pdev, lnum, in, in_size);\n                if ( lcnt < 8 * in_y_mult )\n                {\t/* Pad with lines of zeros. */\n                        memset(in + lcnt * line_size, 0,\n                               in_size - lcnt * line_size);\n                }",
+      "explanation": "Copies up to 8 (or 16) scan lines into the in buffer, returning the actual number copied in lcnt. If fewer than the full block were available (short at page bottom), the remainder of the buffer is zero-padded: memset starting at in + lcnt*line_size for in_size - lcnt*line_size bytes. This arithmetic assumes 0 <= lcnt <= 8*in_y_mult so that the start offset stays inside the buffer and the length stays non-negative; a negative lcnt (error return) makes the start pointer point before the buffer and the length exceed in_size."
+    },
+    {
+      "file": "corpus/train/train_0039_cwe120.c",
+      "lines": "111-128",
+      "code": "if ( y_9pin_high )\n                {\t/* Shuffle the scan lines */\n                        byte *p;\n                        int i;\n                        static const char index[] =\n                        {  0, 2, 4, 6, 8, 10, 12, 14,\n                           1, 3, 5, 7, 9, 11, 13, 15\n                        };\n                        for ( i = 0; i < 16; i++ )\n                        {\n                                memcpy( out + (i * line_size),\n                                        in + (index[i] * line_size),\n                                        line_size);\n                        }\n                        p = in;\n                        in = out;\n                        out = p;\n                }",
+      "explanation": "In 9-pin-high mode the 16 fetched lines are de-interleaved: line i of out receives line index[i] of in (evens then odds). index[] is a fixed 16-entry permutation of 0..15. Because in_size = line_size*16 in this mode, both out+i*line_size and in+index[i]*line_size stay within the buffers as long as line_size and in_size were computed without overflow. After the shuffle in/out are swapped so subsequent passes read the reordered data."
+    },
+    {
+      "file": "corpus/train/train_0039_cwe120.c",
+      "lines": "130-153",
+      "code": "for ( ypass = 0; ypass < y_passes; ypass++ )\n        {\n            for ( pass = first_pass; pass <= last_pass; pass++ )\n            {\n                /* We have to 'transpose' blocks of 8 pixels x 8 lines, */\n                /* because that's how the printer wants the data. */\n\n                if ( pass == first_pass )\n                {\n                    out_end = out;\n                    inp = in;\n                    in_end = inp + line_size;\n\n                    for ( ; inp < in_end; inp++, out_end += 8 )\n                    {\n                        gdev_prn_transpose_8x8(inp + (ypass * 8 * line_size),\n                                               line_size, out_end, 1);\n                    }\n                    /* Remove trailing 0s. */\n                    while ( out_end > out && out_end[-1] == 0 )\n                    {\n                        out_end--;\n                    }\n                }",
+      "explanation": "For each vertical pass, on the first sub-pass the 8x8 pixel/line blocks are transposed into out: for each byte column inp (0..line_size-1) gdev_prn_transpose_8x8 reads 8 lines starting at inp + ypass*8*line_size (stride line_size) and writes 8 output bytes at out_end, advancing out_end by 8. This produces line_size*8 output bytes into out (which is in_size or in_size/2). Trailing zero bytes are then trimmed by walking out_end back. The read window inp + ypass*8*line_size + 7*line_size must stay within the in buffer, which holds again as long as in_size arithmetic did not overflow."
+    },
+    {
+      "file": "corpus/train/train_0039_cwe120.c",
+      "lines": "155-173",
+      "code": "/* Transfer whatever is left and print. */\n                if ( out_end > out )\n                {\n                    okiibm_output_run(out, (int)(out_end - out),\n                                   out_y_mult, start_graphics,\n                                   prn_stream, pass);\n                }\n                gp_fputc('\\r', prn_stream);\n            }\n            if ( ypass < y_passes - 1 )\n            {\n                int n = 1 + (y_step == 0 ? 1 : 0);\n                gp_fprintf(prn_stream, \"\\033J%c\", n);\n                y_step = (y_step + n) % 3;\n            }\n        }\n        skip = 16 - y_passes + 1;\t\t/* no skip on last Y pass */\n        lnum += 8 * in_y_mult;\n        }",
+      "explanation": "If any non-zero output remains, okiibm_output_run emits it as a graphics run of length (out_end-out) at the current pass/mode, followed by a carriage return. Between vertical passes a small ESC J feed is issued. After both passes the residual skip is reset and lnum advanced by 8 or 16 lines. start_graphics (the value read from graphics_modes_9) is passed straight to okiibm_output_run, so a bad table read would propagate the wrong/uninitialized mode into the output formatter."
+    },
+    {
+      "file": "corpus/train/train_0039_cwe120.c",
+      "lines": "175-181",
+      "code": "/* Reinitialize the printer. */\n        gp_fwrite(end_string, 1, end_length, prn_stream);\n        gp_fflush(prn_stream);\n\n        gs_free(pdev->memory, (char *)buf2, in_size, 1, \"okiibm_print_page(buf2)\");\n        gs_free(pdev->memory, (char *)buf1, in_size, 1, \"okiibm_print_page(buf1)\");\n        return 0;",
+      "explanation": "Cleanup: write the end_string trailer (end_length bytes, same signed-count hazard as init_length), flush the stream, and free both scratch buffers with the same in_size passed to the allocator. Freeing with the same size used at allocation keeps the Ghostscript sized-free accounting consistent. Returns 0 on success."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0039_cwe120.c",
+      "lines": "32-36",
+      "code": "line_size = gdev_mem_bytes_per_scan_line((gx_device *)pdev);\n        /* Note that in_size is a multiple of 8. */\n        in_size = line_size * (8 * in_y_mult);\n        buf1 = (byte *)gs_malloc(pdev->memory, in_size, 1, \"okiibm_print_page(buf1)\");\n        buf2 = (byte *)gs_malloc(pdev->memory, in_size, 1, \"okiibm_print_page(buf2)\");",
+      "explanation": "Signed-int allocation-size overflow (CWE-190) leading to heap overflow (CWE-787/CWE-120). line_size is derived from the device's pixel width, which a malicious document can inflate by requesting a very large page or high resolution. in_size = line_size * (8*in_y_mult) is computed in 32-bit signed int with no overflow or upper-bound check; a line_size above ~2^28 (16x) wraps to a small or negative value. gs_malloc then allocates a buffer far smaller than the true line_size*16 span. Every subsequent write assumes in_size == line_size*8*in_y_mult: the memset at 107-108, the 16 memcpy(...,line_size) at 121-123, and the transpose loop at 143-146 all index by line_size and will write past the undersized allocation, corrupting the heap. The implementation must validate line_size and compute in_size in a wider unsigned type (or reject when line_size*8*in_y_mult would overflow) BEFORE allocating."
+    },
+    {
+      "file": "corpus/train/train_0039_cwe120.c",
+      "lines": "28-40",
+      "code": "if (x_dpi / 60 >= sizeof(graphics_modes_9)/sizeof(graphics_modes_9[0])) {\n            return_error(gs_error_rangecheck);\n        }\n...\n        start_graphics = graphics_modes_9[x_dpi / 60];",
+      "explanation": "Upper-bound-only guard leaves a negative-index out-of-bounds read (CWE-125). The added check compares x_dpi/60 against the unsigned array length (5) and rejects x_dpi >= 300, but it does NOT reject a negative x_dpi. x_dpi is a signed int copied from pdev->x_pixels_per_inch; if a document sets a negative or malformed horizontal resolution, x_dpi/60 is negative and the comparison against an unsigned value promotes the negative int to a large unsigned, so it may also fail to catch it — but even when it passes, graphics_modes_9[negative] at line 40 reads before the static array. The resulting garbage start_graphics then flows to first_pass/last_pass (41-42) and okiibm_output_run (159), altering control flow and emitted data. The implementation must also reject x_dpi < 0 (e.g. use an unsigned bucket only after confirming x_dpi >= 0)."
+    },
+    {
+      "file": "corpus/train/train_0039_cwe120.c",
+      "lines": "104-108",
+      "code": "lcnt = gdev_prn_copy_scan_lines(pdev, lnum, in, in_size);\n                if ( lcnt < 8 * in_y_mult )\n                {\t/* Pad with lines of zeros. */\n                        memset(in + lcnt * line_size, 0,\n                               in_size - lcnt * line_size);",
+      "explanation": "Unvalidated return value driving pointer/length arithmetic (CWE-787 via CWE-252). gdev_prn_copy_scan_lines returns the number of lines copied but can return a negative Ghostscript error code. The guard 'lcnt < 8 * in_y_mult' is satisfied by any negative lcnt, so the code then computes memset destination in + lcnt*line_size (a pointer BEFORE the buffer when lcnt<0) and length in_size - lcnt*line_size (which grows LARGER than in_size when lcnt<0). That memset writes a huge zero run starting before buf, an out-of-bounds heap write. The implementation must confirm lcnt >= 0 (treat negative as an error/return) before using it as an offset and length."
+    },
+    {
+      "file": "corpus/train/train_0039_cwe120.c",
+      "lines": "69-71",
+      "code": "if ( in_data[0] == 0 &&\n                     !memcmp((char *)in_data, (char *)in_data + 1, line_size - 1)\n                   )",
+      "explanation": "Length underflow in the blank-line test (CWE-191 -> out-of-bounds read CWE-125). line_size is a signed int and is passed as line_size - 1 to memcmp, whose size parameter is size_t. If line_size is 0 (a degenerate/zero-width scan line, reachable via device geometry), line_size - 1 is -1, which converts to SIZE_MAX and memcmp reads ~4GB from in_data, crashing or leaking memory. Even the in_data[0] read assumes at least one valid byte exists. The implementation must ensure line_size >= 1 before this comparison, or short-circuit when line_size <= 1."
+    },
+    {
+      "file": "corpus/train/train_0039_cwe120.c",
+      "lines": "56-176",
+      "code": "gp_fwrite(init_string, 1, init_length, prn_stream);\n...\n        gp_fwrite(end_string, 1, end_length, prn_stream);",
+      "explanation": "Signed length passed as an unsigned count (CWE-20 / CWE-195). init_length and end_length are signed ints handed to gp_fwrite, whose count parameter is size_t. A negative length converts to a gigantic size_t, causing gp_fwrite to read far past the string buffer (out-of-bounds read, potential info leak or crash). These strings come from the in-tree device definition so this is lower risk than the document-controlled paths, but the contract is that both lengths are non-negative and match their buffers; the implementation should assert init_length >= 0 and end_length >= 0."
+    },
+    {
+      "file": "corpus/train/train_0039_cwe120.c",
+      "lines": "143-146",
+      "code": "for ( ; inp < in_end; inp++, out_end += 8 )\n                    {\n                        gdev_prn_transpose_8x8(inp + (ypass * 8 * line_size),\n                                               line_size, out_end, 1);\n                    }",
+      "explanation": "Latent read/write bounds dependency on the in_size invariant. The transpose reads 8 lines at stride line_size starting at inp + ypass*8*line_size (up to inp + ypass*8*line_size + 7*line_size within in) and writes 8 bytes at out_end for each of line_size columns (line_size*8 bytes into out). These stay in bounds ONLY if in_size truly equals line_size*8*in_y_mult and no overflow occurred at line 34. If the line-34 multiplication wrapped, both the ypass source window and the out_end run exceed the real allocation, turning this loop into the actual out-of-bounds write primitive. The implementation must guarantee the buffers are genuinely line_size*8*in_y_mult bytes."
+    }
+  ],
+  "summary": "A Ghostscript OKI 9-pin printer page routine that allocates two line_size*8*in_y_mult scratch buffers and writes transposed raster into them. The dominant risk is a 32-bit signed integer overflow in the in_size allocation-size computation (line 34) from document-controllable page width, yielding an undersized buffer and heap overflow via the later memset/memcpy/transpose writes. The 'fixed' revision adds an upper-bound check on the graphics_modes_9 table index but leaves a negative-index read and several unvalidated signed lengths/return values.",
+  "reviewed_anchors": [
+    { "anchor": "okiibm_print_page1(...) signature with init_length/end_length int params", "disposition": "finding", "reason": "signed int lengths flow to gp_fwrite size_t count (lines 56/176)" },
+    { "anchor": "static const char graphics_modes_9[5]", "disposition": "finding", "reason": "fixed-size table indexed by attacker-influenced x_dpi/60; guard is upper-bound only" },
+    { "anchor": "line 28 bounds check x_dpi / 60 >= sizeof(...)/sizeof(...)", "disposition": "finding", "reason": "catches upper bound but not negative x_dpi, so negative-index read remains" },
+    { "anchor": "x_dpi = pdev->x_pixels_per_inch (line 27)", "disposition": "finding", "reason": "signed device-controlled resolution used as array index" },
+    { "anchor": "line_size = gdev_mem_bytes_per_scan_line(...) (line 32)", "disposition": "finding", "reason": "feeds in_size multiplication and memcmp length; can be large or 0" },
+    { "anchor": "in_size = line_size * (8 * in_y_mult) (line 34)", "disposition": "finding", "reason": "signed multiply with no overflow/bound check -> undersized allocation" },
+    { "anchor": "buf1/buf2 = gs_malloc(...) (lines 35-36)", "disposition": "finding", "reason": "size derives from overflowable in_size; NULL is checked but size is not" },
+    { "anchor": "NULL-check block lines 47-53", "disposition": "dismissed", "reason": "correctly frees the succeeding buffer and returns VMerror; malloc-NULL deref is handled" },
+    { "anchor": "gp_fwrite(init_string,1,init_length,...) (line 56)", "disposition": "finding", "reason": "signed init_length converts to huge size_t if negative" },
+    { "anchor": "while ( lnum < pdev->height ) (line 59)", "disposition": "dismissed", "reason": "loop bound; lnum advances by 8*in_y_mult, terminates; height only bounds iteration count" },
+    { "anchor": "gdev_prn_get_bits(pdev, lnum, in, &in_data) (line 68)", "disposition": "dismissed", "reason": "fills in-buffer of in_size; safe given the in_size invariant tracked in the overflow finding" },
+    { "anchor": "memcmp(in_data, in_data+1, line_size - 1) (line 70)", "disposition": "finding", "reason": "line_size-1 underflows to SIZE_MAX when line_size==0" },
+    { "anchor": "skip arithmetic / ESC J emission (lines 74,85-101,171)", "disposition": "dismissed", "reason": "writes only to prn_stream; skip capped to <=255 before %c emission, no memory access" },
+    { "anchor": "lcnt = gdev_prn_copy_scan_lines(...) (line 104)", "disposition": "finding", "reason": "negative error return passes the lcnt<8*in_y_mult guard and drives OOB memset" },
+    { "anchor": "memset(in + lcnt*line_size, 0, in_size - lcnt*line_size) (lines 107-108)", "disposition": "finding", "reason": "OOB write when lcnt<0; part of the lcnt finding" },
+    { "anchor": "static const char index[16] and memcpy loop (lines 115-123)", "disposition": "dismissed", "reason": "fixed 0..15 permutation; in-bounds given in_size==line_size*16 in 9-pin-high mode (covered by overflow finding)" },
+    { "anchor": "gdev_prn_transpose_8x8(...) loop (lines 143-146)", "disposition": "finding", "reason": "read/write window valid only if in_size arithmetic did not overflow; latent OOB tied to line 34" },
+    { "anchor": "okiibm_output_run(out, out_end-out, out_y_mult, start_graphics, ...) (lines 158-160)", "disposition": "dismissed", "reason": "length is (out_end-out) with out_end>out guard; start_graphics correctness covered by table findings" },
+    { "anchor": "gp_fwrite(end_string,1,end_length,...) (line 176)", "disposition": "finding", "reason": "same signed-length hazard as init_length; grouped in that finding" },
+    { "anchor": "gs_free(pdev->memory, buf, in_size, 1, ...) (lines 179-180)", "disposition": "dismissed", "reason": "sized free matches allocation size; consistent accounting, no double free" }
+  ],
+  "findings": [
+    {
+      "title": "Signed integer overflow in in_size allocation size -> undersized buffers and heap overflow",
+      "anchor": "in_size = line_size * (8 * in_y_mult)",
+      "file": "corpus/train/train_0039_cwe120.c",
+      "line": "34-36",
+      "code": "in_size = line_size * (8 * in_y_mult);\n        buf1 = (byte *)gs_malloc(pdev->memory, in_size, 1, \"okiibm_print_page(buf1)\");\n        buf2 = (byte *)gs_malloc(pdev->memory, in_size, 1, \"okiibm_print_page(buf2)\");",
+      "bug_class": "Integer overflow leading to heap buffer overflow",
+      "cwe": "CWE-190",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0039_cwe120.c and implementation (gdev_mem_bytes_per_scan_line, not provided)",
+      "invariant": "in_size must equal the true byte extent line_size * 8 * in_y_mult with no wraparound; the multiplication must be done in a width that cannot overflow and line_size must be validated against a sane maximum before allocation.",
+      "failure_mode": "A malicious document requests a very large page width/resolution so line_size is large; the 32-bit signed multiply line_size*(8*in_y_mult) wraps to a small or negative value, gs_malloc allocates an undersized (or, for negative, misinterpreted) buffer, and the subsequent memset (107-108), 16 memcpy of line_size bytes (121-123), and transpose loop (143-146) write line_size*8*in_y_mult bytes into it, corrupting the heap for potential code execution.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether line_size is bounded and whether in_size is computed/checked in a non-overflowing type before the two gs_malloc calls."
+    },
+    {
+      "title": "Out-of-bounds table read for negative resolution (upper-bound-only guard)",
+      "anchor": "start_graphics = graphics_modes_9[x_dpi / 60]",
+      "file": "corpus/train/train_0039_cwe120.c",
+      "line": "28-40",
+      "code": "if (x_dpi / 60 >= sizeof(graphics_modes_9)/sizeof(graphics_modes_9[0])) {\n            return_error(gs_error_rangecheck);\n        }\n...\n        start_graphics = graphics_modes_9[x_dpi / 60];",
+      "bug_class": "Out-of-bounds read (negative array index)",
+      "cwe": "CWE-125",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0039_cwe120.c",
+      "invariant": "The index x_dpi/60 must be within [0, 4]; both the lower bound (x_dpi >= 0) and the upper bound must be enforced before indexing graphics_modes_9.",
+      "failure_mode": "x_dpi is a signed int from pdev->x_pixels_per_inch. The guard only rejects the high end; a negative x_dpi makes x_dpi/60 negative and graphics_modes_9[negative] reads before the static array, yielding a garbage start_graphics that then steers first_pass/last_pass (41-42) and is passed to okiibm_output_run (159). The signed-vs-unsigned comparison at line 28 further muddies the negative case.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether x_pixels_per_inch can be negative/zero at this point and whether a lower-bound check on x_dpi exists anywhere upstream."
+    },
+    {
+      "title": "Unchecked negative return of gdev_prn_copy_scan_lines drives out-of-bounds memset",
+      "anchor": "memset(in + lcnt * line_size, 0, in_size - lcnt * line_size)",
+      "file": "corpus/train/train_0039_cwe120.c",
+      "line": "104-108",
+      "code": "lcnt = gdev_prn_copy_scan_lines(pdev, lnum, in, in_size);\n                if ( lcnt < 8 * in_y_mult )\n                {\t/* Pad with lines of zeros. */\n                        memset(in + lcnt * line_size, 0,\n                               in_size - lcnt * line_size);",
+      "bug_class": "Out-of-bounds write from unvalidated return value",
+      "cwe": "CWE-787",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0039_cwe120.c and implementation (gdev_prn_copy_scan_lines, not provided)",
+      "invariant": "lcnt must be in [0, 8*in_y_mult] before it is multiplied by line_size to form a buffer offset and subtracted from in_size to form a length; a negative error return must be handled, not used as a count.",
+      "failure_mode": "gdev_prn_copy_scan_lines can return a negative error code. Any negative lcnt satisfies 'lcnt < 8 * in_y_mult', so memset writes starting at in + lcnt*line_size (before the buffer) for in_size - lcnt*line_size bytes (larger than in_size), producing a large out-of-bounds heap write.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether gdev_prn_copy_scan_lines can return < 0 here and whether callers elsewhere guard lcnt >= 0."
+    },
+    {
+      "title": "memcmp length underflow when line_size is zero",
+      "anchor": "memcmp((char *)in_data, (char *)in_data + 1, line_size - 1)",
+      "file": "corpus/train/train_0039_cwe120.c",
+      "line": "69-71",
+      "code": "if ( in_data[0] == 0 &&\n                     !memcmp((char *)in_data, (char *)in_data + 1, line_size - 1)\n                   )",
+      "bug_class": "Integer underflow to huge size_t (out-of-bounds read)",
+      "cwe": "CWE-191",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0039_cwe120.c",
+      "invariant": "line_size must be >= 1 before computing line_size - 1 as a memcmp length; a zero-width scan line must be handled without an underflowing subtraction.",
+      "failure_mode": "If line_size is 0 (degenerate device geometry), line_size - 1 == -1 converts to SIZE_MAX and memcmp reads ~4GB starting at in_data, causing a crash or memory disclosure. The in_data[0] read also assumes at least one byte is present.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether gdev_mem_bytes_per_scan_line can return 0 for a valid device configuration reachable from a document."
+    },
+    {
+      "title": "Signed init_length/end_length passed as unsigned gp_fwrite count",
+      "anchor": "gp_fwrite(init_string, 1, init_length, prn_stream)",
+      "file": "corpus/train/train_0039_cwe120.c",
+      "line": "56",
+      "code": "gp_fwrite(init_string, 1, init_length, prn_stream);",
+      "bug_class": "Signed-to-unsigned length conversion (out-of-bounds read)",
+      "cwe": "CWE-195",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0039_cwe120.c",
+      "invariant": "init_length and end_length (line 176) must be non-negative and equal to the true length of their respective strings before being passed to gp_fwrite, whose count parameter is size_t.",
+      "failure_mode": "If a caller passes a negative init_length or end_length, the value converts to an enormous size_t and gp_fwrite reads far past the string buffer (out-of-bounds read / crash / info leak). Lower risk because these strings originate from the in-tree device definition rather than the document.",
+      "cve_analog": "",
+      "what_to_confirm": "That every caller of okiibm_print_page1 supplies non-negative init_length/end_length matching the strings."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm line_size (gdev_mem_bytes_per_scan_line) is bounded and that in_size = line_size*8*in_y_mult cannot overflow 32-bit signed int before either gs_malloc at lines 35-36.",
+    "Add a lower-bound check rejecting negative/zero x_dpi so graphics_modes_9[x_dpi/60] at line 40 cannot index before the array; verify the line-28 comparison handles the signed case.",
+    "Verify gdev_prn_copy_scan_lines cannot return a negative value here, or add an lcnt >= 0 check before the memset offset/length arithmetic at lines 107-108.",
+    "Ensure line_size >= 1 before the memcmp(..., line_size - 1) at line 70 to avoid the size_t underflow.",
+    "Confirm all callers pass non-negative init_length/end_length to the gp_fwrite calls at lines 56 and 176.",
+    "Confirm the transpose read window inp + ypass*8*line_size + 7*line_size (lines 145-146) and the out_end run stay within the true buffer size under all page geometries."
+  ]
+}

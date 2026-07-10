@@ -1,0 +1,242 @@
+{
+  "subsystem": "OpenCV DISOpticalFlow (Dense Inverse Search optical flow), OpenCL/UMat compute path. This is the DISOpticalFlowImpl::ocl_calc member function, which drives the coarse-to-fine pyramid optical-flow estimation between two input frames I0 and I1 and writes a 2-channel float flow field. It computes a pyramid depth from the image dimensions and the configured patch_size / patch_stride, prepares GPU buffers, then iterates from the coarsest pyramid level down to the finest running structure-tensor precompute, patch inverse search, densification, optional variational refinement, and upsampling between levels.",
+  "provenance": "Identified by class and method naming: DISOpticalFlowImpl::ocl_calc, the OpenCV type names UMat / InputArray / InputOutputArray / InputOutputArray::getUMatRef, the OpenCV error API CV_Error(cv::Error::StsBadSize, ...), pixel type macros CV_32F / CV_32FC2, and DIS-specific members patch_size, patch_stride, finest_scale, coarsest_scale, u_I0s/u_I1s/u_Ux/u_Uy pyramids and variational_refinement_processors. The in-file banner names corpus/eval/eval_0021_cwe369.cpp and the header comment '/* sample: primevul_train_2168_fixed */' marks it as a PrimeVul-derived OpenCV snippet. This matches OpenCV modules/video/src/dis_flow.cpp.",
+  "trust_boundary": "Two distinct input surfaces. (1) The image data I0/I1/flow: an application may feed frames decoded from untrusted media, so their dimensions (I0Mat.cols, I0Mat.rows, sizes) are attacker-influenceable. Small or degenerate dimensions drive the pyramid-depth math on lines 12-13 and the per-level ws/hs computation on lines 34-35. (2) The configuration members patch_size, patch_stride, finest_scale: these are set through the public DISOpticalFlow setter API (setPatchSize/setPatchStride/setFinestScale) by application code. They are trusted-by-convention but NOT range-validated here, so a caller that passes 0 (or the default being overwritten) turns them into division denominators and a bit-shift count on untrusted-adjacent paths. The hostile values are therefore patch_size==0, patch_stride==0, degenerate image dimensions, and any finest_scale/coarsest_scale relationship that this function does not fully bound.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/eval/eval_0021_cwe369.cpp",
+      "lines": "2-5",
+      "code": "bool DISOpticalFlowImpl::ocl_calc(InputArray I0, InputArray I1, InputOutputArray flow)\n{\n    UMat I0Mat = I0.getUMat();\n    UMat I1Mat = I1.getUMat();",
+      "explanation": "Entry point of the OpenCL flow computation. It takes two input frames (I0 previous, I1 next) as generic InputArray handles and an in/out flow field. The first two statements materialize the inputs as GPU-side UMat objects via getUMat(), which either wraps existing device memory or uploads the host Mat. From here on the code reasons about I0Mat.cols/rows and I1Mat.size() as the authoritative frame geometry. Nothing here validates that I0 and I1 have equal size or non-zero dimensions."
+    },
+    {
+      "file": "corpus/eval/eval_0021_cwe369.cpp",
+      "lines": "6-11",
+      "code": "    bool use_input_flow = false;\n    if (flow.sameSize(I0) && flow.depth() == CV_32F && flow.channels() == 2)\n        use_input_flow = true;\n    else\n        flow.create(I1Mat.size(), CV_32FC2);\n    UMat &u_flowMat = flow.getUMatRef();",
+      "explanation": "Decides whether the caller-supplied flow buffer can be reused as an initial estimate. If flow already matches I0 in size and is a CV_32FC2 (two 32-bit float channels) buffer, use_input_flow is set true and the existing contents seed the estimate. Otherwise flow is (re)allocated to I1's size as CV_32FC2. Finally u_flowMat is bound as a reference to the underlying UMat so results can be written back in place. use_input_flow is later passed to ocl_prepareBuffers to control whether the top-level flow is zeroed or seeded."
+    },
+    {
+      "file": "corpus/eval/eval_0021_cwe369.cpp",
+      "lines": "12-13",
+      "code": "    coarsest_scale = min((int)(log(max(I0Mat.cols, I0Mat.rows) / (4.0 * patch_size)) / log(2.0) + 0.5), /* Original code search for maximal movement of width/4 */\n                         (int)(log(min(I0Mat.cols, I0Mat.rows) / patch_size) / log(2.0)));              /* Deepest pyramid level greater or equal than patch*/",
+      "explanation": "Computes the number of pyramid levels (coarsest_scale). The first term estimates the level at which the search window covers about width/4 of movement: max(cols,rows) divided by (4.0*patch_size), log base 2, rounded. The second term is the deepest level whose down-sampled image is still at least one patch wide: min(cols,rows) divided by patch_size, log base 2. The minimum of the two is taken. Note the two denominators: 4.0*patch_size is a double expression (floating division), while min(I0Mat.cols, I0Mat.rows) / patch_size is INTEGER division because both operands are int members/fields. patch_size is a configurable member with no zero-check here."
+    },
+    {
+      "file": "corpus/eval/eval_0021_cwe369.cpp",
+      "lines": "15-16",
+      "code": "    if (coarsest_scale<0)\n        CV_Error(cv::Error::StsBadSize, \"The input image must have either width or height >= 12\");",
+      "explanation": "Guard added in this ('_fixed') revision: if the computed pyramid depth is negative (which happens when the image is too small for the configured patch_size, i.e. width and height both below ~12 for defaults), it raises a cv::Error StsBadSize exception rather than proceeding with a negative level count that would later index arrays out of bounds. This catches the too-small-image case but only after the divisions on lines 12-13 have already executed, and it only rejects strictly-negative values (coarsest_scale==0 passes)."
+    },
+    {
+      "file": "corpus/eval/eval_0021_cwe369.cpp",
+      "lines": "18-24",
+      "code": "    if (coarsest_scale<finest_scale)\n    {\n        // choose the finest level based on coarsest level.\n        // Refs: https://github.com/tikroeger/OF_DIS/blob/2c9f2a674f3128d3a41c10e41cc9f3a35bb1b523/run_dense.cpp#L239\n        int original_img_width = I0.size().width;\n        autoSelectPatchSizeAndScales(original_img_width);\n    }",
+      "explanation": "Reconciles the configured finest_scale with the just-computed coarsest_scale. If the caller asked for a finest level deeper than the coarsest level that the image can support (coarsest_scale < finest_scale), the code delegates to autoSelectPatchSizeAndScales(original_img_width) to recompute patch_size, patch_stride, finest_scale (and, per its name, the scales) from the original image width. This is the mechanism that can silently overwrite the configured patch parameters, and its post-conditions are relied on for the loop bound below."
+    },
+    {
+      "file": "corpus/eval/eval_0021_cwe369.cpp",
+      "lines": "26-28",
+      "code": "    ocl_prepareBuffers(I0Mat, I1Mat, u_flowMat, use_input_flow);\n    u_Ux[coarsest_scale].setTo(0.0f);\n    u_Uy[coarsest_scale].setTo(0.0f);",
+      "explanation": "ocl_prepareBuffers allocates and fills the per-level pyramid arrays (u_I0s, u_I1s, u_I0xs, u_I0ys, u_I1s_ext, u_Ux, u_Uy, scratch buffers) sized by coarsest_scale. Immediately after, the coarsest-level horizontal and vertical flow components u_Ux[coarsest_scale] and u_Uy[coarsest_scale] are zeroed to seed the coarse-to-fine iteration. This indexing assumes coarsest_scale is a valid in-range index into u_Ux/u_Uy, i.e. that ocl_prepareBuffers sized those vectors to at least coarsest_scale+1 using the SAME coarsest_scale value."
+    },
+    {
+      "file": "corpus/eval/eval_0021_cwe369.cpp",
+      "lines": "30-35",
+      "code": "    for (int i = coarsest_scale; i >= finest_scale; i--)\n    {\n        w = u_I0s[i].cols;\n        h = u_I0s[i].rows;\n        ws = 1 + (w - patch_size) / patch_stride;\n        hs = 1 + (h - patch_size) / patch_stride;",
+      "explanation": "Main coarse-to-fine loop, iterating from the coarsest level down to finest_scale. For each level it reads the level's image width/height (w, h) from u_I0s[i], then computes the number of patch positions horizontally (ws) and vertically (hs). ws/hs are 1 plus the number of whole patch_stride steps that fit in (dimension - patch_size). Both ws and hs use INTEGER division by patch_stride. w-patch_size and h-patch_size can be negative if a pyramid level shrinks below patch_size. ws/hs feed the grid dimensions of every subsequent kernel launch this iteration."
+    },
+    {
+      "file": "corpus/eval/eval_0021_cwe369.cpp",
+      "lines": "37-45",
+      "code": "        if (!ocl_precomputeStructureTensor(u_I0xx_buf, u_I0yy_buf, u_I0xy_buf,\n                                           u_I0x_buf, u_I0y_buf, u_I0xs[i], u_I0ys[i]))\n            return false;\n\n        if (!ocl_PatchInverseSearch(u_Ux[i], u_Uy[i], u_I0s[i], u_I1s_ext[i], u_I0xs[i], u_I0ys[i], 2, i))\n            return false;\n\n        if (!ocl_Densification(u_Ux[i], u_Uy[i], u_Sx, u_Sy, u_I0s[i], u_I1s[i]))\n            return false;",
+      "explanation": "The three core per-level kernels. ocl_precomputeStructureTensor computes the spatial-gradient products (Ixx, Iyy, Ixy, Ix, Iy) from the level's x/y derivative images. ocl_PatchInverseSearch runs the inverse-search patch matching (2 iterations) that refines u_Ux[i]/u_Uy[i]. ocl_Densification converts sparse per-patch displacements into a dense flow at this level using scratch buffers u_Sx/u_Sy. Each returns bool; a false (kernel enqueue/compile failure) short-circuits the whole function to return false. These consumers use ws/hs and the pyramid images computed above as their work sizes."
+    },
+    {
+      "file": "corpus/eval/eval_0021_cwe369.cpp",
+      "lines": "47-49",
+      "code": "        if (variational_refinement_iter > 0)\n            variational_refinement_processors[i]->calcUV(u_I0s[i], u_I1s[i],\n                                                         u_Ux[i].getMat(ACCESS_WRITE), u_Uy[i].getMat(ACCESS_WRITE));",
+      "explanation": "Optional variational refinement. If configured (variational_refinement_iter > 0), the per-level VariationalRefinement processor refines the flow using the level's images and the current u_Ux[i]/u_Uy[i] mapped to host-accessible Mats with ACCESS_WRITE. variational_refinement_processors[i] is indexed by the same level i, so the array must contain a valid non-null processor for every level in [finest_scale, coarsest_scale]."
+    },
+    {
+      "file": "corpus/eval/eval_0021_cwe369.cpp",
+      "lines": "51-58",
+      "code": "        if (i > finest_scale)\n        {\n            resize(u_Ux[i], u_Ux[i - 1], u_Ux[i - 1].size());\n            resize(u_Uy[i], u_Uy[i - 1], u_Uy[i - 1].size());\n            multiply(u_Ux[i - 1], 2, u_Ux[i - 1]);\n            multiply(u_Uy[i - 1], 2, u_Uy[i - 1]);\n        }\n    }",
+      "explanation": "Upsampling step between pyramid levels. Except at the finest level, the current level's flow is resized up to the next finer level's dimensions (u_Ux[i-1]/u_Uy[i-1]) and the displacement magnitudes are doubled with multiply(..., 2, ...) because each finer level has double the resolution. The i-1 indexing is safe only while i > finest_scale (guaranteed by the guard) AND finest_scale >= 0 so that i-1 never goes below index 0."
+    },
+    {
+      "file": "corpus/eval/eval_0021_cwe369.cpp",
+      "lines": "59-67",
+      "code": "    vector<UMat> uxy(2);\n    uxy[0] = u_Ux[finest_scale];\n    uxy[1] = u_Uy[finest_scale];\n    merge(uxy, u_U);\n    resize(u_U, u_flowMat, u_flowMat.size());\n    multiply(u_flowMat, 1 << finest_scale, u_flowMat);\n\n    return true;\n}",
+      "explanation": "Finalization. The finest-level Ux and Uy components are merged into a two-channel UMat u_U, resized to the output flow buffer's size, and finally scaled by 1 << finest_scale to convert displacements from the finest pyramid level's coordinate space back to full image resolution. The scale factor is produced by a left-shift of the literal 1 by finest_scale. The function returns true on success. u_Ux[finest_scale]/u_Uy[finest_scale] indexing and the shift both assume finest_scale is a small non-negative integer."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/eval/eval_0021_cwe369.cpp",
+      "lines": "34-35",
+      "code": "        ws = 1 + (w - patch_size) / patch_stride;\n        hs = 1 + (h - patch_size) / patch_stride;",
+      "explanation": "Division by zero (CWE-369). patch_stride is a caller-configurable int member (set via setPatchStride) with no lower-bound validation in this function. If patch_stride == 0, both (w - patch_size) / patch_stride expressions are integer divisions by zero, which is undefined behavior and on x86/ARM raises SIGFPE, hard-crashing the process. This is the primary divide-by-zero hazard flagged by the sample name (cwe369). An attacker (or a mis-driving caller) that sets patch_stride to 0 turns any flow computation into a denial of service. The implementation MUST reject patch_stride <= 0 before this loop (or clamp to >=1)."
+    },
+    {
+      "file": "corpus/eval/eval_0021_cwe369.cpp",
+      "lines": "12-13",
+      "code": "    coarsest_scale = min((int)(log(max(I0Mat.cols, I0Mat.rows) / (4.0 * patch_size)) / log(2.0) + 0.5), /* Original code search for maximal movement of width/4 */\n                         (int)(log(min(I0Mat.cols, I0Mat.rows) / patch_size) / log(2.0)));              /* Deepest pyramid level greater or equal than patch*/",
+      "explanation": "Second divide-by-zero surface (CWE-369). The second min() argument, min(I0Mat.cols, I0Mat.rows) / patch_size, is INTEGER division (both operands int) so patch_size == 0 divides by zero and raises SIGFPE. (The first term, 4.0 * patch_size, is double, so patch_size==0 there yields +inf and a garbage-but-non-trapping scale rather than a crash — still wrong, but the integer term traps first.) patch_size is caller-set via setPatchSize with no zero guard here, and this line runs before the coarsest_scale<0 guard on line 15, so the guard cannot prevent it. The implementation MUST enforce patch_size >= 1."
+    },
+    {
+      "file": "corpus/eval/eval_0021_cwe369.cpp",
+      "lines": "27-28",
+      "code": "    u_Ux[coarsest_scale].setTo(0.0f);\n    u_Uy[coarsest_scale].setTo(0.0f);",
+      "explanation": "Out-of-bounds container access (CWE-125/CWE-787, latent in ocl_prepareBuffers). The coarsest_scale<0 guard on line 15 rejects negative depths, but coarsest_scale==0 and any large positive value pass. Indexing u_Ux[coarsest_scale] is safe only if ocl_prepareBuffers sized u_Ux/u_Uy to at least coarsest_scale+1 using the identical coarsest_scale. If autoSelectPatchSizeAndScales (line 23) mutates patch_size/patch_stride/finest_scale and any recomputation of coarsest_scale diverges from the sizing used inside ocl_prepareBuffers, this indexing (and every u_*[i] access in the loop) reads/writes past the vector. Confirm the vectors are always sized from the same coarsest_scale that indexes them, after any autoSelect."
+    },
+    {
+      "file": "corpus/eval/eval_0021_cwe369.cpp",
+      "lines": "30-30",
+      "code": "    for (int i = coarsest_scale; i >= finest_scale; i--)",
+      "explanation": "Loop-bound / index-underflow risk (CWE-191 / CWE-125). The loop and the i-1 upsampling (lines 53-56) are only safe if finest_scale >= 0 and finest_scale <= coarsest_scale. Line 18 handles coarsest_scale < finest_scale by calling autoSelectPatchSizeAndScales, but this function does not itself re-assert that autoSelect produced finest_scale >= 0 and finest_scale <= the new coarsest_scale. A negative finest_scale would let i decrement below 0 and index u_I0s[i]/u_Ux[i] out of bounds; a finest_scale left larger than coarsest_scale would skip the loop entirely and then still index u_Ux[finest_scale] on line 60 out of range. Confirm autoSelect's post-conditions bound finest_scale."
+    },
+    {
+      "file": "corpus/eval/eval_0021_cwe369.cpp",
+      "lines": "64-64",
+      "code": "    multiply(u_flowMat, 1 << finest_scale, u_flowMat);",
+      "explanation": "Undefined/overflowing left shift (CWE-190 / CWE-682). 1 << finest_scale shifts a signed int literal. If finest_scale is >= 31 the shift overflows the sign bit (UB), and if finest_scale is negative the shift count is negative (UB). For a normally-configured finest_scale (small, 0-5) this is fine, but because finest_scale can be overwritten by autoSelectPatchSizeAndScales and is not re-validated here, a corrupted/large value produces an undefined or absurd scale factor that silently corrupts the output flow magnitudes. Confirm finest_scale stays in [0, 30]."
+    },
+    {
+      "file": "corpus/eval/eval_0021_cwe369.cpp",
+      "lines": "34-35",
+      "code": "        ws = 1 + (w - patch_size) / patch_stride;\n        hs = 1 + (h - patch_size) / patch_stride;",
+      "explanation": "Negative / degenerate work-size (CWE-191, secondary to the divide-by-zero on the same lines). When a deep pyramid level shrinks so that w < patch_size or h < patch_size, (w - patch_size) is negative and ws/hs become <= 0 (or exactly 1 for the boundary). ws/hs are used as the horizontal/vertical patch-grid dimensions for the kernels on lines 41-44; a zero or negative grid dimension can produce a zero/negative global work size or an underflowing index computation inside those kernels. The implementation MUST ensure every retained pyramid level is at least patch_size in both dimensions (which the coarsest_scale=min(...) formula intends, but only if patch_size/patch_stride are valid)."
+    },
+    {
+      "file": "corpus/eval/eval_0021_cwe369.cpp",
+      "lines": "4-7",
+      "code": "    UMat I0Mat = I0.getUMat();\n    UMat I1Mat = I1.getUMat();\n    bool use_input_flow = false;\n    if (flow.sameSize(I0) && flow.depth() == CV_32F && flow.channels() == 2)",
+      "explanation": "Missing input equivalence validation (CWE-20). The function never checks that I0 and I1 have the same size or the same type/depth, nor that they are non-empty. flow is allocated to I1Mat.size() (line 10) while use_input_flow is decided against I0's size (line 7), and coarsest_scale mixes I0Mat.cols/rows. If I0 and I1 differ in size, the pyramid built from I1 and indexed with an I0-derived coarsest_scale can mismatch, and an empty input yields cols==rows==0 feeding the log() math. Confirm the public entry point (calc) validates non-empty, equal-size, single-channel-or-consistent inputs before ocl_calc runs."
+    }
+  ],
+  "summary": "This OpenCV DISOpticalFlow OpenCL path contains two concrete divide-by-zero sinks (CWE-369): integer division by patch_stride on lines 34-35 and by patch_size on line 13, both denominators being caller-configurable int members with no zero/positive validation in this function. A patch_stride or patch_size of 0 raises SIGFPE and crashes the process (denial of service) — the labeled bug class. Secondary latent risks are out-of-range pyramid indexing if autoSelectPatchSizeAndScales leaves coarsest_scale/finest_scale inconsistent with ocl_prepareBuffers' sizing, an undefined 1<<finest_scale shift, and missing equal-size/non-empty input validation.",
+  "reviewed_anchors": [
+    {"anchor": "DISOpticalFlowImpl::ocl_calc(InputArray I0, InputArray I1, InputOutputArray flow) — signature", "disposition": "finding", "reason": "Entry point; inputs I0/I1/flow are not validated for equal size or non-emptiness before use (CWE-20)."},
+    {"anchor": "I0.getUMat() / I1.getUMat() (lines 4-5)", "disposition": "dismissed", "reason": "Materializes inputs to UMat; the risk is the absent size/type validation, captured under the signature anchor, not in getUMat itself."},
+    {"anchor": "flow.sameSize/depth/channels + flow.create (lines 7-10)", "disposition": "dismissed", "reason": "Type/size gate for the output buffer; correctly forces CV_32FC2 and does not itself carry an unsafe contract."},
+    {"anchor": "coarsest_scale = min(... / (4.0 * patch_size) ..., ... / patch_size ...) (lines 12-13)", "disposition": "finding", "reason": "Integer division by patch_size can divide by zero (CWE-369); executes before the <0 guard."},
+    {"anchor": "if (coarsest_scale<0) CV_Error(StsBadSize) (lines 15-16)", "disposition": "dismissed", "reason": "Defensive guard; correct as far as it goes but only rejects strictly-negative depth and runs after the line 12-13 divisions."},
+    {"anchor": "if (coarsest_scale<finest_scale) autoSelectPatchSizeAndScales(original_img_width) (lines 18-24)", "disposition": "finding", "reason": "Can overwrite patch_size/patch_stride/finest_scale; its post-conditions are relied upon but not re-asserted, feeding the loop-bound / index risks."},
+    {"anchor": "ocl_prepareBuffers(I0Mat, I1Mat, u_flowMat, use_input_flow) (line 26)", "disposition": "dismissed", "reason": "Not shown; its sizing is the trusted precondition for the u_*[coarsest_scale]/u_*[i] indexing findings rather than a distinct bug here."},
+    {"anchor": "u_Ux[coarsest_scale].setTo / u_Uy[coarsest_scale].setTo (lines 27-28)", "disposition": "finding", "reason": "Container index by coarsest_scale is OOB if ocl_prepareBuffers sized differently (CWE-125/787, latent)."},
+    {"anchor": "for (int i = coarsest_scale; i >= finest_scale; i--) (line 30)", "disposition": "finding", "reason": "Loop bound and i-1 upsampling depend on 0 <= finest_scale <= coarsest_scale, which is not re-validated after autoSelect (CWE-191/125)."},
+    {"anchor": "w = u_I0s[i].cols; h = u_I0s[i].rows; (lines 32-33)", "disposition": "dismissed", "reason": "Reads level dimensions; itself benign, feeds the ws/hs computation which carries the finding."},
+    {"anchor": "ws = 1 + (w - patch_size) / patch_stride; hs = ... (lines 34-35)", "disposition": "finding", "reason": "Division by zero when patch_stride==0 (CWE-369, primary) and negative work size when w<patch_size (CWE-191)."},
+    {"anchor": "ocl_precomputeStructureTensor(...) (lines 37-38)", "disposition": "dismissed", "reason": "Kernel dispatch that consumes the pyramid buffers; no independent contract visible in this file beyond the ws/hs sizing already flagged."},
+    {"anchor": "ocl_PatchInverseSearch(...) (line 41)", "disposition": "dismissed", "reason": "Kernel dispatch; consumes u_Ux/u_Uy/ws/hs; risk is upstream sizing already captured."},
+    {"anchor": "ocl_Densification(...) (line 44)", "disposition": "dismissed", "reason": "Kernel dispatch; same as above, no distinct anchor-level contract shown."},
+    {"anchor": "variational_refinement_processors[i]->calcUV(...) (lines 47-49)", "disposition": "dismissed", "reason": "Indexed by the same level i; a null/short processor array would be a latent deref, but is subsumed by the finest/coarsest index-range finding."},
+    {"anchor": "resize/multiply upsampling with i-1 (lines 51-57)", "disposition": "dismissed", "reason": "i-1 indexing is guarded by i>finest_scale and is safe iff finest_scale>=0, already captured by the loop-bound finding."},
+    {"anchor": "uxy[0]/uxy[1] = u_Ux/u_Uy[finest_scale]; merge (lines 59-62)", "disposition": "dismissed", "reason": "Indexed by finest_scale; range safety is covered by the loop-bound finding."},
+    {"anchor": "multiply(u_flowMat, 1 << finest_scale, u_flowMat) (line 64)", "disposition": "finding", "reason": "1 << finest_scale is UB for finest_scale>=31 or negative (CWE-190/682)."},
+    {"anchor": "patch_size (member, used lines 12-13, 34-35)", "disposition": "finding", "reason": "Caller-configurable divisor with no zero/positive guard; divide-by-zero and negative-size source."},
+    {"anchor": "patch_stride (member, used lines 34-35)", "disposition": "finding", "reason": "Caller-configurable divisor with no zero guard; primary CWE-369 sink."},
+    {"anchor": "finest_scale (member, used lines 18, 30, 51, 60-61, 64)", "disposition": "finding", "reason": "Used as loop bound, array index, and shift count; not range-validated after autoSelect."}
+  ],
+  "findings": [
+    {
+      "title": "Divide by zero via patch_stride in per-level patch-grid sizing",
+      "anchor": "ws = 1 + (w - patch_size) / patch_stride; hs = 1 + (h - patch_size) / patch_stride;",
+      "file": "corpus/eval/eval_0021_cwe369.cpp",
+      "line": "34-35",
+      "code": "        ws = 1 + (w - patch_size) / patch_stride;\n        hs = 1 + (h - patch_size) / patch_stride;",
+      "bug_class": "Divide by zero (integer division by attacker/caller-controlled zero denominator)",
+      "cwe": "CWE-369",
+      "severity": "high",
+      "where_it_lives": "corpus/eval/eval_0021_cwe369.cpp (this function); patch_stride is set in implementation (file not provided) via setPatchStride",
+      "invariant": "patch_stride must be strictly greater than 0 before any (dimension - patch_size) / patch_stride division executes.",
+      "failure_mode": "A caller sets patch_stride to 0 (or a code path leaves it 0). On the first loop iteration the integer division (w - patch_size) / patch_stride divides by zero, raising SIGFPE on x86/ARM and terminating the process — a denial of service on any input.",
+      "cve_analog": "",
+      "what_to_confirm": "That DISOpticalFlow validates/clamps patch_stride >= 1 (in setPatchStride or before this loop) and that autoSelectPatchSizeAndScales never yields patch_stride == 0."
+    },
+    {
+      "title": "Divide by zero via patch_size in pyramid-depth computation",
+      "anchor": "(int)(log(min(I0Mat.cols, I0Mat.rows) / patch_size) / log(2.0))",
+      "file": "corpus/eval/eval_0021_cwe369.cpp",
+      "line": "12-13",
+      "code": "    coarsest_scale = min((int)(log(max(I0Mat.cols, I0Mat.rows) / (4.0 * patch_size)) / log(2.0) + 0.5), /* Original code search for maximal movement of width/4 */\n                         (int)(log(min(I0Mat.cols, I0Mat.rows) / patch_size) / log(2.0)));              /* Deepest pyramid level greater or equal than patch*/",
+      "bug_class": "Divide by zero (integer division by zero denominator)",
+      "cwe": "CWE-369",
+      "severity": "high",
+      "where_it_lives": "corpus/eval/eval_0021_cwe369.cpp (this function); patch_size is set in implementation (file not provided) via setPatchSize",
+      "invariant": "patch_size must be strictly greater than 0 before it is used as a divisor.",
+      "failure_mode": "With patch_size == 0, the second min() argument min(I0Mat.cols, I0Mat.rows) / patch_size is integer division by zero (both operands int), raising SIGFPE and crashing before the coarsest_scale<0 guard can run. The first term uses 4.0*patch_size (double) and would instead yield +inf, so the integer term traps first.",
+      "cve_analog": "",
+      "what_to_confirm": "That patch_size is validated >= 1 at configuration time and that this integer division cannot be reached with patch_size == 0."
+    },
+    {
+      "title": "Pyramid index derived from unbounded coarsest_scale/finest_scale after autoSelect",
+      "anchor": "for (int i = coarsest_scale; i >= finest_scale; i--)",
+      "file": "corpus/eval/eval_0021_cwe369.cpp",
+      "line": "30",
+      "code": "    for (int i = coarsest_scale; i >= finest_scale; i--)",
+      "bug_class": "Out-of-bounds container access / index underflow",
+      "cwe": "CWE-125",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided) — autoSelectPatchSizeAndScales and ocl_prepareBuffers",
+      "invariant": "After all adjustments, 0 <= finest_scale <= coarsest_scale, and u_I0s/u_I1s/u_Ux/u_Uy/variational_refinement_processors are all sized to at least coarsest_scale+1 using the same coarsest_scale.",
+      "failure_mode": "The line-15 guard only rejects coarsest_scale < 0. If autoSelectPatchSizeAndScales (line 23) leaves finest_scale negative, i decrements below 0 and u_I0s[i]/u_Ux[i] read out of bounds; if it leaves finest_scale > coarsest_scale, the loop is skipped and u_Ux[finest_scale] on line 60 is out of range. Either yields OOB read/write and possible memory corruption or crash.",
+      "cve_analog": "",
+      "what_to_confirm": "That autoSelectPatchSizeAndScales guarantees 0 <= finest_scale <= coarsest_scale and that ocl_prepareBuffers sizes every indexed vector from that same coarsest_scale."
+    },
+    {
+      "title": "OOB access of u_Ux/u_Uy at coarsest_scale relative to buffer sizing",
+      "anchor": "u_Ux[coarsest_scale].setTo(0.0f); u_Uy[coarsest_scale].setTo(0.0f);",
+      "file": "corpus/eval/eval_0021_cwe369.cpp",
+      "line": "27-28",
+      "code": "    u_Ux[coarsest_scale].setTo(0.0f);\n    u_Uy[coarsest_scale].setTo(0.0f);",
+      "bug_class": "Out-of-bounds container access (index/size mismatch)",
+      "cwe": "CWE-787",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided) — ocl_prepareBuffers",
+      "invariant": "u_Ux and u_Uy must have size >= coarsest_scale + 1 for the exact coarsest_scale value used to index them here.",
+      "failure_mode": "If ocl_prepareBuffers sizes u_Ux/u_Uy from a different scale than the coarsest_scale computed on lines 12-13 (e.g. after autoSelect changed patch_size but coarsest_scale was not recomputed consistently), indexing u_Ux[coarsest_scale] writes past the vector, corrupting memory or crashing.",
+      "cve_analog": "",
+      "what_to_confirm": "That ocl_prepareBuffers resizes u_Ux/u_Uy (and all pyramid vectors) to coarsest_scale+1 using the identical coarsest_scale that indexes them."
+    },
+    {
+      "title": "Undefined behavior in 1 << finest_scale flow rescale",
+      "anchor": "multiply(u_flowMat, 1 << finest_scale, u_flowMat);",
+      "file": "corpus/eval/eval_0021_cwe369.cpp",
+      "line": "64",
+      "code": "    multiply(u_flowMat, 1 << finest_scale, u_flowMat);",
+      "bug_class": "Undefined behavior / integer overflow in left shift",
+      "cwe": "CWE-190",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0021_cwe369.cpp (this function); finest_scale set in implementation (file not provided)",
+      "invariant": "finest_scale must be in [0, 30] so that 1 << finest_scale is a well-defined positive int.",
+      "failure_mode": "If finest_scale is >= 31, the shift overflows the sign bit (UB); if negative, the shift count is negative (UB). The resulting scale factor is undefined/garbage, silently corrupting the returned flow magnitudes. Requires a corrupted/misconfigured finest_scale, so severity is low.",
+      "cve_analog": "",
+      "what_to_confirm": "That finest_scale is constrained to a small non-negative range wherever it is set and by autoSelectPatchSizeAndScales."
+    },
+    {
+      "title": "Missing equal-size / non-empty validation of I0 and I1",
+      "anchor": "UMat I0Mat = I0.getUMat(); UMat I1Mat = I1.getUMat();",
+      "file": "corpus/eval/eval_0021_cwe369.cpp",
+      "line": "4-7",
+      "code": "    UMat I0Mat = I0.getUMat();\n    UMat I1Mat = I1.getUMat();\n    bool use_input_flow = false;\n    if (flow.sameSize(I0) && flow.depth() == CV_32F && flow.channels() == 2)",
+      "bug_class": "Missing input validation",
+      "cwe": "CWE-20",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0021_cwe369.cpp and the public calc entry (implementation, file not provided)",
+      "invariant": "I0 and I1 must be non-empty and of equal size/type; the output flow geometry must be derived consistently from that shared size.",
+      "failure_mode": "The code allocates flow from I1Mat.size() but tests use_input_flow against I0's size and computes coarsest_scale from I0Mat dimensions. Mismatched I0/I1 sizes cause the I1-built pyramid to be indexed with I0-derived scale/geometry, and empty inputs (cols==rows==0) feed log(0) producing -inf and a bogus coarsest_scale (caught only later by the <0 guard).",
+      "cve_analog": "",
+      "what_to_confirm": "That the public DISOpticalFlow::calc validates non-empty, equal-size, consistent-type I0/I1 before dispatching to ocl_calc."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm patch_stride is validated/clamped to >= 1 before lines 34-35 (setPatchStride and autoSelectPatchSizeAndScales) — primary CWE-369 sink.",
+    "Confirm patch_size is validated >= 1 before the integer division on line 13 — second CWE-369 sink that traps before the coarsest_scale<0 guard.",
+    "Verify autoSelectPatchSizeAndScales guarantees 0 <= finest_scale <= coarsest_scale on return, so the loop (line 30) and i-1 upsampling never index out of range.",
+    "Verify ocl_prepareBuffers sizes u_I0s/u_I1s/u_I0xs/u_I0ys/u_I1s_ext/u_Ux/u_Uy and variational_refinement_processors to coarsest_scale+1 using the same coarsest_scale that indexes them (lines 27-28, 37-61).",
+    "Confirm finest_scale stays within [0, 30] so 1 << finest_scale (line 64) is defined.",
+    "Confirm the public calc entry validates I0/I1 are non-empty and equal-size/type before ocl_calc, and that flow geometry is derived consistently.",
+    "Check that pyramid levels retained by the coarsest_scale=min(...) formula are always at least patch_size in each dimension so (w - patch_size) on lines 34-35 is non-negative."
+  ]
+}

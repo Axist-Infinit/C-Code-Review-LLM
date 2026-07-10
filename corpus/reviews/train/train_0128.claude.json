@@ -1,0 +1,298 @@
+{
+  "subsystem": "GPAC libgpac ISO Base Media File Format (ISOBMFF / MP4) sample-table resolver. The function stbl_GetSampleInfos() maps a 1-based sampleNumber onto its byte offset in the media file by cross-referencing the Sample-To-Chunk table (stsc), the Chunk Offset table (stco / co64), and the Sample Size table (stsz). It is a core lookup used whenever a demuxer/reader needs to seek to or read a specific sample from an MP4 track.",
+  "provenance": "Identified from GPAC-specific types and naming: GF_Err return type, GF_SampleTableBox / GF_StscEntry / GF_ChunkOffsetBox / GF_ChunkLargeOffsetBox structs, the u32/u64 scalar typedefs, the GF_ISOM_BOX_TYPE_STCO box-type constant, and error codes GF_BAD_PARAM / GF_ISOM_INVALID_FILE / GF_OK. The stbl_ prefix and 'firstSampleInCurrentChunk'/'ghostNumber' cache fields are GPAC's isomedia sample-table code. The leading comment '/* sample: primevul_c_validation_0083_fixed */' marks it as a curated validation sample.",
+  "trust_boundary": "The GF_SampleTableBox *stbl and everything it points to (SampleToChunk->entries[], nb_entries, ChunkOffset->offsets[], nb_entries, SampleSize->sampleSize/sampleCount, and per-entry samplesPerChunk / firstChunk / sampleDescriptionIndex) are populated by parsing an attacker-supplied MP4 file. Every count, size, and per-entry field is therefore hostile: a crafted stsc/stco/stsz box can set nb_entries, sampleCount, samplesPerChunk, and firstChunk to arbitrary values. sampleNumber is caller-supplied and, in the general reader API, is bounded by the file-declared sample count (also attacker-influenced). The invariant that array indices stay within nb_entries is the security boundary this function must enforce before every table access.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0128_cwe416.c",
+      "lines": "2-8",
+      "code": "GF_Err stbl_GetSampleInfos(GF_SampleTableBox *stbl, u32 sampleNumber, u64 *offset, u32 *chunkNumber, u32 *descIndex, GF_StscEntry **out_ent)\n{\n\tGF_Err e;\n\tu32 i, k, offsetInChunk, size, chunk_num;\n\tGF_ChunkOffsetBox *stco;\n\tGF_ChunkLargeOffsetBox *co64;\n\tGF_StscEntry *ent;",
+      "explanation": "The signature takes the parsed sample table stbl and a 1-based sampleNumber, and returns four results by pointer: the absolute file offset (u64 *offset), the chunk index (u32 *chunkNumber), the sample-description index (u32 *descIndex), and optionally a pointer to the resolved stsc entry (GF_StscEntry **out_ent). Local u32s i/k are loop/chunk counters, offsetInChunk accumulates the byte offset of the sample within its chunk, size holds a single sample size, and chunk_num is the computed chunk number. stco and co64 are the two alternative chunk-offset views (32-bit vs 64-bit). ent is a working pointer that will point INTO stbl->SampleToChunk->entries[]; its lifetime is tied to that array."
+    },
+    {
+      "file": "corpus/train/train_0128_cwe416.c",
+      "lines": "10-14",
+      "code": "\t(*offset) = 0;\n\t(*chunkNumber) = (*descIndex) = 0;\n\tif (out_ent) (*out_ent) = NULL;\n\tif (!stbl || !sampleNumber) return GF_BAD_PARAM;\n\tif (!stbl->ChunkOffset || !stbl->SampleToChunk || !stbl->SampleSize) return GF_ISOM_INVALID_FILE;",
+      "explanation": "The outputs are zero-initialized and out_ent is cleared to NULL when supplied. Two guards follow: reject a NULL stbl or a zero sampleNumber (GF_BAD_PARAM) — note that because sampleNumber is 1-based, the code later computes sampleNumber-1 as an index, so 0 is rejected here to avoid underflow. The second guard requires the three sub-boxes (ChunkOffset, SampleToChunk, SampleSize) to be present, else the file is invalid. Notably these guards check pointer presence but not the relationship between sampleNumber and the table sizes."
+    },
+    {
+      "file": "corpus/train/train_0128_cwe416.c",
+      "lines": "16-21",
+      "code": "\tif (stbl->SampleSize && stbl->SampleToChunk->nb_entries == stbl->SampleSize->sampleCount) {\n\t\tent = &stbl->SampleToChunk->entries[sampleNumber-1];\n\t\tif (!ent) return GF_BAD_PARAM;\n\t\t(*descIndex) = ent->sampleDescriptionIndex;\n\t\t(*chunkNumber) = sampleNumber;\n\t\tif (out_ent) *out_ent = ent;",
+      "explanation": "This is a fast-path optimization: when the number of stsc entries exactly equals the total sample count, each sample maps 1:1 to its own stsc entry, so the entry for sampleNumber is directly entries[sampleNumber-1]. The code then reads ent->sampleDescriptionIndex into *descIndex, sets *chunkNumber = sampleNumber, and hands the interior pointer back through *out_ent. The check 'if (!ent)' on line 18 is a null test on the address of an array element, which can never be null. Critically, the branch condition only compares nb_entries against sampleCount; it does not verify that sampleNumber itself is within [1, nb_entries] before indexing entries[sampleNumber-1]."
+    },
+    {
+      "file": "corpus/train/train_0128_cwe416.c",
+      "lines": "22-36",
+      "code": "\t\tif ( stbl->ChunkOffset->type == GF_ISOM_BOX_TYPE_STCO) {\n\t\t\tstco = (GF_ChunkOffsetBox *)stbl->ChunkOffset;\n\t\t\tif (!stco->offsets) return GF_ISOM_INVALID_FILE;\n\t\t\tif (stco->nb_entries < sampleNumber) return GF_ISOM_INVALID_FILE;\n\n\t\t\t(*offset) = (u64) stco->offsets[sampleNumber - 1];\n\t\t} else {\n\t\t\tco64 = (GF_ChunkLargeOffsetBox *)stbl->ChunkOffset;\n\t\t\tif (!co64->offsets) return GF_ISOM_INVALID_FILE;\n\t\t\tif (co64->nb_entries < sampleNumber) return GF_ISOM_INVALID_FILE;\n\n\t\t\t(*offset) = co64->offsets[sampleNumber - 1];\n\t\t}\n\t\treturn GF_OK;",
+      "explanation": "Still on the fast path, the code resolves the file offset from the chunk-offset box. If the box type is STCO it uses the 32-bit offsets[] array; otherwise it treats it as the 64-bit co64 offsets[]. In BOTH branches it defensively checks that offsets is non-NULL AND that nb_entries >= sampleNumber before indexing offsets[sampleNumber-1]. This is the correct bounds pattern — and it stands in contrast to line 17, where the entries[] access was NOT bounds-checked. The function returns GF_OK with the resolved offset."
+    },
+    {
+      "file": "corpus/train/train_0128_cwe416.c",
+      "lines": "38-46",
+      "code": "\t//check our cache: if desired sample is at or above current cache entry, start from here\n\tif (stbl->SampleToChunk->firstSampleInCurrentChunk &&\n\t        (stbl->SampleToChunk->firstSampleInCurrentChunk <= sampleNumber)) {\n\n\t\ti = stbl->SampleToChunk->currentIndex;\n\t\tent = &stbl->SampleToChunk->entries[stbl->SampleToChunk->currentIndex];\n\t\tGetGhostNum(ent, i, stbl->SampleToChunk->nb_entries, stbl);\n\t\tk = stbl->SampleToChunk->currentChunk;\n\t}",
+      "explanation": "The general (non-1:1) path begins with a resumable cache. If a previous call left firstSampleInCurrentChunk set and the requested sampleNumber is at or beyond that cached position, the walk resumes from the cached currentIndex rather than restarting. It sets the loop index i and ent to the cached entry entries[currentIndex], recomputes the 'ghost number' (the number of chunks this stsc run implicitly represents, via GetGhostNum), and seeds k with the cached currentChunk. The cache fields (currentIndex, currentChunk, firstSampleInCurrentChunk, ghostNumber) are mutable state stored inside the SampleToChunk box across calls."
+    },
+    {
+      "file": "corpus/train/train_0128_cwe416.c",
+      "lines": "48-57",
+      "code": "\telse {\n\t\ti = 0;\n\t\tstbl->SampleToChunk->currentIndex = 0;\n\t\tstbl->SampleToChunk->currentChunk = 1;\n\t\tstbl->SampleToChunk->ghostNumber = 1;\n\t\tstbl->SampleToChunk->firstSampleInCurrentChunk = 1;\n\t\tent = &stbl->SampleToChunk->entries[0];\n\t\tGetGhostNum(ent, 0, stbl->SampleToChunk->nb_entries, stbl);\n\t\tk = stbl->SampleToChunk->currentChunk;\n\t}",
+      "explanation": "Otherwise the walk starts cold from the first stsc entry: i and the cache indices are reset, firstSampleInCurrentChunk is set to 1 (samples are 1-based), ent points to entries[0], and GetGhostNum initializes ghostNumber for the first run. This access entries[0] is only safe if nb_entries >= 1; the function reached here without verifying nb_entries > 0."
+    },
+    {
+      "file": "corpus/train/train_0128_cwe416.c",
+      "lines": "60-66",
+      "code": "\tfor (; i < stbl->SampleToChunk->nb_entries; i++) {\n\t\tassert(stbl->SampleToChunk->firstSampleInCurrentChunk <= sampleNumber);\n\t\t//corrupted file (less sample2chunk info than sample count\n\t\tif (k > stbl->SampleToChunk->ghostNumber) {\n\t\t\treturn GF_ISOM_INVALID_FILE;\n\t\t}",
+      "explanation": "The main loop iterates stsc entries from i up to nb_entries. An assert documents the invariant firstSampleInCurrentChunk <= sampleNumber, but assert() is compiled out under NDEBUG in release builds, so it is not a runtime guard. The loop then rejects the file if the running chunk counter k has passed ghostNumber — the code's own detection of 'fewer sample-to-chunk records than the sample count claims'. This guarantees ghostNumber - k does not underflow at line 69."
+    },
+    {
+      "file": "corpus/train/train_0128_cwe416.c",
+      "lines": "68-82",
+      "code": "\t\t//check if sample is in current chunk\n\t\tu32 max_chunks_in_entry = stbl->SampleToChunk->ghostNumber - k;\n\t\tu32 nb_chunks_for_sample = sampleNumber - stbl->SampleToChunk->firstSampleInCurrentChunk;\n\t\tif (ent->samplesPerChunk) \n\t\t\tnb_chunks_for_sample /= ent->samplesPerChunk;\n\n\t\tif (\n\t\t\t(nb_chunks_for_sample <= max_chunks_in_entry)\n\t\t\t&& (stbl->SampleToChunk->firstSampleInCurrentChunk + (nb_chunks_for_sample+1) * ent->samplesPerChunk > sampleNumber)\n\t\t) {\n\n\t\t\tstbl->SampleToChunk->firstSampleInCurrentChunk += nb_chunks_for_sample * ent->samplesPerChunk;\n\t\t\tstbl->SampleToChunk->currentChunk += nb_chunks_for_sample;\n\t\t\tgoto sample_found;\n\t\t}",
+      "explanation": "Per entry the code computes max_chunks_in_entry (how many chunks this stsc run still spans) and nb_chunks_for_sample (how many samplesPerChunk-sized chunks separate sampleNumber from firstSampleInCurrentChunk). The division is guarded against a zero samplesPerChunk. It then tests whether the target sample falls inside this stsc run: the sample count so far plus one chunk's worth must exceed sampleNumber. If so it advances firstSampleInCurrentChunk and currentChunk to the matching chunk and jumps to sample_found. The arithmetic on line 76 multiplies attacker-controlled samplesPerChunk by (nb_chunks_for_sample+1) in u32, and the subtraction on line 70 is unsigned."
+    },
+    {
+      "file": "corpus/train/train_0128_cwe416.c",
+      "lines": "83-97",
+      "code": "\t\tmax_chunks_in_entry += 1;\n\t\tstbl->SampleToChunk->firstSampleInCurrentChunk += max_chunks_in_entry * ent->samplesPerChunk;\n\t\tstbl->SampleToChunk->currentChunk += max_chunks_in_entry;\n\n\t\t//not in this entry, get the next entry if not the last one\n\t\tif (i+1 != stbl->SampleToChunk->nb_entries) {\n\t\t\tent = &stbl->SampleToChunk->entries[i+1];\n\t\t\t//update the GhostNumber\n\t\t\tGetGhostNum(ent, i+1, stbl->SampleToChunk->nb_entries, stbl);\n\t\t\t//update the entry in our cache\n\t\t\tstbl->SampleToChunk->currentIndex = i+1;\n\t\t\tstbl->SampleToChunk->currentChunk = 1;\n\t\t\tk = 1;\n\t\t}",
+      "explanation": "If the sample is not in this run, the code skips the whole run: it advances firstSampleInCurrentChunk by max_chunks_in_entry*samplesPerChunk and bumps currentChunk. It then moves ent to entries[i+1] and recomputes the ghost number, updating the cache. The access entries[i+1] is guarded by 'if (i+1 != nb_entries)', so it stays within bounds (i+1 < nb_entries). The loop's i++ advances afterward."
+    },
+    {
+      "file": "corpus/train/train_0128_cwe416.c",
+      "lines": "98-99",
+      "code": "\t//if we get here, gasp, the sample was not found\n\treturn GF_ISOM_INVALID_FILE;",
+      "explanation": "If the loop exhausts all stsc entries without matching, the sample number does not correspond to a valid position in the sample table and the file is reported invalid."
+    },
+    {
+      "file": "corpus/train/train_0128_cwe416.c",
+      "lines": "101-107",
+      "code": "sample_found:\n\n\t(*descIndex) = ent->sampleDescriptionIndex;\n\t(*chunkNumber) = chunk_num = ent->firstChunk + stbl->SampleToChunk->currentChunk - 1;\n\tif (out_ent) *out_ent = ent;\n\tif (! *chunkNumber)\n\t\treturn GF_ISOM_INVALID_FILE;",
+      "explanation": "On a match, *descIndex is taken from the resolved entry, and chunk_num / *chunkNumber is computed as ent->firstChunk (attacker-controlled) plus the offset into the run minus one. The interior pointer ent is returned through out_ent. A zero chunkNumber is rejected (it would underflow the 1-based offsets[] index at lines 139/143). Note the addition ent->firstChunk + currentChunk - 1 is u32 and can overflow if firstChunk is large, but the subsequent nb_entries bound check catches out-of-range results."
+    },
+    {
+      "file": "corpus/train/train_0128_cwe416.c",
+      "lines": "109-133",
+      "code": "\t//ok, get the size of all the previous samples in the chunk\n\toffsetInChunk = 0;\n\t//constant size\n\tif (stbl->SampleSize && stbl->SampleSize->sampleSize) {\n\t\tu32 diff = sampleNumber - stbl->SampleToChunk->firstSampleInCurrentChunk;\n\t\toffsetInChunk += diff * stbl->SampleSize->sampleSize;\n\t} else if ((stbl->r_last_chunk_num == chunk_num) && (stbl->r_last_sample_num == sampleNumber)) {\n\t\toffsetInChunk = stbl->r_last_offset_in_chunk;\n\t} else if ((stbl->r_last_chunk_num == chunk_num) && (stbl->r_last_sample_num + 1 == sampleNumber)) {\n\t\te = stbl_GetSampleSize(stbl->SampleSize, stbl->r_last_sample_num, &size);\n\t\tif (e) return e;\n\t\tstbl->r_last_offset_in_chunk += size;\n\t\tstbl->r_last_sample_num = sampleNumber;\n\t\toffsetInChunk = stbl->r_last_offset_in_chunk;\n\t} else {\n\t\t//warning, firstSampleInChunk is at least 1 - not 0\n\t\tfor (i = stbl->SampleToChunk->firstSampleInCurrentChunk; i < sampleNumber; i++) {\n\t\t\te = stbl_GetSampleSize(stbl->SampleSize, i, &size);\n\t\t\tif (e) return e;\n\t\t\toffsetInChunk += size;\n\t\t}\n\t\tstbl->r_last_chunk_num = chunk_num;\n\t\tstbl->r_last_sample_num = sampleNumber;\n\t\tstbl->r_last_offset_in_chunk = offsetInChunk;\n\t}",
+      "explanation": "This block sums the byte sizes of the samples that precede the target within its chunk to get offsetInChunk. Four cases: (1) constant sample size — multiply the number of preceding samples by sampleSize; (2) exact cache hit — reuse r_last_offset_in_chunk; (3) one-sample-ahead cache hit — add the last sample's size and update the running cache; (4) cold path — loop from firstSampleInCurrentChunk to sampleNumber calling stbl_GetSampleSize for each, accumulating, then refresh the r_last_* cache. The multiplications (diff * sampleSize) and the accumulation are u32 and can overflow with crafted sizes, but the result only feeds the final absolute offset (not an array index)."
+    },
+    {
+      "file": "corpus/train/train_0128_cwe416.c",
+      "lines": "135-145",
+      "code": "\t//now get the chunk\n\tif ( stbl->ChunkOffset->type == GF_ISOM_BOX_TYPE_STCO) {\n\t\tstco = (GF_ChunkOffsetBox *)stbl->ChunkOffset;\n\t\tif (stco->nb_entries < (*chunkNumber) ) return GF_ISOM_INVALID_FILE;\n\t\t(*offset) = (u64) stco->offsets[(*chunkNumber) - 1] + (u64) offsetInChunk;\n\t} else {\n\t\tco64 = (GF_ChunkLargeOffsetBox *)stbl->ChunkOffset;\n\t\tif (co64->nb_entries < (*chunkNumber) ) return GF_ISOM_INVALID_FILE;\n\t\t(*offset) = co64->offsets[(*chunkNumber) - 1] + (u64) offsetInChunk;\n\t}\n\treturn GF_OK;",
+      "explanation": "Finally the absolute file offset is the chunk's base offset plus offsetInChunk. As on the fast path, both STCO and co64 branches bound-check nb_entries >= chunkNumber before indexing offsets[chunkNumber-1], and chunkNumber was proven non-zero at line 106. This chunk-offset access is therefore correctly bounded. The function returns GF_OK."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0128_cwe416.c",
+      "lines": "16-17",
+      "code": "\tif (stbl->SampleSize && stbl->SampleToChunk->nb_entries == stbl->SampleSize->sampleCount) {\n\t\tent = &stbl->SampleToChunk->entries[sampleNumber-1];",
+      "explanation": "Out-of-bounds read (CWE-125). The fast path is entered whenever nb_entries == sampleCount, but the code then indexes entries[sampleNumber-1] WITHOUT ever checking sampleNumber against nb_entries. sampleNumber is caller-supplied; if it exceeds nb_entries (e.g. a reader that trusts a larger, separately-parsed sample count, or a direct API caller passing an out-of-range index), entries[sampleNumber-1] reads past the end of the SampleToChunk->entries heap allocation. ent->sampleDescriptionIndex (line 19) is then read from that out-of-bounds memory and, worse, the wild interior pointer is published to the caller via *out_ent (line 21). Compare the very next block (lines 25/31) which DOES check nb_entries < sampleNumber before indexing offsets[] — the entries[] access is missing that identical guard. Invariant: the implementation must verify sampleNumber <= SampleToChunk->nb_entries before computing entries[sampleNumber-1]."
+    },
+    {
+      "file": "corpus/train/train_0128_cwe416.c",
+      "lines": "21",
+      "code": "\t\tif (out_ent) *out_ent = ent;",
+      "explanation": "Use-after-free / dangling interior pointer (CWE-416) — latent contract. Both here and at line 105 the function returns ent, a pointer INTO stbl->SampleToChunk->entries[], to the caller. That pointer is only valid while the entries array is neither freed nor reallocated. GPAC's sample-table code reallocs entries when samples are added/edited (e.g. during fragment/edit operations) and frees it when the box is destroyed. If a caller stashes the returned GF_StscEntry* and then triggers any operation that grows or releases SampleToChunk->entries, the stored pointer dangles and a subsequent dereference is a use-after-free. Invariant: callers must treat *out_ent as valid only for the immediate, synchronous use before any sample-table mutation; the safer contract is to return a copy or an index rather than an interior pointer."
+    },
+    {
+      "file": "corpus/train/train_0128_cwe416.c",
+      "lines": "42-43",
+      "code": "\t\ti = stbl->SampleToChunk->currentIndex;\n\t\tent = &stbl->SampleToChunk->entries[stbl->SampleToChunk->currentIndex];",
+      "explanation": "Out-of-bounds read via stale cache (CWE-125 / CWE-825). currentIndex is persistent cache state read straight from the box and used to index entries[currentIndex] with no check that currentIndex < nb_entries. If the SampleToChunk table is re-parsed, truncated, or shrunk between calls (or currentIndex is corrupted by another code path), the cached index can exceed the current entries[] length and this dereference reads out of bounds. GetGhostNum is then called on the bad ent. Invariant: currentIndex must be re-validated against the current nb_entries before use, or invalidated whenever entries is reallocated."
+    },
+    {
+      "file": "corpus/train/train_0128_cwe416.c",
+      "lines": "54-55",
+      "code": "\t\tent = &stbl->SampleToChunk->entries[0];\n\t\tGetGhostNum(ent, 0, stbl->SampleToChunk->nb_entries, stbl);",
+      "explanation": "Out-of-bounds read on empty table (CWE-125). The cold-start path unconditionally takes entries[0] and passes it to GetGhostNum. The earlier guards only checked that SampleToChunk is non-NULL, not that nb_entries >= 1. A crafted stsc box with nb_entries == 0 but a non-NULL entries pointer (or a zero-length allocation) makes entries[0] an out-of-bounds/one-past-the-end read. The loop at line 60 would not execute for nb_entries==0, but the entries[0] read and GetGhostNum call already happened. Invariant: reject nb_entries == 0 before dereferencing entries[0]."
+    },
+    {
+      "file": "corpus/train/train_0128_cwe416.c",
+      "lines": "76",
+      "code": "\t\t\t&& (stbl->SampleToChunk->firstSampleInCurrentChunk + (nb_chunks_for_sample+1) * ent->samplesPerChunk > sampleNumber)",
+      "explanation": "Unsigned integer overflow (CWE-190) in the in-chunk test. samplesPerChunk comes straight from the stsc box and is attacker-controlled; nb_chunks_for_sample is derived from sampleNumber. The product (nb_chunks_for_sample+1) * samplesPerChunk plus firstSampleInCurrentChunk is computed in 32-bit unsigned and can wrap around 2^32 with large crafted values. A wrapped result flips the comparison, causing the wrong chunk/entry to be selected, which then feeds firstSampleInCurrentChunk/currentChunk (lines 79-80) and ultimately a wrong file offset. The same overflow class applies to the += multiplications at lines 79 and 84. Invariant: perform this arithmetic in 64-bit or bound samplesPerChunk against the declared sample count before multiplying."
+    },
+    {
+      "file": "corpus/train/train_0128_cwe416.c",
+      "lines": "61",
+      "code": "\t\tassert(stbl->SampleToChunk->firstSampleInCurrentChunk <= sampleNumber);",
+      "explanation": "Security invariant enforced only by assert (CWE-191 exposure). Line 70 computes 'sampleNumber - firstSampleInCurrentChunk' in unsigned; if firstSampleInCurrentChunk ever exceeds sampleNumber the result underflows to a near-2^32 value. The only stated protection is this assert, which is removed under NDEBUG in production builds, so in release the underflow can occur and produce a huge nb_chunks_for_sample. Here the wrapped value only feeds comparisons/multiplies (not a direct array index), so impact is corrupted chunk logic / wrong offset rather than a direct OOB, but relying on assert() for a size invariant is unsafe. Invariant: enforce firstSampleInCurrentChunk <= sampleNumber with a real runtime check that returns GF_ISOM_INVALID_FILE."
+    },
+    {
+      "file": "corpus/train/train_0128_cwe416.c",
+      "lines": "71-72",
+      "code": "\t\tif (ent->samplesPerChunk) \n\t\t\tnb_chunks_for_sample /= ent->samplesPerChunk;",
+      "explanation": "Attacker-controlled samplesPerChunk == 0 (CWE-369 avoided, but logic hazard). The guard correctly prevents a divide-by-zero, but when samplesPerChunk is 0 the run advances by zero samples at lines 79/84 (multiplying by 0), so firstSampleInCurrentChunk does not progress within the entry. The loop still terminates because i++ advances, but the offset math for that entry is meaningless and, combined with the constant-size branch at line 113 (diff * sampleSize), yields a wrong offsetInChunk. Invariant: a zero samplesPerChunk in an stsc run is malformed and should be rejected rather than silently skipped."
+    },
+    {
+      "file": "corpus/train/train_0128_cwe416.c",
+      "lines": "18",
+      "code": "\t\tif (!ent) return GF_BAD_PARAM;",
+      "explanation": "Dead / misleading check (low, defensive-quality). ent was just assigned &entries[sampleNumber-1] (line 17), the address of an array element, which is never NULL regardless of whether the index is in bounds. This test gives a false sense of validation: it never fires and, crucially, it does NOT catch the out-of-bounds index that is the actual risk at line 17. Invariant: replace the null test with a real bounds check on sampleNumber vs nb_entries."
+    }
+  ],
+  "summary": "A GPAC ISOBMFF sample-table resolver whose STCO/co64 chunk-offset accesses are correctly bounds-checked, but whose fast path (line 17) indexes SampleToChunk->entries[sampleNumber-1] with no check of sampleNumber against nb_entries — an out-of-bounds read that also leaks a wild interior pointer through out_ent. The out_ent contract itself is a latent use-after-free surface (interior pointer into a reallocatable/freeable array), and several attacker-controlled u32 arithmetic sites (samplesPerChunk multiplies, firstSampleInCurrentChunk subtraction guarded only by a compiled-out assert) risk overflow/underflow-driven wrong offsets. Overall medium-to-high risk driven by the missing entries[] bounds check and the pointer-lifetime contract.",
+  "reviewed_anchors": [
+    {"anchor": "stbl_GetSampleInfos(...) signature, incl. GF_StscEntry **out_ent output", "disposition": "finding", "reason": "Returns an interior pointer into entries[] to the caller — a lifetime/use-after-free contract (CWE-416)."},
+    {"anchor": "sampleNumber (u32 parameter)", "disposition": "finding", "reason": "Used as entries[sampleNumber-1] index at line 17 without a bounds check against nb_entries (CWE-125)."},
+    {"anchor": "line 13: if (!stbl || !sampleNumber) return GF_BAD_PARAM", "disposition": "dismissed", "reason": "Correctly rejects NULL stbl and zero sampleNumber (guards the -1 index underflow)."},
+    {"anchor": "line 14: !ChunkOffset || !SampleToChunk || !SampleSize guard", "disposition": "dismissed", "reason": "Presence check on required sub-boxes; sound as far as it goes."},
+    {"anchor": "line 16 fast-path condition nb_entries == sampleCount", "disposition": "finding", "reason": "Gate does not bound sampleNumber, enabling the OOB read at line 17."},
+    {"anchor": "line 17: entries[sampleNumber-1]", "disposition": "finding", "reason": "Unbounded index into heap array (CWE-125)."},
+    {"anchor": "line 18: if (!ent) return GF_BAD_PARAM", "disposition": "finding", "reason": "Dead null check on &array[i]; never fires and masks the real bounds bug."},
+    {"anchor": "line 21 / line 105: *out_ent = ent", "disposition": "finding", "reason": "Publishes interior pointer into reallocatable entries[] — dangling/UAF contract (CWE-416)."},
+    {"anchor": "lines 24-27: stco offsets bounds check + offsets[sampleNumber-1]", "disposition": "dismissed", "reason": "Checks offsets non-NULL and nb_entries >= sampleNumber before indexing — correct."},
+    {"anchor": "lines 30-33: co64 offsets bounds check + offsets[sampleNumber-1]", "disposition": "dismissed", "reason": "Same correct bounds pattern as the STCO branch."},
+    {"anchor": "line 43: entries[currentIndex] (cache resume)", "disposition": "finding", "reason": "currentIndex used unchecked against nb_entries; stale cache -> OOB read (CWE-125/825)."},
+    {"anchor": "line 54: entries[0] (cold start)", "disposition": "finding", "reason": "Dereferences entries[0] without verifying nb_entries >= 1 (CWE-125)."},
+    {"anchor": "line 61: assert(firstSampleInCurrentChunk <= sampleNumber)", "disposition": "finding", "reason": "Security invariant only asserted; compiled out under NDEBUG, exposing line-70 unsigned underflow (CWE-191)."},
+    {"anchor": "line 63: if (k > ghostNumber) return", "disposition": "dismissed", "reason": "Prevents ghostNumber - k underflow at line 69; correct guard for corrupted stsc."},
+    {"anchor": "line 69: max_chunks_in_entry = ghostNumber - k", "disposition": "dismissed", "reason": "Guarded by the k > ghostNumber check on line 63."},
+    {"anchor": "line 70: nb_chunks_for_sample = sampleNumber - firstSampleInCurrentChunk", "disposition": "finding", "reason": "Unsigned subtraction protected only by a compiled-out assert; underflow possible (CWE-191)."},
+    {"anchor": "lines 71-72: if (samplesPerChunk) nb_chunks_for_sample /= samplesPerChunk", "disposition": "finding", "reason": "Div-by-zero guarded, but samplesPerChunk==0 causes non-advancing/wrong offset logic."},
+    {"anchor": "line 76: (nb_chunks_for_sample+1) * ent->samplesPerChunk", "disposition": "finding", "reason": "u32 multiply of attacker-controlled fields; integer overflow -> wrong chunk (CWE-190)."},
+    {"anchor": "lines 79/84: firstSampleInCurrentChunk += n * samplesPerChunk", "disposition": "finding", "reason": "Same overflow class as line 76 (covered by the CWE-190 finding)."},
+    {"anchor": "line 89: entries[i+1]", "disposition": "dismissed", "reason": "Guarded by 'if (i+1 != nb_entries)', so i+1 < nb_entries."},
+    {"anchor": "line 104: chunk_num = ent->firstChunk + currentChunk - 1", "disposition": "dismissed", "reason": "firstChunk is attacker-controlled but result is bounds-checked against nb_entries at lines 138/142 and non-zero at 106."},
+    {"anchor": "line 106: if (!*chunkNumber) return", "disposition": "dismissed", "reason": "Prevents chunkNumber-1 underflow on the offsets[] index."},
+    {"anchor": "line 113-114: diff * sampleSize", "disposition": "dismissed", "reason": "u32 overflow possible but result feeds only the final file offset, not an array index; low impact."},
+    {"anchor": "lines 115-122: r_last_* cache branches + stbl_GetSampleSize", "disposition": "dismissed", "reason": "Bounds/validation of sizes live in stbl_GetSampleSize (implementation not provided); errors are propagated."},
+    {"anchor": "lines 125-129: size accumulation loop", "disposition": "dismissed", "reason": "Delegates per-sample size lookup to stbl_GetSampleSize with error propagation; no direct OOB here."},
+    {"anchor": "lines 138-139: stco nb_entries check + offsets[chunkNumber-1]", "disposition": "dismissed", "reason": "Correctly checks nb_entries >= chunkNumber before indexing."},
+    {"anchor": "lines 142-143: co64 nb_entries check + offsets[chunkNumber-1]", "disposition": "dismissed", "reason": "Same correct bounds pattern."},
+    {"anchor": "GetGhostNum(ent, i, nb_entries, stbl) calls", "disposition": "dismissed", "reason": "External helper (not provided); its own bounds behavior is out of scope, but it is fed the possibly-bad ent from lines 43/54."}
+  ],
+  "findings": [
+    {
+      "title": "Fast-path OOB read: entries[sampleNumber-1] unchecked against nb_entries",
+      "anchor": "ent = &stbl->SampleToChunk->entries[sampleNumber-1];",
+      "file": "corpus/train/train_0128_cwe416.c",
+      "line": "16-21",
+      "code": "\tif (stbl->SampleSize && stbl->SampleToChunk->nb_entries == stbl->SampleSize->sampleCount) {\n\t\tent = &stbl->SampleToChunk->entries[sampleNumber-1];\n\t\tif (!ent) return GF_BAD_PARAM;\n\t\t(*descIndex) = ent->sampleDescriptionIndex;\n\t\t(*chunkNumber) = sampleNumber;\n\t\tif (out_ent) *out_ent = ent;",
+      "bug_class": "Out-of-bounds read (missing index bound check)",
+      "cwe": "CWE-125",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0128_cwe416.c",
+      "invariant": "sampleNumber must satisfy 1 <= sampleNumber <= SampleToChunk->nb_entries before computing entries[sampleNumber-1]; the fast path must include the same nb_entries bound check that the STCO/co64 branches use.",
+      "failure_mode": "The branch is entered on nb_entries == sampleCount but never bounds sampleNumber. A caller passing sampleNumber > nb_entries (e.g. from a separately-parsed, larger declared sample count, or a direct API caller) makes entries[sampleNumber-1] read past the heap allocation; ent->sampleDescriptionIndex is read from OOB memory and the wild pointer is exported via *out_ent, escalating to further OOB/UAF at the caller.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm whether any reachable caller can pass sampleNumber exceeding SampleToChunk->nb_entries (and whether nb_entries can differ from the value driving the caller's loop), and that no earlier guard bounds it."
+    },
+    {
+      "title": "out_ent returns interior pointer into reallocatable entries[] (dangling/UAF)",
+      "anchor": "GF_StscEntry **out_ent  /  *out_ent = ent",
+      "file": "corpus/train/train_0128_cwe416.c",
+      "line": "21",
+      "code": "\t\tif (out_ent) *out_ent = ent;",
+      "bug_class": "Use-after-free / dangling interior pointer",
+      "cwe": "CWE-416",
+      "severity": "high",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "The GF_StscEntry* handed back through out_ent (here and at line 105) must not outlive the SampleToChunk->entries allocation; the array must not be reallocated (sample add/edit) or freed (box destroy) while the caller holds the pointer.",
+      "failure_mode": "ent aliases entries[i]. GPAC reallocates entries when samples are appended/edited and frees it on box teardown. A caller that caches *out_ent and later triggers any sample-table mutation dereferences freed/moved memory — a use-after-free with attacker-influenced timing via crafted media operations.",
+      "cve_analog": "",
+      "what_to_confirm": "Trace all callers of out_ent to confirm the returned entry is consumed immediately and never held across a stsc realloc/free; consider returning an index or a copy instead."
+    },
+    {
+      "title": "Stale/corrupt currentIndex indexes entries[] without bound check",
+      "anchor": "ent = &stbl->SampleToChunk->entries[stbl->SampleToChunk->currentIndex];",
+      "file": "corpus/train/train_0128_cwe416.c",
+      "line": "42-44",
+      "code": "\t\ti = stbl->SampleToChunk->currentIndex;\n\t\tent = &stbl->SampleToChunk->entries[stbl->SampleToChunk->currentIndex];\n\t\tGetGhostNum(ent, i, stbl->SampleToChunk->nb_entries, stbl);",
+      "bug_class": "Out-of-bounds read via stale cache index",
+      "cwe": "CWE-125",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0128_cwe416.c",
+      "invariant": "currentIndex must always be < nb_entries; it must be re-validated on entry or invalidated whenever entries is reallocated/shrunk.",
+      "failure_mode": "currentIndex is persistent state read directly from the box. If entries is re-parsed/truncated between calls or currentIndex is otherwise corrupted, entries[currentIndex] reads out of bounds and the bad ent is passed to GetGhostNum, propagating the OOB.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify currentIndex is reset/bounded whenever SampleToChunk->entries or nb_entries changes, and that no path leaves it >= nb_entries."
+    },
+    {
+      "title": "Cold-start entries[0] dereferenced without nb_entries >= 1 check",
+      "anchor": "ent = &stbl->SampleToChunk->entries[0];",
+      "file": "corpus/train/train_0128_cwe416.c",
+      "line": "54-55",
+      "code": "\t\tent = &stbl->SampleToChunk->entries[0];\n\t\tGetGhostNum(ent, 0, stbl->SampleToChunk->nb_entries, stbl);",
+      "bug_class": "Out-of-bounds read on empty table",
+      "cwe": "CWE-125",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0128_cwe416.c",
+      "invariant": "SampleToChunk->nb_entries must be >= 1 before entries[0] is dereferenced.",
+      "failure_mode": "A crafted stsc with nb_entries == 0 (but a non-NULL/zero-length entries allocation) still reaches this cold-start path; entries[0] and the following GetGhostNum read one-past/out-of-bounds before the loop's i < nb_entries condition would have skipped it.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the parser rejects a zero-entry stsc, or add a nb_entries==0 guard before line 54."
+    },
+    {
+      "title": "Integer overflow in in-chunk test on attacker-controlled samplesPerChunk",
+      "anchor": "firstSampleInCurrentChunk + (nb_chunks_for_sample+1) * ent->samplesPerChunk",
+      "file": "corpus/train/train_0128_cwe416.c",
+      "line": "74-84",
+      "code": "\t\tif (\n\t\t\t(nb_chunks_for_sample <= max_chunks_in_entry)\n\t\t\t&& (stbl->SampleToChunk->firstSampleInCurrentChunk + (nb_chunks_for_sample+1) * ent->samplesPerChunk > sampleNumber)\n\t\t) {\n\n\t\t\tstbl->SampleToChunk->firstSampleInCurrentChunk += nb_chunks_for_sample * ent->samplesPerChunk;",
+      "bug_class": "Unsigned integer overflow",
+      "cwe": "CWE-190",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0128_cwe416.c",
+      "invariant": "The chunk arithmetic must not wrap: (nb_chunks_for_sample+1) * samplesPerChunk (and the += forms at lines 79/84) must be computed with overflow-safe width or with samplesPerChunk bounded against the declared sample count.",
+      "failure_mode": "samplesPerChunk is read from the stsc box and is fully attacker-controlled. Large values overflow the u32 products, flipping the comparison so the wrong stsc run/chunk is selected; the corrupted firstSampleInCurrentChunk/currentChunk then yield an incorrect (attacker-steered) final file offset used for subsequent reads.",
+      "cve_analog": "",
+      "what_to_confirm": "Check whether the parser caps samplesPerChunk, and whether promoting this arithmetic to 64-bit changes chunk selection for large crafted values."
+    },
+    {
+      "title": "Size invariant enforced only by assert() -> release-build unsigned underflow",
+      "anchor": "assert(firstSampleInCurrentChunk <= sampleNumber); ... sampleNumber - firstSampleInCurrentChunk",
+      "file": "corpus/train/train_0128_cwe416.c",
+      "line": "61-70",
+      "code": "\t\tassert(stbl->SampleToChunk->firstSampleInCurrentChunk <= sampleNumber);",
+      "bug_class": "Integer underflow (invariant not enforced at runtime)",
+      "cwe": "CWE-191",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0128_cwe416.c",
+      "invariant": "firstSampleInCurrentChunk <= sampleNumber must hold before the unsigned subtraction at line 70; this must be a real runtime check, not an assert that NDEBUG removes.",
+      "failure_mode": "Under NDEBUG the assert is compiled out. If firstSampleInCurrentChunk ever exceeds sampleNumber, 'sampleNumber - firstSampleInCurrentChunk' wraps to ~2^32. The wrapped value feeds comparisons/multiplies (not a direct index), so the concrete impact is wrong chunk logic / bad offset rather than a direct OOB, but the safety property is unguarded in production.",
+      "cve_analog": "",
+      "what_to_confirm": "Prove firstSampleInCurrentChunk can never exceed sampleNumber on any reachable path, or replace the assert with a checked return of GF_ISOM_INVALID_FILE."
+    },
+    {
+      "title": "Zero samplesPerChunk skips advance, producing wrong offset",
+      "anchor": "if (ent->samplesPerChunk) nb_chunks_for_sample /= ent->samplesPerChunk;",
+      "file": "corpus/train/train_0128_cwe416.c",
+      "line": "71-84",
+      "code": "\t\tif (ent->samplesPerChunk) \n\t\t\tnb_chunks_for_sample /= ent->samplesPerChunk;",
+      "bug_class": "Malformed-input logic error (zero multiplier)",
+      "cwe": "CWE-20",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0128_cwe416.c",
+      "invariant": "An stsc entry with samplesPerChunk == 0 is malformed and should be rejected; chunk/offset math must not proceed with a zero samples-per-chunk.",
+      "failure_mode": "The division is guarded so there is no divide-by-zero, but with samplesPerChunk==0 the advances at lines 79/84 add zero, so firstSampleInCurrentChunk does not progress within the entry and the resulting offsetInChunk (and constant-size math at line 114) is incorrect for that run. Impact is wrong data offsets, not memory unsafety.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the stsc parser rejects samplesPerChunk == 0, or add an explicit reject here."
+    },
+    {
+      "title": "Dead null check masks the real bounds bug",
+      "anchor": "if (!ent) return GF_BAD_PARAM;",
+      "file": "corpus/train/train_0128_cwe416.c",
+      "line": "18",
+      "code": "\t\tif (!ent) return GF_BAD_PARAM;",
+      "bug_class": "Ineffective validation (dead check)",
+      "cwe": "CWE-570",
+      "severity": "info",
+      "where_it_lives": "corpus/train/train_0128_cwe416.c",
+      "invariant": "Validation must test the actual hazard (index in range), not the address of an array element, which is never NULL.",
+      "failure_mode": "ent = &entries[sampleNumber-1] is always non-NULL, so this branch never executes; it provides a false appearance of validation while the genuine out-of-bounds index at line 17 goes unchecked.",
+      "cve_analog": "",
+      "what_to_confirm": "Replace with 'if (sampleNumber > stbl->SampleToChunk->nb_entries) return GF_ISOM_INVALID_FILE;' before line 17."
+    }
+  ],
+  "audit_checklist": [
+    "Add a bound check sampleNumber <= SampleToChunk->nb_entries before entries[sampleNumber-1] at line 17 (mirror the STCO/co64 checks).",
+    "Audit every caller of out_ent to confirm the returned GF_StscEntry* is never held across an entries[] realloc or free (UAF); prefer returning an index/copy.",
+    "Validate SampleToChunk->currentIndex < nb_entries on cache resume (line 43) and invalidate the cache whenever entries is reallocated/shrunk.",
+    "Guard nb_entries >= 1 before the cold-start entries[0] dereference at line 54.",
+    "Replace the assert on line 61 with a runtime check that returns GF_ISOM_INVALID_FILE when firstSampleInCurrentChunk > sampleNumber.",
+    "Bound or 64-bit-promote the samplesPerChunk multiplications at lines 76/79/84 to prevent u32 overflow-driven wrong chunk selection.",
+    "Reject stsc entries with samplesPerChunk == 0 rather than silently skipping the divide.",
+    "Confirm stbl_GetSampleSize validates the sample index and propagates errors for the size-accumulation loop (lines 118/126)."
+  ]
+}

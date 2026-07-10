@@ -1,0 +1,228 @@
+{
+  "subsystem": "A Qt/C++ member function Helper::getPartitionSizeInfo() that queries the used/free size and block size of a disk partition. When the partition is mounted it shells out to the POSIX df utility and parses its columns; when it is NOT mounted it runs a partclone executable (partclone.ext4, partclone.dd, etc.) against the raw block device and parses partclone's status lines. This is the kind of privileged storage/partition helper found in deepin/dde-file-manager's root daemon (deepin-daemon / dde-file-manager 'Helper'), i.e. a root-side worker invoked over D-Bus/polkit on behalf of an unprivileged desktop client.",
+  "provenance": "Identified from the API surface: QString/QStringList/QByteArray/QByteArrayList/QProcess/QRegularExpression are Qt types; the class name 'Helper', the dCError() logging macro, DDevicePartInfo, getPartcloneExecuter(), and the partclone invocation ('partclone ... -c -q -C -L /var/log/partclone.log') are characteristic of Deepin's dde-file-manager disk-manager helper. The banner 'sample: primevul_train_2256_fixed' and filename train_0085_cwe61.cpp indicate a PrimeVul-derived sample; no label is trusted for the review itself.",
+  "trust_boundary": "partDevice (the const QString & parameter) is the untrusted input. In the deployment this function models, the helper runs as root and partDevice originates from an unprivileged D-Bus client (the device path/identifier the caller wants sized). It flows directly, via QString::arg(), into two shell-command strings passed to the single-argument QProcess::start(const QString &command) overload, which word-splits its argument. A second, distinct hostile surface is the CONTENT parsed back: when the device is not mounted, partclone reads an attacker-supplied block device/image and its textual status output ('Space in use:', 'Free Space:', 'Block size:') is parsed and multiplied. The fixed log path /var/log/partclone.log is written as root, making the on-disk filesystem another attacker surface.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0085_cwe61.cpp",
+      "lines": "2-8",
+      "code": "bool Helper::getPartitionSizeInfo(const QString &partDevice, qint64 *used, qint64 *free, int *blockSize)\n{\n    QProcess process;\n    QStringList env_list = QProcess::systemEnvironment();\n\n    env_list.append(\"LANG=C\");\n    process.setEnvironment(env_list);",
+      "explanation": "The function takes a partition/device identifier partDevice by const-reference and three OUT pointers: used and free (qint64, bytes) and blockSize (int). All three OUT pointers are optional and are null-checked before each write. A local QProcess is created; the environment is copied from the current process and LANG=C is appended so that the child tool emits C-locale (English, dot-decimal) output that the later string parsing depends on. Note that env_list is only appended to, so a pre-existing LANG in the inherited environment is not removed, only shadowed by the later duplicate — LANG=C being appended last is what actually takes effect for most shells' getenv semantics."
+    },
+    {
+      "file": "corpus/train/train_0085_cwe61.cpp",
+      "lines": "10-18",
+      "code": "    if (Helper::isMounted(partDevice)) {\n        process.start(QString(\"df -B1 -P %1\").arg(partDevice));\n        process.waitForFinished();\n\n        if (process.exitCode() != 0) {\n            dCError(\"Call df failed: %s\", qPrintable(process.readAllStandardError()));\n\n            return false;\n        }",
+      "explanation": "If the partition is currently mounted, the code runs 'df -B1 -P <partDevice>' to obtain size accounting from the mounted filesystem. -B1 forces byte-granularity output and -P selects POSIX (single-line-per-filesystem) formatting so the parser can assume a fixed column layout. The command is built by interpolating partDevice into a single command STRING via QString::arg() and handed to the QProcess::start(const QString &) overload, which internally splits the string into program + arguments on whitespace (respecting quotes) — it does NOT run a shell. waitForFinished() blocks for the default 30s. A non-zero exit code is treated as failure: it logs df's stderr via dCError (a literal format string with a %s argument, so not a format-string sink) and returns false."
+    },
+    {
+      "file": "corpus/train/train_0085_cwe61.cpp",
+      "lines": "20-31",
+      "code": "        QByteArray output = process.readAll();\n        const QByteArrayList &lines = output.trimmed().split('\\n');\n\n        if (lines.count() != 2)\n            return false;\n\n        output = lines.last().simplified();\n\n        const QByteArrayList &values = output.split(' ');\n\n        if (values.count() != 6)\n            return false;",
+      "explanation": "df's stdout is read, trimmed of surrounding whitespace, and split on newline. The code requires exactly two lines: the header row plus one filesystem data row; anything else (0, or multiple filesystems) is rejected. It takes the last line (the data row), simplified() (collapses internal runs of whitespace to single spaces and trims), then splits on a single space to get the six POSIX df columns: Filesystem, 1024-blocks(here bytes), Used, Available, Capacity, Mounted-on. It enforces exactly six columns before indexing, which is the defensive bound that keeps the subsequent values.at(2)/at(3) in range."
+    },
+    {
+      "file": "corpus/train/train_0085_cwe61.cpp",
+      "lines": "33-47",
+      "code": "        bool ok = false;\n\n        if (used)\n            *used = values.at(2).toLongLong(&ok);\n\n        if (!ok)\n            return false;\n\n        if (free)\n            *free = values.at(3).toLongLong(&ok);\n\n        if (!ok)\n            return false;\n\n        return true;",
+      "explanation": "Column index 2 (Used bytes) and index 3 (Available bytes) are converted to qint64 via toLongLong, which sets ok=false on non-numeric input. Each conversion is validated before returning true. There is a subtle correctness bug that is NOT a security issue: if the used pointer is null, *used is skipped but ok stays false from its initialization, so the very next 'if (!ok) return false' returns false even though nothing went wrong — the function only succeeds when the caller actually passes a non-null used pointer. Functionally this is the mounted-partition success path."
+    },
+    {
+      "file": "corpus/train/train_0085_cwe61.cpp",
+      "lines": "48-55",
+      "code": "    } else {\n        process.start(QString(\"%1 -s %2 -c -q -C -L /var/log/partclone.log\").arg(getPartcloneExecuter(DDevicePartInfo(partDevice))).arg(partDevice));\n        process.setStandardOutputFile(\"/dev/null\");\n        process.setReadChannel(QProcess::StandardError);\n        process.waitForStarted();\n\n        qint64 used_block = -1;\n        qint64 free_block = -1;",
+      "explanation": "If the device is not mounted, the code cannot use df, so it runs partclone directly against the raw device to count used/free blocks. getPartcloneExecuter(DDevicePartInfo(partDevice)) chooses the correct partclone binary for the filesystem type and its return value is interpolated as the program (%1); partDevice is the -s (source) argument (%2). Flags: -c (clone/count mode), -q (quiet), -C (skip size check), -L <logfile> (write log to the fixed path /var/log/partclone.log). Again the single-string QProcess::start overload is used. stdout is redirected to /dev/null and the read channel is set to stderr, because partclone prints its progress/status to stderr. waitForStarted() is called but its boolean result is discarded. used_block and free_block are sentinel-initialized to -1 so the later 'read all three fields' guard can detect that a field was never seen."
+    },
+    {
+      "file": "corpus/train/train_0085_cwe61.cpp",
+      "lines": "57-65",
+      "code": "        while (process.waitForReadyRead(5000)) {\n            const QByteArray &data = process.readAll();\n\n            for (QByteArray line : data.split('\\n')) {\n                line = line.simplified();\n\n                if (QString::fromLatin1(line).contains(QRegularExpression(\"\\\\berror\\\\b\"))) {\n                    dCError(\"Call \\\"%s %s\\\" failed: \\\"%s\\\"\", qPrintable(process.program()), qPrintable(process.arguments().join(' ')), line.constData());",
+      "explanation": "The reader loop blocks up to 5000ms per iteration waiting for partclone stderr; the loop terminates when waitForReadyRead times out or the process exits/closes the channel. Each chunk is split on newline and every line is simplified(). A QRegularExpression matching the whole word 'error' is compiled fresh on EVERY line (a performance smell, not a security bug) to detect partclone error output, which is logged via dCError. The format string is a literal with three %s arguments (program name, joined arguments, and the offending line), so there is no format-string injection despite the line being attacker-influenced."
+    },
+    {
+      "file": "corpus/train/train_0085_cwe61.cpp",
+      "lines": "67-88",
+      "code": "                if (line.startsWith(\"Space in use:\")) {\n                    bool ok = false;\n                    const QByteArray &value = line.split(' ').value(6, \"-1\");\n\n                    used_block = value.toLongLong(&ok);\n\n                    if (!ok) {\n                        dCError(\"String to LongLong failed, String: %s\", value.constData());\n\n                        return false;\n                    }\n                } else if (line.startsWith(\"Free Space:\")) {\n                    bool ok = false;\n                    const QByteArray &value = line.split(' ').value(5, \"-1\");\n\n                    free_block = value.toLongLong(&ok);\n\n                    if (!ok) {\n                        dCError(\"String to LongLong failed, String: %s\", value.constData());\n\n                        return false;\n                    }",
+      "explanation": "Two of the three status fields are parsed. For a 'Space in use:' line, token index 6 is taken; for 'Free Space:' line, token index 5. Both use QByteArrayList::value(index, default) rather than at(), so an out-of-range index safely returns the '-1' default instead of throwing/UB — this is correct defensive indexing. Each token is converted to qint64 and validated with ok; on failure the token is logged and the function returns false. used_block/free_block are populated but no computation happens yet — the final math is deferred until the block-size line arrives."
+    },
+    {
+      "file": "corpus/train/train_0085_cwe61.cpp",
+      "lines": "89-99",
+      "code": "                } else if (line.startsWith(\"Block size:\")) {\n                    bool ok = false;\n                    const QByteArray &value = line.split(' ').value(2, \"-1\");\n\n                    int block_size = value.toInt(&ok);\n\n                    if (!ok) {\n                        dCError(\"String to Int failed, String: %s\", value.constData());\n\n                        return false;\n                    }",
+      "explanation": "The 'Block size:' line yields token index 2, converted to int via toInt (32-bit) with ok validation. block_size is the multiplier that converts the block counts into byte totals. This line is treated as the terminal record: partclone prints block size after the used/free counts, so reaching it means all three inputs should be available. Note block_size is a 32-bit int while used_block/free_block are 64-bit — the product type in the next step is therefore governed by the 64-bit operand."
+    },
+    {
+      "file": "corpus/train/train_0085_cwe61.cpp",
+      "lines": "101-117",
+      "code": "                    if (used_block < 0 || free_block < 0 || block_size < 0)\n                        return false;\n\n                    if (used)\n                        *used = used_block * block_size;\n\n                    if (free)\n                        *free = free_block * block_size;\n\n                    if (blockSize)\n                        *blockSize = block_size;\n\n                    process.terminate();\n                    process.waitForFinished();\n\n                    return true;\n                }",
+      "explanation": "Before computing, the code rejects any of the three values still being negative (either the -1 sentinel meaning a field never appeared, or a genuinely negative parse). It then multiplies used_block * block_size and free_block * block_size to convert blocks to bytes, writing each through its (null-checked) OUT pointer, and stores block_size into *blockSize. Having obtained everything it needs, it terminates the still-running partclone (SIGTERM) and waits for it to exit, then returns true. This is the unmounted-partition success path."
+    },
+    {
+      "file": "corpus/train/train_0085_cwe61.cpp",
+      "lines": "122-123",
+      "code": "    return false;\n}",
+      "explanation": "The final fallthrough return false covers: the partclone branch where waitForReadyRead timed out or the process ended before a 'Block size:' line was seen (loop exits without the inner 'return true'), and any path that drops out of the else block. It is the safe default that reports failure when the expected data was not fully collected."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0085_cwe61.cpp",
+      "lines": "11",
+      "code": "        process.start(QString(\"df -B1 -P %1\").arg(partDevice));",
+      "explanation": "partDevice is interpolated into a single command STRING and passed to QProcess::start(const QString &command), which splits the string on whitespace (honoring quotes) into program and argument list. Because the attacker-controlled partDevice is embedded before splitting, a value containing spaces injects ADDITIONAL command-line arguments (argument injection, CWE-88). For example partDevice = '/dev/sda1 --output=source' or any df option/operand is passed straight to df. There is no shell, so ';', '|', '$()' are NOT interpreted, but argument injection alone changes tool behavior and, combined with option-processing tools, can leak information or alter output. The safe contract is to use the QProcess::start(program, QStringList args) overload so partDevice is a single, un-split argv element, and/or to validate partDevice as a strict '/dev/...' device path before use."
+    },
+    {
+      "file": "corpus/train/train_0085_cwe61.cpp",
+      "lines": "49",
+      "code": "        process.start(QString(\"%1 -s %2 -c -q -C -L /var/log/partclone.log\").arg(getPartcloneExecuter(DDevicePartInfo(partDevice))).arg(partDevice));",
+      "explanation": "This is the more dangerous instance of the same single-string-start argument-injection pattern, because partclone is a raw-block-device tool typically run as root in this helper. partDevice (%2) is again word-split, so a value with embedded spaces injects extra partclone flags/operands (e.g. changing -s source, adding an -o output/restore target, or overriding the log/behavior). The program token %1 is getPartcloneExecuter(DDevicePartInfo(partDevice))'s return value, itself derived from partDevice; if that helper can return a path/string containing spaces the PROGRAM name is also split. The invariant: build argv as a list (QStringList overload), never a concatenated string, and canonicalize/validate partDevice to a device node the caller is authorized to touch before spawning a privileged partclone against it."
+    },
+    {
+      "file": "corpus/train/train_0085_cwe61.cpp",
+      "lines": "49",
+      "code": "        process.start(QString(\"%1 -s %2 -c -q -C -L /var/log/partclone.log\").arg(getPartcloneExecuter(DDevicePartInfo(partDevice))).arg(partDevice));",
+      "explanation": "partclone is directed to write its log to the FIXED, world-predictable path /var/log/partclone.log via -L. When the helper runs as root, an attacker who can pre-create /var/log/partclone.log as a symlink (or who controls anything on the resolution path of /var/log) causes root-privileged partclone to open/write through that symlink, enabling arbitrary-file overwrite / privileged file corruption (symlink following, CWE-61). The write happens under the helper's identity, not the requester's. The implementation must not log to an attacker-influenceable fixed path as root: use a per-invocation file created with O_CREAT|O_EXCL|O_NOFOLLOW in a root-only directory (e.g. a mkstemp file under /run or a 0700 root dir), or drop the log entirely."
+    },
+    {
+      "file": "corpus/train/train_0085_cwe61.cpp",
+      "lines": "105-108",
+      "code": "                    if (used)\n                        *used = used_block * block_size;\n\n                    if (free)\n                        *free = free_block * block_size;",
+      "explanation": "used_block/free_block are 64-bit values parsed from partclone's stderr, and block_size is a 32-bit int similarly parsed; both originate from a tool reading an ATTACKER-SUPPLIED (unmounted) block device or image, so their values are attacker-influenced. The products used_block * block_size and free_block * block_size are computed in signed 64-bit arithmetic. Large-but-non-negative operands (e.g. used_block near INT64_MAX with block_size > 1) overflow qint64, which is signed-overflow undefined behavior in C++ and, in practice, yields a wrapped/negative byte total (CWE-190). The negativity gate on line 101 checks the inputs, not the product, so a wrong or negative size is returned to callers that may use it for allocation/UI/space accounting. The invariant: bound the operands (reasonable device-size limits) and/or perform a checked multiplication (e.g. __builtin_mul_overflow) before writing *used/*free."
+    },
+    {
+      "file": "corpus/train/train_0085_cwe61.cpp",
+      "lines": "52",
+      "code": "        process.waitForStarted();",
+      "explanation": "The boolean return of waitForStarted() is discarded (CWE-252, unchecked return value). If partclone fails to launch (missing binary from getPartcloneExecuter, permission error), the subsequent waitForReadyRead(5000) loop simply never enters and the function falls through to 'return false' at line 122 — no crash, but the true root cause (spawn failure) is silently swallowed with no diagnostic, which weakens auditability of a privileged operation. Lower severity than the injection issues but worth confirming the caller distinguishes 'device not sizeable' from 'tool failed to run'."
+    },
+    {
+      "file": "corpus/train/train_0085_cwe61.cpp",
+      "lines": "57",
+      "code": "        while (process.waitForReadyRead(5000)) {",
+      "explanation": "The read loop is driven by partclone, which is processing an attacker-controlled block device. As long as partclone keeps emitting output at least once per 5s and never prints a 'Block size:' line, this loop runs indefinitely, holding the (root) helper busy — a potential resource-exhaustion / denial-of-service against the privileged service (CWE-400, latent). The 5000ms timeout only bounds a SINGLE quiet interval, not total runtime. The implementation should cap total elapsed time / total bytes read for the privileged child rather than relying solely on seeing a terminal 'Block size:' token."
+    }
+  ],
+  "summary": "A root-side partition-sizing helper builds two external-tool command lines by interpolating the untrusted partDevice into a single command STRING passed to QProcess::start(const QString&), which word-splits it — enabling argument injection (CWE-88) into df and, more seriously, into a root-run partclone. Secondary risks are symlink-following on the fixed root-written log path /var/log/partclone.log (CWE-61) and unchecked signed 64-bit overflow when multiplying attacker-influenced block counts by block size (CWE-190). The output parsing itself is written defensively (strict count checks, value() with defaults, ok-validated conversions).",
+  "reviewed_anchors": [
+    {"anchor": "getPartitionSizeInfo(const QString &partDevice, qint64 *used, qint64 *free, int *blockSize)", "disposition": "finding", "reason": "partDevice is the untrusted input; the OUT pointers receive attacker-influenced computed sizes."},
+    {"anchor": "process.start(QString(\"df -B1 -P %1\").arg(partDevice)) (line 11)", "disposition": "finding", "reason": "single-string QProcess::start word-splits interpolated partDevice -> argument injection into df."},
+    {"anchor": "process.start(QString(\"%1 -s %2 ... -L /var/log/partclone.log\")...) (line 49)", "disposition": "finding", "reason": "same single-string-start argument injection into a root-run partclone, plus fixed log path."},
+    {"anchor": "-L /var/log/partclone.log (fixed log path, line 49)", "disposition": "finding", "reason": "predictable root-written path is a symlink-following (CWE-61) target."},
+    {"anchor": "getPartcloneExecuter(DDevicePartInfo(partDevice)) (line 49)", "disposition": "finding", "reason": "provides the program token %1 derived from partDevice; if it can contain whitespace the program name is also split (part of the injection finding)."},
+    {"anchor": "*used = used_block * block_size (line 105)", "disposition": "finding", "reason": "signed 64-bit multiply of attacker-influenced operands can overflow (CWE-190)."},
+    {"anchor": "*free = free_block * block_size (line 108)", "disposition": "finding", "reason": "same overflow class as line 105."},
+    {"anchor": "process.waitForStarted() (line 52)", "disposition": "finding", "reason": "return value discarded; spawn failure is swallowed (CWE-252)."},
+    {"anchor": "while (process.waitForReadyRead(5000)) (line 57)", "disposition": "finding", "reason": "per-read timeout does not bound total runtime; latent DoS on the privileged helper (CWE-400)."},
+    {"anchor": "env_list.append(\"LANG=C\"); setEnvironment(env_list) (lines 7-8)", "disposition": "dismissed", "reason": "hardening step to force C-locale output; appends rather than removes prior LANG but the trailing entry wins — no security contract violated."},
+    {"anchor": "if (lines.count() != 2) return false (line 23)", "disposition": "dismissed", "reason": "strict row-count check that bounds later indexing; defensive, no bug."},
+    {"anchor": "if (values.count() != 6) return false (line 30)", "disposition": "dismissed", "reason": "strict column-count check guaranteeing values.at(2)/at(3) are in range; correct bound."},
+    {"anchor": "values.at(2)/values.at(3) toLongLong(&ok) (lines 36,42)", "disposition": "dismissed", "reason": "indices are proven in range by the count==6 guard and conversions are ok-validated; safe."},
+    {"anchor": "line.split(' ').value(6/5/2, \"-1\") (lines 69,80,91)", "disposition": "dismissed", "reason": "QByteArrayList::value(index, default) returns the default on out-of-range, so no OOB; conversions ok-validated."},
+    {"anchor": "if (used_block < 0 || free_block < 0 || block_size < 0) (line 101)", "disposition": "dismissed", "reason": "correct sentinel/negative gate; checks inputs (the product overflow is filed separately)."},
+    {"anchor": "dCError(...) log calls (lines 15,64,74,85,96)", "disposition": "dismissed", "reason": "all use literal format strings with %s arguments; attacker-controlled text is an argument, not the format string — no format-string injection."},
+    {"anchor": "QRegularExpression(\"\\\\berror\\\\b\") compiled per line (line 63)", "disposition": "dismissed", "reason": "constant, anchored regex over bounded input; a performance smell (recompiled each line), not a security issue such as ReDoS."},
+    {"anchor": "process.setStandardOutputFile(\"/dev/null\") (line 50)", "disposition": "dismissed", "reason": "writes to the null device; not attacker-influenceable, no symlink concern."},
+    {"anchor": "process.terminate(); process.waitForFinished() (lines 113-114)", "disposition": "dismissed", "reason": "normal child teardown after success; no lifetime/UAF issue."}
+  ],
+  "findings": [
+    {
+      "title": "Argument injection into root-run partclone via single-string QProcess::start",
+      "anchor": "process.start(QString(\"%1 -s %2 -c -q -C -L /var/log/partclone.log\").arg(getPartcloneExecuter(DDevicePartInfo(partDevice))).arg(partDevice))",
+      "file": "corpus/train/train_0085_cwe61.cpp",
+      "line": "49",
+      "code": "        process.start(QString(\"%1 -s %2 -c -q -C -L /var/log/partclone.log\").arg(getPartcloneExecuter(DDevicePartInfo(partDevice))).arg(partDevice));",
+      "bug_class": "Argument injection into a subprocess (word-splitting of an interpolated command string)",
+      "cwe": "CWE-88",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0085_cwe61.cpp",
+      "invariant": "Untrusted partDevice must reach the child as exactly ONE argv element and must be validated as an authorized device node before a privileged tool is spawned against it; use QProcess::start(program, QStringList) instead of the single command-string overload.",
+      "failure_mode": "QProcess::start(const QString&) splits its command on whitespace. Because partDevice (and the program token derived from it) is interpolated before splitting, a partDevice containing spaces injects extra partclone flags/operands (e.g. altering -s source, adding an output/restore target, or overriding behavior) into a partclone process typically running as root, enabling unintended privileged block-device operations. No shell is involved, so this is argument injection rather than full shell command injection, but the privilege context makes it high impact.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm which overload of QProcess::start is used and whether partDevice can contain spaces/option-like tokens; confirm partDevice is validated/canonicalized (e.g. matches an allowlisted /dev/ node) before this call and whether the daemon runs privileged."
+    },
+    {
+      "title": "Argument injection into df via single-string QProcess::start",
+      "anchor": "process.start(QString(\"df -B1 -P %1\").arg(partDevice))",
+      "file": "corpus/train/train_0085_cwe61.cpp",
+      "line": "11",
+      "code": "        process.start(QString(\"df -B1 -P %1\").arg(partDevice));",
+      "bug_class": "Argument injection into a subprocess (word-splitting of an interpolated command string)",
+      "cwe": "CWE-88",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0085_cwe61.cpp",
+      "invariant": "partDevice must be passed as a single argv element (QStringList overload) and validated as a device path before interpolation into any command executed on the user's behalf.",
+      "failure_mode": "Same single-string-start pattern as line 49: a partDevice containing whitespace injects additional operands/options into df. Impact is lower than the partclone case (df is a read-only reporting tool), but attacker-chosen df options can change/confuse the parsed output or target a different filesystem than intended.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether df's start uses the list overload elsewhere in the codebase and whether partDevice is sanitized upstream; whether the two-line/six-column checks reliably reject manipulated output."
+    },
+    {
+      "title": "Symlink following on fixed root-written log path /var/log/partclone.log",
+      "anchor": "-L /var/log/partclone.log",
+      "file": "corpus/train/train_0085_cwe61.cpp",
+      "line": "49",
+      "code": "        process.start(QString(\"%1 -s %2 -c -q -C -L /var/log/partclone.log\").arg(getPartcloneExecuter(DDevicePartInfo(partDevice))).arg(partDevice));",
+      "bug_class": "UNIX symbolic-link following on a predictable privileged-write path",
+      "cwe": "CWE-61",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided)",
+      "invariant": "A root-privileged process must not open/write a fixed, attacker-predictable path; log files should be created in a root-only directory with O_CREAT|O_EXCL|O_NOFOLLOW or via mkstemp, never at a guessable shared location.",
+      "failure_mode": "partclone is told to write its log to the constant path /var/log/partclone.log while (in this helper's deployment) running as root. If an attacker can pre-create that path as a symlink to a sensitive file, or control any component of its resolution, the root-privileged open/write follows the link and overwrites/corrupts the target file. This is a latent property of the partclone invocation contract rather than logic visible in this function.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the privilege level of the process at this call site, the ownership/permissions of /var/log and the log file, and whether partclone opens the -L path with O_NOFOLLOW/O_EXCL semantics."
+    },
+    {
+      "title": "Signed 64-bit integer overflow when converting block counts to bytes",
+      "anchor": "*used = used_block * block_size",
+      "file": "corpus/train/train_0085_cwe61.cpp",
+      "line": "105-108",
+      "code": "                    if (used)\n                        *used = used_block * block_size;\n\n                    if (free)\n                        *free = free_block * block_size;",
+      "bug_class": "Integer overflow in signed multiplication",
+      "cwe": "CWE-190",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0085_cwe61.cpp",
+      "invariant": "The product of the parsed block count and block size must be range-checked (or computed with a checked-multiply primitive) before being stored into *used/*free; operands should be bounded to plausible device sizes.",
+      "failure_mode": "used_block/free_block (qint64) and block_size (int) are parsed from partclone stderr, which reflects an attacker-supplied (unmounted) block device or image. Large non-negative operands make used_block * block_size overflow signed 64-bit range (undefined behavior; in practice wraps to a wrong/negative value). The negativity guard at line 101 validates the inputs, not the product, so callers receive an incorrect byte total for space accounting/allocation/UI.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether callers use *used/*free for allocation or bounds decisions, and whether partclone's reported block counts are otherwise capped; consider __builtin_mul_overflow before assignment."
+    },
+    {
+      "title": "Unchecked waitForStarted() return hides subprocess spawn failure",
+      "anchor": "process.waitForStarted()",
+      "file": "corpus/train/train_0085_cwe61.cpp",
+      "line": "52",
+      "code": "        process.waitForStarted();",
+      "bug_class": "Unchecked return value / missing error handling",
+      "cwe": "CWE-252",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0085_cwe61.cpp",
+      "invariant": "The result of launching a privileged subprocess must be checked so that a failed spawn is reported distinctly from a legitimately empty result.",
+      "failure_mode": "If partclone fails to start (missing/renamed binary from getPartcloneExecuter, permission denied), waitForStarted()'s false return is ignored; the read loop never executes and the function silently returns false at line 122, giving callers no way to distinguish 'no data' from 'tool never ran' and leaving no diagnostic for a privileged operation.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether callers need to distinguish spawn failure, and whether a dCError/return path should be added on !waitForStarted()."
+    },
+    {
+      "title": "Read loop runtime not bounded — latent DoS on privileged helper",
+      "anchor": "while (process.waitForReadyRead(5000))",
+      "file": "corpus/train/train_0085_cwe61.cpp",
+      "line": "57",
+      "code": "        while (process.waitForReadyRead(5000)) {",
+      "bug_class": "Uncontrolled resource consumption",
+      "cwe": "CWE-400",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0085_cwe61.cpp",
+      "invariant": "A privileged helper must cap total time and/or bytes spent processing an attacker-controlled device, not merely each idle interval.",
+      "failure_mode": "partclone processes an attacker-supplied block device. If it emits some output at least once every 5s but never prints a 'Block size:' terminal line, the loop never breaks via the inner return true and only exits when the process finally ends — allowing an attacker to keep the root helper busy (resource exhaustion). The 5000ms argument bounds a single quiet interval only.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether an overall timeout/byte cap or a hard process kill deadline exists around this loop for the privileged child."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm partDevice's origin (D-Bus/polkit client?) and privilege level of this helper; verify it is validated/canonicalized to an authorized /dev/ node before any QProcess call.",
+    "Replace both single-string QProcess::start calls (lines 11, 49) with the start(program, QStringList args) overload so partDevice cannot be word-split into extra arguments.",
+    "Verify what getPartcloneExecuter(DDevicePartInfo(partDevice)) can return; ensure the program path cannot contain whitespace/attacker data and is not itself injectable.",
+    "Check the ownership/permissions and symlink safety of /var/log/partclone.log when partclone runs (likely) as root; move to an O_EXCL|O_NOFOLLOW per-run file in a root-only dir.",
+    "Add a checked multiply (or operand bounds) around used_block * block_size and free_block * block_size before writing *used/*free.",
+    "Handle waitForStarted() == false explicitly, and add an overall time/byte cap plus a guaranteed process kill around the waitForReadyRead loop.",
+    "Confirm the mounted-branch success requires a non-null used pointer (ok stays false when used is null) is intended behavior, not a latent functional bug affecting callers."
+  ]
+}

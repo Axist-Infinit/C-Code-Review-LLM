@@ -1,0 +1,336 @@
+{
+  "subsystem": "UPX (Ultimate Packer for eXecutables) ELF64 self-decompression stub host code: PackLinuxElf64::unpack(). This is the routine that reverses UPX packing of a 64-bit ELF file — it parses the UPX overlay headers (l_info, p_info, b_info), decompresses the saved original ELF Ehdr/Phdrs into a scratch buffer, then walks the program headers to reconstruct and write each PT_LOAD extent (and, for shared libraries, restores PT_DYNAMIC/DT_INIT) to the OutputFile.",
+  "provenance": "Identified by the UPX-specific symbol vocabulary: the class/method PackLinuxElf64::unpack, UPX types and helpers upx_uint64_t / upx_byte / b_info / p_info / l_info / linfo / ph (PackHeader), the byte-swap accessors get_te16/get_te32/get_te64/get_le32, upx_adler32, UPX_MAGIC_LE32, unpackExtent/decompress/find_LOAD_gap/mem_size_valid/up4/funpad4, and the UPX-style throw* error helpers. The banner 'FILE: corpus/train/train_0138_cwe476.cpp' and the header comment '/* sample: primevul_train_2349_fixed */' confirm the origin (a PrimeVul C/C++ sample). Elf64_Ehdr/Elf64_Phdr/Elf64_Dyn are standard ELF wire structures.",
+  "trust_boundary": "The entire input file 'fi' is attacker-controlled: it is the untrusted UPX-packed ELF that the user asks upx to unpack. Every field read from it through get_te16/te32/te64/le32 is hostile — including e_phnum (both ehdri.e_phnum and the decompressed ehdr->e_phnum), e_entry, e_machine, e_ident, the p_info fields p_filesize/p_blocksize, the b_info fields sz_unc/sz_cpr, linfo.l_lsize, and every Elf64_Phdr field (p_type, p_offset, p_filesz, p_vaddr, p_flags) and Elf64_Dyn field decoded from the decompressed header block and from ibuf. The output file 'fo' is trusted (and may legitimately be NULL in a test/list pass, which is why every write is guarded by 'if (fo)'). The scratch destinations — the 1024-byte stack union u.buf and the heap buffer ibuf sized blocksize+OVERHEAD — are the assets an over-read/over-write corrupts.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0138_cwe476.cpp",
+      "lines": "2-6",
+      "code": "void PackLinuxElf64::unpack(OutputFile *fo)\n{\n    if (e_phoff != sizeof(Elf64_Ehdr)) {// Phdrs not contiguous with Ehdr\n        throwCantUnpack(\"bad e_phoff\");\n    }",
+      "explanation": "Entry point of the ELF64 unpacker. 'fo' is the output file to receive the reconstructed original executable (it can be NULL for a dry run). The first gate insists that the program-header table begins immediately after the ELF header (e_phoff == sizeof(Elf64_Ehdr)); if not, unpacking aborts. e_phoff comes from the packed file's own ehdr (a member already parsed earlier), so this is a coarse structural sanity check, not a full validation of the phdr table."
+    },
+    {
+      "file": "corpus/train/train_0138_cwe476.cpp",
+      "lines": "7-10",
+      "code": "    unsigned const c_phnum = get_te16(&ehdri.e_phnum);\n    upx_uint64_t old_data_off = 0;\n    upx_uint64_t old_data_len = 0;\n    upx_uint64_t old_dtinit = 0;",
+      "explanation": "c_phnum is the number of program headers in the *compressed* container's ELF header (ehdri), read as a target-endian 16-bit value so it can be 0..65535, fully attacker-controlled. old_data_off/old_data_len will later hold the file offset and size of the second PT_LOAD of a shared library, and old_dtinit the saved DT_INIT value to restore. All three are 64-bit unsigned quantities that will be filled from attacker-supplied phdr fields."
+    },
+    {
+      "file": "corpus/train/train_0138_cwe476.cpp",
+      "lines": "12-19",
+      "code": "    unsigned szb_info = sizeof(b_info);\n    {\n        upx_uint64_t const e_entry = get_te64(&ehdri.e_entry);\n        if (e_entry < 0x401180\n        &&  get_te16(&ehdri.e_machine)==Elf64_Ehdr::EM_386) { /* old style, 8-byte b_info */\n            szb_info = 2*sizeof(unsigned);\n        }\n    }",
+      "explanation": "Chooses the on-disk size of the per-block b_info header. Normally it is sizeof(b_info); but for very old EM_386 packs whose entry point is below 0x401180 it is shrunk to two unsigned words (8 bytes). e_entry and e_machine are read from the untrusted ehdri, so the attacker selects which b_info layout the parser uses; szb_info is threaded through every subsequent readx and seek that skips a block header."
+    },
+    {
+      "file": "corpus/train/train_0138_cwe476.cpp",
+      "lines": "21-23",
+      "code": "    fi->seek(overlay_offset - sizeof(l_info), SEEK_SET);\n    fi->readx(&linfo, sizeof(linfo));\n    lsize = get_te16(&linfo.l_lsize);",
+      "explanation": "Positions the input just before the UPX overlay and reads the l_info structure. lsize is taken from linfo.l_lsize as a target-endian 16-bit field (0..65535) — it is the size of the UPX loader stub, and it is attacker-controlled. 'overlay_offset' is a class member computed earlier from the packed file; the subtraction 'overlay_offset - sizeof(l_info)' is a file position, not a memory index."
+    },
+    {
+      "file": "corpus/train/train_0138_cwe476.cpp",
+      "lines": "24-29",
+      "code": "    p_info hbuf;  fi->readx(&hbuf, sizeof(hbuf));\n    unsigned orig_file_size = get_te32(&hbuf.p_filesize);\n    blocksize = get_te32(&hbuf.p_blocksize);\n    if (file_size > (off_t)orig_file_size || blocksize > orig_file_size\n        || !mem_size_valid(1, blocksize, OVERHEAD))\n        throwCantUnpack(\"p_info corrupted\");",
+      "explanation": "Reads the UPX p_info record and extracts orig_file_size (the size the original executable should decompress to) and blocksize (the maximum size of any single compressed block). Both are 32-bit target-endian, attacker-controlled. The guard rejects the file if the packed file is larger than the claimed original, if blocksize exceeds orig_file_size, or if mem_size_valid(1, blocksize, OVERHEAD) reports that blocksize+OVERHEAD would be an unsafe allocation. This is the key bound that later sizes the heap buffer ibuf, so the check matters a great deal."
+    },
+    {
+      "file": "corpus/train/train_0138_cwe476.cpp",
+      "lines": "31-37",
+      "code": "#define MAX_ELF_HDR 1024\n    union {\n        unsigned char buf[MAX_ELF_HDR];\n        //struct { Elf64_Ehdr ehdr; Elf64_Phdr phdr; } e;\n    } u;\n    Elf64_Ehdr *const ehdr = (Elf64_Ehdr *) u.buf;\n    Elf64_Phdr const *phdr = 0;",
+      "explanation": "Declares the fixed 1024-byte scratch buffer u.buf that will receive the decompressed original ELF header plus its program-header table. 'ehdr' aliases the start of u.buf as an Elf64_Ehdr; 'phdr' is a program-header cursor initialised to NULL. Because sizeof(Elf64_Ehdr) is 64 and sizeof(Elf64_Phdr) is 56, at most (1024-64)/56 ≈ 17 program headers physically fit in u.buf — a hard capacity that later loops driven by the attacker-chosen e_phnum do not enforce."
+    },
+    {
+      "file": "corpus/train/train_0138_cwe476.cpp",
+      "lines": "39-47",
+      "code": "    ibuf.alloc(blocksize + OVERHEAD);\n    b_info bhdr; memset(&bhdr, 0, sizeof(bhdr));\n    fi->readx(&bhdr, szb_info);\n    ph.u_len = get_te32(&bhdr.sz_unc);\n    ph.c_len = get_te32(&bhdr.sz_cpr);\n    if (ph.c_len > (unsigned)file_size || ph.c_len == 0 || ph.u_len == 0\n    ||  ph.u_len > sizeof(u))\n        throwCantUnpack(\"b_info corrupted\");\n    ph.filter_cto = bhdr.b_cto8;",
+      "explanation": "Allocates the heap decompression buffer ibuf with capacity blocksize+OVERHEAD (blocksize was bounded above), then reads the first b_info block header. sz_unc/sz_cpr are the uncompressed and compressed lengths of the first block, both attacker-controlled 32-bit values, stored into ph.u_len/ph.c_len. The guard rejects zero lengths, a compressed length larger than the whole file, and — crucially — an uncompressed length larger than sizeof(u) (1024), which bounds the decompression destination for the header block. filter_cto stores the unfilter parameter byte."
+    },
+    {
+      "file": "corpus/train/train_0138_cwe476.cpp",
+      "lines": "49-53",
+      "code": "    // Uncompress Ehdr and Phdrs.\n    if (ibuf.getSize() < ph.c_len  ||  sizeof(u) < ph.u_len)\n        throwCompressedDataViolation();\n    fi->readx(ibuf, ph.c_len);\n    decompress(ibuf, (upx_byte *)ehdr, false);",
+      "explanation": "Re-checks that the compressed length fits the heap buffer and the uncompressed length fits u.buf, reads ph.c_len compressed bytes into ibuf, and decompresses them into u.buf via 'ehdr'. After this call, u.buf holds the reconstructed original Elf64_Ehdr followed by its program headers. The destination bound (sizeof(u) >= ph.u_len) protects the raw decompression byte count, but not the *number of program headers* that later loops will read out of u.buf."
+    },
+    {
+      "file": "corpus/train/train_0138_cwe476.cpp",
+      "lines": "54-65",
+      "code": "    if (ehdr->e_type   !=ehdri.e_type\n    ||  ehdr->e_machine!=ehdri.e_machine\n    ||  ehdr->e_version!=ehdri.e_version\n        // less strict for EM_PPC64 to workaround earlier bug\n    ||  !( ehdr->e_flags==ehdri.e_flags\n        || Elf64_Ehdr::EM_PPC64 == get_te16(&ehdri.e_machine))\n    ||  ehdr->e_ehsize !=ehdri.e_ehsize\n        // check EI_MAG[0-3], EI_CLASS, EI_DATA, EI_VERSION\n    ||  memcmp(ehdr->e_ident, ehdri.e_ident, Elf64_Ehdr::EI_OSABI)) {\n        throwCantUnpack(\"ElfXX_Ehdr corrupted\");\n    }\n    fi->seek(- (off_t) (szb_info + ph.c_len), SEEK_CUR);",
+      "explanation": "Cross-checks the decompressed header against the container header (type/machine/version/flags/ehsize and the first EI_OSABI bytes of e_ident) to ensure the reconstructed header is self-consistent. Note both operands (ehdr->* and ehdri.*) are attacker-influenced, so this is an internal-consistency test rather than a trust anchor. Finally it rewinds the input by szb_info+ph.c_len so the block just consumed can be re-read by unpackExtent."
+    },
+    {
+      "file": "corpus/train/train_0138_cwe476.cpp",
+      "lines": "67-71",
+      "code": "    unsigned const u_phnum = get_te16(&ehdr->e_phnum);\n    unsigned total_in = 0;\n    unsigned total_out = 0;\n    unsigned c_adler = upx_adler32(NULL, 0);\n    unsigned u_adler = upx_adler32(NULL, 0);",
+      "explanation": "u_phnum is the program-header count taken from the *decompressed* original ehdr (ehdr->e_phnum), a target-endian 16-bit value the attacker controls (0..65535). It drives every phdr-walk loop below over both u.buf and ibuf. total_in/total_out accumulate consumed/produced byte counts, and c_adler/u_adler seed the running Adler-32 checksums verified at the end."
+    },
+    {
+      "file": "corpus/train/train_0138_cwe476.cpp",
+      "lines": "73-89",
+      "code": "    // Packed ET_EXE has no PT_DYNAMIC.\n    // Packed ET_DYN has original PT_DYNAMIC for info needed by rtld.\n    bool const is_shlib = !!elf_find_ptype(Elf64_Phdr::PT_DYNAMIC, phdri, c_phnum);\n    if (is_shlib) {\n        // Unpack and output the Ehdr and Phdrs for real.\n        // This depends on position within input file fi.\n        unpackExtent(ph.u_len, fo, total_in, total_out,\n            c_adler, u_adler, false, szb_info);\n\n        // The first PT_LOAD.  Part is not compressed (for benefit of rtld.)\n        // Read enough to position the input for next unpackExtent.\n        fi->seek(0, SEEK_SET);\n        fi->readx(ibuf, overlay_offset + sizeof(hbuf) + szb_info + ph.c_len);\n        overlay_offset -= sizeof(linfo);\n        if (fo) {\n            fo->write(ibuf + ph.u_len, overlay_offset - ph.u_len);\n        }",
+      "explanation": "Determines whether this is a shared library by searching the container's program headers (phdri/c_phnum) for a PT_DYNAMIC entry. For a shlib it first unpacks the header extent, then re-reads the whole prefix of the file into ibuf using length 'overlay_offset + sizeof(hbuf) + szb_info + ph.c_len', adjusts overlay_offset, and (if writing) emits the uncompressed prefix via fo->write(ibuf + ph.u_len, overlay_offset - ph.u_len). Both the readx length and the write length are computed from attacker-controlled quantities (overlay_offset, ph.c_len, ph.u_len) that are unrelated to ibuf's blocksize+OVERHEAD capacity."
+    },
+    {
+      "file": "corpus/train/train_0138_cwe476.cpp",
+      "lines": "90-114",
+      "code": "        // Search the Phdrs of compressed\n        int n_ptload = 0;\n        phdr = (Elf64_Phdr *) (void *) (1+ (Elf64_Ehdr *)(unsigned char *)ibuf);\n        for (unsigned j=0; j < u_phnum; ++phdr, ++j) {\n            if (PT_LOAD64==get_te32(&phdr->p_type) && 0!=n_ptload++) {\n                old_data_off = get_te64(&phdr->p_offset);\n                old_data_len = get_te64(&phdr->p_filesz);\n                break;\n            }\n        }\n\n        total_in  = overlay_offset;\n        total_out = overlay_offset;\n        ph.u_len = 0;\n\n        // Decompress and unfilter the tail of first PT_LOAD.\n        phdr = (Elf64_Phdr *) (void *) (1+ ehdr);\n        for (unsigned j=0; j < u_phnum; ++phdr, ++j) {\n            if (PT_LOAD64==get_te32(&phdr->p_type)) {\n                ph.u_len = get_te64(&phdr->p_filesz) - overlay_offset;\n                break;\n            }\n        }\n        unpackExtent(ph.u_len, fo, total_in, total_out,\n            c_adler, u_adler, false, szb_info);",
+      "explanation": "Two phdr walks, both bounded only by the attacker-chosen u_phnum. The first walks the program headers embedded in ibuf (just past the ELF header) to find the second PT_LOAD and capture its file offset/size into old_data_off/old_data_len. The second walks the phdrs in u.buf to find the first PT_LOAD and sets ph.u_len to that segment's p_filesz minus overlay_offset — an unsigned 64-bit subtraction — then unpacks that many bytes. The subtraction assumes p_filesz >= overlay_offset."
+    },
+    {
+      "file": "corpus/train/train_0138_cwe476.cpp",
+      "lines": "116-137",
+      "code": "    else {  // main executable\n        // Decompress each PT_LOAD.\n        bool first_PF_X = true;\n        phdr = (Elf64_Phdr *) (void *) (1+ ehdr);  // uncompressed\n        for (unsigned j=0; j < u_phnum; ++phdr, ++j) {\n            if (PT_LOAD64==get_te32(&phdr->p_type)) {\n                unsigned const filesz = get_te64(&phdr->p_filesz);\n                unsigned const offset = get_te64(&phdr->p_offset);\n                if (fo)\n                    fo->seek(offset, SEEK_SET);\n                if (Elf64_Phdr::PF_X & get_te32(&phdr->p_flags)) {\n                    unpackExtent(filesz, fo, total_in, total_out,\n                        c_adler, u_adler, first_PF_X, szb_info);\n                    first_PF_X = false;\n                }\n                else {\n                    unpackExtent(filesz, fo, total_in, total_out,\n                        c_adler, u_adler, false, szb_info);\n                }\n            }\n        }\n    }",
+      "explanation": "The main-executable path: iterate u_phnum program headers in u.buf, and for each PT_LOAD extract filesz and offset (both narrowed from 64-bit to 'unsigned', truncating the high 32 bits), seek the output there, and unpack that extent — the first executable (PF_X) segment gets the unfilter flag. filesz flows directly into unpackExtent as the amount to produce; nothing here re-checks it against orig_file_size, so the per-segment sizes are trusted from the decompressed header."
+    },
+    {
+      "file": "corpus/train/train_0138_cwe476.cpp",
+      "lines": "138-145",
+      "code": "    phdr = phdri;\n    load_va = 0;\n    for (unsigned j=0; j < c_phnum; ++j) {\n        if (PT_LOAD64==get_te32(&phdr->p_type)) {\n            load_va = get_te64(&phdr->p_vaddr);\n            break;\n        }\n    }",
+      "explanation": "Resets the cursor to the container's program-header array phdri and scans c_phnum entries for the first PT_LOAD to recover its virtual base load_va. phdri is a class member holding the parsed container phdrs; the loop dereferences it without a local NULL check, and c_phnum is attacker-controlled."
+    },
+    {
+      "file": "corpus/train/train_0138_cwe476.cpp",
+      "lines": "146-157",
+      "code": "    if (is_shlib\n    ||  ((unsigned)(get_te64(&ehdri.e_entry) - load_va) + up4(lsize) +\n                ph.getPackHeaderSize() + sizeof(overlay_offset))\n            < up4(file_size)) {\n        // Loader is not at end; skip past it.\n        funpad4(fi);  // MATCH01\n        unsigned d_info[6]; fi->readx(d_info, sizeof(d_info));\n        if (0==old_dtinit) {\n            old_dtinit = d_info[2 + (0==d_info[0])];\n        }\n        fi->seek(lsize - sizeof(d_info), SEEK_CUR);\n    }",
+      "explanation": "If the loader stub is not at the end of the file (or always for a shlib), skip past it: align, read a 6-word d_info array, and if no DT_INIT was captured yet, take old_dtinit from d_info[2] or d_info[3] depending on whether d_info[0] is zero. Then advance by lsize - sizeof(d_info). Because lsize (from linfo.l_lsize) is attacker-controlled and only 16 bits, the seek delta 'lsize - sizeof(d_info)' is computed in unsigned/size_t arithmetic and wraps huge if lsize < 24 — a file-position anomaly rather than a memory-safety bug."
+    },
+    {
+      "file": "corpus/train/train_0138_cwe476.cpp",
+      "lines": "159-178",
+      "code": "    // The gaps between PT_LOAD and after last PT_LOAD\n    phdr = (Elf64_Phdr *) (u.buf + sizeof(*ehdr));\n    upx_uint64_t hi_offset(0);\n    for (unsigned j = 0; j < u_phnum; ++j) {\n        if (PT_LOAD64==phdr[j].p_type\n        &&  hi_offset < phdr[j].p_offset)\n            hi_offset = phdr[j].p_offset;\n    }\n    for (unsigned j = 0; j < u_phnum; ++j) {\n        unsigned const size = find_LOAD_gap(phdr, j, u_phnum);\n        if (size) {\n            unsigned const where = get_te64(&phdr[j].p_offset) +\n                                   get_te64(&phdr[j].p_filesz);\n            if (fo)\n                fo->seek(where, SEEK_SET);\n            unpackExtent(size, fo, total_in, total_out,\n                c_adler, u_adler, false, szb_info,\n                (phdr[j].p_offset != hi_offset));\n        }\n    }",
+      "explanation": "Handles the padding gaps between loadable segments. It re-bases the phdr cursor at u.buf+sizeof(Ehdr) and, over two u_phnum-bounded loops, first computes hi_offset (the maximum p_offset) then, for each gap reported by find_LOAD_gap, seeks the output to p_offset+p_filesz and unpacks the gap. Every access phdr[j] indexes the fixed 1024-byte u.buf using the attacker-controlled u_phnum with no capacity check."
+    },
+    {
+      "file": "corpus/train/train_0138_cwe476.cpp",
+      "lines": "180-192",
+      "code": "    // check for end-of-file\n    fi->readx(&bhdr, szb_info);\n    unsigned const sz_unc = ph.u_len = get_te32(&bhdr.sz_unc);\n\n    if (sz_unc == 0) { // uncompressed size 0 -> EOF\n        // note: magic is always stored le32\n        unsigned const sz_cpr = get_le32(&bhdr.sz_cpr);\n        if (sz_cpr != UPX_MAGIC_LE32)  // sz_cpr must be h->magic\n            throwCompressedDataViolation();\n    }\n    else { // extra bytes after end?\n        throwCompressedDataViolation();\n    }",
+      "explanation": "Reads a trailing b_info to confirm end-of-stream: a zero uncompressed size marks EOF, in which case the compressed-size slot must equal the UPX magic (UPX_MAGIC_LE32); any nonzero size means unexpected trailing data and is rejected. This is the terminal integrity gate on the block stream."
+    },
+    {
+      "file": "corpus/train/train_0138_cwe476.cpp",
+      "lines": "194-231",
+      "code": "    if (is_shlib) {  // the non-first PT_LOAD\n        int n_ptload = 0;\n        unsigned load_off = 0;\n        phdr = (Elf64_Phdr *) (u.buf + sizeof(*ehdr));\n        for (unsigned j= 0; j < u_phnum; ++j, ++phdr) {\n            if (PT_LOAD64==get_te32(&phdr->p_type) && 0!=n_ptload++) {\n                load_off = get_te64(&phdr->p_offset);\n                fi->seek(old_data_off, SEEK_SET);\n                fi->readx(ibuf, old_data_len);\n                total_in  += old_data_len;\n                total_out += old_data_len;\n                if (fo) {\n                    fo->seek(get_te64(&phdr->p_offset), SEEK_SET);\n                    fo->rewrite(ibuf, old_data_len);\n                }\n            }\n        }\n        // Restore DT_INIT.d_val\n        phdr = (Elf64_Phdr *) (u.buf + sizeof(*ehdr));\n        for (unsigned j= 0; j < u_phnum; ++j, ++phdr) {\n            if (phdr->PT_DYNAMIC==get_te32(&phdr->p_type)) {\n                unsigned const dyn_off = get_te64(&phdr->p_offset);\n                unsigned const dyn_len = get_te64(&phdr->p_filesz);\n                Elf64_Dyn *dyn = (Elf64_Dyn *)((unsigned char *)ibuf +\n                    (dyn_off - load_off));\n                for (unsigned j2= 0; j2 < dyn_len; ++dyn, j2 += sizeof(*dyn)) {\n                    if (dyn->DT_INIT==get_te32(&dyn->d_tag)) {\n                        if (fo) {\n                            fo->seek(sizeof(upx_uint64_t) + j2 + dyn_off, SEEK_SET);\n                            fo->rewrite(&old_dtinit, sizeof(old_dtinit));\n                            fo->seek(0, SEEK_END);\n                        }\n                        break;\n                    }\n                }\n            }\n        }\n    }",
+      "explanation": "The shared-library tail. First loop: at the second PT_LOAD it captures load_off, seeks to old_data_off, and reads old_data_len bytes into ibuf (then rewrites them to the output). Second loop: at the PT_DYNAMIC segment it forms a pointer 'ibuf + (dyn_off - load_off)' and walks dyn_len bytes of Elf64_Dyn entries looking for DT_INIT to patch old_dtinit into the output. old_data_len, dyn_off, dyn_len and load_off are all attacker-controlled 64-bit phdr fields; the pointer arithmetic (dyn_off - load_off) and the loop bound dyn_len are used to index ibuf with no check against ibuf's capacity."
+    },
+    {
+      "file": "corpus/train/train_0138_cwe476.cpp",
+      "lines": "233-243",
+      "code": "    // update header with totals\n    ph.c_len = total_in;\n    ph.u_len = total_out;\n\n    // all bytes must be written\n    if (total_out != orig_file_size)\n        throwEOFException();\n\n    // finally test the checksums\n    if (ph.c_adler != c_adler || ph.u_adler != u_adler)\n        throwChecksumError();\n#undef MAX_ELF_HDR\n}",
+      "explanation": "Final bookkeeping: record the accumulated compressed/uncompressed totals, require that the total output equals the claimed orig_file_size, and verify the running Adler-32 checksums against the stored header values. These end-of-run checks catch inconsistent streams, but they run only after all the parsing/copying above has already executed, so they do not protect the earlier memory operations."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0138_cwe476.cpp",
+      "lines": "85",
+      "code": "        fi->readx(ibuf, overlay_offset + sizeof(hbuf) + szb_info + ph.c_len);",
+      "explanation": "ibuf was allocated with capacity blocksize+OVERHEAD (line 39), a bound derived only from p_blocksize. Here the shlib path reads 'overlay_offset + sizeof(hbuf) + szb_info + ph.c_len' bytes into ibuf. overlay_offset is the (attacker-influenced) file position of the overlay and is completely unrelated to blocksize; nothing constrains this sum to <= ibuf.getSize(). If overlay_offset (plus the constants and ph.c_len) exceeds blocksize+OVERHEAD, readx writes past the end of the heap buffer — a remote heap buffer overflow (CWE-787). The implementation must clamp the read length to ibuf.getSize() or reject overlay_offset that exceeds the allocation."
+    },
+    {
+      "file": "corpus/train/train_0138_cwe476.cpp",
+      "lines": "201-202",
+      "code": "                fi->seek(old_data_off, SEEK_SET);\n                fi->readx(ibuf, old_data_len);",
+      "explanation": "old_data_len was set at line 96 from get_te64(&phdr->p_filesz) — a fully attacker-controlled 64-bit program-header field, captured while walking u_phnum entries. It is never checked against ibuf's capacity (blocksize+OVERHEAD) before this readx copies old_data_len bytes into ibuf. A crafted second PT_LOAD with a large p_filesz overflows the heap buffer (CWE-787); the subsequent fo->rewrite(ibuf, old_data_len) then also reads old_data_len bytes back out of ibuf (CWE-125). The invariant is old_data_len <= ibuf.getSize()."
+    },
+    {
+      "file": "corpus/train/train_0138_cwe476.cpp",
+      "lines": "217-219",
+      "code": "                Elf64_Dyn *dyn = (Elf64_Dyn *)((unsigned char *)ibuf +\n                    (dyn_off - load_off));\n                for (unsigned j2= 0; j2 < dyn_len; ++dyn, j2 += sizeof(*dyn)) {",
+      "explanation": "dyn_off (from p_offset) and load_off (from the second PT_LOAD's p_offset) are both attacker-controlled. The base pointer is ibuf + (dyn_off - load_off): if dyn_off < load_off the unsigned subtraction wraps to a huge value, pointing far outside ibuf; even without wrap, a large (dyn_off - load_off) points past the buffer. The loop then reads Elf64_Dyn entries for dyn_len bytes (dyn_len is p_filesz, attacker-controlled) with no bound against ibuf's size, dereferencing dyn->d_tag out of bounds (CWE-125), and can drive an out-of-bounds output rewrite (CWE-787). The invariant: dyn_off >= load_off and (dyn_off - load_off) + dyn_len <= ibuf.getSize()."
+    },
+    {
+      "file": "corpus/train/train_0138_cwe476.cpp",
+      "lines": "160-165",
+      "code": "    phdr = (Elf64_Phdr *) (u.buf + sizeof(*ehdr));\n    upx_uint64_t hi_offset(0);\n    for (unsigned j = 0; j < u_phnum; ++j) {\n        if (PT_LOAD64==phdr[j].p_type\n        &&  hi_offset < phdr[j].p_offset)\n            hi_offset = phdr[j].p_offset;",
+      "explanation": "u_phnum comes from the decompressed ehdr->e_phnum (line 67) and can be up to 65535, but u.buf is only MAX_ELF_HDR = 1024 bytes and holds at most ~17 Elf64_Phdr entries after the 64-byte Ehdr. The b_info guard (line 45) bounds the number of *decompressed bytes* to sizeof(u), but nothing bounds e_phnum against that byte count. This loop (and the identical u_phnum-bounded walks at lines 93, 107, 120, 167, 198, 213) indexes phdr[j] past the end of the 1024-byte stack union, an out-of-bounds read of stack memory (CWE-125) whose values then steer offsets/sizes handed to unpackExtent. The implementation must reject u_phnum whose phdr table would exceed the decompressed header bytes / u.buf capacity."
+    },
+    {
+      "file": "corpus/train/train_0138_cwe476.cpp",
+      "lines": "109",
+      "code": "                ph.u_len = get_te64(&phdr->p_filesz) - overlay_offset;",
+      "explanation": "This unsigned 64-bit subtraction sets the amount to decompress for the tail of the first PT_LOAD. p_filesz is attacker-controlled; if it is smaller than overlay_offset the result wraps to a value near 2^64, which is then passed to unpackExtent(ph.u_len, ...) as the uncompressed length to produce. That is the classic underflow-to-huge-size primitive (CWE-191) leading to over-long output/decompression. The code must verify p_filesz >= overlay_offset (reject when too short) before subtracting."
+    },
+    {
+      "file": "corpus/train/train_0138_cwe476.cpp",
+      "lines": "88",
+      "code": "            fo->write(ibuf + ph.u_len, overlay_offset - ph.u_len);",
+      "explanation": "Both the source pointer (ibuf + ph.u_len) and the length (overlay_offset - ph.u_len) depend on attacker-controlled values. If ph.u_len > overlay_offset the length underflows to a huge unsigned value (CWE-191), and ibuf + ph.u_len can already point past the just-read region, so the write copies far more than ibuf holds — an out-of-bounds read feeding the output (CWE-125). The invariant is ph.u_len <= overlay_offset and ph.u_len within the bytes actually read into ibuf at line 85."
+    },
+    {
+      "file": "corpus/train/train_0138_cwe476.cpp",
+      "lines": "138-141",
+      "code": "    phdr = phdri;\n    load_va = 0;\n    for (unsigned j=0; j < c_phnum; ++j) {\n        if (PT_LOAD64==get_te32(&phdr->p_type)) {",
+      "explanation": "phdr is set to the class member phdri and immediately dereferenced (phdr->p_type) inside a c_phnum-bounded loop, with no NULL guard here. If the container-parse path left phdri NULL (or if c_phnum overstates the phdri allocation), this dereferences a NULL/undersized pointer — a NULL-pointer dereference / out-of-bounds read (CWE-476 / CWE-125). Note the local cursor 'phdr' was initialised to 0 at line 37, underlining that a NULL phdr is a reachable state in this function; the implementation must guarantee phdri is non-NULL and holds c_phnum valid entries before this walk."
+    },
+    {
+      "file": "corpus/train/train_0138_cwe476.cpp",
+      "lines": "156",
+      "code": "        fi->seek(lsize - sizeof(d_info), SEEK_CUR);",
+      "explanation": "lsize is from linfo.l_lsize (attacker-controlled, 16-bit). sizeof(d_info) is 24. 'lsize - sizeof(d_info)' is evaluated in unsigned/size_t arithmetic, so any lsize < 24 wraps to a near-SIZE_MAX seek delta (CWE-191). This corrupts the input file position rather than memory directly, but a wild seek can desynchronise all subsequent readx calls (and, combined with the size fields above, contribute to the memory issues). The implementation should validate lsize >= sizeof(d_info)."
+    }
+  ],
+  "summary": "This UPX PackLinuxElf64::unpack routine parses a fully attacker-controlled packed ELF64 and reconstructs it, but trusts several attacker-supplied 64-bit program-header sizes/offsets and the decompressed e_phnum count without bounding them against the fixed 1024-byte stack union u.buf or the blocksize+OVERHEAD heap buffer ibuf. The result is a cluster of memory-safety hazards: heap overflows via readx lengths derived from overlay_offset and p_filesz (lines 85, 202), out-of-bounds reads from unbounded u_phnum phdr walks and from the (dyn_off - load_off) pointer arithmetic (lines 160-165, 217-219), and unsigned underflows in size computations (lines 88, 109, 156). Overall risk is high for a tool routinely run on untrusted binaries.",
+  "reviewed_anchors": [
+    {"anchor": "e_phoff != sizeof(Elf64_Ehdr) guard (line 4)", "disposition": "dismissed", "reason": "Structural sanity check that aborts; imposes a constraint rather than consuming a length into a buffer."},
+    {"anchor": "c_phnum = get_te16(&ehdri.e_phnum) (line 7)", "disposition": "finding", "reason": "Attacker-controlled 16-bit count that bounds the phdri walk at line 140 with no capacity check."},
+    {"anchor": "szb_info selection (lines 12-18)", "disposition": "dismissed", "reason": "Selects a header size (8 or sizeof(b_info)); both are small fixed reads into fixed structs, no overflow surface."},
+    {"anchor": "lsize = get_te16(&linfo.l_lsize) (line 23)", "disposition": "finding", "reason": "Attacker-controlled loader size used in the underflowing seek at line 156."},
+    {"anchor": "orig_file_size = get_te32(&hbuf.p_filesize) (line 25)", "disposition": "dismissed", "reason": "Used only in comparison guards (lines 27, 238); not used as a copy length."},
+    {"anchor": "blocksize = get_te32(&hbuf.p_blocksize) (line 26)", "disposition": "dismissed", "reason": "Bounded by the p_info guard and mem_size_valid before sizing ibuf; the guard is the mitigation."},
+    {"anchor": "p_info guard (lines 27-29)", "disposition": "dismissed", "reason": "This is a validation gate, the mitigation for blocksize; no contract of its own violated."},
+    {"anchor": "MAX_ELF_HDR / union u.buf[1024] (lines 31-35)", "disposition": "finding", "reason": "Fixed 1024-byte destination indexed by attacker-controlled u_phnum in multiple phdr walks."},
+    {"anchor": "Elf64_Ehdr *ehdr / Elf64_Phdr *phdr=0 (lines 36-37)", "disposition": "finding", "reason": "phdr initialised NULL; the phdr=phdri walk at line 138 can dereference a NULL/undersized pointer (CWE-476)."},
+    {"anchor": "ibuf.alloc(blocksize + OVERHEAD) (line 39)", "disposition": "finding", "reason": "Heap buffer whose capacity is exceeded by the readx at lines 85 and 202."},
+    {"anchor": "ph.u_len = get_te32(&bhdr.sz_unc) / ph.c_len = get_te32(&bhdr.sz_cpr) (lines 42-43)", "disposition": "dismissed", "reason": "Both are bounded by the b_info guard (lines 44-46) and the decompression re-check (line 50) before use as decompression sizes."},
+    {"anchor": "b_info guard (lines 44-46)", "disposition": "dismissed", "reason": "Validation gate bounding ph.u_len<=sizeof(u) and ph.c_len<=file_size; it is the mitigation, but it does NOT bound u_phnum."},
+    {"anchor": "decompress destination re-check (lines 50-53)", "disposition": "dismissed", "reason": "Correctly bounds the decompression byte count against ibuf/u.buf; the residual gap is the phdr count, tracked separately."},
+    {"anchor": "Ehdr consistency memcmp/compares (lines 54-64)", "disposition": "dismissed", "reason": "Both operands are attacker-influenced, so it is an internal-consistency check with no buffer contract."},
+    {"anchor": "u_phnum = get_te16(&ehdr->e_phnum) (line 67)", "disposition": "finding", "reason": "Attacker-controlled 16-bit count driving every phdr walk over u.buf and ibuf with no capacity bound."},
+    {"anchor": "is_shlib = elf_find_ptype(PT_DYNAMIC, phdri, c_phnum) (line 75)", "disposition": "dismissed", "reason": "Boolean classifier over container phdrs; selects a code path but carries no direct buffer contract itself."},
+    {"anchor": "fi->readx(ibuf, overlay_offset + sizeof(hbuf) + szb_info + ph.c_len) (line 85)", "disposition": "finding", "reason": "Read length derived from overlay_offset, unrelated to ibuf capacity -> heap overflow write (CWE-787)."},
+    {"anchor": "fo->write(ibuf + ph.u_len, overlay_offset - ph.u_len) (line 88)", "disposition": "finding", "reason": "Unsigned underflow of the write length when ph.u_len > overlay_offset (CWE-191)."},
+    {"anchor": "old_data_off/old_data_len = p_offset/p_filesz (lines 95-96)", "disposition": "finding", "reason": "old_data_len is used unbounded as the readx length into ibuf at line 202."},
+    {"anchor": "ph.u_len = get_te64(&phdr->p_filesz) - overlay_offset (line 109)", "disposition": "finding", "reason": "Unsigned 64-bit underflow to a huge decompress size (CWE-191)."},
+    {"anchor": "main-exec PT_LOAD loop filesz/offset (lines 120-134)", "disposition": "dismissed", "reason": "Same unbounded-u_phnum OOB read root cause as line 160-165; folded into the u_phnum finding to avoid duplicate findings."},
+    {"anchor": "phdr = phdri; c_phnum load_va loop (lines 138-145)", "disposition": "finding", "reason": "Dereferences member phdri without NULL guard (CWE-476)."},
+    {"anchor": "d_info[6] / old_dtinit = d_info[2 + (0==d_info[0])] (lines 152-154)", "disposition": "dismissed", "reason": "Index is 2 or 3 into a 6-element local array; in bounds."},
+    {"anchor": "fi->seek(lsize - sizeof(d_info), SEEK_CUR) (line 156)", "disposition": "finding", "reason": "Unsigned underflow of the seek delta when lsize < 24 (CWE-191); file-position corruption."},
+    {"anchor": "gap loops over u.buf, u_phnum bound (lines 160-178)", "disposition": "finding", "reason": "phdr[j] indexes the 1024-byte u.buf with attacker-controlled u_phnum -> OOB read (CWE-125)."},
+    {"anchor": "EOF b_info / UPX_MAGIC_LE32 check (lines 180-192)", "disposition": "dismissed", "reason": "Terminal integrity gate comparing sz_cpr to the magic; a check, not a buffer op."},
+    {"anchor": "shlib non-first PT_LOAD readx/rewrite old_data_len (lines 198-208)", "disposition": "finding", "reason": "Unbounded old_data_len copied into/out of ibuf -> heap overflow (CWE-787)."},
+    {"anchor": "dyn = ibuf + (dyn_off - load_off); dyn_len loop (lines 217-219)", "disposition": "finding", "reason": "Pointer underflow plus unbounded dyn_len walk of ibuf -> OOB read/write (CWE-125/191)."},
+    {"anchor": "fo->rewrite(&old_dtinit, sizeof(old_dtinit)) at computed offset (lines 221-224)", "disposition": "dismissed", "reason": "Writes a fixed 8 bytes to the output file at an attacker-chosen offset; output file is trusted and offset is a file position, not a memory index."},
+    {"anchor": "totals / orig_file_size / adler checks (lines 234-243)", "disposition": "dismissed", "reason": "Post-hoc integrity checks; run after all copies, so they gate acceptance but not the earlier memory ops."}
+  ],
+  "findings": [
+    {
+      "title": "Heap overflow: readx length derived from overlay_offset exceeds ibuf capacity",
+      "anchor": "fi->readx(ibuf, overlay_offset + sizeof(hbuf) + szb_info + ph.c_len);",
+      "file": "corpus/train/train_0138_cwe476.cpp",
+      "line": "85",
+      "code": "        fi->readx(ibuf, overlay_offset + sizeof(hbuf) + szb_info + ph.c_len);",
+      "bug_class": "Heap buffer overflow (unbounded copy length)",
+      "cwe": "CWE-787",
+      "severity": "critical",
+      "where_it_lives": "corpus/train/train_0138_cwe476.cpp (shlib branch of PackLinuxElf64::unpack)",
+      "invariant": "The number of bytes read into ibuf must never exceed ibuf.getSize() (== blocksize + OVERHEAD).",
+      "failure_mode": "ibuf is sized from p_blocksize alone, but the read length adds overlay_offset (the attacker-controlled overlay file position) plus ph.c_len. A packed shared library with a large overlay_offset/ph.c_len makes the sum exceed blocksize+OVERHEAD, so readx writes past the heap allocation, corrupting adjacent heap memory and enabling remote code execution when upx unpacks the file.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm whether readx clamps to ibuf.getSize() or whether overlay_offset+sizeof(hbuf)+szb_info+ph.c_len is validated <= ibuf.getSize() before this call."
+    },
+    {
+      "title": "Heap overflow: attacker-controlled old_data_len (p_filesz) copied into ibuf",
+      "anchor": "fi->readx(ibuf, old_data_len);",
+      "file": "corpus/train/train_0138_cwe476.cpp",
+      "line": "202",
+      "code": "                fi->readx(ibuf, old_data_len);",
+      "bug_class": "Heap buffer overflow (unchecked length field)",
+      "cwe": "CWE-787",
+      "severity": "critical",
+      "where_it_lives": "corpus/train/train_0138_cwe476.cpp (shlib non-first PT_LOAD, PackLinuxElf64::unpack)",
+      "invariant": "old_data_len (from the second PT_LOAD's p_filesz) must be <= ibuf.getSize() before being used as a read/rewrite length.",
+      "failure_mode": "old_data_len is set at line 96 from get_te64(&phdr->p_filesz), a 64-bit attacker-controlled program-header field, and is never checked against ibuf's blocksize+OVERHEAD capacity. A crafted second PT_LOAD with a large p_filesz overflows ibuf here (and the following fo->rewrite(ibuf, old_data_len) over-reads it), giving heap corruption / OOB read.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify old_data_len is bounded by ibuf.getSize() (and by the actual file remainder) before the readx and the subsequent rewrite."
+    },
+    {
+      "title": "Out-of-bounds read: unbounded u_phnum drives phdr walks over the fixed 1024-byte u.buf",
+      "anchor": "for (unsigned j = 0; j < u_phnum; ++j) { if (PT_LOAD64==phdr[j].p_type ...",
+      "file": "corpus/train/train_0138_cwe476.cpp",
+      "line": "160-168",
+      "code": "    phdr = (Elf64_Phdr *) (u.buf + sizeof(*ehdr));\n    upx_uint64_t hi_offset(0);\n    for (unsigned j = 0; j < u_phnum; ++j) {\n        if (PT_LOAD64==phdr[j].p_type\n        &&  hi_offset < phdr[j].p_offset)\n            hi_offset = phdr[j].p_offset;\n    }\n    for (unsigned j = 0; j < u_phnum; ++j) {\n        unsigned const size = find_LOAD_gap(phdr, j, u_phnum);",
+      "bug_class": "Out-of-bounds read (count field vs fixed buffer)",
+      "cwe": "CWE-125",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0138_cwe476.cpp (multiple phdr loops in PackLinuxElf64::unpack)",
+      "invariant": "u_phnum must be bounded so that sizeof(Elf64_Ehdr) + u_phnum*sizeof(Elf64_Phdr) <= MAX_ELF_HDR (1024) / the number of decompressed header bytes.",
+      "failure_mode": "u_phnum = get_te16(&ehdr->e_phnum) can be up to 65535, but u.buf holds only ~17 Elf64_Phdr entries. The b_info guard bounds the decompressed byte count, not the phdr count, so every u_phnum-bounded walk (lines 93, 107, 120, 160-168, 198, 213) reads Elf64_Phdr entries past the end of the 1024-byte stack union, leaking adjacent stack memory into offsets/sizes that then steer unpackExtent seeks and lengths.",
+      "cve_analog": "",
+      "what_to_confirm": "Check whether e_phnum is validated against (ph.u_len - sizeof(Ehdr))/sizeof(Phdr) or against MAX_ELF_HDR before these loops."
+    },
+    {
+      "title": "OOB read/write: (dyn_off - load_off) pointer underflow and unbounded dyn_len walk of ibuf",
+      "anchor": "Elf64_Dyn *dyn = (Elf64_Dyn *)((unsigned char *)ibuf + (dyn_off - load_off));",
+      "file": "corpus/train/train_0138_cwe476.cpp",
+      "line": "217-219",
+      "code": "                Elf64_Dyn *dyn = (Elf64_Dyn *)((unsigned char *)ibuf +\n                    (dyn_off - load_off));\n                for (unsigned j2= 0; j2 < dyn_len; ++dyn, j2 += sizeof(*dyn)) {",
+      "bug_class": "Out-of-bounds access (pointer underflow + unchecked length)",
+      "cwe": "CWE-125",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0138_cwe476.cpp (DT_INIT restore loop, PackLinuxElf64::unpack)",
+      "invariant": "dyn_off >= load_off and (dyn_off - load_off) + dyn_len <= ibuf.getSize(); dyn_len must be a valid multiple/size within ibuf.",
+      "failure_mode": "dyn_off, load_off and dyn_len are all attacker-controlled 64-bit phdr fields. If dyn_off < load_off the unsigned subtraction wraps huge and the base pointer lands far outside ibuf; the loop then dereferences dyn->d_tag for dyn_len bytes with no bound against ibuf's size, causing an out-of-bounds read (and, on a DT_INIT match, an attacker-directed output rewrite). Any dyn_off/dyn_len past the buffer over-reads heap memory.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the code checks dyn_off >= load_off and that (dyn_off - load_off) + dyn_len stays within ibuf before dereferencing dyn."
+    },
+    {
+      "title": "Unsigned underflow: p_filesz - overlay_offset yields a huge decompress size",
+      "anchor": "ph.u_len = get_te64(&phdr->p_filesz) - overlay_offset;",
+      "file": "corpus/train/train_0138_cwe476.cpp",
+      "line": "109",
+      "code": "                ph.u_len = get_te64(&phdr->p_filesz) - overlay_offset;",
+      "bug_class": "Integer underflow (unsigned subtraction) feeding a size",
+      "cwe": "CWE-191",
+      "severity": "high",
+      "where_it_lives": "corpus/train/train_0138_cwe476.cpp (shlib first PT_LOAD tail, PackLinuxElf64::unpack)",
+      "invariant": "p_filesz of the first PT_LOAD must be >= overlay_offset before the subtraction; reject the file otherwise.",
+      "failure_mode": "p_filesz is attacker-controlled. If it is smaller than overlay_offset, the 64-bit unsigned subtraction wraps to a value near 2^64, which is passed to unpackExtent as ph.u_len (the amount to produce), driving an over-long decompression/output — a classic underflow-to-huge-size primitive.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify a 'reject if p_filesz < overlay_offset' guard exists before this subtraction."
+    },
+    {
+      "title": "Unsigned underflow: overlay_offset - ph.u_len as an oversized write length",
+      "anchor": "fo->write(ibuf + ph.u_len, overlay_offset - ph.u_len);",
+      "file": "corpus/train/train_0138_cwe476.cpp",
+      "line": "88",
+      "code": "            fo->write(ibuf + ph.u_len, overlay_offset - ph.u_len);",
+      "bug_class": "Integer underflow (unsigned subtraction) feeding a length",
+      "cwe": "CWE-191",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0138_cwe476.cpp (shlib prefix write, PackLinuxElf64::unpack)",
+      "invariant": "ph.u_len <= overlay_offset, and ibuf must actually contain overlay_offset bytes read at line 85.",
+      "failure_mode": "If ph.u_len > overlay_offset the length 'overlay_offset - ph.u_len' wraps to a huge unsigned value and the source pointer ibuf+ph.u_len may already point past the read region, so fo->write copies far beyond ibuf's contents — an out-of-bounds read into the output. Reachable only when fo is non-NULL.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm ph.u_len is validated <= overlay_offset and within the bytes read into ibuf before this write."
+    },
+    {
+      "title": "Possible NULL/undersized pointer dereference of phdri in the load_va scan",
+      "anchor": "phdr = phdri; ... if (PT_LOAD64==get_te32(&phdr->p_type))",
+      "file": "corpus/train/train_0138_cwe476.cpp",
+      "line": "138-141",
+      "code": "    phdr = phdri;\n    load_va = 0;\n    for (unsigned j=0; j < c_phnum; ++j) {\n        if (PT_LOAD64==get_te32(&phdr->p_type)) {",
+      "bug_class": "NULL pointer / out-of-bounds dereference",
+      "cwe": "CWE-476",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided) — depends on how phdri is populated for the container",
+      "invariant": "phdri must be non-NULL and point to at least c_phnum valid Elf64_Phdr entries before this walk.",
+      "failure_mode": "phdr is assigned the class member phdri and dereferenced (phdr->p_type) inside a c_phnum-bounded loop with no local NULL/size check. If the container-parse path left phdri NULL (the local phdr was even initialised to 0 at line 37) or if the attacker-controlled c_phnum overstates the phdri allocation, this reads through a NULL/undersized pointer, crashing or reading out of bounds.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm phdri is guaranteed non-NULL with c_phnum valid entries at this point (i.e. the container phdr table was successfully parsed and bounded)."
+    },
+    {
+      "title": "Unsigned underflow of seek delta when lsize < sizeof(d_info)",
+      "anchor": "fi->seek(lsize - sizeof(d_info), SEEK_CUR);",
+      "file": "corpus/train/train_0138_cwe476.cpp",
+      "line": "156",
+      "code": "        fi->seek(lsize - sizeof(d_info), SEEK_CUR);",
+      "bug_class": "Integer underflow (unsigned subtraction) in file positioning",
+      "cwe": "CWE-191",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0138_cwe476.cpp (loader-skip block, PackLinuxElf64::unpack)",
+      "invariant": "lsize (linfo.l_lsize) must be >= sizeof(d_info) (24) before computing the skip delta.",
+      "failure_mode": "lsize is an attacker-controlled 16-bit field. 'lsize - sizeof(d_info)' is computed in unsigned/size_t arithmetic, so lsize < 24 wraps to a near-SIZE_MAX seek offset, desynchronising the input file position for all subsequent readx calls. This is a robustness/position-corruption issue rather than a direct memory-safety break.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify lsize is validated >= sizeof(d_info) before this seek."
+    }
+  ],
+  "audit_checklist": [
+    "Bound e_phnum/u_phnum against (decompressed header bytes - sizeof(Ehdr))/sizeof(Phdr) and MAX_ELF_HDR before every phdr walk over u.buf and ibuf.",
+    "Clamp the line-85 readx length (overlay_offset + sizeof(hbuf) + szb_info + ph.c_len) to ibuf.getSize(), or reject overlay_offset that would exceed the allocation.",
+    "Validate old_data_len (p_filesz of the 2nd PT_LOAD) <= ibuf.getSize() and <= remaining file bytes before readx/rewrite at lines 202/207.",
+    "Guard the DT_INIT loop: require dyn_off >= load_off and (dyn_off - load_off) + dyn_len <= ibuf.getSize() before forming the dyn pointer (lines 217-219).",
+    "Add 'reject if too short before subtracting' guards for p_filesz - overlay_offset (line 109), overlay_offset - ph.u_len (line 88), and lsize - sizeof(d_info) (line 156).",
+    "Confirm phdri is non-NULL and holds c_phnum valid entries before the load_va scan at line 138.",
+    "Check that filesz/offset truncation from 64-bit to unsigned in the main-exec loop (lines 122-123) cannot drop high bits to bypass later bounds.",
+    "Ensure the final orig_file_size / Adler-32 checks (lines 238-243) are not the only defense — they run after all copies have executed."
+  ]
+}

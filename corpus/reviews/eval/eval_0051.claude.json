@@ -1,0 +1,251 @@
+{
+  "subsystem": "TensorFlow CPU kernel: the grouped (depthwise-of-groups) 2-D convolution launch functor. This is the operator() of the `LaunchGrouped`/grouped-conv helper used by the Conv2D op family. It reshapes the input and filter tensors so that the convolution 'group' becomes a leading dimension, runs a per-group SpatialConvolution on Eigen tensor chips, then shuffles the result back. It processes floating tensors that flow through a TensorFlow graph/SavedModel at Conv2D execution time.",
+  "provenance": "Identified by TensorFlow-specific types and idioms: `OpKernelContext* ctx`, `Tensor`, `TensorShape`, `TensorFormat`/`FORMAT_NHWC`, `Padding`/`EXPLICIT`, `ctx->eigen_device<CPUDevice>()`, Eigen `tensor<T,5>()`/`shaped<T,5>()`/`.shuffle()`/`.chip<0>()`, `functor::SpatialConvolution<CPUDevice,T>`, `BrainPadding2EigenPadding`, and `absl::BlockingCounter`. These are the internal APIs of tensorflow/core/kernels/conv_ops (grouped convolution path). The sample banner `primevul_test_0013_vuln` and filename `eval_0051_cwe354.cpp` are provenance hints only and were not used to judge the code.",
+  "trust_boundary": "In TensorFlow the shapes and attributes reaching this kernel are attacker-influenced: a malicious or crafted SavedModel/GraphDef, or crafted feeds to a served model, control `input.dim_size(3)` (in_depth), `filter.dim_size(2)` (patch_depth), the `padding` enum, and the `explicit_paddings` vector contents/length (an op attribute). None of these are validated inside this function. An adversary who can submit a model or its inputs can therefore drive `patch_depth`, `in_depth`, and `explicit_paddings.size()` to hostile values (zero, non-divisor, too-short). The op's shape-inference/`Compute` layer is supposed to validate these, but this launcher assumes it already did.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/eval/eval_0051_cwe354.cpp",
+      "lines": "2-6",
+      "code": "  void operator()(OpKernelContext* ctx, const Tensor& input,\n                  const Tensor& filter, int row_stride, int col_stride,\n                  int row_dilation, int col_dilation, const Padding& padding,\n                  const std::vector<int64_t>& explicit_paddings, Tensor* output,\n                  TensorFormat data_format) {",
+      "explanation": "The entry point is a function-object `operator()` that launches a grouped convolution. `ctx` is the op-kernel context (provides the Eigen device and error reporting). `input` and `filter` are the read-only 4-D convolution operands. `row_stride`/`col_stride`/`row_dilation`/`col_dilation` are convolution geometry ints. `padding` is an enum (SAME/VALID/EXPLICIT). `explicit_paddings` is a caller-supplied vector of pad amounts used only when padding==EXPLICIT. `output` is the writable result tensor. `data_format` describes the memory layout (NHWC vs NCHW). All shape/count values consumed below come from these tensors' `dim_size()` and from `explicit_paddings`, so this signature is the trust boundary."
+    },
+    {
+      "file": "corpus/eval/eval_0051_cwe354.cpp",
+      "lines": "7-9",
+      "code": "    DCHECK(data_format == FORMAT_NHWC)\n        << \"Grouped conv implementation only \"\n           \"supports NHWC tensor format for now.\";",
+      "explanation": "A debug assertion states that the grouped path only supports the NHWC layout. Everything after this line assumes NHWC, i.e. that the channel/depth is the last (index-3) dimension. `DCHECK` is a *debug-only* macro in TensorFlow: it is compiled to a no-op in optimized/release builds, so in production this is documentation, not an enforced precondition."
+    },
+    {
+      "file": "corpus/eval/eval_0051_cwe354.cpp",
+      "lines": "11-13",
+      "code": "    const int64_t in_depth = input.dim_size(3);\n    const int64_t patch_depth = filter.dim_size(2);\n    const int64_t num_groups = in_depth / patch_depth;",
+      "explanation": "`in_depth` is the number of input channels (last NHWC dim). `patch_depth` is the filter's input-channel-per-group depth (filter dim 2). `num_groups` is derived by integer division `in_depth / patch_depth`. This single division defines how many independent convolution groups exist and is used as a dimension size and loop bound throughout the rest of the function. It is computed directly from two attacker-influenced tensor dimensions with no guard that `patch_depth != 0` or that it divides `in_depth` evenly."
+    },
+    {
+      "file": "corpus/eval/eval_0051_cwe354.cpp",
+      "lines": "15-16",
+      "code": "    // Shuffle input/filter tensors to have group as a leading dimension.\n    std::array<int64_t, 5> shuffle({3, 0, 1, 2, 4});",
+      "explanation": "A fixed permutation `{3,0,1,2,4}` used with Eigen's `.shuffle()` to move the (newly introduced) group axis to the front. The pre-shuffle layout places `num_groups` at index 3 and this permutation rotates it to index 0, giving a 5-D tensor whose leading dimension is the group. The array is a compile-time constant and carries no attacker data itself."
+    },
+    {
+      "file": "corpus/eval/eval_0051_cwe354.cpp",
+      "lines": "18-22",
+      "code": "    // Compute pre shuffle dimemnsions.\n    auto pre_shuffle = [&](const Tensor& tensor) -> std::array<int64, 5> {\n      return {tensor.dim_size(0), tensor.dim_size(1), tensor.dim_size(2),\n              num_groups, tensor.dim_size(3) / num_groups};\n    };",
+      "explanation": "`pre_shuffle` maps a 4-D tensor's shape to a 5-D shape by splitting the last dimension into `{num_groups, dim_size(3) / num_groups}`. This is used to *reinterpret* the flat tensor buffer as a 5-D tensor via `shaped<T,5>()`. Correctness depends on `num_groups` evenly dividing `dim_size(3)` so that the product of the 5 dimensions equals the original element count; otherwise the reinterpreted shape describes more or fewer elements than the buffer holds. It also divides by `num_groups`, which can be zero."
+    },
+    {
+      "file": "corpus/eval/eval_0051_cwe354.cpp",
+      "lines": "24-28",
+      "code": "    // Compute post shuffle dimemnsions.\n    auto post_shuffle = [&](const Tensor& tensor) -> std::array<int64, 5> {\n      return {num_groups, tensor.dim_size(0), tensor.dim_size(1),\n              tensor.dim_size(2), tensor.dim_size(3) / num_groups};\n    };",
+      "explanation": "`post_shuffle` produces the shape *after* the group axis has been rotated to the front: `{num_groups, d0, d1, d2, dim_size(3)/num_groups}`. It is used to allocate the temporary shuffled tensors (`TensorShape(post_shuffle(...))`). Like `pre_shuffle` it divides `dim_size(3)` by `num_groups` and assumes an exact split; a wrong or zero `num_groups` corrupts the allocated shape."
+    },
+    {
+      "file": "corpus/eval/eval_0051_cwe354.cpp",
+      "lines": "30-33",
+      "code": "    auto& device = ctx->eigen_device<CPUDevice>();\n\n    absl::BlockingCounter shuffles_completed(2);\n    auto on_shuffled = [&]() { shuffles_completed.DecrementCount(); };",
+      "explanation": "`device` is the Eigen CPU device used to schedule the async shuffle assignments. `shuffles_completed` is a countdown latch initialized to 2 (one for input, one for filter). `on_shuffled` is the completion callback that decrements the latch; it is passed to the two device assignments so the code can wait until both async shuffles finish."
+    },
+    {
+      "file": "corpus/eval/eval_0051_cwe354.cpp",
+      "lines": "35-38",
+      "code": "    // Shuffle input into temporary tensor.\n    Tensor input_shuffled(input.dtype(), TensorShape(post_shuffle(input)));\n    input_shuffled.tensor<T, 5>().device(device, on_shuffled) =\n        input.shaped<T, 5>(pre_shuffle(input)).shuffle(shuffle);",
+      "explanation": "Allocates a temporary `input_shuffled` tensor with the post-shuffle shape, then asynchronously computes it by reinterpreting `input` as a 5-D tensor with the pre-shuffle shape and applying the `{3,0,1,2,4}` permutation. The `shaped<T,5>(pre_shuffle(input))` call is a zero-copy reinterpretation of the existing buffer: if the pre-shuffle dimensions do not multiply back to the true element count, this reads/writes out of the buffer's bounds. Completion signals `on_shuffled`."
+    },
+    {
+      "file": "corpus/eval/eval_0051_cwe354.cpp",
+      "lines": "40-43",
+      "code": "    // Shuffle filter into temporary tensor.\n    Tensor filter_shuffled(filter.dtype(), TensorShape(post_shuffle(filter)));\n    filter_shuffled.tensor<T, 5>().device(device, on_shuffled) =\n        filter.shaped<T, 5>(pre_shuffle(filter)).shuffle(shuffle);",
+      "explanation": "Same operation for the filter tensor: allocate `filter_shuffled` with the post-shuffle shape and asynchronously fill it from the reinterpreted-and-permuted `filter`. Here the split dimension is `filter.dim_size(3) / num_groups`. Because `num_groups` was derived from `filter.dim_size(2)` (patch_depth) and `input.dim_size(3)`, a mismatch between filter and input channel counts propagates directly into this reinterpretation."
+    },
+    {
+      "file": "corpus/eval/eval_0051_cwe354.cpp",
+      "lines": "45-49",
+      "code": "    // Wait for the completion of input/filter shuffles.\n    shuffles_completed.Wait();\n\n    // Write group convolution results into temporary output tensor.\n    Tensor output_shuffled(output->dtype(), TensorShape(post_shuffle(*output)));",
+      "explanation": "Blocks until both async shuffles complete, then allocates `output_shuffled` with the post-shuffle shape derived from the caller-provided `*output` tensor. `post_shuffle(*output)` again divides `output->dim_size(3)` by `num_groups`, so the output allocation inherits the same division-by-zero / non-divisibility hazards."
+    },
+    {
+      "file": "corpus/eval/eval_0051_cwe354.cpp",
+      "lines": "51-62",
+      "code": "    for (int64_t i = 0; i < num_groups; ++i) {\n      // TODO(ezhulenev): Run this loop using `parallelFor` (regular parallelFor\n      // will lead to deadlock, SpatialConvolution has to use async Eigen\n      // assignment). This requires small changes to Eigen to support async\n      // exeuction for tensor chipping operation.\n\n      // TODO(ezhulenev): Grouped convolution should also support 1x1 filter\n      // optimization.\n\n      auto input_slice = input_shuffled.tensor<T, 5>().template chip<0>(i);\n      auto filter_slice = filter_shuffled.tensor<T, 5>().template chip<0>(i);\n      auto output_slice = output_shuffled.tensor<T, 5>().template chip<0>(i);",
+      "explanation": "Iterates once per group. For each group index `i` it takes a `chip<0>(i)` — a rank-reducing slice along the leading group axis — of the shuffled input, filter, and output tensors, yielding the per-group 4-D operands. The loop bound is `num_groups`; if that value is wrong (negative-looking via truncation, huge, or zero) the loop either does nothing, spins over too many groups, or indexes chips out of range."
+    },
+    {
+      "file": "corpus/eval/eval_0051_cwe354.cpp",
+      "lines": "64-71",
+      "code": "      if (padding == EXPLICIT) {\n        functor::SpatialConvolution<CPUDevice, T>()(\n            ctx->eigen_device<CPUDevice>(), output_slice, input_slice,\n            filter_slice, row_stride, col_stride, row_dilation, col_dilation,\n            static_cast<int>(explicit_paddings[2]),\n            static_cast<int>(explicit_paddings[3]),\n            static_cast<int>(explicit_paddings[4]),\n            static_cast<int>(explicit_paddings[5]));",
+      "explanation": "When explicit padding is requested, the per-group SpatialConvolution is invoked with four pad amounts read from fixed positions `explicit_paddings[2]`, `[3]`, `[4]`, `[5]`. These are `std::vector::operator[]` accesses with no bounds check and no verification that `explicit_paddings.size() >= 6`. The `int64_t` pad values are also truncated to `int` via `static_cast<int>`, which can wrap large/negative pad geometry into the convolution."
+    },
+    {
+      "file": "corpus/eval/eval_0051_cwe354.cpp",
+      "lines": "72-77",
+      "code": "      } else {\n        functor::SpatialConvolution<CPUDevice, T>()(\n            ctx->eigen_device<CPUDevice>(), output_slice, input_slice,\n            filter_slice, row_stride, col_stride, row_dilation, col_dilation,\n            BrainPadding2EigenPadding(padding));\n      }",
+      "explanation": "For SAME/VALID padding it calls the same SpatialConvolution functor but converts the TensorFlow `padding` enum to Eigen's padding type via `BrainPadding2EigenPadding(padding)`, without touching `explicit_paddings`. This is the non-explicit path and does not read the vector."
+    },
+    {
+      "file": "corpus/eval/eval_0051_cwe354.cpp",
+      "lines": "80-83",
+      "code": "    // Shuffle temporary output back into pre-shuffled shape.\n    std::array<int64_t, 5> rev_shuffle({1, 2, 3, 0, 4});\n    output->shaped<T, 5>(pre_shuffle(*output)).device(device) =\n        output_shuffled.tensor<T, 5>().shuffle(rev_shuffle);",
+      "explanation": "After all groups are computed, the temporary `output_shuffled` is permuted back with `{1,2,3,0,4}` (the inverse of the leading-group rotation) and written into the caller's `output` buffer, which is reinterpreted as 5-D via `pre_shuffle(*output)`. As with the input path, this reinterpretation of the real output buffer is only safe if `num_groups` evenly divides `output->dim_size(3)`."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/eval/eval_0051_cwe354.cpp",
+      "lines": "11-13",
+      "code": "    const int64_t in_depth = input.dim_size(3);\n    const int64_t patch_depth = filter.dim_size(2);\n    const int64_t num_groups = in_depth / patch_depth;",
+      "explanation": "`patch_depth` comes straight from `filter.dim_size(2)`, an attacker-controllable filter shape. If a crafted model supplies a filter whose dim 2 is 0, `in_depth / patch_depth` is an integer division by zero. On the common x86/int64 path this raises SIGFPE and crashes the whole process (a remotely triggerable denial of service for a served model). The implementation must reject `patch_depth <= 0` before this division. This is the primary hostile input path (CWE-369)."
+    },
+    {
+      "file": "corpus/eval/eval_0051_cwe354.cpp",
+      "lines": "19-27",
+      "code": "      return {tensor.dim_size(0), tensor.dim_size(1), tensor.dim_size(2),\n              num_groups, tensor.dim_size(3) / num_groups};",
+      "explanation": "Both `pre_shuffle` and `post_shuffle` compute `tensor.dim_size(3) / num_groups`. If `in_depth < patch_depth` (both positive), the earlier integer division `in_depth / patch_depth` truncates `num_groups` to 0, and this second division is then a division by zero — a second, distinct SIGFPE site reached via the shuffle-shape lambdas at lines 21 and 27. The invariant is that `num_groups >= 1` (guaranteed only if `patch_depth <= in_depth` and `patch_depth > 0`). Distinct anchor from the line-13 division because it depends on `num_groups` being zero rather than `patch_depth` being zero (CWE-369)."
+    },
+    {
+      "file": "corpus/eval/eval_0051_cwe354.cpp",
+      "lines": "36-38",
+      "code": "    Tensor input_shuffled(input.dtype(), TensorShape(post_shuffle(input)));\n    input_shuffled.tensor<T, 5>().device(device, on_shuffled) =\n        input.shaped<T, 5>(pre_shuffle(input)).shuffle(shuffle);",
+      "explanation": "`num_groups = in_depth / patch_depth` is truncating integer division, so `patch_depth` is only guaranteed to divide `in_depth` if validated upstream. When it does not divide evenly, `pre_shuffle` produces the 5-D shape `{d0,d1,d2, num_groups, in_depth/num_groups}` whose product `num_groups * (in_depth/num_groups)` is strictly less than `in_depth`, so `shaped<T,5>()` reinterprets the input buffer with a mismatched element count. This is an improper-consistency-check bug: the reshape/reinterpret is accepted without verifying it maps the same number of elements, leading to out-of-bounds reads of the input buffer during the shuffle and out-of-bounds writes when the same pattern is applied to `output` at lines 82-83. The implementation must enforce `in_depth % patch_depth == 0` (and equal filter/input group depth) before reinterpreting (CWE-125/CWE-787, the CWE-354-style missing consistency validation)."
+    },
+    {
+      "file": "corpus/eval/eval_0051_cwe354.cpp",
+      "lines": "68-71",
+      "code": "            static_cast<int>(explicit_paddings[2]),\n            static_cast<int>(explicit_paddings[3]),\n            static_cast<int>(explicit_paddings[4]),\n            static_cast<int>(explicit_paddings[5]));",
+      "explanation": "When `padding == EXPLICIT`, the code unconditionally indexes `explicit_paddings[2..5]`. `explicit_paddings` is an op attribute whose length an attacker controls; `std::vector::operator[]` performs no bounds check. If the vector has fewer than 6 elements (e.g. empty, or the wrong rank), these reads are out-of-bounds heap reads, feeding uninitialized/adjacent memory as pad amounts (info leak into computation, or a crash). The implementation must verify `explicit_paddings.size() >= 6` before indexing. The additional `static_cast<int>` truncates the int64 pad values, so oversized/negative padding can also be smuggled into SpatialConvolution (CWE-125 / CWE-20)."
+    },
+    {
+      "file": "corpus/eval/eval_0051_cwe354.cpp",
+      "lines": "7-9",
+      "code": "    DCHECK(data_format == FORMAT_NHWC)\n        << \"Grouped conv implementation only \"\n           \"supports NHWC tensor format for now.\";",
+      "explanation": "The only guard that the layout is NHWC is a `DCHECK`, which is compiled out of optimized/release builds. If `data_format` is anything else (e.g. NCHW) in production, the subsequent `dim_size(3)`/`dim_size(2)` reads interpret the wrong axes as depth, so `in_depth`, `patch_depth`, and `num_groups` are computed against the wrong dimensions — producing wrong reshapes and the same out-of-bounds / divide-by-zero hazards from mis-derived sizes. The invariant (NHWC-only) must be enforced with a real runtime `OP_REQUIRES`/error return, not a debug assert (CWE-617 / CWE-20)."
+    },
+    {
+      "file": "corpus/eval/eval_0051_cwe354.cpp",
+      "lines": "51-51",
+      "code": "    for (int64_t i = 0; i < num_groups; ++i) {",
+      "explanation": "The loop bound `num_groups` is an unvalidated derived value. Besides the divide-by-zero that prevents ever reaching this loop, a pathological but divisible pairing (e.g. very large `in_depth` with `patch_depth == 1`) yields an enormous `num_groups`, turning this into an unbounded amount of per-group work and temporary allocation — a resource-exhaustion / DoS vector. The chip indices `chip<0>(i)` also assume `num_groups` exactly equals the leading dimension of the shuffled tensors; any inconsistency between the loop count and the allocated group axis is an out-of-range chip. The implementation must bound and cross-check `num_groups` against the actual tensor shapes (CWE-834 / CWE-20)."
+    }
+  ],
+  "summary": "This TensorFlow grouped-convolution launcher derives all of its group geometry (`num_groups = in_depth / patch_depth`) and its tensor reshapes directly from attacker-influenced tensor dimensions and the `explicit_paddings` attribute, with no validation. It has two clear integer-division-by-zero crash sites (patch_depth==0 at line 13, num_groups==0 at lines 21/27), an out-of-bounds vector read of `explicit_paddings[2..5]` when the attribute is too short, and a reshape/reinterpret that assumes `patch_depth` evenly divides `in_depth` (a missing consistency check that can drive out-of-bounds tensor access). All are remotely triggerable via a crafted model/inputs.",
+  "reviewed_anchors": [
+    {"anchor": "operator()(...) signature, lines 2-6", "disposition": "dismissed", "reason": "Declares the trust boundary; the specific hostile parameters (input/filter/explicit_paddings) are covered by their own anchors."},
+    {"anchor": "DCHECK(data_format == FORMAT_NHWC), line 7", "disposition": "finding", "reason": "Debug-only guard compiled out in release; NHWC precondition is unenforced at runtime."},
+    {"anchor": "in_depth = input.dim_size(3), line 11", "disposition": "dismissed", "reason": "A read of a shape dimension; harmful only via the division that consumes it (line 13 anchor)."},
+    {"anchor": "patch_depth = filter.dim_size(2), line 12", "disposition": "finding", "reason": "Attacker-controlled divisor that can be 0 or a non-divisor; drives the line-13 division-by-zero and the reshape consistency bug."},
+    {"anchor": "num_groups = in_depth / patch_depth, line 13", "disposition": "finding", "reason": "Integer division by attacker-controlled patch_depth: division-by-zero (SIGFPE) and truncation feeding bad reshapes."},
+    {"anchor": "std::array<int64_t,5> shuffle({3,0,1,2,4}), line 16", "disposition": "dismissed", "reason": "Compile-time constant permutation; carries no attacker data."},
+    {"anchor": "pre_shuffle lambda, lines 19-22 (tensor.dim_size(3) / num_groups)", "disposition": "finding", "reason": "Divides by num_groups (can be 0) and assumes an exact split; used for buffer reinterpretation."},
+    {"anchor": "post_shuffle lambda, lines 25-28 (tensor.dim_size(3) / num_groups)", "disposition": "finding", "reason": "Same division-by-num_groups and exact-split assumption; used to allocate temp tensor shapes."},
+    {"anchor": "device = ctx->eigen_device<CPUDevice>(), line 30", "disposition": "dismissed", "reason": "Obtains the compute device; no attacker-controlled contract."},
+    {"anchor": "absl::BlockingCounter shuffles_completed(2), line 32 / on_shuffled, line 33", "disposition": "dismissed", "reason": "Fixed count of 2 matched by two async assignments; latch is balanced and not attacker-influenced."},
+    {"anchor": "input_shuffled alloc + shaped<T,5>(pre_shuffle(input)).shuffle, lines 36-38", "disposition": "finding", "reason": "Zero-copy reinterpretation whose 5-D shape may not match the buffer's element count -> OOB read."},
+    {"anchor": "filter_shuffled alloc + shaped<T,5>(pre_shuffle(filter)).shuffle, lines 41-43", "disposition": "dismissed", "reason": "Same reinterpretation hazard as the input path (lines 36-38 finding); not materially distinct."},
+    {"anchor": "shuffles_completed.Wait() + output_shuffled alloc, lines 46-49", "disposition": "dismissed", "reason": "Shares the post_shuffle division/consistency hazards already captured; the Wait itself is balanced."},
+    {"anchor": "for (int64_t i = 0; i < num_groups; ++i), line 51", "disposition": "finding", "reason": "Unvalidated loop bound: unbounded work/allocation (DoS) and chip-index assumptions."},
+    {"anchor": "chip<0>(i) slices, lines 60-62", "disposition": "dismissed", "reason": "Correct as long as num_groups matches the allocated leading dim; captured under the line-51 loop-bound finding."},
+    {"anchor": "explicit_paddings[2..5], lines 68-71", "disposition": "finding", "reason": "Unchecked std::vector indexing; OOB read when explicit_paddings.size() < 6, plus int64->int truncation."},
+    {"anchor": "else branch BrainPadding2EigenPadding(padding), lines 72-77", "disposition": "dismissed", "reason": "Enum conversion on the non-explicit path; does not touch attacker-length data."},
+    {"anchor": "rev_shuffle + output->shaped<T,5>(pre_shuffle(*output)).device, lines 81-83", "disposition": "dismissed", "reason": "Write-side of the reinterpretation hazard already captured by the lines 36-38 finding (same non-divisibility root cause)."}
+  ],
+  "findings": [
+    {
+      "title": "Division by zero from attacker-controlled filter depth (patch_depth == 0)",
+      "anchor": "num_groups = in_depth / patch_depth",
+      "file": "corpus/eval/eval_0051_cwe354.cpp",
+      "line": "12-13",
+      "code": "    const int64_t patch_depth = filter.dim_size(2);\n    const int64_t num_groups = in_depth / patch_depth;",
+      "bug_class": "Integer division by zero (SIGFPE crash / DoS)",
+      "cwe": "CWE-369",
+      "severity": "high",
+      "where_it_lives": "corpus/eval/eval_0051_cwe354.cpp (this launcher) with the missing guard belonging in the Conv2D op's Compute/shape-validation (implementation, file not provided)",
+      "invariant": "patch_depth (filter.dim_size(2)) must be strictly greater than 0 before it is used as a divisor.",
+      "failure_mode": "A crafted model/filter with dim 2 == 0 makes `in_depth / patch_depth` a division by zero, raising SIGFPE and terminating the process — a remotely triggerable denial of service on any served model that reaches the grouped-conv path.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify an OP_REQUIRES / early error rejects patch_depth <= 0 before line 13 in the calling op; confirm no upstream shape-inference guarantees patch_depth > 0 for all inputs."
+    },
+    {
+      "title": "Second division by zero when num_groups truncates to 0 (in_depth < patch_depth)",
+      "anchor": "tensor.dim_size(3) / num_groups (pre_shuffle / post_shuffle)",
+      "file": "corpus/eval/eval_0051_cwe354.cpp",
+      "line": "21",
+      "code": "              num_groups, tensor.dim_size(3) / num_groups};",
+      "bug_class": "Integer division by zero (SIGFPE crash / DoS)",
+      "cwe": "CWE-369",
+      "severity": "high",
+      "where_it_lives": "corpus/eval/eval_0051_cwe354.cpp (pre_shuffle at line 21 and post_shuffle at line 27)",
+      "invariant": "num_groups must be >= 1, which holds only if 0 < patch_depth <= in_depth.",
+      "failure_mode": "If patch_depth > in_depth (both positive), `in_depth / patch_depth` truncates num_groups to 0, and the shuffle-shape lambdas then evaluate `dim_size(3) / 0`, a second SIGFPE reached when the temporary tensors are shaped/allocated (lines 36, 41, 49, 82).",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm whether upstream validation guarantees in_depth >= patch_depth; if not, add a num_groups >= 1 check before the shuffle lambdas are invoked."
+    },
+    {
+      "title": "Out-of-bounds read of explicit_paddings when the attribute is shorter than 6",
+      "anchor": "explicit_paddings[2] .. explicit_paddings[5]",
+      "file": "corpus/eval/eval_0051_cwe354.cpp",
+      "line": "68-71",
+      "code": "            static_cast<int>(explicit_paddings[2]),\n            static_cast<int>(explicit_paddings[3]),\n            static_cast<int>(explicit_paddings[4]),\n            static_cast<int>(explicit_paddings[5]));",
+      "bug_class": "Out-of-bounds read (unchecked container index) / missing input validation",
+      "cwe": "CWE-125",
+      "severity": "medium",
+      "where_it_lives": "corpus/eval/eval_0051_cwe354.cpp (indexing site) with the size check owed by the op's attribute validation (implementation, file not provided)",
+      "invariant": "explicit_paddings.size() must be >= 6 (indices 2..5 valid) before indexing when padding == EXPLICIT.",
+      "failure_mode": "explicit_paddings is an op attribute of attacker-controlled length; std::vector::operator[] does no bounds checking, so a vector with fewer than 6 elements causes out-of-bounds heap reads that feed adjacent/uninitialized memory into the convolution as pad amounts (or crash). The int64->int static_cast can additionally wrap large/negative pad geometry.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify the op validates explicit_paddings has the expected length (typically 2*num_spatial_dims+... / >= 6 here) before this branch, and that the padding values are range-checked before truncation to int."
+    },
+    {
+      "title": "Reshape/reinterpret assumes patch_depth evenly divides in_depth (missing consistency check)",
+      "anchor": "input.shaped<T, 5>(pre_shuffle(input)).shuffle(shuffle) / output->shaped<T,5>(pre_shuffle(*output))",
+      "file": "corpus/eval/eval_0051_cwe354.cpp",
+      "line": "36-38",
+      "code": "    Tensor input_shuffled(input.dtype(), TensorShape(post_shuffle(input)));\n    input_shuffled.tensor<T, 5>().device(device, on_shuffled) =\n        input.shaped<T, 5>(pre_shuffle(input)).shuffle(shuffle);",
+      "bug_class": "Out-of-bounds tensor access from inconsistent reshape (improper consistency validation)",
+      "cwe": "CWE-787",
+      "severity": "medium",
+      "where_it_lives": "corpus/eval/eval_0051_cwe354.cpp (reinterpretation at lines 36-38 and the write-back at lines 82-83)",
+      "invariant": "in_depth % patch_depth == 0 (and the equivalent for filter/output dim 3) so that num_groups * (dim_size(3)/num_groups) == dim_size(3); the reinterpreted 5-D shape must cover exactly the buffer's element count.",
+      "failure_mode": "num_groups is computed by truncating integer division, so a non-divisor patch_depth yields a 5-D shape whose element product is smaller than the real buffer. shaped<T,5>() reinterprets the buffer without re-checking the element count, so the shuffle reads past the input buffer and the symmetric write-back (lines 82-83) writes past the output buffer — an out-of-bounds read/write driven purely by shape metadata.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the caller enforces in_depth % patch_depth == 0 and that filter/input/output group depths are mutually consistent before this launcher runs; verify shaped<T,5>() is guaranteed element-count-preserving for all reachable shapes."
+    },
+    {
+      "title": "NHWC precondition enforced only by a compiled-out DCHECK",
+      "anchor": "DCHECK(data_format == FORMAT_NHWC)",
+      "file": "corpus/eval/eval_0051_cwe354.cpp",
+      "line": "7-9",
+      "code": "    DCHECK(data_format == FORMAT_NHWC)\n        << \"Grouped conv implementation only \"\n           \"supports NHWC tensor format for now.\";",
+      "bug_class": "Unenforced precondition (debug assert removed in release) leading to wrong-axis size derivation",
+      "cwe": "CWE-617",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0051_cwe354.cpp (this function) plus the op's Compute (implementation, file not provided)",
+      "invariant": "data_format must equal FORMAT_NHWC before dim_size(3)/dim_size(2) are treated as depth axes; the check must be a runtime error return, not DCHECK.",
+      "failure_mode": "In optimized builds DCHECK is a no-op. If data_format is not NHWC (e.g. NCHW), in_depth/patch_depth/num_groups are computed from the wrong axes, producing incorrect reshapes and feeding the divide-by-zero and OOB-reshape hazards above with attacker-favorable values.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm an OP_REQUIRES (or equivalent runtime gate) rejects non-NHWC formats before this launcher is invoked in release builds."
+    },
+    {
+      "title": "Unvalidated num_groups used as loop bound (resource exhaustion / chip-range assumption)",
+      "anchor": "for (int64_t i = 0; i < num_groups; ++i)",
+      "file": "corpus/eval/eval_0051_cwe354.cpp",
+      "line": "51",
+      "code": "    for (int64_t i = 0; i < num_groups; ++i) {",
+      "bug_class": "Unbounded loop / resource exhaustion from unvalidated count",
+      "cwe": "CWE-834",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0051_cwe354.cpp (loop) with bounds owed by op validation (implementation, file not provided)",
+      "invariant": "num_groups must be a sane, bounded positive value that equals the allocated leading (group) dimension of the shuffled tensors.",
+      "failure_mode": "A divisible but extreme pairing (e.g. huge in_depth with patch_depth == 1) makes num_groups enormous, driving unbounded per-group temporary allocation and compute — a memory/CPU exhaustion DoS — while any mismatch between num_groups and the shuffled tensors' leading dim makes chip<0>(i) index out of range.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify num_groups is bounded and exactly matches post_shuffle's leading dimension, and that total allocation is capped, before entering the loop."
+    }
+  ],
+  "audit_checklist": [
+    "Reject patch_depth (filter.dim_size(2)) <= 0 before computing num_groups = in_depth / patch_depth (line 13).",
+    "Guarantee num_groups >= 1 (i.e. patch_depth <= in_depth) before the pre_shuffle/post_shuffle divisions at lines 21 and 27.",
+    "Enforce in_depth % patch_depth == 0 and mutual consistency of input/filter/output group depths so every shaped<T,5>() reinterpretation preserves the buffer's element count (lines 36-38, 41-43, 49, 82-83).",
+    "Validate explicit_paddings.size() >= 6 (and range-check the values) before indexing explicit_paddings[2..5] on the EXPLICIT path (lines 68-71), and audit the int64->int truncation.",
+    "Replace the DCHECK NHWC precondition with a runtime OP_REQUIRES so non-NHWC formats are rejected in release builds (lines 7-9).",
+    "Bound num_groups and cap total temporary allocation before the per-group loop (line 51); confirm num_groups matches the allocated leading dimension used by chip<0>(i).",
+    "Confirm which upstream op (Conv2D Compute/shape-inference) is responsible for these checks and that no code path reaches this launcher with unvalidated shapes/attributes."
+  ]
+}

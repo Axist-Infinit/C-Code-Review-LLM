@@ -1,0 +1,147 @@
+{
+  "subsystem": "QEMU device emulation for the SMSC LAN9118 10/100 Ethernet controller. This function, do_tx_packet(), is the transmit-completion routine: it takes a fully-assembled TX packet out of the device's TX data FIFO, hands it to the QEMU network backend (either looped back to the guest or sent out on the host), and then posts a completion entry into the device's TX status FIFO, raising an interrupt when that FIFO fills.",
+  "provenance": "Identified by the strongly QEMU-specific API surface: the lan9118_state *s device-state parameter, qemu_get_queue(s->nic), qemu_send_packet()/qemu_receive_packet(), the DPRINTF() debug macro, and register/field names (phy_control with MII BMCR loopback bit 0x4000, tx_status_fifo, tx_status_fifo_head/used, int_sts, TSFF_INT, txp->cmd_b) all match hw/net/lan9118.c in the QEMU tree. The in-file banner names it corpus/eval/eval_0013_cwe835.c and the header comment tags it 'primevul_c_train_2791_fixed', indicating this is the post-fix variant of a known CWE-835 sample.",
+  "trust_boundary": "The LAN9118 is a virtual PCI/system-bus NIC exposed to the guest OS. An untrusted guest driver programs the device entirely through MMIO register writes: it sets the PHY control register (s->phy_control, including the loopback bit 0x4000), fills the TX data FIFO to populate s->txp->data / s->txp->len, and writes the per-packet command words (s->txp->cmd_b). do_tx_packet() therefore runs on fully guest-controlled state. The hostile inputs are: the loopback bit (which chooses reentrant local delivery over host transmit), the packet length s->txp->len, the packet body s->txp->data, and the command word s->txp->cmd_b. The QEMU network core and the host side are trusted; the guest is the attacker.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/eval/eval_0013_cwe835.c",
+      "lines": "2-5",
+      "code": "static void do_tx_packet(lan9118_state *s)\n{\n    int n;\n    uint32_t status;",
+      "explanation": "do_tx_packet() is a file-local helper that operates on the single device-instance state struct lan9118_state *s. It is invoked when the guest has finished writing a packet into the TX data FIFO (s->txp) and the device must actually move the frame. The two locals are n, an int used later as the computed slot index into the circular TX status FIFO, and status, a uint32_t that will hold the completion word written into that FIFO. All packet data, lengths, and control bits are reached indirectly through s, which the guest has populated."
+    },
+    {
+      "file": "corpus/eval/eval_0013_cwe835.c",
+      "lines": "7-13",
+      "code": "/* FIXME: Honor TX disable, and allow queueing of packets.  */\n    if (s->phy_control & 0x4000)  {\n        /* This assumes the receive routine doesn't touch the VLANClient.  */\n        qemu_receive_packet(qemu_get_queue(s->nic), s->txp->data, s->txp->len);\n    } else {\n        qemu_send_packet(qemu_get_queue(s->nic), s->txp->data, s->txp->len);\n    }",
+      "explanation": "This block decides how to deliver the assembled frame. s->phy_control is the emulated MII Basic Mode Control Register; bit 0x4000 is the standard BMCR loopback bit. When the guest has set loopback, the frame is delivered back into the same NIC's receive path via qemu_receive_packet(); otherwise it is transmitted out to the host-side network via qemu_send_packet(). Both calls resolve the NIC's client queue with qemu_get_queue(s->nic) and pass the packet body pointer s->txp->data together with its byte length s->txp->len. The critical detail is the choice of qemu_receive_packet() (rather than qemu_send_packet()) for the loopback case: qemu_receive_packet() is QEMU's reentrancy-guarded delivery primitive, which is exactly the fix for the historical infinite-reentrancy bug in this device. The comment on the loopback branch admits an assumption that the receive routine will not disturb the VLANClient/queue object it is running inside."
+    },
+    {
+      "file": "corpus/eval/eval_0013_cwe835.c",
+      "lines": "14",
+      "code": "s->txp->fifo_used = 0;",
+      "explanation": "After the frame has been delivered, the TX packet's FIFO-used counter is reset to zero, marking the TX data FIFO as drained and ready to accept the next packet. This is bookkeeping that returns the txp sub-state to its empty baseline."
+    },
+    {
+      "file": "corpus/eval/eval_0013_cwe835.c",
+      "lines": "16-19",
+      "code": "if (s->tx_status_fifo_used == 512) {\n        /* Status FIFO full */\n        return;\n    }",
+      "explanation": "Before recording a completion entry, the routine checks whether the TX status FIFO is already full. The FIFO holds 512 entries; s->tx_status_fifo_used tracks how many are occupied. If it equals 512 there is no room, so the function returns early and silently drops the status entry (the packet itself was already delivered above). This is the guard that keeps the subsequent array store in bounds."
+    },
+    {
+      "file": "corpus/eval/eval_0013_cwe835.c",
+      "lines": "20-22",
+      "code": "/* Add entry to status FIFO.  */\n    status = s->txp->cmd_b & 0xffff0000u;\n    DPRINTF(\"Sent packet tag:%04x len %d\\n\", status >> 16, s->txp->len);",
+      "explanation": "The completion word is built from the guest-supplied TX command B word (s->txp->cmd_b), keeping only its upper 16 bits (0xffff0000u), which carry the packet tag the guest requested be echoed back in the status entry. The DPRINTF() is a compile-time-gated debug print that logs the tag (status >> 16) and the packet length; it has no runtime effect in production builds. status now holds the value to be enqueued."
+    },
+    {
+      "file": "corpus/eval/eval_0013_cwe835.c",
+      "lines": "23-25",
+      "code": "n = (s->tx_status_fifo_head + s->tx_status_fifo_used) & 511;\n    s->tx_status_fifo[n] = status;\n    s->tx_status_fifo_used++;",
+      "explanation": "This computes the write slot in the circular 512-entry status FIFO: the head index plus the current occupancy, wrapped modulo 512 via the bitmask & 511. Because the mask forces n into 0..511, the store s->tx_status_fifo[n] = status is confined to the valid index range of a 512-element array regardless of the values of head and used. The occupancy counter is then incremented to reflect the newly added entry."
+    },
+    {
+      "file": "corpus/eval/eval_0013_cwe835.c",
+      "lines": "26-29",
+      "code": "if (s->tx_status_fifo_used == 512) {\n        s->int_sts |= TSFF_INT;\n        /* TODO: Stop transmission.  */\n    }",
+      "explanation": "If adding this entry has just filled the status FIFO to its 512-entry capacity, the TX Status FIFO Full interrupt bit (TSFF_INT) is asserted in the interrupt-status register s->int_sts so the guest driver is notified. The TODO notes that transmission is not actually halted at this point, which is a functional gap but not a memory-safety issue."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/eval/eval_0013_cwe835.c",
+      "lines": "8-10",
+      "code": "if (s->phy_control & 0x4000)  {\n        /* This assumes the receive routine doesn't touch the VLANClient.  */\n        qemu_receive_packet(qemu_get_queue(s->nic), s->txp->data, s->txp->len);",
+      "explanation": "This is the security-critical anchor and the reason the sample is tagged cwe835. The guest fully controls the loopback bit 0x4000 in s->phy_control. In loopback mode the just-transmitted frame is delivered straight back into this same NIC's receive path. If that delivery were performed with the ordinary qemu_send_packet() (as an earlier version of this device did), the received frame could re-enter the guest's TX processing and call do_tx_packet() again, and so on without bound: a guest that sets loopback and keeps the TX path primed drives unbounded reentrancy/recursion, a stack-exhausting infinite loop that hangs or crashes the whole QEMU process (guest-triggerable host DoS). The invariant the implementation MUST uphold is that loopback delivery be reentrancy-safe. The shown code satisfies it by using qemu_receive_packet(), which sets QEMU's per-client reentrancy guard so a nested delivery is deferred/rejected rather than recursing. The residual review obligation is to confirm qemu_receive_packet() truly enforces that guard and that no other path (e.g. the else branch or a queued flush) can re-enter do_tx_packet() while a delivery is in flight; the loopback branch's own comment flags the fragile assumption that the receive routine 'doesn't touch the VLANClient'."
+    },
+    {
+      "file": "corpus/eval/eval_0013_cwe835.c",
+      "lines": "10-12",
+      "code": "qemu_receive_packet(qemu_get_queue(s->nic), s->txp->data, s->txp->len);\n    } else {\n        qemu_send_packet(qemu_get_queue(s->nic), s->txp->data, s->txp->len);",
+      "explanation": "Both delivery calls pass the length s->txp->len paired with the buffer s->txp->data, but neither the buffer size nor a bound on len is visible here. s->txp->data is a fixed-size TX packet buffer in lan9118_state, and s->txp->len is accumulated as the guest streams bytes into the TX data FIFO. If the FIFO-write path that fills txp does not clamp len to the size of txp->data, then len can exceed the buffer and qemu_send_packet()/qemu_receive_packet() will read past the end of s->txp->data — an out-of-bounds read that leaks adjacent QEMU heap/struct memory onto the wire or into the guest's own receive buffer (info disclosure), or crashes. This is a latent finding: the overflowing arithmetic is not in do_tx_packet() itself, it lives in the TX FIFO accumulation code that sets txp->len. The invariant is that txp->len can never exceed sizeof(txp->data); this routine trusts that upstream bound."
+    },
+    {
+      "file": "corpus/eval/eval_0013_cwe835.c",
+      "lines": "23-24",
+      "code": "n = (s->tx_status_fifo_head + s->tx_status_fifo_used) & 511;\n    s->tx_status_fifo[n] = status;",
+      "explanation": "The status-FIFO store is the kind of length-vs-fixed-buffer site that is usually dangerous, so it is worth stating explicitly why it is safe here. The index n is masked with & 511, forcing it into 0..511, and tx_status_fifo is a 512-element array, so the write cannot go out of bounds no matter what head/used contain. The full-FIFO guard at lines 16-19 additionally prevents the occupancy counter and the entries from being over-written while full. The only remaining assumption is that tx_status_fifo is declared with exactly 512 elements (matching the 511 mask and the == 512 comparisons); if a refactor shrank that array without updating the mask, this store would overflow. Confirm the declared size."
+    },
+    {
+      "file": "corpus/eval/eval_0013_cwe835.c",
+      "lines": "10",
+      "code": "qemu_receive_packet(qemu_get_queue(s->nic), s->txp->data, s->txp->len);",
+      "explanation": "qemu_get_queue(s->nic) is dereferenced by the delivery call. If s->nic is NULL — for example if do_tx_packet() could ever run before the NIC/net client is fully realized/initialized — qemu_get_queue() would operate on a NULL device and the delivery would fault (NULL pointer dereference / crash). In normal operation the NIC is created at device realize time and this is not reachable, so this is a low-severity, defense-in-depth observation rather than a live bug; it is listed for completeness of the input-validation review."
+    }
+  ],
+  "summary": "This is the fixed variant of the QEMU LAN9118 TX-completion routine. The one security-critical contract is the guest-controlled loopback path (phy_control bit 0x4000): delivering the frame back into the same NIC must be reentrancy-safe or a malicious guest triggers unbounded recursion / an infinite loop that DoSes the host QEMU process (CWE-835/CWE-674, the CVE-2021-3416 family). The shown code correctly mitigates this by using the reentrancy-guarded qemu_receive_packet() instead of qemu_send_packet(). The residual latent risk is the unbounded s->txp->len passed to the delivery calls (potential OOB read of txp->data), which depends on a bound enforced in the TX-FIFO code not shown here. The status-FIFO index is safely masked and carries no memory-safety risk.",
+  "reviewed_anchors": [
+    {"anchor": "do_tx_packet(lan9118_state *s) signature", "disposition": "dismissed", "reason": "Internal helper over trusted device-state pointer; not itself an attack surface, but its body carries the contracts reviewed below."},
+    {"anchor": "int n; / uint32_t status; (locals, lines 4-5)", "disposition": "dismissed", "reason": "Local scratch variables; n is bounded by the & 511 mask before use, status is a plain value copy."},
+    {"anchor": "s->phy_control & 0x4000 (loopback select, line 8)", "disposition": "finding", "reason": "Guest-controlled bit that chooses reentrant local delivery — the trigger for the CWE-835 reentrancy hazard."},
+    {"anchor": "qemu_receive_packet(qemu_get_queue(s->nic), s->txp->data, s->txp->len) (line 10)", "disposition": "finding", "reason": "The loopback delivery whose reentrancy-safety is the entire security contract; also the NULL-queue and OOB-read anchors."},
+    {"anchor": "qemu_send_packet(qemu_get_queue(s->nic), s->txp->data, s->txp->len) (line 12)", "disposition": "finding", "reason": "Passes unbounded s->txp->len against fixed s->txp->data buffer — latent OOB read; not reentrancy-safe but only used on the non-loopback path."},
+    {"anchor": "s->txp->data / s->txp->len (packet buffer + length)", "disposition": "finding", "reason": "Fixed-size buffer paired with a guest-influenced length field consumed by the delivery calls; per method this pairing must get a finding."},
+    {"anchor": "s->txp->fifo_used = 0; (line 14)", "disposition": "dismissed", "reason": "Simple counter reset; no attacker-influenced index or size."},
+    {"anchor": "s->tx_status_fifo_used == 512 (full guard, lines 16, 26)", "disposition": "dismissed", "reason": "Correct full-FIFO check that gates the array store; prevents overwrite/overflow rather than causing one."},
+    {"anchor": "status = s->txp->cmd_b & 0xffff0000u; (line 21)", "disposition": "dismissed", "reason": "Pure value masking of a guest command word into a status scalar; no memory access or arithmetic hazard."},
+    {"anchor": "DPRINTF(\"Sent packet tag:%04x len %d\\n\", ...) (line 22)", "disposition": "dismissed", "reason": "Compile-time-gated debug print with a well-formed constant format string and matching arguments; no untrusted format, no NULL deref."},
+    {"anchor": "n = (s->tx_status_fifo_head + s->tx_status_fifo_used) & 511; (line 23)", "disposition": "finding", "reason": "Fixed-buffer index computation; reviewed and shown safe by the & 511 mask, contingent on the array being 512 entries."},
+    {"anchor": "s->tx_status_fifo[n] = status; (line 24)", "disposition": "dismissed", "reason": "Store index is masked into 0..511 for a 512-element array; in bounds by construction."},
+    {"anchor": "s->int_sts |= TSFF_INT; (line 27) / TSFF_INT macro", "disposition": "dismissed", "reason": "Sets a fixed interrupt-status bit; no attacker-controlled width or index."},
+    {"anchor": "constants 0x4000, 0xffff0000u, 512, 511", "disposition": "dismissed", "reason": "Fixed protocol/FIFO constants; 511/512 must stay consistent with the array size (noted under the status-FIFO finding), the rest are pure bit masks."}
+  ],
+  "findings": [
+    {
+      "title": "Guest-controlled loopback can re-enter the transmit path (uncontrolled recursion / infinite loop)",
+      "anchor": "if (s->phy_control & 0x4000) { ... qemu_receive_packet(qemu_get_queue(s->nic), s->txp->data, s->txp->len); }",
+      "file": "corpus/eval/eval_0013_cwe835.c",
+      "line": "8-10",
+      "code": "if (s->phy_control & 0x4000)  {\n        /* This assumes the receive routine doesn't touch the VLANClient.  */\n        qemu_receive_packet(qemu_get_queue(s->nic), s->txp->data, s->txp->len);",
+      "bug_class": "Uncontrolled recursion / loop with unreachable exit (reentrant packet delivery in loopback mode)",
+      "cwe": "CWE-835",
+      "severity": "high",
+      "where_it_lives": "corpus/eval/eval_0013_cwe835.c (delivery-guard correctness also depends on the qemu_receive_packet implementation, file not provided)",
+      "invariant": "Loopback delivery must be reentrancy-safe: delivering the frame back into this same NIC must not be able to recursively re-invoke do_tx_packet()/the TX path while the current delivery is still on the stack. The device must route loopback through the reentrancy-guarded qemu_receive_packet() and never through qemu_send_packet().",
+      "failure_mode": "A malicious guest sets the PHY loopback bit (phy_control |= 0x4000) and keeps a TX packet primed. Under the pre-fix design that used qemu_send_packet() for loopback, the looped-back frame re-entered the guest's receive-then-transmit logic and called do_tx_packet() again, recursing without bound until the host QEMU process exhausts its stack and crashes — a guest-triggerable host denial of service. The shown code uses qemu_receive_packet(), whose per-NetClientState reentrancy guard breaks the cycle, so this variant is the FIXED form; the finding is retained because the contract is the dominant risk in this routine and must be preserved.",
+      "cve_analog": "CVE-2021-3416",
+      "what_to_confirm": "Confirm qemu_receive_packet() sets and honors the NetClientState reentrancy/queue guard so a nested delivery during an in-flight loopback is deferred or dropped rather than recursing, and that no other code path (queued-packet flush, RX completion callback) can re-enter do_tx_packet() while this call is executing."
+    },
+    {
+      "title": "Unbounded packet length passed to delivery (latent out-of-bounds read of TX buffer)",
+      "anchor": "qemu_send_packet(qemu_get_queue(s->nic), s->txp->data, s->txp->len) / qemu_receive_packet(..., s->txp->data, s->txp->len)",
+      "file": "corpus/eval/eval_0013_cwe835.c",
+      "line": "10-12",
+      "code": "qemu_receive_packet(qemu_get_queue(s->nic), s->txp->data, s->txp->len);\n    } else {\n        qemu_send_packet(qemu_get_queue(s->nic), s->txp->data, s->txp->len);",
+      "bug_class": "Out-of-bounds read (length not validated against fixed source buffer)",
+      "cwe": "CWE-125",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided) — the TX data FIFO accumulation code that sets s->txp->len and sizes s->txp->data",
+      "invariant": "s->txp->len must never exceed the allocated size of the fixed s->txp->data buffer; the code that streams guest bytes into the TX FIFO must clamp len to sizeof(txp->data).",
+      "failure_mode": "The guest streams the packet body and its length into the TX data FIFO. If the FIFO-fill path does not clamp txp->len to the size of txp->data, do_tx_packet() hands an oversized length to qemu_send_packet()/qemu_receive_packet(), which then reads past the end of txp->data. That over-read leaks adjacent QEMU heap/struct bytes onto the host network or into the guest's own RX buffer (information disclosure), or faults. do_tx_packet() performs no length check of its own and fully trusts the upstream bound.",
+      "cve_analog": "",
+      "what_to_confirm": "Locate where s->txp->len and s->txp->data are populated (the TX FIFO write handler) and verify len is bounded by sizeof(txp->data) — i.e. that a guest cannot make len larger than the physical TX buffer."
+    },
+    {
+      "title": "Status-FIFO index relies on the 511 mask matching a 512-entry array",
+      "anchor": "n = (s->tx_status_fifo_head + s->tx_status_fifo_used) & 511; s->tx_status_fifo[n] = status;",
+      "file": "corpus/eval/eval_0013_cwe835.c",
+      "line": "23-24",
+      "code": "n = (s->tx_status_fifo_head + s->tx_status_fifo_used) & 511;\n    s->tx_status_fifo[n] = status;",
+      "bug_class": "Out-of-bounds write (only if array size and 511/512 constants diverge)",
+      "cwe": "CWE-787",
+      "severity": "info",
+      "where_it_lives": "corpus/eval/eval_0013_cwe835.c (array declaration in lan9118_state, definition file not provided)",
+      "invariant": "tx_status_fifo must be declared with exactly 512 entries so that the & 511 mask and the == 512 full-checks keep every index in bounds.",
+      "failure_mode": "As written the store is safe: & 511 forces n into 0..511 and the full guard at lines 16-19 prevents overwriting a full FIFO. The only way this becomes an out-of-bounds write is a maintenance divergence — if the array were resized below 512 without updating the 511 mask and the 512 comparisons. No live bug; recorded so the reviewer confirms the invariant holds.",
+      "cve_analog": "",
+      "what_to_confirm": "Check the declaration of tx_status_fifo in lan9118_state and confirm it has 512 elements, consistent with the & 511 mask and the two == 512 comparisons."
+    }
+  ],
+  "audit_checklist": [
+    "Verify qemu_receive_packet() enforces the NetClientState reentrancy guard so guest-driven loopback (phy_control & 0x4000) cannot recurse back into do_tx_packet() — the core CVE-2021-3416 fix.",
+    "Confirm no other path (RX completion callback, queued-packet flush) can re-enter the TX routine while a loopback delivery is in flight; scrutinize the line-9 assumption that the receive routine 'doesn't touch the VLANClient'.",
+    "Trace where s->txp->len and s->txp->data are set in the TX FIFO write handler and confirm len is clamped to sizeof(txp->data) so the delivery calls cannot over-read.",
+    "Confirm s->tx_status_fifo is declared with exactly 512 entries, matching the & 511 index mask and the == 512 full-checks.",
+    "Confirm s->nic is always realized before do_tx_packet() can run, so qemu_get_queue(s->nic) is never NULL.",
+    "Consider whether dropping the status entry when the status FIFO is full (line 18 early return) or the unimplemented 'Stop transmission' TODO (line 28) can desynchronize guest and device state, though neither is a memory-safety issue."
+  ]
+}

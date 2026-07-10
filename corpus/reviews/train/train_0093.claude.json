@@ -1,0 +1,160 @@
+{
+  "subsystem": "Linux kernel task-introspection helper: collect_syscall() from lib/syscall.c. It captures a target task's current syscall state (stack pointer, instruction pointer, syscall number, and the six syscall arguments) into a caller-supplied struct syscall_info. It backs the userspace-visible /proc/<pid>/syscall file and the PTRACE_GET_SYSCALL_INFO ptrace request, so the struct it fills is copied out to userspace.",
+  "provenance": "Identified by the Linux-kernel internal API surface: struct task_struct, struct pt_regs, try_get_task_stack()/put_task_stack(), task_pt_regs(), user_stack_pointer(), instruction_pointer(), syscall_get_nr()/syscall_get_arguments(), and -EAGAIN. The function name collect_syscall and struct syscall_info with its .sp and .data.{nr,instruction_pointer,args} sub-fields match lib/syscall.c verbatim (data is a struct seccomp_data). The sample banner 'primevul_c_train_2396_fixed' and the filename tag cwe681 indicate this is the PATCHED variant of a CWE-681 (incorrect numeric-type conversion) infoleak.",
+  "trust_boundary": "The trust boundary is the OUTPUT sink, not an input parser: the struct syscall_info this function fills is subsequently copied to an unprivileged userspace reader via /proc/<pid>/syscall or PTRACE_GET_SYSCALL_INFO. 'target' is an arbitrary other task an attacker may inspect. The hostile concern is therefore any byte of the output struct that is left uninitialized on any code path, or any width/sign mismatch between what the kernel writes and what the struct declares — such bytes leak kernel-stack/register contents across the trust boundary. Register reads themselves come from kernel-controlled pt_regs, so the risk is disclosure of stale kernel memory, not attacker-injected data.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0093_cwe681.c",
+      "lines": "1-2",
+      "code": "/* sample: primevul_c_train_2396_fixed */\nstatic int collect_syscall(struct task_struct *target, struct syscall_info *info)",
+      "explanation": "A file-local (static) helper. It takes 'target', the task_struct of the process being introspected, and 'info', a caller-owned struct syscall_info that this function must fully populate. The return is 0 on success or a negative errno. Because 'info' is later serialised to userspace, the function's real contract is that every field of *info be defined before it returns 0."
+    },
+    {
+      "file": "corpus/train/train_0093_cwe681.c",
+      "lines": "4-5",
+      "code": "unsigned long args[6] = { };\n\tstruct pt_regs *regs;",
+      "explanation": "A zero-initialised local scratch array of six native words (unsigned long) that will receive the syscall argument registers, and an uninitialised pointer to the task's saved register frame. The explicit '= { }' zero-fill is security-load-bearing: it guarantees that if syscall_get_arguments() is skipped (no in-flight syscall) the six slots read as 0 rather than as stale stack, and it defines the upper bits when these words are later widened into the 64-bit output field."
+    },
+    {
+      "file": "corpus/train/train_0093_cwe681.c",
+      "lines": "7-12",
+      "code": "if (!try_get_task_stack(target)) {\n\t\t/* Task has no stack, so the task isn't in a syscall. */\n\t\tmemset(info, 0, sizeof(*info));\n\t\tinfo->data.nr = -1;\n\t\treturn 0;\n\t}",
+      "explanation": "try_get_task_stack() takes a reference on the target's kernel stack so it cannot be freed while we read its pt_regs. If it fails, the task has no live stack (e.g. it is exiting or never ran), so there is nothing to report. In that case the whole output struct is zeroed with memset(info,0,sizeof(*info)) and data.nr is set to -1 (the 'not in a syscall' sentinel). This early path fully initialises *info before returning, so nothing leaks here."
+    },
+    {
+      "file": "corpus/train/train_0093_cwe681.c",
+      "lines": "14-18",
+      "code": "regs = task_pt_regs(target);\n\tif (unlikely(!regs)) {\n\t\tput_task_stack(target);\n\t\treturn -EAGAIN;\n\t}",
+      "explanation": "With the stack pinned, task_pt_regs() locates the saved user-mode register frame at the top of the kernel stack. If that pointer is NULL, the function releases the stack reference it just took (put_task_stack) and returns -EAGAIN, telling the caller to retry. The put_task_stack here is the required cleanup that balances the successful try_get_task_stack above; forgetting it on this error path would leak a stack refcount."
+    },
+    {
+      "file": "corpus/train/train_0093_cwe681.c",
+      "lines": "20-21",
+      "code": "info->sp = user_stack_pointer(regs);\n\tinfo->data.instruction_pointer = instruction_pointer(regs);",
+      "explanation": "Reads the user-space stack pointer and program counter out of the saved register frame and stores them into the output. info->sp is the top-level stack pointer; info->data.instruction_pointer is the faulting/current PC. These are 64-bit output fields written directly from register accessors."
+    },
+    {
+      "file": "corpus/train/train_0093_cwe681.c",
+      "lines": "23-25",
+      "code": "info->data.nr = syscall_get_nr(target, regs);\n\tif (info->data.nr != -1L)\n\t\tsyscall_get_arguments(target, regs, args);",
+      "explanation": "syscall_get_nr() returns the current syscall number (an int; -1 means the task is not mid-syscall) and it is stored into data.nr. Only if a syscall is actually in progress does syscall_get_arguments() decode the six argument registers into the local zeroed args[] buffer. Crucially the destination is the LOCAL args[], not info->data.args directly — this indirection is the fix for the historical infoleak."
+    },
+    {
+      "file": "corpus/train/train_0093_cwe681.c",
+      "lines": "27-32",
+      "code": "info->data.args[0] = args[0];\n\tinfo->data.args[1] = args[1];\n\tinfo->data.args[2] = args[2];\n\tinfo->data.args[3] = args[3];\n\tinfo->data.args[4] = args[4];\n\tinfo->data.args[5] = args[5];",
+      "explanation": "Each native-word arg is copied into the corresponding 64-bit output slot info->data.args[i] (a __u64 in struct seccomp_data). On a 64-bit build unsigned long == __u64 and this is a plain move. On a 32-bit build unsigned long is 32-bit, so this assignment WIDENS to 64 bits; because args[] was zero-initialised and its slots hold real 32-bit values, the widening zero-extends cleanly and the high 32 bits are defined. This element-by-element widening copy through a zeroed local is precisely what closes the CWE-681 width-mismatch infoleak."
+    },
+    {
+      "file": "corpus/train/train_0093_cwe681.c",
+      "lines": "34-35",
+      "code": "put_task_stack(target);\n\treturn 0;",
+      "explanation": "Releases the stack reference taken by try_get_task_stack() on the success path and returns 0. Together with the put_task_stack on the -EAGAIN path (line 16) and the no-op-needed early no-stack path (which never took the reference), every exit correctly balances the stack refcount."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0093_cwe681.c",
+      "lines": "27-32",
+      "code": "info->data.args[0] = args[0];\n\tinfo->data.args[1] = args[1];\n\tinfo->data.args[2] = args[2];\n\tinfo->data.args[3] = args[3];\n\tinfo->data.args[4] = args[4];\n\tinfo->data.args[5] = args[5];",
+      "explanation": "This is the CWE-681 core. info->data.args[] is __u64[6] but the source args[] is unsigned long[6], which is only 32 bits wide on 32-bit ABIs. If an implementation had passed info->data.args directly to syscall_get_arguments() (as the vulnerable predecessor did), syscall_get_arguments would write only the low 32 bits of each 64-bit slot and leave the upper 32 bits holding whatever kernel-stack bytes previously occupied that memory — a deterministic 4-bytes-per-argument (24 bytes total) kernel-memory disclosure to any user reading /proc/<pid>/syscall or issuing PTRACE_GET_SYSCALL_INFO (CWE-200). The shown code AVOIDS this by decoding into a zeroed local of native width and then widening, so the invariant 'every high bit of data.args is defined' holds. The reviewer must confirm no future refactor reintroduces a direct write of a wider destination through a narrower accessor."
+    },
+    {
+      "file": "corpus/train/train_0093_cwe681.c",
+      "lines": "9-10",
+      "code": "memset(info, 0, sizeof(*info));\n\t\tinfo->data.nr = -1;",
+      "explanation": "The full-struct memset only runs on the no-stack early-return path. On the SUCCESS path (lines 20-32) *info is instead initialised field by field: sp, data.nr, data.instruction_pointer and data.args[0..5]. If struct syscall_info / struct seccomp_data contains ANY other member or inter-field padding that is not one of those explicitly-assigned fields (for example an 'arch' field, or alignment padding between the 32-bit nr and the following 64-bit fields), that member is left uninitialised on the success path and copied out to userspace — a residual infoleak (CWE-908 use of uninitialised memory -> CWE-200 disclosure). The safe invariant is that the set of explicitly-assigned fields exactly covers every byte the caller copies to userspace; verify against the actual struct definition (not shown here) that no field/padding is missed, or that the caller zeroes the struct before calling."
+    },
+    {
+      "file": "corpus/train/train_0093_cwe681.c",
+      "lines": "23-24",
+      "code": "info->data.nr = syscall_get_nr(target, regs);\n\tif (info->data.nr != -1L)",
+      "explanation": "syscall_get_nr() returns int and data.nr is int, but the sentinel comparison is against the LONG literal -1L. The int value is sign-extended to long before the compare, so a genuine -1 correctly matches -1L and the behaviour is right — but this mixes an int result with a long literal, which is the exact CWE-681 (incorrect numeric conversion) smell the sample name flags. It would become a real bug if data.nr were ever an unsigned type (then -1 would be stored as a large positive value that never equals -1L and syscall_get_arguments would be called with garbage regs state), or if syscall_get_nr on some arch returned a value whose sign-extension differs from truncation-to-int. Confirm data.nr's declared type is signed int and that -1 is the only sentinel."
+    },
+    {
+      "file": "corpus/train/train_0093_cwe681.c",
+      "lines": "7-16",
+      "code": "if (!try_get_task_stack(target)) {\n\t\t/* Task has no stack, so the task isn't in a syscall. */\n\t\tmemset(info, 0, sizeof(*info));\n\t\tinfo->data.nr = -1;\n\t\treturn 0;\n\t}\n\n\tregs = task_pt_regs(target);\n\tif (unlikely(!regs)) {\n\t\tput_task_stack(target);",
+      "explanation": "Object-lifetime contract: try_get_task_stack() pins the target's kernel stack and MUST be paired with exactly one put_task_stack() on every path that took the reference. Here the no-stack branch returns without taking (and without releasing) the ref, the -EAGAIN branch releases it (line 16), and the success path releases it (line 34). This is balanced as written. The failure mode to guard against is any added early return between line 12 and line 34 that skips put_task_stack — that would leak a stack reference and, over repeated /proc reads, pin freed stacks or block task teardown. No such gap exists in the shown code."
+    },
+    {
+      "file": "corpus/train/train_0093_cwe681.c",
+      "lines": "25",
+      "code": "syscall_get_arguments(target, regs, args);",
+      "explanation": "syscall_get_arguments() writes exactly six words into args[6]; the fixed count matches the fixed-size local, so there is no overflow here. The subtle dependency is that if a given architecture's implementation fills FEWER than six slots (e.g. a syscall taking fewer args), the untouched slots must remain 0 — which they do thanks to the '= { }' zero-init on line 4. Were that initialiser removed, skipped-tail slots would leak stack. The invariant: args[] must be fully defined before the copy on lines 27-32, which the zero-init guarantees regardless of how many arguments syscall_get_arguments actually decodes."
+    }
+  ],
+  "summary": "This is the PATCHED collect_syscall() from lib/syscall.c. It correctly closes a CWE-681 kernel-memory infoleak by decoding syscall arguments into a zero-initialised native-width local and widening each into the 64-bit output field, rather than letting a 32-bit accessor write a 64-bit destination directly. No exploitable defect is present in the shown code; the only residual concerns are latent contracts on data it cannot see: that struct syscall_info's field-by-field initialisation on the success path covers every byte copied to userspace (no unset 'arch'/padding), and that data.nr stays a signed int so the -1L sentinel compare remains correct.",
+  "reviewed_anchors": [
+    {"anchor": "static int collect_syscall(struct task_struct *target, struct syscall_info *info) (line 2)", "disposition": "finding", "reason": "Fills an output struct that is copied to userspace; its initialisation-completeness contract is the central security surface."},
+    {"anchor": "unsigned long args[6] = { }; (line 4)", "disposition": "finding", "reason": "Native-width scratch buffer whose width differs from the __u64 destination; the zero-init and width are the crux of the CWE-681 fix."},
+    {"anchor": "struct pt_regs *regs; (line 5)", "disposition": "dismissed", "reason": "Local pointer, NULL-checked at line 15 before any dereference; no attacker control."},
+    {"anchor": "try_get_task_stack(target) (line 7)", "disposition": "finding", "reason": "Refcount acquisition that must be balanced by put_task_stack on all paths; lifetime contract."},
+    {"anchor": "memset(info, 0, sizeof(*info)); (line 9)", "disposition": "finding", "reason": "Only runs on the no-stack path; the asymmetry with the field-by-field success-path init is the residual-infoleak contract."},
+    {"anchor": "info->data.nr = -1; (line 10)", "disposition": "dismissed", "reason": "Sets the 'not in syscall' sentinel on a fully-zeroed struct; correct and self-contained."},
+    {"anchor": "task_pt_regs(target) (line 14)", "disposition": "dismissed", "reason": "Kernel-internal accessor; its NULL result is explicitly handled at line 15."},
+    {"anchor": "if (unlikely(!regs)) { put_task_stack(target); return -EAGAIN; } (lines 15-18)", "disposition": "dismissed", "reason": "Correct NULL guard that releases the stack ref before returning; no defect."},
+    {"anchor": "info->sp = user_stack_pointer(regs); (line 20)", "disposition": "dismissed", "reason": "Single defined assignment from a kernel register accessor; no width or bounds issue."},
+    {"anchor": "info->data.instruction_pointer = instruction_pointer(regs); (line 21)", "disposition": "dismissed", "reason": "64-bit field written from a register accessor; fully defined."},
+    {"anchor": "info->data.nr = syscall_get_nr(target, regs); (line 23)", "disposition": "finding", "reason": "int return stored and then compared to a long literal — the CWE-681 sign/width smell the sample targets."},
+    {"anchor": "if (info->data.nr != -1L) (line 24)", "disposition": "finding", "reason": "int-vs-long-literal comparison; correct only while data.nr stays signed int."},
+    {"anchor": "syscall_get_arguments(target, regs, args); (line 25)", "disposition": "finding", "reason": "Fills the fixed local; safety of partially-filled tails depends on the line-4 zero-init."},
+    {"anchor": "info->data.args[0..5] = args[0..5]; (lines 27-32)", "disposition": "finding", "reason": "unsigned long -> __u64 widening copy; the exact site of the CWE-681 fix and the residual invariant to protect."},
+    {"anchor": "put_task_stack(target); (line 34)", "disposition": "dismissed", "reason": "Balances the success-path stack reference; correct cleanup, no standalone issue."}
+  ],
+  "findings": [
+    {
+      "title": "Width mismatch between native-word scratch args[] and __u64 output slots (CWE-681 infoleak, mitigated here)",
+      "anchor": "unsigned long args[6] = { }; ... info->data.args[i] = args[i];",
+      "file": "corpus/train/train_0093_cwe681.c",
+      "line": "4,27-32",
+      "code": "unsigned long args[6] = { };\ninfo->data.args[0] = args[0];\ninfo->data.args[1] = args[1];\ninfo->data.args[2] = args[2];\ninfo->data.args[3] = args[3];\ninfo->data.args[4] = args[4];\ninfo->data.args[5] = args[5];",
+      "bug_class": "Kernel-memory disclosure via incorrect numeric-type conversion (32-bit unsigned long written into 64-bit field)",
+      "cwe": "CWE-681",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0093_cwe681.c (this is the fixed form); the bug lives in any implementation that writes the __u64 args directly via a native-width accessor",
+      "invariant": "Every 64-bit slot of info->data.args must be fully defined before *info is copied to userspace; a native-width accessor must never write directly into a wider destination without zero-extension.",
+      "failure_mode": "On 32-bit ABIs, passing info->data.args (u64[6]) straight to syscall_get_arguments() writes only the low 32 bits of each element, leaving the high 32 bits holding stale kernel-stack bytes; /proc/<pid>/syscall or PTRACE_GET_SYSCALL_INFO then discloses 24 bytes of kernel memory per call. The shown code prevents this by decoding into a zeroed unsigned long[6] and widening element by element.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm syscall_get_arguments() is only ever handed the native-width local args[] (never info->data.args) and that args[] retains its '= { }' zero-initialiser so widened high bits are always zero."
+    },
+    {
+      "title": "Success path initialises info field-by-field without a memset — unlisted fields/padding may leak",
+      "anchor": "success-path field init vs. no-stack-path memset",
+      "file": "corpus/train/train_0093_cwe681.c",
+      "line": "9,20-32",
+      "code": "memset(info, 0, sizeof(*info));\ninfo->sp = user_stack_pointer(regs);\ninfo->data.instruction_pointer = instruction_pointer(regs);\ninfo->data.nr = syscall_get_nr(target, regs);",
+      "bug_class": "Use of uninitialised structure memory copied to userspace",
+      "cwe": "CWE-908",
+      "severity": "medium",
+      "where_it_lives": "implementation (struct syscall_info / struct seccomp_data definition not provided)",
+      "invariant": "The set of fields explicitly assigned on the success path (sp, data.nr, data.instruction_pointer, data.args[0..5]) must cover every byte of *info that the caller subsequently copies to userspace; any other member or inter-field padding must be zeroed.",
+      "failure_mode": "The full-struct memset runs only on the no-stack path (line 9). On the success path, if struct seccomp_data contains an 'arch' field or alignment padding (e.g. between the int nr and the following __u64 fields) that is not one of the assigned members, that memory is left uninitialised and disclosed to userspace.",
+      "cve_analog": "",
+      "what_to_confirm": "Inspect the real struct syscall_info/seccomp_data layout: verify every field and any padding either appears in the success-path assignments or is covered by an unconditional up-front memset/zero-init."
+    },
+    {
+      "title": "Signed-int syscall number compared against a long sentinel (-1L)",
+      "anchor": "if (info->data.nr != -1L)",
+      "file": "corpus/train/train_0093_cwe681.c",
+      "line": "23-24",
+      "code": "info->data.nr = syscall_get_nr(target, regs);\nif (info->data.nr != -1L)",
+      "bug_class": "Incorrect numeric-type conversion in sentinel comparison",
+      "cwe": "CWE-681",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0093_cwe681.c",
+      "invariant": "data.nr must be a signed type so that syscall_get_nr()'s -1 sentinel sign-extends to -1L and the comparison correctly detects 'not in a syscall'.",
+      "failure_mode": "As written the int result sign-extends to long and matches -1L, so it is correct. It would break if data.nr were changed to an unsigned type (or if an arch accessor returned a value that truncates to int differently), causing the -1 sentinel to never match and syscall_get_arguments() to be called on non-syscall register state, populating args with meaningless values.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify the declared type of struct seccomp_data.nr is signed int and that syscall_get_nr()'s return type matches, so the -1L comparison is sign-safe on every architecture."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm syscall_get_arguments() is invoked with the zero-initialised native-width local args[6], never with info->data.args, on every architecture.",
+    "Verify the '= { }' initialiser on args[6] is preserved so architectures that decode fewer than six arguments leave the rest zero rather than stale stack.",
+    "Check the full struct syscall_info / struct seccomp_data layout for any field (e.g. arch) or padding not written on the success path; ensure it is zeroed before userspace copy-out.",
+    "Confirm struct seccomp_data.nr is a signed int so the (nr != -1L) sentinel comparison is correct after integer promotion.",
+    "Trace all exits (no-stack return, -EAGAIN return, success return) to confirm try_get_task_stack() is balanced by exactly one put_task_stack() on every path that acquired the reference.",
+    "Confirm the caller copies exactly sizeof(struct syscall_info) and no more, so no trailing bytes beyond the initialised region reach userspace."
+  ]
+}

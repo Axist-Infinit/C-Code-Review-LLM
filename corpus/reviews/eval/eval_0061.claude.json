@@ -1,0 +1,131 @@
+{
+  "subsystem": "Linux kernel process/task introspection. This is collect_syscall(), the internal helper behind task_current_syscall() in lib/syscall.c, which snapshots the syscall a (possibly foreign) task is currently executing: its number, the six arguments, the user stack pointer and the instruction pointer. Its output feeds /proc/<pid>/syscall and the PTRACE_GET_SYSCALL_INFO ptrace request, i.e. it produces data that is ultimately copied to userspace.",
+  "provenance": "Identified by naming and kernel-internal API surface, not SPDX (none shown). The signature collect_syscall(struct task_struct *target, struct syscall_info *info) plus the helpers try_get_task_stack/put_task_stack, task_pt_regs, user_stack_pointer, instruction_pointer, syscall_get_nr and syscall_get_arguments are all Linux kernel arch/scheduler primitives. struct syscall_info embeds struct seccomp_data (info->data.nr / info->data.instruction_pointer / info->data.args). The banner 'primevul_c_train_2396_vuln' and filename hint cwe681 (Incorrect Conversion between Numeric Types); this matches lib/syscall.c::collect_syscall.",
+  "trust_boundary": "The target task is arbitrary and chosen by an unprivileged reader (any process that can open /proc/<pid>/syscall, subject to ptrace_may_access). The *input* registers come from the target's saved pt_regs and are not the interesting attack surface here; the interesting boundary is the OUTPUT direction: struct syscall_info *info is filled here and then serialized to userspace by the /proc and ptrace layers. Anything left uninitialized in *info, or any field written with the wrong width, becomes a kernel-memory disclosure to a user-controlled reader. The trust boundary is therefore 'kernel stack/heap contents -> userspace', and the hostile actor is a low-privilege process that can request the snapshot of a task it is allowed to inspect.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/eval/eval_0061_cwe681.c",
+      "lines": "1-4",
+      "code": "/* sample: primevul_c_train_2396_vuln */\nstatic int collect_syscall(struct task_struct *target, struct syscall_info *info)\n{\n\tstruct pt_regs *regs;",
+      "explanation": "A file-scope static helper that takes a pointer to the task being inspected (target) and an output structure (info) it must populate. struct syscall_info wraps a struct seccomp_data (reached as info->data) holding the syscall number (nr), the instruction pointer, and a six-element argument array (args[6], each element a __u64), plus a top-level info->sp for the user stack pointer. The single local regs will point at the target's saved register file. Nothing is initialized yet; the contract that info is fully populated on every return path is established entirely by the code below."
+    },
+    {
+      "file": "corpus/eval/eval_0061_cwe681.c",
+      "lines": "6-11",
+      "code": "\tif (!try_get_task_stack(target)) {\n\t\t/* Task has no stack, so the task isn't in a syscall. */\n\t\tmemset(info, 0, sizeof(*info));\n\t\tinfo->data.nr = -1;\n\t\treturn 0;\n\t}",
+      "explanation": "try_get_task_stack() takes a reference on the target's kernel stack (and returns false if the task has no stack, e.g. it is a kernel thread or has been reaped). On the no-stack path the function fully zero-initializes the ENTIRE output with memset(info, 0, sizeof(*info)) and then sets info->data.nr = -1 to signal 'not in a syscall', returning success. This is the ONLY code path that guarantees info is completely initialized before return; note that memset is scoped to this early-return branch, not performed unconditionally at the top of the function."
+    },
+    {
+      "file": "corpus/eval/eval_0061_cwe681.c",
+      "lines": "13-17",
+      "code": "\tregs = task_pt_regs(target);\n\tif (unlikely(!regs)) {\n\t\tput_task_stack(target);\n\t\treturn -EAGAIN;\n\t}",
+      "explanation": "With a stack reference held, task_pt_regs(target) locates the saved register frame at the top of the target's kernel stack. If it is NULL (no valid frame), the code releases the stack reference with put_task_stack(target) and returns -EAGAIN. Importantly the stack reference taken at line 6 is correctly balanced by put_task_stack here before the error return, so this error path does not leak the stack reference. On this path info is returned untouched to the caller (the caller is expected to treat -EAGAIN as 'retry', not consume info)."
+    },
+    {
+      "file": "corpus/eval/eval_0061_cwe681.c",
+      "lines": "19-20",
+      "code": "\tinfo->sp = user_stack_pointer(regs);\n\tinfo->data.instruction_pointer = instruction_pointer(regs);",
+      "explanation": "The two scalar location fields are filled from the register frame: info->sp receives the user-mode stack pointer and info->data.instruction_pointer receives the user-mode program counter. Both are full-width copies of arch accessors and are always written on this success path, so these two fields are not a disclosure concern."
+    },
+    {
+      "file": "corpus/eval/eval_0061_cwe681.c",
+      "lines": "22-25",
+      "code": "\tinfo->data.nr = syscall_get_nr(target, regs);\n\tif (info->data.nr != -1L)\n\t\tsyscall_get_arguments(target, regs,\n\t\t\t\t      (unsigned long *)&info->data.args[0]);",
+      "explanation": "syscall_get_nr(target, regs) returns the in-progress syscall number as an int and is stored into info->data.nr (an int field of seccomp_data). If the task is not currently in a syscall the arch returns -1 (NO_SYSCALL); the guard info->data.nr != -1L compares that int against the long literal -1L. Only when a real syscall is in progress does the code call syscall_get_arguments(target, regs, ...) to copy the six syscall arguments. The destination is passed as (unsigned long *)&info->data.args[0], i.e. the __u64 args[6] array is reinterpreted as an array of unsigned long. syscall_get_arguments is declared to write through an unsigned long * (it writes six unsigned long values); the cast bridges the __u64 array to that unsigned-long-typed sink."
+    },
+    {
+      "file": "corpus/eval/eval_0061_cwe681.c",
+      "lines": "27-29",
+      "code": "\tput_task_stack(target);\n\treturn 0;\n}",
+      "explanation": "On the normal success path the stack reference acquired at line 6 is released with put_task_stack(target) and the function returns 0. Reference accounting is balanced across all three exits (no-stack early return took no reference; the !regs path and this path each release exactly one), so there is no task-stack refcount leak or use-after-free from the get/put pairing itself."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/eval/eval_0061_cwe681.c",
+      "lines": "24-25",
+      "code": "\t\tsyscall_get_arguments(target, regs,\n\t\t\t\t      (unsigned long *)&info->data.args[0]);",
+      "explanation": "This is the CWE-681 incorrect-numeric-conversion at the heart of the sample. info->data.args is __u64 args[6] (a fixed 48-byte, six-slot, 64-bit-per-element array), but it is handed to syscall_get_arguments through a (unsigned long *) cast, and that callee writes exactly six unsigned long values. On any LP64 (64-bit) kernel unsigned long == __u64, so widths match and there is no bug. On an ILP32 (32-bit) kernel unsigned long is 4 bytes: the callee writes six consecutive 4-byte words, filling only the first 24 bytes of the 48-byte array, and it fills them contiguously (arg0 -> bytes 0..3, arg1 -> bytes 4..7, ...) rather than one value per 8-byte __u64 slot. The result is twofold: (1) the six argument values land in the wrong, low-half positions and the high halves of the low slots are never written, and (2) the trailing 24 bytes (the last three __u64 slots) are never written at all. Because there is NO unconditional memset of info on this path (memset only runs in the line 6-11 no-stack branch), those uninitialized bytes hold whatever was previously on the kernel stack/heap backing *info. Since info is subsequently serialized to userspace via /proc/<pid>/syscall and PTRACE_GET_SYSCALL_INFO, an unprivileged reader who can inspect the task obtains a leak of uninitialized kernel memory (CWE-908 use of uninitialized resource -> CWE-200 information exposure), rooted in the width-mismatched pointer conversion. The invariant the implementation must uphold: the destination width syscall_get_arguments writes MUST equal the element width of info->data.args, or the full args array must be zero-initialized before the (truncated) write, on every 32-bit and compat build."
+    },
+    {
+      "file": "corpus/eval/eval_0061_cwe681.c",
+      "lines": "22-25",
+      "code": "\tinfo->data.nr = syscall_get_nr(target, regs);\n\tif (info->data.nr != -1L)\n\t\tsyscall_get_arguments(target, regs,\n\t\t\t\t      (unsigned long *)&info->data.args[0]);",
+      "explanation": "Complementary uninitialized-output hazard tied to the same missing top-level memset. When info->data.nr == -1 (task holds a stack but is not currently executing a syscall) the guard on line 23 skips syscall_get_arguments entirely, so info->data.args[0..5] is left completely uninitialized on this success (return 0) path — only sp, instruction_pointer and nr get written. Whether this leaks depends on the consumer: if the /proc or ptrace serializer emits the args array whenever the call succeeds (rather than gating on nr != -1), the whole 48-byte args array discloses stale kernel memory. The invariant: info->data.args must be zeroed before any early skip, i.e. the code should memset the output unconditionally at function entry rather than only in the no-stack branch, so no success path can return partially-initialized args."
+    },
+    {
+      "file": "corpus/eval/eval_0061_cwe681.c",
+      "lines": "23-23",
+      "code": "\tif (info->data.nr != -1L)",
+      "explanation": "A minor numeric-type-mismatch (also CWE-681 in spirit) that is benign but worth noting for the student: info->data.nr is an int, syscall_get_nr returns int, yet the comparison is against the long literal -1L. The int is sign-extended to long before the compare, so -1 (int) becomes -1L and the intended NO_SYSCALL check still works on both 32- and 64-bit. The risk would only materialize if some arch's syscall_get_nr returned a large non-negative value whose low 32 bits happened to be 0xFFFFFFFF; because nr is int and the arch contract is 'negative means no syscall', this does not occur in practice. No exploit here — flagged only so the width-mismatch pattern is learned as distinct from the load-bearing args cast above."
+    }
+  ],
+  "summary": "Kernel syscall-snapshot helper that populates a struct syscall_info later copied to userspace. Its one real defect is a CWE-681 pointer conversion: the __u64 args[6] output array is written through an (unsigned long *) cast, so on 32-bit/compat kernels syscall_get_arguments only fills 24 of 48 bytes, and because the array is not unconditionally zeroed the uninitialized tail (and, when nr == -1, the whole array) is disclosed to an unprivileged /proc or ptrace reader. Refcounting of the task stack is correctly balanced; risk is a kernel-memory information leak on non-LP64 builds, not memory corruption.",
+  "reviewed_anchors": [
+    {"anchor": "collect_syscall(struct task_struct *target, struct syscall_info *info) — signature (line 2)", "disposition": "finding", "reason": "Populates an output struct that is serialized to userspace; completeness of initialization on every return path is its core contract."},
+    {"anchor": "struct pt_regs *regs (line 4)", "disposition": "dismissed", "reason": "Local pointer, NULL-checked at line 14 before use; carries no direct external contract."},
+    {"anchor": "try_get_task_stack(target) (line 6) / put_task_stack(target) (lines 15, 27)", "disposition": "dismissed", "reason": "Stack reference is acquired once and released on both the !regs path and the normal path; the no-stack path takes none. Balanced — no refcount leak or UAF."},
+    {"anchor": "memset(info, 0, sizeof(*info)) (line 8)", "disposition": "finding", "reason": "Scoped only to the no-stack branch; its ABSENCE on the main path is what leaves args uninitialized before the truncated write and the nr==-1 skip."},
+    {"anchor": "info->data.nr = -1 (line 9)", "disposition": "dismissed", "reason": "Assigns the NO_SYSCALL sentinel to an int field on the fully-zeroed no-stack path; correct."},
+    {"anchor": "info->sp = user_stack_pointer(regs) (line 19)", "disposition": "dismissed", "reason": "Full-width scalar always written on the success path; not a disclosure or corruption vector."},
+    {"anchor": "info->data.instruction_pointer = instruction_pointer(regs) (line 20)", "disposition": "dismissed", "reason": "Full-width scalar always written on the success path; safe."},
+    {"anchor": "info->data.nr = syscall_get_nr(target, regs) (line 22)", "disposition": "dismissed", "reason": "int returned into int field, always written; the value itself is not attacker-forged in a corrupting way."},
+    {"anchor": "if (info->data.nr != -1L) (line 23)", "disposition": "finding", "reason": "int-vs-long literal comparison (numeric-type-mismatch, CWE-681) — benign, reported as low; and its skip branch leaves args uninitialized (tied to the memset anchor)."},
+    {"anchor": "(unsigned long *)&info->data.args[0] cast into __u64 args[6] (lines 24-25)", "disposition": "finding", "reason": "Primary CWE-681: destination element width (__u64) differs from the width syscall_get_arguments writes (unsigned long) on 32-bit, truncating writes and leaving uninitialized bytes that leak to userspace."}
+  ],
+  "findings": [
+    {
+      "title": "Width-mismatched pointer cast writes __u64 argument array as unsigned long, leaking uninitialized kernel memory on 32-bit",
+      "anchor": "(unsigned long *)&info->data.args[0] passed to syscall_get_arguments",
+      "file": "corpus/eval/eval_0061_cwe681.c",
+      "line": "24-25",
+      "code": "\t\tsyscall_get_arguments(target, regs,\n\t\t\t\t      (unsigned long *)&info->data.args[0]);",
+      "bug_class": "Incorrect numeric-type conversion -> use of uninitialized memory / kernel information disclosure",
+      "cwe": "CWE-681",
+      "severity": "medium",
+      "where_it_lives": "implementation (file not provided) — the write happens inside syscall_get_arguments; the defect is the cast/contract at this call site",
+      "invariant": "The pointer type handed to syscall_get_arguments must have the same element width as info->data.args (__u64), OR info->data.args must be fully zero-initialized before the call, so that on ILP32/compat builds no high halves or trailing slots are left uninitialized before *info is copied to userspace.",
+      "failure_mode": "On a 32-bit kernel unsigned long is 4 bytes while info->data.args[i] is __u64 (8 bytes). syscall_get_arguments writes six 4-byte words, filling only the first 24 of 48 bytes (and placing the values at the wrong offsets), leaving 24 bytes uninitialized. With no unconditional memset of *info, those stale kernel-stack/heap bytes are then serialized to userspace via /proc/<pid>/syscall or PTRACE_GET_SYSCALL_INFO, letting an unprivileged inspector read leaked kernel memory. On 64-bit the widths coincide and there is no bug.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether unsigned long == __u64 on every supported/compat build, whether info->data.args is zeroed before this write, and whether the /proc and ptrace serializers copy the full args[6] array (all 48 bytes) to userspace on the success path."
+    },
+    {
+      "title": "info->data.args left uninitialized on success when target is not in a syscall (memset scoped to no-stack branch only)",
+      "anchor": "if (info->data.nr != -1L) guard skipping syscall_get_arguments",
+      "file": "corpus/eval/eval_0061_cwe681.c",
+      "line": "22-25",
+      "code": "\tinfo->data.nr = syscall_get_nr(target, regs);\n\tif (info->data.nr != -1L)\n\t\tsyscall_get_arguments(target, regs,\n\t\t\t\t      (unsigned long *)&info->data.args[0]);",
+      "bug_class": "Use of uninitialized memory (missing unconditional output zeroing) -> potential information disclosure",
+      "cwe": "CWE-908",
+      "severity": "low",
+      "where_it_lives": "corpus/eval/eval_0061_cwe681.c",
+      "invariant": "Every success (return 0) path must fully initialize info->data.args; the zeroing must not be confined to the no-stack branch at lines 8-9.",
+      "failure_mode": "When the stack exists but nr == -1, line 23 skips syscall_get_arguments and args[0..5] is never written on this return-0 path, since memset only runs in the line 6-11 branch. If the caller serializes the args array unconditionally, the full 48-byte array discloses stale kernel memory to a user-controlled reader.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether proc_pid_syscall / PTRACE_GET_SYSCALL_INFO emit args when nr == -1, and whether moving memset(info, 0, sizeof(*info)) to unconditional function entry is the intended fix."
+    },
+    {
+      "title": "int syscall-number field compared against a long literal (-1L)",
+      "anchor": "if (info->data.nr != -1L)",
+      "file": "corpus/eval/eval_0061_cwe681.c",
+      "line": "23",
+      "code": "\tif (info->data.nr != -1L)",
+      "bug_class": "Numeric-type mismatch (sign/width) in comparison",
+      "cwe": "CWE-681",
+      "severity": "info",
+      "where_it_lives": "corpus/eval/eval_0061_cwe681.c",
+      "invariant": "The NO_SYSCALL sentinel comparison must use the same type/width as info->data.nr (int); relying on implicit int->long sign extension is fragile stylistically though correct here.",
+      "failure_mode": "info->data.nr is int and syscall_get_nr returns int, but the compare is against the long -1L; the int is sign-extended so the check behaves correctly (-1 -> -1L). No exploit — reported only to distinguish this benign width mismatch from the load-bearing args cast; it would matter only if an arch returned a value whose semantics diverge under widening, which the negative-means-no-syscall contract precludes.",
+      "cve_analog": "",
+      "what_to_confirm": "That syscall_get_nr's contract on all arches is 'returns int, negative == no syscall', so the widened comparison can never misclassify a real syscall as NO_SYSCALL or vice versa."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm sizeof(unsigned long) vs sizeof(__u64) for every supported arch and the 32-bit compat path; the args cast is only safe where they are equal.",
+    "Verify info->data.args is fully zero-initialized before syscall_get_arguments on 32-bit, or that memset(info,0,sizeof(*info)) is moved to unconditional function entry.",
+    "Check the nr == -1 success path: is args serialized to userspace by /proc/<pid>/syscall and PTRACE_GET_SYSCALL_INFO when it was never written?",
+    "Confirm the /proc and ptrace serializers copy exactly the initialized bytes of struct syscall_info and never emit padding or stale tail slots.",
+    "Re-verify try_get_task_stack/put_task_stack pairing across all three return paths (already balanced in the shown code) if the function is edited.",
+    "Confirm syscall_get_arguments writes exactly six elements and does not itself over- or under-run relative to args[6]."
+  ]
+}

@@ -1,0 +1,151 @@
+{
+  "subsystem": "Teeworlds/DDNet game-server networking layer. CServer::SendMsg is the server's central outbound-message dispatch routine: it wraps a serialized game message (CMsgPacker) into a network chunk (CNetChunk), applies vital/flush send flags, optionally records the message to the demo recorder, and hands it to the low-level network server (m_NetServer) either to a single client (by ClientID) or broadcast to all in-game clients.",
+  "provenance": "Identified by the Teeworlds/DDNet engine naming conventions: class CServer with member arrays m_aClients[MAX_CLIENTS], the CMsgPacker/CNetChunk types, the CClient state enum (STATE_EMPTY, STATE_INGAME), the mem_zero helper, the MSGFLAG_* / NETSENDFLAG_* flag families, and the m_NetServer / m_DemoRecorder members. These are the exact identifiers used in the Teeworlds engine's src/engine/server/server.cpp. The banner comment /* sample: primevul_validation_0254_fixed */ and the filename train_0309_cwe703.cpp indicate this is the post-fix revision of a PrimeVul sample tagged CWE-703 (improper handling of exceptional conditions).",
+  "trust_boundary": "This function runs on the trusted server side and produces server-to-client traffic, so the message BODY (pMsg) is server-generated rather than raw wire input. The security-relevant inputs are the caller-supplied integers: ClientID (which indexes the fixed m_aClients[] array and therefore must be range-checked before any dereference) and Flags. The connection/client state (m_aClients[i].m_State, m_Quitting) is mutated asynchronously by the network/disconnect machinery, so the client slot referenced by ClientID may be EMPTY or in the middle of being torn down; treating that state as an exceptional condition that must gate the send is the whole point of the guard on line 9. The hostile surface is thus an out-of-range or stale ClientID and a client slot whose lifetime is expiring underneath the send.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0309_cwe703.cpp",
+      "lines": "2-6",
+      "code": "int CServer::SendMsg(CMsgPacker *pMsg, int Flags, int ClientID)\n{\n\tCNetChunk Packet;\n\tif(!pMsg)\n\t\treturn -1;",
+      "explanation": "The method signature takes a pointer to a message packer (pMsg, the serialized message to send), a bitmask Flags controlling delivery semantics, and an integer ClientID selecting the destination (-1 meaning broadcast). It declares a stack-local CNetChunk named Packet that will describe the outbound network chunk. The first guard rejects a NULL pMsg by returning -1, preventing a NULL dereference at the later pMsg->Data()/pMsg->Size() calls. This is a defensive contract check on the sole pointer parameter."
+    },
+    {
+      "file": "corpus/train/train_0309_cwe703.cpp",
+      "lines": "8-10",
+      "code": "\t// drop invalid packet\n\tif(ClientID != -1 && (ClientID < 0 || ClientID >= MAX_CLIENTS || m_aClients[ClientID].m_State == CClient::STATE_EMPTY || m_aClients[ClientID].m_Quitting))\n\t\treturn 0;",
+      "explanation": "This is the core validation gate. When ClientID is not the broadcast sentinel (-1), it must be a valid index into m_aClients[]: the expression rejects ClientID < 0 and ClientID >= MAX_CLIENTS BEFORE any m_aClients[ClientID] access, and because C++ && / || short-circuit left-to-right, the range checks are evaluated first, so the subsequent m_aClients[ClientID].m_State and m_aClients[ClientID].m_Quitting reads only run once the index is proven in-bounds. Beyond the bounds check it also drops the send if the target slot is STATE_EMPTY (no connected client) or m_Quitting (a client mid-disconnect). Returning 0 signals a benign no-op drop. The m_Quitting sub-condition is the fix that distinguishes this 'fixed' sample from the vulnerable original: it prevents dispatching to a client whose object is being dismantled."
+    },
+    {
+      "file": "corpus/train/train_0309_cwe703.cpp",
+      "lines": "12-15",
+      "code": "\tmem_zero(&Packet, sizeof(CNetChunk));\n\tPacket.m_ClientID = ClientID;\n\tPacket.m_pData = pMsg->Data();\n\tPacket.m_DataSize = pMsg->Size();",
+      "explanation": "The CNetChunk is fully zero-initialized with mem_zero over sizeof(CNetChunk), ensuring no uninitialized padding/flag bits leak into the network layer. It is then populated: m_ClientID records the destination, m_pData is set to the message payload pointer returned by pMsg->Data(), and m_DataSize is set to pMsg->Size(). Note that m_pData is a borrowed pointer into the CMsgPacker's internal buffer — the chunk does not own or copy the data, so the buffer must outlive the Send() call. m_DataSize is taken verbatim from the packer with no additional clamp here."
+    },
+    {
+      "file": "corpus/train/train_0309_cwe703.cpp",
+      "lines": "17-20",
+      "code": "\tif(Flags&MSGFLAG_VITAL)\n\t\tPacket.m_Flags |= NETSENDFLAG_VITAL;\n\tif(Flags&MSGFLAG_FLUSH)\n\t\tPacket.m_Flags |= NETSENDFLAG_FLUSH;",
+      "explanation": "The caller-facing message flags are translated into network-layer send flags. MSGFLAG_VITAL (reliable/ack'd delivery) maps to NETSENDFLAG_VITAL and MSGFLAG_FLUSH (send immediately rather than coalescing) maps to NETSENDFLAG_FLUSH, OR'd into Packet.m_Flags. Because Packet was zeroed first, only the requested bits are set. These flags govern reliability and buffering in the transport but carry no memory-safety contract themselves."
+    },
+    {
+      "file": "corpus/train/train_0309_cwe703.cpp",
+      "lines": "22-24",
+      "code": "\t// write message to demo recorder\n\tif(!(Flags&MSGFLAG_NORECORD))\n\t\tm_DemoRecorder.RecordMessage(pMsg->Data(), pMsg->Size());",
+      "explanation": "Unless the caller sets MSGFLAG_NORECORD, the raw message (pMsg->Data(), pMsg->Size()) is appended to the server-side demo recording. This happens independently of whether the message will actually be sent (the NOSEND check comes later), and independently of ClientID validity, so a message can be recorded to the demo even if it is ultimately not transmitted. RecordMessage receives the same borrowed pointer and length; its own buffering must respect Size()."
+    },
+    {
+      "file": "corpus/train/train_0309_cwe703.cpp",
+      "lines": "26-41",
+      "code": "\tif(!(Flags&MSGFLAG_NOSEND))\n\t{\n\t\tif(ClientID == -1)\n\t\t{\n\t\t\t// broadcast\n\t\t\tint i;\n\t\t\tfor(i = 0; i < MAX_CLIENTS; i++)\n\t\t\t\tif(m_aClients[i].m_State == CClient::STATE_INGAME && !m_aClients[i].m_Quitting)\n\t\t\t\t{\n\t\t\t\t\tPacket.m_ClientID = i;\n\t\t\t\t\tm_NetServer.Send(&Packet);\n\t\t\t\t}\n\t\t}\n\t\telse\n\t\t\tm_NetServer.Send(&Packet);\n\t}",
+      "explanation": "Unless MSGFLAG_NOSEND is set, the packet is dispatched. For the broadcast case (ClientID == -1) it iterates i over [0, MAX_CLIENTS), and for each slot that is STATE_INGAME and not m_Quitting it rewrites Packet.m_ClientID = i and calls m_NetServer.Send(&Packet). The per-iteration state re-check mirrors the entry gate and, crucially, also honors m_Quitting so a client tearing down is skipped. The loop bound i < MAX_CLIENTS keeps the m_aClients[i] index in range. For the targeted case (ClientID != -1) it simply calls m_NetServer.Send(&Packet) once, relying on the line-9 gate having already validated the index and state."
+    },
+    {
+      "file": "corpus/train/train_0309_cwe703.cpp",
+      "lines": "42-43",
+      "code": "\treturn 0;\n}",
+      "explanation": "The function returns 0 for the success/normal path (including the benign-drop cases handled earlier). The only distinct error return is -1 for a NULL pMsg. Callers therefore cannot distinguish 'sent' from 'dropped as invalid' from 'recorded but NOSEND' — all yield 0 — which is acceptable for a fire-and-forget dispatch but offers no delivery confirmation."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0309_cwe703.cpp",
+      "lines": "8-10",
+      "code": "\t// drop invalid packet\n\tif(ClientID != -1 && (ClientID < 0 || ClientID >= MAX_CLIENTS || m_aClients[ClientID].m_State == CClient::STATE_EMPTY || m_aClients[ClientID].m_Quitting))\n\t\treturn 0;",
+      "explanation": "This guard is the whole security contract of the function and the subject of the CWE-703 fix. The m_Quitting sub-check is what prevents the exceptional condition of sending to a client whose slot is mid-teardown: in the vulnerable predecessor the guard checked only STATE_EMPTY (and range), so a message could be dispatched to a client that was disconnecting, whose associated network/connection object may already be partially freed or reset — a use-after-free / stale-state dispatch in the transport layer (m_NetServer.Send). The invariant the implementation must uphold is: never pass a ClientID to m_NetServer.Send whose slot is EMPTY or Quitting, and never dereference m_aClients[ClientID] before proving 0 <= ClientID < MAX_CLIENTS. Note the correctness of the short-circuit ordering is load-bearing: if the range tests were ever reordered after the m_State/m_Quitting reads, an out-of-range ClientID would produce an out-of-bounds read of m_aClients[]. As written the ordering is safe, but it is a fragile invariant a future edit could break."
+    },
+    {
+      "file": "corpus/train/train_0309_cwe703.cpp",
+      "lines": "9-40",
+      "code": "\tif(ClientID != -1 && (ClientID < 0 || ClientID >= MAX_CLIENTS || m_aClients[ClientID].m_State == CClient::STATE_EMPTY || m_aClients[ClientID].m_Quitting))",
+      "explanation": "The gate validates the target slot's state ONCE at entry (line 9), but the actual transmit for the targeted case happens later at line 40 (m_NetServer.Send). In the single-threaded server main loop these two points are not separated by any yield, so the state cannot change between them and there is no true TOCTOU window. The latent risk is that this safety depends entirely on the send path remaining synchronous and re-entrancy-free: if m_NetServer.Send or any hook it invokes could run a callback that disconnects/frees the client (setting m_Quitting or STATE_EMPTY) and then the same Packet were reused, the validated state would be stale. The implementation must guarantee that dispatch does not re-enter SendMsg for the same slot and that Send treats m_ClientID/m_pData as borrowed for the call's duration only."
+    },
+    {
+      "file": "corpus/train/train_0309_cwe703.cpp",
+      "lines": "14-15",
+      "code": "\tPacket.m_pData = pMsg->Data();\n\tPacket.m_DataSize = pMsg->Size();",
+      "explanation": "m_DataSize is taken directly from pMsg->Size() with no upper clamp in this function. m_pData is a borrowed pointer into the packer's buffer that is NOT copied; the network layer must consume it before pMsg is destroyed or reused. Two latent hazards live in the code this only declares: (1) if pMsg->Size() can exceed the maximum chunk/packet size the transport supports, the overrun/fragmentation must be handled by m_NetServer.Send — a mismatch there is a classic length-versus-buffer overflow (the guarantee lives in the implementation, not here); (2) the borrowed-pointer lifetime contract means any path where the packer's buffer is freed or overwritten before Send completes is a use-after-free. Neither bug is visible in the shown code, but the header-level contract (borrowed pointer + caller-trusted size) is where they would manifest."
+    },
+    {
+      "file": "corpus/train/train_0309_cwe703.cpp",
+      "lines": "22-24",
+      "code": "\tif(!(Flags&MSGFLAG_NORECORD))\n\t\tm_DemoRecorder.RecordMessage(pMsg->Data(), pMsg->Size());",
+      "explanation": "The demo recording is gated only by MSGFLAG_NORECORD and runs before the NOSEND check and independently of ClientID validity. Functionally this means a message dropped as undeliverable (e.g. a targeted send whose slot became invalid) can still be written into the demo file, and a NOSEND message is recorded but never transmitted. This is an information-integrity / desync concern for demo playback rather than a memory-safety bug, but it is worth confirming the recorder correctly length-bounds Size() into its own buffer, since it receives the same untrusted-length value as the network path."
+    }
+  ],
+  "summary": "This is the hardened (post-fix) revision of a Teeworlds/DDNet server message-dispatch routine. Its single security-critical contract is the line-9 gate, which range-checks ClientID before indexing m_aClients[] and — the actual CWE-703 fix — refuses to send to a slot that is EMPTY or m_Quitting, preventing dispatch to a client being torn down. As shown the code is memory-safe: bounds are checked via short-circuit ordering, the broadcast loop is correctly bounded, and NULL pMsg is rejected. The residual risks are latent and live in the implementation this code calls (unclamped m_DataSize into the transport, borrowed-pointer lifetime, and the fragility of the state-gate ordering), not in the visible logic. Overall risk: LOW for the shown function."
+  ,
+  "reviewed_anchors": [
+    {"anchor": "int CServer::SendMsg(CMsgPacker *pMsg, int Flags, int ClientID)", "disposition": "finding", "reason": "Entry point; ClientID is the attacker-relevant index and Flags/pMsg the other inputs — the whole function's safety hinges on its guards."},
+    {"anchor": "if(!pMsg) return -1;", "disposition": "dismissed", "reason": "Correct NULL guard on the sole pointer parameter; prevents the later pMsg->Data()/Size() NULL deref. No defect."},
+    {"anchor": "line 9 guard: ClientID != -1 && (ClientID < 0 || ClientID >= MAX_CLIENTS || ...STATE_EMPTY... || ...m_Quitting)", "disposition": "finding", "reason": "The core validation/exceptional-condition gate (CWE-703); its m_Quitting sub-check is the fix and its short-circuit ordering is a load-bearing OOB-prevention invariant."},
+    {"anchor": "MAX_CLIENTS", "disposition": "dismissed", "reason": "Fixed array bound used correctly in both the line-9 check and the broadcast loop; no misuse shown."},
+    {"anchor": "m_aClients[ClientID] (indexed access)", "disposition": "dismissed", "reason": "Every dereference is guarded by a prior in-range test via && / || short-circuit; no out-of-bounds access in the shown code."},
+    {"anchor": "CClient::STATE_EMPTY / STATE_INGAME", "disposition": "dismissed", "reason": "State enum values used only in comparisons; correctly distinguish live from dead slots."},
+    {"anchor": "m_aClients[i].m_State / m_Quitting", "disposition": "dismissed", "reason": "Read-only state checks; the m_Quitting check is the safety mechanism, used correctly at both line 9 and line 33."},
+    {"anchor": "mem_zero(&Packet, sizeof(CNetChunk))", "disposition": "dismissed", "reason": "Full zero-init of the stack chunk over its exact sizeof; prevents uninitialized flag/padding leakage. No defect."},
+    {"anchor": "Packet.m_pData = pMsg->Data(); Packet.m_DataSize = pMsg->Size();", "disposition": "finding", "reason": "Borrowed (non-owning) pointer plus an unclamped caller-supplied size handed to the transport — a latent lifetime / length-versus-buffer contract for the implementation."},
+    {"anchor": "Packet.m_ClientID = ClientID", "disposition": "dismissed", "reason": "Stores the validated destination id; overwritten per-iteration in broadcast. No safety issue."},
+    {"anchor": "Flags & MSGFLAG_VITAL / MSGFLAG_FLUSH -> NETSENDFLAG_*", "disposition": "dismissed", "reason": "Pure flag translation OR'd into a zeroed field; governs reliability only, no memory contract."},
+    {"anchor": "if(!(Flags&MSGFLAG_NORECORD)) m_DemoRecorder.RecordMessage(pMsg->Data(), pMsg->Size())", "disposition": "finding", "reason": "Recording runs before the NOSEND/validity gates and passes the same untrusted-length value to a second consumer; integrity concern and a second length-bound to confirm."},
+    {"anchor": "if(!(Flags&MSGFLAG_NOSEND)) { ... }", "disposition": "dismissed", "reason": "Correctly gates the transmit; broadcast vs targeted split is well-formed."},
+    {"anchor": "broadcast loop: for(i = 0; i < MAX_CLIENTS; i++) ... m_NetServer.Send(&Packet)", "disposition": "dismissed", "reason": "Loop bound keeps i in range; per-slot STATE_INGAME && !m_Quitting re-check mirrors the entry gate. No defect."},
+    {"anchor": "m_NetServer.Send(&Packet) (line 40 and line 36)", "disposition": "dismissed", "reason": "Downstream transmit; receives a validated ClientID and a zeroed chunk. Its own length/lifetime handling is out of scope but noted in findings."},
+    {"anchor": "return 0 / return -1", "disposition": "dismissed", "reason": "Coarse return contract (0 covers sent, dropped, and NOSEND); no delivery confirmation, but not a security defect."}
+  ],
+  "findings": [
+    {
+      "title": "State gate against sending to an EMPTY/quitting client slot (CWE-703 fix); OOB safety depends on short-circuit ordering",
+      "anchor": "if(ClientID != -1 && (ClientID < 0 || ClientID >= MAX_CLIENTS || m_aClients[ClientID].m_State == CClient::STATE_EMPTY || m_aClients[ClientID].m_Quitting))",
+      "file": "corpus/train/train_0309_cwe703.cpp",
+      "line": "9",
+      "code": "\tif(ClientID != -1 && (ClientID < 0 || ClientID >= MAX_CLIENTS || m_aClients[ClientID].m_State == CClient::STATE_EMPTY || m_aClients[ClientID].m_Quitting))\n\t\treturn 0;",
+      "bug_class": "Improper handling of exceptional condition (send to slot mid-teardown); latent use-after-free / stale-state dispatch",
+      "cwe": "CWE-703",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0309_cwe703.cpp (guard shown); downstream effect in m_NetServer.Send implementation (file not provided)",
+      "invariant": "A ClientID must be proven 0 <= ClientID < MAX_CLIENTS before any m_aClients[ClientID] dereference, AND the target slot must be neither STATE_EMPTY nor m_Quitting before the id is passed to m_NetServer.Send. The range tests must remain ordered before the state reads so short-circuit evaluation prevents an out-of-bounds array read.",
+      "failure_mode": "Without the m_Quitting sub-check (the vulnerable predecessor of this 'fixed' sample), a caller could target a client whose connection object is being destroyed, causing the transport to operate on a partially-freed/reset client structure — an exceptional-condition/use-after-free class bug. As shown the check is present and correct, so the risk is mitigated; the remaining fragility is that reordering the boolean terms in a future edit would turn an out-of-range ClientID into an out-of-bounds read of m_aClients[].",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm m_Quitting is set synchronously the moment a client begins disconnecting (before any m_NetServer.Send could target it), and that the && / || term ordering is preserved so bounds are always evaluated before the m_aClients[] dereference."
+    },
+    {
+      "title": "Unclamped message size and borrowed payload pointer passed to the transport",
+      "anchor": "Packet.m_pData = pMsg->Data(); Packet.m_DataSize = pMsg->Size();",
+      "file": "corpus/train/train_0309_cwe703.cpp",
+      "line": "14-15",
+      "code": "\tPacket.m_pData = pMsg->Data();\n\tPacket.m_DataSize = pMsg->Size();",
+      "bug_class": "Length-versus-buffer / borrowed-pointer lifetime (latent overflow or use-after-free in the network layer)",
+      "cwe": "CWE-120",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided) — CMsgPacker buffer and m_NetServer.Send",
+      "invariant": "pMsg->Size() must not exceed the maximum chunk/packet size the transport can carry (or the transport must fragment/reject safely), and the buffer behind pMsg->Data() must remain valid and unmodified until m_NetServer.Send has fully consumed the chunk, since m_pData is stored by reference, not copied.",
+      "failure_mode": "If Size() can exceed the network layer's chunk buffer and Send copies m_DataSize bytes without its own clamp, a buffer overflow occurs; if the packer's buffer is freed/reused before Send finishes (e.g. Packet outlives pMsg), the transport reads freed memory. Both live entirely in the implementation this code calls — the shown function performs no bound and no copy.",
+      "cve_analog": "",
+      "what_to_confirm": "Verify CMsgPacker enforces a maximum Size() bounded by the transport's max payload, and that m_NetServer.Send either copies the payload or documents that pMsg must outlive the call."
+    },
+    {
+      "title": "Demo recording occurs before send/validity gating and reuses the untrusted length",
+      "anchor": "if(!(Flags&MSGFLAG_NORECORD)) m_DemoRecorder.RecordMessage(pMsg->Data(), pMsg->Size());",
+      "file": "corpus/train/train_0309_cwe703.cpp",
+      "line": "23-24",
+      "code": "\tif(!(Flags&MSGFLAG_NORECORD))\n\t\tm_DemoRecorder.RecordMessage(pMsg->Data(), pMsg->Size());",
+      "bug_class": "Ordering/integrity: record-before-validate; second consumer of an unclamped length",
+      "cwe": "CWE-20",
+      "severity": "info",
+      "where_it_lives": "implementation (file not provided) — CDemoRecorder.RecordMessage",
+      "invariant": "RecordMessage must length-bound pMsg->Size() into its own storage exactly as the network path must, and the caller must accept that recording is decoupled from actual transmission (a NOSEND or dropped message may still be recorded).",
+      "failure_mode": "A message that is ultimately not sent (NOSEND, or a targeted send to a slot that fails a later check) is still written to the demo, producing a demo stream that does not match wire reality. Separately, RecordMessage receives the same caller-supplied Size() with no clamp here, so any missing bound inside the recorder is a latent overflow in the recording buffer.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm CDemoRecorder.RecordMessage bounds Size() against its buffer, and that recording-before-validation is intentional for demo fidelity."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm m_Quitting is set atomically/synchronously at the start of a client disconnect so the line-9 gate always sees teardown-in-progress before m_NetServer.Send could target that slot.",
+    "Verify the boolean term ordering on line 9 is preserved (range tests before m_aClients[ClientID] state reads) so no future edit introduces an out-of-bounds read of m_aClients[].",
+    "Check that CMsgPacker::Size() is bounded by the transport's maximum payload and that m_NetServer.Send clamps or fragments m_DataSize rather than trusting it.",
+    "Verify the borrowed pointer m_pData (from pMsg->Data()) remains valid until Send completes — i.e. Packet never outlives pMsg and the packer buffer is not reused mid-send.",
+    "Confirm CDemoRecorder::RecordMessage length-bounds the same untrusted Size() into its own buffer.",
+    "Confirm the single-threaded assumption: m_NetServer.Send does not re-enter SendMsg or run a callback that could free/disconnect the client whose state was validated at line 9.",
+    "Confirm broadcast semantics: passing ClientID == -1 for a supposedly-targeted send silently broadcasts to all in-game clients — verify no caller can be tricked into that."
+  ]
+}

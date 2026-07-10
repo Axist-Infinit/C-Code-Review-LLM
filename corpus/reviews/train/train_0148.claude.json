@@ -1,0 +1,178 @@
+{
+  "subsystem": "curl (libcurl) URL/hostname handling. This is the file-static helper fix_hostname() from lib/url.c, called during connection setup to normalize the host portion of a URL before it is used for DNS resolution and TLS SNI. It sets a display name, strips a single trailing dot, and — for non-ASCII host names — converts the name to IDNA ACE (punycode) form using either GNU libidn (idna_to_ascii_lz) or the Win32 IDN API. The '_fixed' suffix on the sample tag (primevul_c_train_2637_fixed) indicates this is the patched revision of a known bug.",
+  "provenance": "Identified as curl/libcurl by exact symbol names and idioms: the function name fix_hostname, the argument types struct SessionHandle, struct connectdata and struct hostname, the logging macro infof(data, ...), the libidn calls idna_to_ascii_lz / stringprep_check_version / stringprep_locale_charset / tld_check_name, curl's own Curl_idn_strerror, and the feature macros USE_LIBIDN, USE_WIN32_IDN, CURL_DISABLE_VERBOSE_STRINGS, LIBIDN_REQUIRED_VERSION. The sample banner /* sample: primevul_c_train_2637_fixed */ marks it as a PrimeVul-derived training sample and the fixed variant.",
+  "trust_boundary": "host->name is attacker-influenced data: it is the host component parsed out of a URL, which in libcurl commonly originates from an untrusted source (a redirect Location header, a user-supplied or server-supplied URL, an HTTP proxy target, etc.). Its length and byte content — including the degenerate empty string, a trailing '.', and arbitrary non-ASCII/UTF-8 — are all controllable. host->name is treated as a NUL-terminated C string throughout, so both its length (via strlen) and every index into it depend on where the terminator lands. The remaining arguments (data, conn) are internal handles, but the string they carry is hostile.",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0148_cwe119.c",
+      "lines": "1-4",
+      "code": "/* sample: primevul_c_train_2637_fixed */\nstatic void fix_hostname(struct SessionHandle *data,\n                         struct connectdata *conn, struct hostname *host)\n{",
+      "explanation": "A file-static helper with no return value. It takes the per-transfer easy handle (data, used for logging via infof), the per-connection object (conn, used for error-string formatting), and a struct hostname* host whose most important members here are host->name (the NUL-terminated host string), host->dispname (a display alias), and host->encalloc (an owned heap allocation of the ACE-encoded name). Because it returns void, any conversion failure can only be logged, never signalled to the caller — the caller proceeds with whatever host->name holds afterward."
+    },
+    {
+      "file": "corpus/train/train_0148_cwe119.c",
+      "lines": "5-12",
+      "code": "  size_t len;\n\n#ifndef USE_LIBIDN\n  (void)data;\n  (void)conn;\n#elif defined(CURL_DISABLE_VERBOSE_STRINGS)\n  (void)conn;\n#endif",
+      "explanation": "Declares len as a size_t (an UNSIGNED type — important below) that will hold strlen(host->name). The preprocessor block suppresses unused-parameter warnings depending on build configuration: when libidn is not compiled in, neither data nor conn is used, so both are cast to void; when libidn is present but verbose strings are disabled, only conn is unused. These casts have no runtime effect and no security relevance; they exist purely for warning hygiene across curl's many build permutations."
+    },
+    {
+      "file": "corpus/train/train_0148_cwe119.c",
+      "lines": "14-15",
+      "code": "  /* set the name we use to display the host name */\n  host->dispname = host->name;",
+      "explanation": "host->dispname is aliased to the current host->name pointer. This is the human-readable name used later in log/error messages. Crucially this alias is captured BEFORE any IDNA conversion below, so dispname keeps pointing at the ORIGINAL (possibly non-ASCII) name buffer even after host->name is later repointed to the ACE-encoded allocation. The lifetime of dispname is therefore tied to the original name storage, not to host->encalloc."
+    },
+    {
+      "file": "corpus/train/train_0148_cwe119.c",
+      "lines": "17-21",
+      "code": "  len = strlen(host->name);\n  if(len && (host->name[len-1] == '.'))\n    /* strip off a single trailing dot if present, primarily for SNI but\n       there's no use for it */\n    host->name[len-1]=0;",
+      "explanation": "Computes the length of the host string, then strips exactly one trailing '.' if present. This is the security-relevant core of the fix: the guard is 'len &&' FIRST, so the subexpression host->name[len-1] is only evaluated when len is non-zero. Because len is size_t (unsigned), if len were 0 then len-1 would wrap to SIZE_MAX rather than -1, making host->name[len-1] a wild, far out-of-bounds index. The short-circuit 'len &&' is precisely what prevents that. When a real trailing dot is found the byte is overwritten with a NUL, shortening the name in place (used mainly so the trailing dot does not appear in the TLS SNI extension)."
+    },
+    {
+      "file": "corpus/train/train_0148_cwe119.c",
+      "lines": "23-23",
+      "code": "  if(!is_ASCII_name(host->name)) {",
+      "explanation": "Fast path: if the (dot-trimmed) name is pure ASCII, nothing further is needed and the function effectively ends. is_ASCII_name scans host->name to its NUL terminator; a correctly NUL-terminated string is assumed. Only non-ASCII names fall into the IDNA conversion block that follows, which is compiled differently depending on which IDN backend (if any) is available."
+    },
+    {
+      "file": "corpus/train/train_0148_cwe119.c",
+      "lines": "24-45",
+      "code": "#ifdef USE_LIBIDN\n  /*************************************************************\n   * Check name for non-ASCII and convert hostname to ACE form.\n   *************************************************************/\n  if(stringprep_check_version(LIBIDN_REQUIRED_VERSION)) {\n    char *ace_hostname = NULL;\n    int rc = idna_to_ascii_lz(host->name, &ace_hostname, 0);\n    infof (data, \"Input domain encoded as `%s'\\n\",\n           stringprep_locale_charset ());\n    if(rc != IDNA_SUCCESS)\n      infof(data, \"Failed to convert %s to ACE; %s\\n\",\n            host->name, Curl_idn_strerror(conn, rc));\n    else {\n      /* tld_check_name() displays a warning if the host name contains\n         \"illegal\" characters for this TLD */\n      (void)tld_check_name(data, ace_hostname);\n\n      host->encalloc = ace_hostname;\n      /* change the name pointer to point to the encoded hostname */\n      host->name = host->encalloc;\n    }\n  }",
+      "explanation": "The GNU libidn conversion path. It first confirms the runtime libidn is at least LIBIDN_REQUIRED_VERSION. ace_hostname is initialized to NULL, then idna_to_ascii_lz(host->name, &ace_hostname, 0) converts the locale-encoded name to ASCII Compatible Encoding, allocating ace_hostname on success. The flags argument is 0, which selects libidn's default (IDNA 2003) processing. The infof call logs the locale charset unconditionally (even before the result is known). On failure (rc != IDNA_SUCCESS) it only logs and leaves host->name unchanged. On success it (a) runs tld_check_name for a cosmetic TLD warning, (b) stores the new allocation in host->encalloc so it can be freed later, and (c) repoints host->name at that owned buffer. Ownership of the ACE string now lives in host->encalloc."
+    },
+    {
+      "file": "corpus/train/train_0148_cwe119.c",
+      "lines": "46-59",
+      "code": "#elif defined(USE_WIN32_IDN)\n  /*************************************************************\n   * Check name for non-ASCII and convert hostname to ACE form.\n   *************************************************************/\n    char *ace_hostname = NULL;\n    int rc = curl_win32_idn_to_ascii(host->name, &ace_hostname);\n    if(rc == 0)\n      infof(data, \"Failed to convert %s to ACE;\\n\",\n            host->name);\n    else {\n      host->encalloc = ace_hostname;\n      /* change the name pointer to point to the encoded hostname */\n      host->name = host->encalloc;\n    }",
+      "explanation": "The Windows IDN backend, mutually exclusive with USE_LIBIDN. It mirrors the libidn path: ace_hostname starts NULL, curl_win32_idn_to_ascii returns 0 on failure (logged) and non-zero on success. On success the freshly allocated ACE name is stored in host->encalloc and host->name is repointed to it. The ownership and lifetime contract is identical to the libidn branch, so the same encalloc/dispname considerations apply here."
+    },
+    {
+      "file": "corpus/train/train_0148_cwe119.c",
+      "lines": "60-64",
+      "code": "#else\n    infof(data, \"IDN support not present, can't parse Unicode domains\\n\");\n#endif\n  }\n}",
+      "explanation": "When no IDN backend is compiled in, the function simply logs that Unicode domains cannot be parsed and returns, leaving the non-ASCII host->name untouched — the caller then proceeds to resolve/connect using the raw non-ASCII bytes. The closing braces end the non-ASCII if-block and the function. Note the function never reports success/failure to its caller, so an unconverted or failed name silently continues down the connection path."
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0148_cwe119.c",
+      "lines": "17-21",
+      "code": "  len = strlen(host->name);\n  if(len && (host->name[len-1] == '.'))\n    /* strip off a single trailing dot if present, primarily for SNI but\n       there's no use for it */\n    host->name[len-1]=0;",
+      "explanation": "This is the memory-safety hazard this revision exists to prevent, and it is centered on len being an UNSIGNED size_t. If host->name is the empty string (an attacker can supply a zero-length host, e.g. from a crafted URL/redirect), then len == 0 and, WITHOUT the leading 'len &&' guard, len-1 does not become -1 but wraps to SIZE_MAX. host->name[SIZE_MAX] is then a far out-of-bounds read (CWE-125), and if that stray byte happens to equal '.', the subsequent host->name[len-1]=0 becomes an out-of-bounds WRITE of a NUL byte (CWE-787) — a remotely-influenced memory-corruption primitive. The fixed code shown here is SAFE because '&&' short-circuits and host->name[len-1] is never evaluated when len==0. The invariant the implementation must uphold: never index host->name at len-1 unless len>0. The concrete thing to protect is exactly the 'len &&' short-circuit — removing or reordering it reintroduces the underflow."
+    },
+    {
+      "file": "corpus/train/train_0148_cwe119.c",
+      "lines": "30-30",
+      "code": "    int rc = idna_to_ascii_lz(host->name, &ace_hostname, 0);",
+      "explanation": "The flags argument 0 makes libidn perform IDNA 2003 processing, which maps/normalizes certain code points differently than IDNA 2008 (for example characters like the German sharp-s or certain confusables). An attacker who controls host->name can craft a Unicode name that IDNA 2003 folds to an ACE label for a DIFFERENT domain than the user intended, so the connection (and therefore the certificate check, cookies, and SNI) targets an attacker-chosen host — a name-confusion / spoofing issue rather than a memory bug. This maps to curl's documented IDNA 2003 weakness. The implementation should use consistent, current IDNA processing and must ensure the converted name is what the security decisions downstream key off of."
+    },
+    {
+      "file": "corpus/train/train_0148_cwe119.c",
+      "lines": "41-43",
+      "code": "      host->encalloc = ace_hostname;\n      /* change the name pointer to point to the encoded hostname */\n      host->name = host->encalloc;",
+      "explanation": "host->encalloc is the single owning pointer for the ACE allocation and is assigned unconditionally on success (the same happens at line 56 in the Win32 branch). If fix_hostname (or an equivalent path) can run more than once for the same host struct, or if host->encalloc already holds a previous allocation, this assignment overwrites the old pointer without freeing it, leaking that buffer (CWE-401). Separately, host->name is repointed away from its original storage; the implementation must guarantee that (a) whatever previously owned host->name is not double-freed given that host->name now points into encalloc, and (b) encalloc is freed exactly once during connection teardown. The invariant: encalloc must be empty/freed before a new ACE string is stored, and the original name buffer and the encalloc buffer must have clearly separated ownership."
+    },
+    {
+      "file": "corpus/train/train_0148_cwe119.c",
+      "lines": "15-15",
+      "code": "  host->dispname = host->name;",
+      "explanation": "dispname is captured as an alias of the original name pointer before the IDNA swap at line 43/58. After conversion, host->name owns/points into host->encalloc while host->dispname still points at the ORIGINAL name buffer. If that original buffer is freed (or reallocated) while dispname is later dereferenced in a log/error message, dispname is a dangling read (CWE-825 / potential CWE-416 at the logging site). The implementation must keep the original name storage alive for as long as dispname may be used, and must not assume dispname and name share a lifetime with encalloc."
+    },
+    {
+      "file": "corpus/train/train_0148_cwe119.c",
+      "lines": "33-35",
+      "code": "    if(rc != IDNA_SUCCESS)\n      infof(data, \"Failed to convert %s to ACE; %s\\n\",\n            host->name, Curl_idn_strerror(conn, rc));",
+      "explanation": "On conversion failure the code only logs; fix_hostname returns void, so the caller cannot tell the name was never converted and will resolve/connect using the raw non-ASCII host->name. This is a robustness/validation gap (CWE-20) rather than memory corruption. Also note the log arguments dereference data and conn via infof/Curl_idn_strerror; if either handle could be NULL at this point the log site would fault (CWE-476) — verify callers always pass live handles. The invariant: a failed IDNA conversion should not silently proceed as if the name were valid, and logging must not assume non-NULL handles beyond curl's normal guarantees."
+    }
+  ],
+  "summary": "This is the FIXED revision of a curl fix_hostname() sample and it is low risk: the central memory-safety bug — an unsigned size_t underflow when strlen(host->name)==0 that turned host->name[len-1] into a far out-of-bounds read and a conditional out-of-bounds NUL write — is correctly neutralized by the leading 'len &&' short-circuit on line 18. The residual issues are minor and largely latent in the implementation: IDNA 2003 name confusion at line 30 (a real curl weakness), ownership/leak discipline around host->encalloc, and dispname lifetime coupling. No exploitable buffer overflow remains in the code as shown.",
+  "reviewed_anchors": [
+    {"anchor": "fix_hostname(struct SessionHandle *data, struct connectdata *conn, struct hostname *host) signature (lines 2-3)", "disposition": "dismissed", "reason": "void-returning entry point; carries the contract but the danger lives in the specific statements below, reviewed individually."},
+    {"anchor": "size_t len; (line 5)", "disposition": "finding", "reason": "unsigned length variable whose 0 value makes len-1 wrap to SIZE_MAX; central to the underflow contract at line 18/21."},
+    {"anchor": "unused-parameter (void) casts, lines 8-11", "disposition": "dismissed", "reason": "warning-suppression only; no runtime effect and no security contract."},
+    {"anchor": "host->dispname = host->name; (line 15)", "disposition": "finding", "reason": "aliases the original name buffer before the IDNA swap; lifetime/dangling-pointer contract."},
+    {"anchor": "len = strlen(host->name); (line 17)", "disposition": "dismissed", "reason": "assumes host->name is NUL-terminated, which is curl's invariant for this field; the risk surfaces at the index on line 18, reviewed there."},
+    {"anchor": "if(len && (host->name[len-1] == '.')) (line 18)", "disposition": "finding", "reason": "the size_t underflow guard; without 'len &&' this is an OOB read/write — the file's core fix."},
+    {"anchor": "host->name[len-1]=0; (line 21)", "disposition": "finding", "reason": "conditional in-place NUL write at len-1; OOB write if the underflow guard is absent (same finding as line 18)."},
+    {"anchor": "is_ASCII_name(host->name) (line 23)", "disposition": "dismissed", "reason": "read-only scan to the NUL terminator; relies on the same NUL-termination invariant, no separate memory bug."},
+    {"anchor": "stringprep_check_version(LIBIDN_REQUIRED_VERSION) (line 28)", "disposition": "dismissed", "reason": "runtime version gate; no attacker-controlled input, no memory contract."},
+    {"anchor": "char *ace_hostname = NULL; (lines 29, 50)", "disposition": "dismissed", "reason": "correctly initialized to NULL and only used after a success check; no uninitialized-use risk."},
+    {"anchor": "idna_to_ascii_lz(host->name, &ace_hostname, 0) (line 30)", "disposition": "finding", "reason": "flags=0 selects IDNA 2003, enabling hostname confusion/spoofing (documented curl weakness)."},
+    {"anchor": "infof(data, \"Input domain encoded as ...\", stringprep_locale_charset()) (lines 31-32)", "disposition": "dismissed", "reason": "logging with a library-provided charset string; cosmetic (logged before the result is known) but not a security bug; data assumed non-NULL per curl invariants."},
+    {"anchor": "if(rc != IDNA_SUCCESS) ... infof(... Curl_idn_strerror(conn, rc)) (lines 33-35)", "disposition": "finding", "reason": "failure is only logged, never propagated (void return); silent continue with non-ASCII name and log-site handle deref."},
+    {"anchor": "tld_check_name(data, ace_hostname) (line 39)", "disposition": "dismissed", "reason": "explicitly (void)-cast advisory warning only; result unused, no state change relevant to safety."},
+    {"anchor": "host->encalloc = ace_hostname; / host->name = host->encalloc; (lines 41-43, 56-58)", "disposition": "finding", "reason": "sole owning pointer overwritten unconditionally; leak if a prior allocation exists and ownership/free discipline for name vs encalloc must be exact."},
+    {"anchor": "curl_win32_idn_to_ascii(host->name, &ace_hostname) (line 51)", "disposition": "dismissed", "reason": "Win32 mirror of the libidn path; same ownership contract already captured by the encalloc finding, no distinct new bug."},
+    {"anchor": "infof(data, \"IDN support not present...\") (line 61)", "disposition": "dismissed", "reason": "no-backend log message; leaves name untouched, no memory contract."}
+  ],
+  "findings": [
+    {
+      "title": "Unsigned size_t underflow -> out-of-bounds read/write on empty host name (mitigated in this revision)",
+      "anchor": "if(len && (host->name[len-1] == '.'))  /  host->name[len-1]=0;",
+      "file": "corpus/train/train_0148_cwe119.c",
+      "line": "17-21",
+      "code": "  len = strlen(host->name);\n  if(len && (host->name[len-1] == '.'))\n    /* strip off a single trailing dot if present, primarily for SNI but\n       there's no use for it */\n    host->name[len-1]=0;",
+      "bug_class": "Out-of-bounds access via unsigned integer underflow (empty-string edge case)",
+      "cwe": "CWE-191",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0148_cwe119.c",
+      "invariant": "host->name[len-1] must never be evaluated when len==0; because len is size_t, len-1 underflows to SIZE_MAX rather than -1, so the code MUST short-circuit on len before indexing.",
+      "failure_mode": "An attacker-supplied zero-length host name makes len==0. Without the leading 'len &&' guard, len-1 wraps to SIZE_MAX and host->name[len-1] is a wild out-of-bounds read (CWE-125); if that byte equals '.', host->name[len-1]=0 performs an out-of-bounds NUL write (CWE-787). The revision shown is SAFE because '&&' prevents evaluating the index when len==0 — this finding documents the contract the fix upholds.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm the 'len &&' short-circuit is present and evaluated BEFORE host->name[len-1] on line 18, and that no later refactor indexes host->name at len-1 without a len>0 guard."
+    },
+    {
+      "title": "IDNA 2003 hostname conversion enables name confusion/spoofing",
+      "anchor": "idna_to_ascii_lz(host->name, &ace_hostname, 0)",
+      "file": "corpus/train/train_0148_cwe119.c",
+      "line": "30",
+      "code": "    int rc = idna_to_ascii_lz(host->name, &ace_hostname, 0);",
+      "bug_class": "Improper input validation / hostname confusion (IDNA 2003 mapping)",
+      "cwe": "CWE-20",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0148_cwe119.c (libidn conversion) and implementation (file not provided) for downstream cert/cookie/SNI use",
+      "invariant": "The ACE name derived from an attacker-controlled Unicode host must map to the same domain a modern (IDNA 2008/UTS-46) resolver would use, so that certificate verification, cookie scoping, and SNI all key off an unambiguous target.",
+      "failure_mode": "flags==0 selects IDNA 2003 semantics; a crafted Unicode host name can fold to an ACE label for a different domain than intended, redirecting the connection and its TLS/cookie security decisions to an attacker-chosen host without the user noticing.",
+      "cve_analog": "CVE-2016-8625",
+      "what_to_confirm": "Verify whether the build/library performs IDNA 2003 vs IDNA 2008/UTS-46 processing here and whether downstream verification uses the converted name consistently."
+    },
+    {
+      "title": "host->encalloc overwritten unconditionally — potential memory leak / ownership hazard",
+      "anchor": "host->encalloc = ace_hostname; / host->name = host->encalloc;",
+      "file": "corpus/train/train_0148_cwe119.c",
+      "line": "41-43",
+      "code": "      host->encalloc = ace_hostname;\n      /* change the name pointer to point to the encoded hostname */\n      host->name = host->encalloc;",
+      "bug_class": "Memory leak / owning-pointer overwrite (same pattern at Win32 line 56)",
+      "cwe": "CWE-401",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0148_cwe119.c; free/teardown in implementation (file not provided)",
+      "invariant": "host->encalloc must be NULL/freed before a new ACE allocation is stored, and the ownership of the original host->name buffer versus the encalloc buffer must be clearly separated so encalloc is freed exactly once and the original is not double-freed.",
+      "failure_mode": "If host->encalloc already holds an allocation (e.g. fix_hostname or an equivalent conversion runs twice for the same host), this assignment overwrites the pointer without freeing the previous buffer, leaking it. Repointing host->name into encalloc also demands careful teardown to avoid freeing the wrong owner.",
+      "cve_analog": "",
+      "what_to_confirm": "Confirm host->encalloc is freed (and cleared) before any re-entry, and that connection teardown frees encalloc exactly once without touching the original name buffer through host->name."
+    },
+    {
+      "title": "dispname aliases the original name buffer across the IDNA pointer swap",
+      "anchor": "host->dispname = host->name;",
+      "file": "corpus/train/train_0148_cwe119.c",
+      "line": "15",
+      "code": "  host->dispname = host->name;",
+      "bug_class": "Dangling/aliased pointer lifetime (use of pointer after underlying buffer may be freed)",
+      "cwe": "CWE-825",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0148_cwe119.c; buffer lifetime managed in implementation (file not provided)",
+      "invariant": "The original host->name storage that dispname aliases must remain valid for the entire time dispname may be dereferenced (logging/error paths), even after host->name is repointed to host->encalloc.",
+      "failure_mode": "dispname is captured before the IDNA swap on line 43/58; afterward host->name owns/points into encalloc while dispname still points at the original buffer. If that original buffer is freed or reallocated before a later log/error message reads dispname, the read is out-of-lifetime (CWE-825, potential CWE-416 at the log site).",
+      "cve_analog": "",
+      "what_to_confirm": "Verify the original name buffer outlives all dispname uses and is not freed while host->name/encalloc are managed separately."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm the 'len &&' short-circuit on line 18 remains before host->name[len-1]; a zero-length host name must never index at len-1 (size_t underflow to SIZE_MAX).",
+    "Verify no other code path indexes host->name at len-1 (or performs (len - k)) without first proving len>0/len>=k, given len is unsigned.",
+    "Check whether IDNA 2003 (flags==0 in idna_to_ascii_lz) vs IDNA 2008/UTS-46 is used and whether downstream cert/cookie/SNI decisions use the converted name consistently (CVE-2016-8625 class).",
+    "Confirm host->encalloc is NULL or freed before assignment on lines 41/56, and freed exactly once at teardown without double-freeing the original name buffer.",
+    "Confirm the original name buffer aliased by host->dispname (line 15) outlives every dispname dereference after host->name is repointed to encalloc.",
+    "Confirm idna_to_ascii_lz / curl_win32_idn_to_ascii do not leave a stray allocation in ace_hostname on the failure path (rc != IDNA_SUCCESS / rc==0) that is never stored in encalloc and thus leaked.",
+    "Confirm data and conn are non-NULL wherever infof/Curl_idn_strerror dereference them, and decide whether a failed IDNA conversion should be signalled to the caller rather than silently proceeding with the raw name."
+  ]
+}

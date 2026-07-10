@@ -1,0 +1,299 @@
+{
+  "subsystem": "Flatpak command-line client — the implementation of the `flatpak build` builtin (flatpak_builtin_build). It sets up an unprivileged bubblewrap (bwrap) sandbox around a build directory: it reads the build directory's `metadata` key-file, resolves the runtime/SDK, computes the sandbox permission set, assembles the bwrap argument vector (bind mounts, tmpfs, environment variables), and finally execvpe()s bwrap to run a command inside that sandbox.",
+  "provenance": "Identified from the GLib/GObject idioms (g_autoptr, g_auto(GStrv), GKeyFile, GFile, GBytes, GError, gsize/gboolean) and the pervasive `flatpak_*` API surface (flatpak_context_new, flatpak_find_deploy_for_ref, flatpak_bwrap_new, flatpak_run_setup_base_argv, flatpak_get_bwrap). The FLATPAK_METADATA_GROUP_* / FLATPAK_METADATA_KEY_* constants and the FlatpakDecomposed/FlatpakDeploy/FlatpakContext/FlatpakBwrap types are unmistakably Flatpak's app/runtime model (app/builtins/flatpak-builtins-build.c). The in-band sample tag `primevul_c_train_3238_fixed` marks this as the post-fix revision drawn from PrimeVul.",
+  "trust_boundary": "Two untrusted inputs enter. (1) The build DIRECTORY and, crucially, its `metadata` file (lines 84-95): `flatpak build DIR` is pointed at a directory whose contents — including the metadata key-file — may be attacker-authored (a downloaded/checked-out build tree, a manifest from an untrusted source). Every g_key_file_get_string() value (id, runtime_pref, extensionof_ref/tag, x_dir, x_subdir_suffix, permission entries) is therefore attacker-influenced data that flows into path construction, sandbox permissions, and the bwrap argument vector. (2) The process argv (directory, command, opt_bind_mounts, opt_build_dir) is supplied by whoever invokes the command. The downstream consumer being fed these values is bubblewrap via execvpe(), so the central hazard class is injection/traversal of metadata-derived strings into mount destinations and sandbox configuration (CWE-74/CWE-22).",
+  "what_the_code_does": [
+    {
+      "file": "corpus/train/train_0269_cwe74.c",
+      "lines": "2-52",
+      "code": "flatpak_builtin_build (int argc, char **argv, GCancellable *cancellable, GError **error)\n{\n  g_autoptr(GOptionContext) context = NULL;\n  g_autoptr(FlatpakDeploy) runtime_deploy = NULL;\n  g_autoptr(GBytes) runtime_deploy_data = NULL;\n  g_autoptr(FlatpakDeploy) extensionof_deploy = NULL;\n  g_autoptr(GFile) var = NULL;\n  g_autoptr(GFile) var_tmp = NULL;\n  g_autoptr(GFile) var_lib = NULL;\n  g_autoptr(GFile) usr = NULL;\n  g_autoptr(GFile) res_deploy = NULL;\n  g_autoptr(GFile) res_files = NULL;\n  g_autoptr(GFile) app_files = NULL;\n  gboolean app_files_ro = FALSE;\n  g_autoptr(GFile) runtime_files = NULL;\n  g_autoptr(GFile) metadata = NULL;\n  g_autofree char *metadata_contents = NULL;\n  g_autofree char *runtime_pref = NULL;\n  g_autoptr(FlatpakDecomposed) runtime_ref = NULL;\n  g_autofree char *extensionof_ref = NULL;\n  g_autofree char *extensionof_tag = NULL;\n  g_autofree char *extension_point = NULL;\n  g_autofree char *extension_tmpfs_point = NULL;\n  g_autoptr(GKeyFile) metakey = NULL;\n  g_autoptr(GKeyFile) runtime_metakey = NULL;\n  g_autoptr(FlatpakBwrap) bwrap = NULL;\n  g_auto(GStrv) minimal_envp = NULL;\n  gsize metadata_size;\n  const char *directory = NULL;\n  const char *command = \"/bin/sh\";\n  g_autofree char *id = NULL;\n  int i;\n  int rest_argv_start, rest_argc;\n  g_autoptr(FlatpakContext) arg_context = NULL;\n  g_autoptr(FlatpakContext) app_context = NULL;\n  gboolean custom_usr;\n  FlatpakRunFlags run_flags;\n  const char *group = NULL;\n  const char *runtime_key = NULL;\n  const char *dest = NULL;\n  gboolean is_app = FALSE;\n  gboolean is_extension = FALSE;\n  gboolean is_app_extension = FALSE;\n  g_autofree char *arch = NULL;\n  g_autofree char *app_info_path = NULL;\n  g_autofree char *app_extensions = NULL;\n  g_autofree char *runtime_extensions = NULL;\n  g_autofree char *instance_id_host_dir = NULL;\n  char pid_str[64];\n  g_autofree char *pid_path = NULL;\n  g_autoptr(GFile) app_id_dir = NULL;",
+      "explanation": "The function signature: `flatpak_builtin_build(int argc, char **argv, GCancellable *cancellable, GError **error)` is the builtin handler for `flatpak build`; argc/argv carry the sub-command's arguments, cancellable is a GLib cancellation token, and error is the GError out-param used throughout. The body opens with a large block of stack locals. Almost all heap-owning pointers use g_autoptr/g_autofree so they are freed at scope exit; this is GLib's scope-based cleanup and generally protects against leaks and use-after-return. Note the security-relevant declarations: `metadata_contents`/`metadata_size` will hold the raw untrusted metadata file; `metakey`/`runtime_metakey` are parsed GKeyFile handles; `command` defaults to `\"/bin/sh\"` (line 31); `extension_point`/`extension_tmpfs_point`/`dest` are path strings that will be handed to bwrap; and `char pid_str[64]` (line 50) is the only fixed-size stack buffer in the function. `directory`, `command`, `group`, `runtime_key`, `dest` are plain `const char *` (not autofree), so their ownership must be tracked manually.",
+      "explanation_note": ""
+    },
+    {
+      "file": "corpus/train/train_0269_cwe74.c",
+      "lines": "54-68",
+      "code": "  context = g_option_context_new (_(\"DIRECTORY [COMMAND [ARGUMENT…]] - Build in directory\"));\n  g_option_context_set_translation_domain (context, GETTEXT_PACKAGE);\n\n  rest_argc = 0;\n  for (i = 1; i < argc; i++)\n    {\n      /* The non-option is the directory, take it out of the arguments */\n      if (argv[i][0] != '-')\n        {\n          rest_argv_start = i;\n          rest_argc = argc - i;\n          argc = i;\n          break;\n        }\n    }",
+      "explanation": "Creates the GOptionContext for --help/usage text and sets the gettext domain. Then it hand-splits argv: it scans from index 1 for the first argument that does not start with '-', treats that as the DIRECTORY, and records `rest_argv_start` (index of the directory) and `rest_argc` (count of remaining args from the directory onward). It then truncates `argc` to `i` so the subsequent option parser only sees the leading option flags, leaving the directory and trailing command/arguments in the `rest_*` slice. If no non-option is found, rest_argc stays 0. Note `argv[i][0]` dereferences each argv element; argv entries are NUL-terminated C strings from the caller, so `[0]` is at worst the terminator — safe.",
+      "explanation_note": ""
+    },
+    {
+      "file": "corpus/train/train_0269_cwe74.c",
+      "lines": "70-81",
+      "code": "  arg_context = flatpak_context_new ();\n  g_option_context_add_group (context, flatpak_context_get_options (arg_context));\n\n  if (!flatpak_option_context_parse (context, options, &argc, &argv, FLATPAK_BUILTIN_FLAG_NO_DIR, NULL, cancellable, error))\n    return FALSE;\n\n  if (rest_argc == 0)\n    return usage_error (context, _(\"DIRECTORY must be specified\"), error);\n\n  directory = argv[rest_argv_start];\n  if (rest_argc >= 2)\n    command = argv[rest_argv_start + 1];",
+      "explanation": "Builds a FlatpakContext (`arg_context`) to collect sandbox-permission options passed on the command line, registers its GOptionGroup, and runs the global option parser over the truncated argv. On parse failure it returns FALSE. It then enforces that a DIRECTORY was given (rest_argc != 0). `directory` is set to the first rest argument, and if a second rest argument exists it becomes `command` (overriding the /bin/sh default). Both `directory` and `command` are raw user-supplied argv strings; `command` will later be exec'd as the program run inside the sandbox.",
+      "explanation_note": ""
+    },
+    {
+      "file": "corpus/train/train_0269_cwe74.c",
+      "lines": "83-95",
+      "code": "  res_deploy = g_file_new_for_commandline_arg (directory);\n  metadata = g_file_get_child (res_deploy, opt_metadata ? opt_metadata : \"metadata\");\n\n  if (!g_file_query_exists (res_deploy, NULL) ||\n      !g_file_query_exists (metadata, NULL))\n    return flatpak_fail (error, _(\"Build directory %s not initialized, use flatpak build-init\"), directory);\n\n  if (!g_file_load_contents (metadata, cancellable, &metadata_contents, &metadata_size, NULL, error))\n    return FALSE;\n\n  metakey = g_key_file_new ();\n  if (!g_key_file_load_from_data (metakey, metadata_contents, metadata_size, 0, error))\n    return FALSE;",
+      "explanation": "This is the trust-boundary crossing. `res_deploy` is a GFile for the user-named build directory; `metadata` is its child file (default name `metadata`, overridable via --metadata). After confirming both exist, `g_file_load_contents` reads the entire metadata file into the heap buffer `metadata_contents` with byte length `metadata_size`. `g_key_file_new()` + `g_key_file_load_from_data(metakey, metadata_contents, metadata_size, 0, ...)` parses those raw bytes as a GLib key-file (INI-style groups/keys). From here on, `metakey` is fully attacker-controlled structured data: every group name, key, and value is chosen by whoever authored the build directory.",
+      "explanation_note": ""
+    },
+    {
+      "file": "corpus/train/train_0269_cwe74.c",
+      "lines": "97-121",
+      "code": "  if (g_key_file_has_group (metakey, FLATPAK_METADATA_GROUP_APPLICATION))\n    {\n      group = FLATPAK_METADATA_GROUP_APPLICATION;\n      is_app = TRUE;\n    }\n  else if (g_key_file_has_group (metakey, FLATPAK_METADATA_GROUP_RUNTIME))\n    {\n      group = FLATPAK_METADATA_GROUP_RUNTIME;\n    }\n  else\n    return flatpak_fail (error, _(\"metadata invalid, not application or runtime\"));\n\n  extensionof_ref = g_key_file_get_string (metakey,\n                                           FLATPAK_METADATA_GROUP_EXTENSION_OF,\n                                           FLATPAK_METADATA_KEY_REF, NULL);\n  if (extensionof_ref != NULL)\n    {\n      is_extension = TRUE;\n      if (g_str_has_prefix (extensionof_ref, \"app/\"))\n        is_app_extension = TRUE;\n    }",
+      "explanation": "Determines whether the metadata describes an Application or a Runtime by checking for the corresponding [Application]/[Runtime] group, selecting `group` accordingly and setting `is_app`. Absence of both is a hard error. It then reads the `ref` key of the [ExtensionOf] group into `extensionof_ref`; if present, this metadata describes an extension, so `is_extension` is set, and if the parent ref begins with `app/` it is an app-extension (`is_app_extension`). These booleans steer the large extension-handling block below and, ultimately, whether files are mounted under /app or /usr. All three values (extensionof_ref, the group, the flags) derive from attacker-controlled metadata.",
+      "explanation_note": ""
+    },
+    {
+      "file": "corpus/train/train_0269_cwe74.c",
+      "lines": "119-140",
+      "code": "  extensionof_tag = g_key_file_get_string (metakey,\n                                           FLATPAK_METADATA_GROUP_EXTENSION_OF,\n                                           FLATPAK_METADATA_KEY_TAG, NULL);\n\n  id = g_key_file_get_string (metakey, group, FLATPAK_METADATA_KEY_NAME, error);\n  if (id == NULL)\n    return FALSE;\n\n  if (opt_runtime)\n    runtime_key = FLATPAK_METADATA_KEY_RUNTIME;\n  else\n    runtime_key = FLATPAK_METADATA_KEY_SDK;\n\n  runtime_pref = g_key_file_get_string (metakey, group, runtime_key, error);\n  if (runtime_pref == NULL)\n    return FALSE;\n\n  runtime_ref = flatpak_decomposed_new_from_pref (FLATPAK_KINDS_RUNTIME, runtime_pref, error);\n  if (runtime_ref == NULL)\n    return FALSE;\n\n  arch = flatpak_decomposed_dup_arch (runtime_ref);",
+      "explanation": "Reads more metadata values: `extensionof_tag` (used to disambiguate tagged extensions), `id` (the app/runtime name, required), and `runtime_pref` (the runtime or SDK reference string, keyed by --runtime vs the default SDK). `runtime_pref` is parsed by `flatpak_decomposed_new_from_pref` into a structured `runtime_ref`; on failure the function bails. `arch` is extracted from the parsed ref. `id`, `runtime_pref`, and `arch` all originate in untrusted metadata and later become environment values (FLATPAK_ID, FLATPAK_ARCH) and path components (via flatpak_get_data_dir(id) and the extension subdir logic).",
+      "explanation_note": ""
+    },
+    {
+      "file": "corpus/train/train_0269_cwe74.c",
+      "lines": "142-162",
+      "code": "  custom_usr = FALSE;\n  usr = g_file_get_child (res_deploy,  opt_sdk_dir ? opt_sdk_dir : \"usr\");\n  if (g_file_query_exists (usr, cancellable))\n    {\n      custom_usr = TRUE;\n      runtime_files = g_object_ref (usr);\n    }\n  else\n    {\n      runtime_deploy = flatpak_find_deploy_for_ref (flatpak_decomposed_get_ref (runtime_ref), NULL, NULL, cancellable, error);\n      if (runtime_deploy == NULL)\n        return FALSE;\n\n      runtime_deploy_data = flatpak_deploy_get_deploy_data (runtime_deploy, FLATPAK_DEPLOY_VERSION_ANY, cancellable, error);\n      if (runtime_deploy_data == NULL)\n        return FALSE;\n\n      runtime_metakey = flatpak_deploy_get_metadata (runtime_deploy);\n\n      runtime_files = flatpak_deploy_get_files (runtime_deploy);\n    }",
+      "explanation": "Resolves the runtime files tree. If the build directory ships its own `usr` subdirectory (or --sdk-dir), `custom_usr` is set and that directory is used directly as `runtime_files`. Otherwise the referenced runtime is looked up in the installed deploys via `flatpak_find_deploy_for_ref`, its deploy data and metadata are fetched, and `runtime_files` points at the installed runtime's files. This branch decides whether /usr in the sandbox comes from the (untrusted) build tree or from an installed, trusted runtime — and `custom_usr` later flips the /usr mount from read-only to writable (line 287, 312).",
+      "explanation_note": ""
+    },
+    {
+      "file": "corpus/train/train_0269_cwe74.c",
+      "lines": "164-183",
+      "code": "  var = g_file_get_child (res_deploy, \"var\");\n  var_tmp = g_file_get_child (var, \"tmp\");\n  if (!flatpak_mkdir_p (var_tmp, cancellable, error))\n    return FALSE;\n  var_lib = g_file_get_child (var, \"lib\");\n  if (!flatpak_mkdir_p (var_lib, cancellable, error))\n    return FALSE;\n\n  res_files = g_file_get_child (res_deploy, \"files\");\n\n  if (is_app)\n    {\n      app_files = g_object_ref (res_files);\n      if (opt_with_appdir)\n        {\n          app_id_dir = flatpak_get_data_dir (id);\n          if (!flatpak_ensure_data_dir (app_id_dir, cancellable, NULL))\n            g_clear_object (&app_id_dir);\n        }\n    }",
+      "explanation": "Creates `var/tmp` and `var/lib` inside the build directory (these are bind-mounted into the sandbox later) and computes `res_files` = the build directory's `files` subtree. For an application, `app_files` is that `files` tree; if --with-appdir is set, `flatpak_get_data_dir(id)` computes a per-app data directory from the untrusted `id` and ensures it exists (failure just clears the handle rather than aborting). `id` here becomes a path component under the host's data directory.",
+      "explanation_note": ""
+    },
+    {
+      "file": "corpus/train/train_0269_cwe74.c",
+      "lines": "184-244",
+      "code": "  else if (is_extension)\n    {\n      g_autoptr(GKeyFile) x_metakey = NULL;\n      g_autofree char *x_group = NULL;\n      g_autofree char *x_dir = NULL;\n      g_autofree char *x_subdir_suffix = NULL;\n      char *x_subdir = NULL;\n      g_autofree char *bare_extension_point = NULL;\n\n      extensionof_deploy = flatpak_find_deploy_for_ref (extensionof_ref, NULL, NULL, cancellable, error);\n      if (extensionof_deploy == NULL)\n        return FALSE;\n\n      x_metakey = flatpak_deploy_get_metadata (extensionof_deploy);\n\n      if (!find_matching_extension_group_in_metakey (x_metakey,\n                                                     id,\n                                                     extensionof_tag,\n                                                     &x_group,\n                                                     error))\n        return FALSE;\n\n      if (x_group == NULL)\n        {\n          /* Failed, look for subdirectories=true parent */\n          char *last_dot = strrchr (id, '.');\n\n          if (last_dot != NULL)\n            {\n              char *parent_id = g_strndup (id, last_dot - id);\n              if (!find_matching_extension_group_in_metakey (x_metakey,\n                                                             parent_id,\n                                                             extensionof_tag,\n                                                             &x_group,\n                                                             error))\n                return FALSE;\n\n              if (x_group != NULL &&\n                  g_key_file_get_boolean (x_metakey, x_group,\n                                          FLATPAK_METADATA_KEY_SUBDIRECTORIES,\n                                          NULL))\n                x_subdir = last_dot + 1;\n            }\n\n          if (x_subdir == NULL)\n            return flatpak_fail (error, _(\"No extension point matching %s in %s\"), id, extensionof_ref);\n        }\n\n      x_dir = g_key_file_get_string (x_metakey, x_group,\n                                     FLATPAK_METADATA_KEY_DIRECTORY, error);\n      if (x_dir == NULL)\n        return FALSE;",
+      "explanation": "The extension branch. It looks up the parent app/runtime referenced by `extensionof_ref` among installed deploys, gets the parent's metadata `x_metakey`, and asks `find_matching_extension_group_in_metakey` to find the extension-point group that matches this extension's `id` (optionally by `extensionof_tag`). If no direct group matches, it retries with the parent id (everything before the last '.'): `parent_id = g_strndup(id, last_dot - id)`, and if that group declares `subdirectories=true`, it sets `x_subdir = last_dot + 1` — i.e. `x_subdir` points at the trailing component of `id` after the final dot. Finally it reads the extension point's `directory` value into `x_dir`. Note `x_subdir` aliases into the `id` buffer (not a copy), and both `x_dir` (from parent metadata) and `x_subdir` (from this metadata's id) are attacker-influenced strings destined for path construction.",
+      "explanation_note": ""
+    },
+    {
+      "file": "corpus/train/train_0269_cwe74.c",
+      "lines": "246-266",
+      "code": "      x_subdir_suffix = g_key_file_get_string (x_metakey, x_group,\n                                               FLATPAK_METADATA_KEY_SUBDIRECTORY_SUFFIX,\n                                               NULL);\n\n      if (is_app_extension)\n        {\n          app_files = flatpak_deploy_get_files (extensionof_deploy);\n          app_files_ro = TRUE;\n          if (x_subdir != NULL)\n            extension_tmpfs_point = g_build_filename (\"/app\", x_dir, NULL);\n          bare_extension_point = g_build_filename (\"/app\", x_dir, x_subdir, NULL);\n        }\n      else\n        {\n          if (x_subdir != NULL)\n            extension_tmpfs_point = g_build_filename (\"/usr\", x_dir, NULL);\n          bare_extension_point = g_build_filename (\"/usr\", x_dir, x_subdir, NULL);\n        }\n\n      extension_point = g_build_filename (bare_extension_point, x_subdir_suffix, NULL);",
+      "explanation": "Reads the optional `subdirectory-suffix` value, then constructs the in-sandbox mount paths. For an app extension, the parent's files become read-only `app_files`, and `bare_extension_point` = `/app/<x_dir>[/<x_subdir>]`; otherwise the base is `/usr`. `extension_tmpfs_point` = the directory that will be mounted as a tmpfs, and `extension_point` = `bare_extension_point` joined with `x_subdir_suffix`. These path strings are built purely from metadata-derived components (`x_dir`, `x_subdir`, `x_subdir_suffix`) with `g_build_filename`, which concatenates path segments but does NOT canonicalize or reject `..`. `extension_point` and `extension_tmpfs_point` are subsequently used as bwrap mount destinations and as the FLATPAK_DEST environment value.",
+      "explanation_note": ""
+    },
+    {
+      "file": "corpus/train/train_0269_cwe74.c",
+      "lines": "268-279",
+      "code": "  app_context = flatpak_app_compute_permissions (metakey,\n                                                 runtime_metakey,\n                                                 error);\n  if (app_context == NULL)\n    return FALSE;\n\n  flatpak_context_allow_host_fs (app_context);\n  flatpak_context_merge (app_context, arg_context);\n\n  minimal_envp = flatpak_run_get_minimal_env (TRUE, FALSE);\n  bwrap = flatpak_bwrap_new (minimal_envp);\n  flatpak_bwrap_add_args (bwrap, flatpak_get_bwrap (), NULL);",
+      "explanation": "Computes the effective sandbox permission set `app_context` from the app metadata and runtime metadata. Then, unconditionally, `flatpak_context_allow_host_fs(app_context)` grants the build sandbox access to the host filesystem, and `flatpak_context_merge(app_context, arg_context)` folds in any permissions the user passed on the command line. It creates a minimal environment, a new FlatpakBwrap (the argument/env accumulator), and seeds argv[0] with the bwrap executable path. The host-fs grant is deliberate for a build tool but is a broad, permissive default: the build command runs its payload with the host filesystem visible, on top of whatever permissions the untrusted metadata's [Context] declared.",
+      "explanation_note": ""
+    },
+    {
+      "file": "corpus/train/train_0269_cwe74.c",
+      "lines": "281-309",
+      "code": "  run_flags =\n    FLATPAK_RUN_FLAG_DEVEL | FLATPAK_RUN_FLAG_MULTIARCH | FLATPAK_RUN_FLAG_NO_SESSION_HELPER |\n    FLATPAK_RUN_FLAG_SET_PERSONALITY | FLATPAK_RUN_FLAG_NO_A11Y_BUS_PROXY;\n  if (opt_die_with_parent)\n    run_flags |= FLATPAK_RUN_FLAG_DIE_WITH_PARENT;\n  if (custom_usr)\n    run_flags |= FLATPAK_RUN_FLAG_WRITABLE_ETC;\n\n  run_flags |= flatpak_context_get_run_flags (app_context);\n\n  /* Unless manually specified, we disable dbus proxy */\n  if (!flatpak_context_get_needs_session_bus_proxy (arg_context))\n    run_flags |= FLATPAK_RUN_FLAG_NO_SESSION_BUS_PROXY;\n\n  if (!flatpak_context_get_needs_system_bus_proxy (arg_context))\n    run_flags |= FLATPAK_RUN_FLAG_NO_SYSTEM_BUS_PROXY;\n\n  if (opt_log_session_bus)\n    run_flags |= FLATPAK_RUN_FLAG_LOG_SESSION_BUS;\n\n  if (opt_log_system_bus)\n    run_flags |= FLATPAK_RUN_FLAG_LOG_SYSTEM_BUS;\n\n  /* Never set up an a11y bus for builds */\n  run_flags |= FLATPAK_RUN_FLAG_NO_A11Y_BUS_PROXY;\n\n  if (!flatpak_run_setup_base_argv (bwrap, runtime_files, app_id_dir, arch,\n                                    run_flags, error))\n    return FALSE;",
+      "explanation": "Assembles the FlatpakRunFlags bitmask. The build sandbox always enables DEVEL mode (relaxed seccomp), MULTIARCH, SET_PERSONALITY, and skips the session helper and a11y proxy. `custom_usr` adds WRITABLE_ETC. Crucially, `run_flags |= flatpak_context_get_run_flags(app_context)` merges flags derived from the (untrusted) metadata context. The dbus-proxy flags are disabled unless the user explicitly requested them. `flatpak_run_setup_base_argv` then emits the base bwrap arguments (namespace setup, /proc, /dev, the runtime files as /usr scaffolding) into `bwrap`.",
+      "explanation_note": ""
+    },
+    {
+      "file": "corpus/train/train_0269_cwe74.c",
+      "lines": "311-332",
+      "code": "  flatpak_bwrap_add_args (bwrap,\n                          (custom_usr && !opt_readonly)  ? \"--bind\" : \"--ro-bind\", flatpak_file_get_path_cached (runtime_files), \"/usr\",\n                          NULL);\n\n  if (!custom_usr)\n    flatpak_bwrap_add_args (bwrap,\n                            \"--lock-file\", \"/usr/.ref\",\n                            NULL);\n\n  if (app_files)\n    flatpak_bwrap_add_args (bwrap,\n                            (app_files_ro || opt_readonly) ? \"--ro-bind\" : \"--bind\", flatpak_file_get_path_cached (app_files), \"/app\",\n                            NULL);\n  else\n    flatpak_bwrap_add_args (bwrap,\n                            \"--dir\", \"/app\",\n                            NULL);\n\n  if (extension_tmpfs_point)\n    flatpak_bwrap_add_args (bwrap,\n                            \"--tmpfs\", extension_tmpfs_point,\n                            NULL);",
+      "explanation": "Emits the core bind mounts. `runtime_files` is bound at `/usr` (writable if custom_usr and not --readonly, else read-only), with a lock-file on the installed runtime. `app_files` is bound at `/app` (read-only for app-extensions or --readonly, else writable), or an empty `/app` dir is created if there are no app files. If an `extension_tmpfs_point` was computed, a tmpfs is mounted there. Here the metadata-derived `extension_tmpfs_point` string is passed directly as the `--tmpfs` destination argument to bwrap.",
+      "explanation_note": ""
+    },
+    {
+      "file": "corpus/train/train_0269_cwe74.c",
+      "lines": "334-347",
+      "code": "  /* We add the actual bind below so that we're not shadowed by other extensions or their tmpfs */\n\n  if (extension_point)\n    dest = extension_point;\n  else if (is_app)\n    dest = g_strdup (\"/app\");\n  else\n    dest = g_strdup (\"/usr\");\n\n  flatpak_bwrap_add_args (bwrap,\n                          \"--setenv\", \"FLATPAK_DEST\", dest,\n                          \"--setenv\", \"FLATPAK_ID\", id,\n                          \"--setenv\", \"FLATPAK_ARCH\", arch,\n                          NULL);",
+      "explanation": "Chooses `dest`: the metadata-derived `extension_point` if this is an extension, otherwise the literal /app or /usr (the g_strdup'd literals leak, since `dest` is a plain const char*, but that is not a security issue). It then sets three environment variables inside the sandbox via bwrap `--setenv`: FLATPAK_DEST=`dest`, FLATPAK_ID=`id`, FLATPAK_ARCH=`arch`. All three values (dest via extension_point, id, arch) originate in untrusted metadata; they are passed as discrete argv elements to bwrap (not through a shell), so they set env values but cannot break argv tokenization.",
+      "explanation_note": ""
+    },
+    {
+      "file": "corpus/train/train_0269_cwe74.c",
+      "lines": "354-361",
+      "code": "  flatpak_bwrap_add_args (bwrap,\n                          \"--bind\", flatpak_file_get_path_cached (var_lib), \"/var/lib\",\n                          NULL);\n  flatpak_bwrap_add_args (bwrap,\n                          \"--bind\", flatpak_file_get_path_cached (var_tmp), \"/var/tmp\",\n                          NULL);\n\n  flatpak_run_apply_env_vars (bwrap, app_context);",
+      "explanation": "Binds the build directory's `var/lib` and `var/tmp` into the sandbox at /var/lib and /var/tmp, then applies the environment variables declared in `app_context` (the merged metadata + CLI permission context) to the bwrap environment. `flatpak_run_apply_env_vars` pushes metadata-declared [Environment] entries into the sandbox env.",
+      "explanation_note": ""
+    },
+    {
+      "file": "corpus/train/train_0269_cwe74.c",
+      "lines": "363-382",
+      "code": "  if (is_app)\n    {\n      g_autoptr(FlatpakDecomposed) fake_ref =\n        flatpak_decomposed_new_from_parts (FLATPAK_KINDS_APP, id, arch, \"nobranch\", NULL);\n      if (fake_ref != NULL &&\n          !flatpak_run_add_extension_args (bwrap, metakey, fake_ref, FALSE, &app_extensions, cancellable, error))\n        return FALSE;\n    }\n\n  if (!custom_usr &&\n      !flatpak_run_add_extension_args (bwrap, runtime_metakey, runtime_ref, FALSE, &runtime_extensions, cancellable, error))\n    return FALSE;\n\n  /* Mount this after the above extensions so we always win */\n  if (extension_point)\n    flatpak_bwrap_add_args (bwrap,\n                            \"--bind\", flatpak_file_get_path_cached (res_files), extension_point,\n                            NULL);",
+      "explanation": "For applications, a synthetic ref (`fake_ref` with branch \"nobranch\") built from the untrusted `id`/`arch` is used to add extension mount args from the app metadata. For non-custom-usr, runtime extension args are added from the runtime metadata. Finally, if an `extension_point` was computed, the build directory's `files` tree (`res_files`) is bind-mounted at that metadata-derived destination path — this is the write-target of the extension being built. Again, `extension_point` flows straight into the `--bind` destination argument.",
+      "explanation_note": ""
+    },
+    {
+      "file": "corpus/train/train_0269_cwe74.c",
+      "lines": "384-398",
+      "code": "  if (!flatpak_run_add_app_info_args (bwrap,\n                                      app_files, NULL, app_extensions,\n                                      runtime_files, runtime_deploy_data, runtime_extensions,\n                                      id, NULL,\n                                      runtime_ref,\n                                      app_id_dir, app_context, NULL,\n                                      FALSE, TRUE, TRUE,\n                                      &app_info_path, -1,\n                                      &instance_id_host_dir,\n                                      error))\n    return FALSE;\n\n  if (!flatpak_run_add_environment_args (bwrap, app_info_path, run_flags, id,\n                                         app_context, app_id_dir, NULL, NULL, cancellable, error))\n    return FALSE;",
+      "explanation": "Writes the flatpak-info file (metadata describing the running instance) and gets back `app_info_path` and `instance_id_host_dir` (the host-side directory for this instance). Then `flatpak_run_add_environment_args` translates the `app_context` permission set (filesystem, device, socket, dbus rules) into concrete bwrap mount/args. This is where the merged, partly-untrusted permission context is materialized into actual sandbox exposure. `instance_id_host_dir` is an output path used later for the pid file.",
+      "explanation_note": ""
+    },
+    {
+      "file": "corpus/train/train_0269_cwe74.c",
+      "lines": "400-421",
+      "code": "  for (i = 0; opt_bind_mounts != NULL && opt_bind_mounts[i] != NULL; i++)\n    {\n      char *split = strchr (opt_bind_mounts[i], '=');\n      if (split == NULL)\n        {\n          g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,\n                       _(\"Missing '=' in bind mount option '%s'\"), opt_bind_mounts[i]);\n          return FALSE;\n        }\n\n      *split++ = 0;\n      flatpak_bwrap_add_args (bwrap,\n                              \"--bind\", split, opt_bind_mounts[i],\n                              NULL);\n    }\n\n  if (opt_build_dir != NULL)\n    {\n      flatpak_bwrap_add_args (bwrap,\n                              \"--chdir\", opt_build_dir,\n                              NULL);\n    }",
+      "explanation": "Handles the --bind-mount CLI options. Each option is of the form `dest=src`; `strchr` finds the '=', a missing '=' is a hard error, and `*split++ = 0` splits the string in place (NUL-terminating the destination and advancing `split` to the source). It then emits `--bind <src> <dest>` to bwrap, letting the user bind arbitrary host paths into the sandbox. If --build-dir was given, a `--chdir` to that directory is added. These are user-supplied (not metadata) values, so they represent the invoking user's own choices.",
+      "explanation_note": ""
+    },
+    {
+      "file": "corpus/train/train_0269_cwe74.c",
+      "lines": "423-437",
+      "code": "  flatpak_bwrap_envp_to_args (bwrap);\n\n  if (!flatpak_bwrap_bundle_args (bwrap, 1, -1, FALSE, error))\n    return FALSE;\n\n  flatpak_bwrap_add_args (bwrap, command, NULL);\n  flatpak_bwrap_append_argsv (bwrap,\n                              &argv[rest_argv_start + 2],\n                              rest_argc - 2);\n\n  g_ptr_array_add (bwrap->argv, NULL);\n\n  g_snprintf (pid_str, sizeof (pid_str), \"%d\", getpid ());\n  pid_path = g_build_filename (instance_id_host_dir, \"pid\", NULL);\n  g_file_set_contents (pid_path, pid_str, -1, NULL);",
+      "explanation": "Finalizes the argument vector: converts collected env settings to `--setenv` args, bundles file descriptors, appends the `command` (the user's command, or /bin/sh) and the remaining user arguments `&argv[rest_argv_start + 2]` with count `rest_argc - 2`, and NULL-terminates the argv array. It then formats the current pid into the fixed 64-byte `pid_str` via `g_snprintf` (bounded by `sizeof(pid_str)`, so no overflow — a pid never approaches 64 digits) and writes it to `<instance_id_host_dir>/pid`. The write error is ignored (NULL error arg), which is non-security. Note `flatpak_bwrap_append_argsv` is passed `rest_argc - 2`: `command` is consumed at rest_argv_start+1, so when only the directory is given (rest_argc==1) this count is negative; the callee must treat the count as signed and clamp — otherwise a negative/huge count is a hazard (see risks).",
+      "explanation_note": ""
+    },
+    {
+      "file": "corpus/train/train_0269_cwe74.c",
+      "lines": "439-450",
+      "code": "  /* Ensure we unset O_CLOEXEC */\n  child_setup (bwrap->fds);\n  if (execvpe (flatpak_get_bwrap (), (char **) bwrap->argv->pdata, bwrap->envp) == -1)\n    {\n      g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno),\n                   _(\"Unable to start app\"));\n      return FALSE;\n    }\n\n  /* Not actually reached... */\n  return TRUE;\n}",
+      "explanation": "`child_setup(bwrap->fds)` clears O_CLOEXEC on the passed fds so they survive the exec, then `execvpe` replaces the current process image with bubblewrap, passing the fully-assembled argv (`bwrap->argv->pdata`) and env (`bwrap->envp`). On success this never returns; on failure it records an errno-based error and returns FALSE. This is the sink for everything assembled above: every metadata-derived string that reached the argv/envp arrays is now handed to bwrap, which enforces the sandbox and then executes `command` inside it.",
+      "explanation_note": ""
+    }
+  ],
+  "what_could_go_wrong": [
+    {
+      "file": "corpus/train/train_0269_cwe74.c",
+      "lines": "90-95",
+      "code": "  if (!g_file_load_contents (metadata, cancellable, &metadata_contents, &metadata_size, NULL, error))\n    return FALSE;\n\n  metakey = g_key_file_new ();\n  if (!g_key_file_load_from_data (metakey, metadata_contents, metadata_size, 0, error))\n    return FALSE;",
+      "explanation": "This is the root trust-boundary issue that all others inherit from: the `metadata` key-file is loaded from a directory the operator merely points at, and is treated as authoritative configuration for the sandbox. Every value read from `metakey` afterward — id, runtime/SDK ref, extensionof ref/tag, the [Context] permissions, [Environment] entries — is attacker-chosen. The invariant the implementation must uphold is that NONE of these values may be trusted to be well-formed or benign: they must be validated (path components rejected for `..`/absolute escapes, refs parsed strictly, permission strings not silently widening the sandbox) before being turned into mount paths, env values, or run flags. `g_key_file_load_from_data` is given the full `metadata_size`; the parser must also be robust to embedded NUL bytes and duplicate keys so that what is parsed here matches what any later permission display would show (CWE-20 improper input validation).",
+      "explanation_note": ""
+    },
+    {
+      "file": "corpus/train/train_0269_cwe74.c",
+      "lines": "256-265",
+      "code": "          bare_extension_point = g_build_filename (\"/app\", x_dir, x_subdir, NULL);\n        }\n      else\n        {\n          if (x_subdir != NULL)\n            extension_tmpfs_point = g_build_filename (\"/usr\", x_dir, NULL);\n          bare_extension_point = g_build_filename (\"/usr\", x_dir, x_subdir, NULL);\n        }\n\n      extension_point = g_build_filename (bare_extension_point, x_subdir_suffix, NULL);",
+      "explanation": "Path-injection / traversal into a mount destination. `x_dir` and `x_subdir_suffix` come from key-file `directory`/`subdirectory-suffix` values, and `x_subdir` is the tail of the untrusted `id`. `g_build_filename` merely joins segments with '/'; it does NOT canonicalize or reject `..` or absolute components. A `directory` value like `../../../../etc` (or one containing an absolute path) makes `extension_point`/`extension_tmpfs_point` resolve outside the intended /app or /usr subtree. Because these strings are then used verbatim as bwrap `--tmpfs`/`--bind` destinations (lines 331 and 381), a crafted parent-extension metadata could direct the tmpfs or the res_files bind mount at an unexpected path inside the sandbox namespace, potentially shadowing runtime files the build then trusts. The invariant: extension directory/suffix values must be constrained to a single relative sub-path with no `..`/root escape before being used as a mount target (CWE-22 path traversal, a CWE-74-class injection into the downstream bwrap consumer).",
+      "explanation_note": ""
+    },
+    {
+      "file": "corpus/train/train_0269_cwe74.c",
+      "lines": "274-275",
+      "code": "  flatpak_context_allow_host_fs (app_context);\n  flatpak_context_merge (app_context, arg_context);",
+      "explanation": "The build sandbox is unconditionally granted host-filesystem access and then merged with permissions that partly come from the untrusted metadata (`app_context` was computed from `metakey` on line 268) plus the DEVEL run flag (line 282, relaxed seccomp). This is intentional for a developer build tool, but it means a hostile build directory runs its `command` (defaulting to /bin/sh, or worse an attacker-chosen argv) with the host filesystem visible and a weakened seccomp profile. The security contract is that `flatpak build` is only ever pointed at trusted build trees: running it against an untrusted directory is close to running the embedded command with the user's own privileges plus host FS. Metadata that adds device/socket/filesystem permissions via [Context] further widens this. The invariant: the operator must treat `flatpak build DIR` as executing DIR's content, and the tool must not silently escalate beyond host-fs from metadata alone (CWE-668 exposure / CWE-732 permissive defaults).",
+      "explanation_note": ""
+    },
+    {
+      "file": "corpus/train/train_0269_cwe74.c",
+      "lines": "428-431",
+      "code": "  flatpak_bwrap_add_args (bwrap, command, NULL);\n  flatpak_bwrap_append_argsv (bwrap,\n                              &argv[rest_argv_start + 2],\n                              rest_argc - 2);",
+      "explanation": "Signed count underflow feeding an argv appender. `rest_argc` is the number of args from the directory onward; `command` (if present) is at rest_argv_start+1, so the trailing args start at rest_argv_start+2 and number `rest_argc - 2`. When only a directory is supplied, `rest_argc == 1`, so `rest_argc - 2 == -1`; with directory+command, `rest_argc == 2`, so the count is 0. `flatpak_bwrap_append_argsv` must treat its length as a SIGNED int and copy nothing for a non-positive count. If the implementation instead takes it as an unsigned/size_t or loops `while (i < count)` against a `char**` without bounding on the NULL terminator, a `-1` becomes a huge count and it walks past `argv` end reading out-of-bounds pointers (CWE-125 / CWE-191). The invariant: append must clamp a negative count to zero. Confirm the callee's signature and loop bound.",
+      "explanation_note": ""
+    },
+    {
+      "file": "corpus/train/train_0269_cwe74.c",
+      "lines": "400-413",
+      "code": "  for (i = 0; opt_bind_mounts != NULL && opt_bind_mounts[i] != NULL; i++)\n    {\n      char *split = strchr (opt_bind_mounts[i], '=');\n      if (split == NULL)\n        {\n          g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,\n                       _(\"Missing '=' in bind mount option '%s'\"), opt_bind_mounts[i]);\n          return FALSE;\n        }\n\n      *split++ = 0;\n      flatpak_bwrap_add_args (bwrap,\n                              \"--bind\", split, opt_bind_mounts[i],\n                              NULL);",
+      "explanation": "The --bind-mount option lets the invoker bind any host path (`split`, the source after '=') to any destination (`opt_bind_mounts[i]`, before '=') inside the sandbox with no validation. This is by design and is the operator's own privilege, so it is low severity, but it is worth noting that combined with the host-fs grant it makes the build sandbox a thin boundary. There is also a mild parsing sharp edge: `*split++ = 0` splits on the FIRST '=', so a source path containing '=' is truncated at the first one; and an option like `dest=` yields an empty source. The invariant is only that these are the user's deliberate choices; no metadata reaches this loop.",
+      "explanation_note": ""
+    },
+    {
+      "file": "corpus/train/train_0269_cwe74.c",
+      "lines": "435-437",
+      "code": "  g_snprintf (pid_str, sizeof (pid_str), \"%d\", getpid ());\n  pid_path = g_build_filename (instance_id_host_dir, \"pid\", NULL);\n  g_file_set_contents (pid_path, pid_str, -1, NULL);",
+      "explanation": "Minor/defensive: `char pid_str[64]` is filled with the decimal pid via `g_snprintf` bounded by `sizeof(pid_str)`, so there is no overflow (a pid is far shorter than 64 bytes) — this fixed buffer is safe. The `pid_path` is built from `instance_id_host_dir`, an output of flatpak_run_add_app_info_args (line 392); if that value were ever NULL, `g_build_filename(NULL, \"pid\", NULL)` yields just \"pid\" and the write lands in the current directory, and the write error is silently ignored (NULL error). This is low severity because instance_id_host_dir is produced by trusted flatpak code, but the ignored error and the assumed-non-NULL handle are worth confirming (CWE-252 unchecked return / potential CWE-476 if the callee can return NULL without failing).",
+      "explanation_note": ""
+    }
+  ],
+  "summary": "This is the post-fix `flatpak build` builtin. It is defensively written (autoptr cleanup, checked returns) and has no obvious memory-corruption bug in the shown code. Its real security surface is trust: the build directory's `metadata` key-file is fully attacker-controllable and its values flow into path construction (extension mount points via g_build_filename), sandbox permissions (allow_host_fs + merged metadata context under DEVEL/relaxed seccomp), and the bwrap argv/envp that is finally execvpe'd. The sharpest concrete contracts to verify are path-traversal neutralization of the extension `directory`/`subdirectory-suffix` values and the signed handling of the `rest_argc - 2` count passed to flatpak_bwrap_append_argsv.",
+  "reviewed_anchors": [
+    { "anchor": "flatpak_builtin_build(int argc, char **argv, GCancellable *cancellable, GError **error) — signature (line 2)", "disposition": "dismissed", "reason": "Standard flatpak builtin signature; argv is the untrusted input surface analyzed via the values it carries, not a bug in itself." },
+    { "anchor": "char pid_str[64] (line 50)", "disposition": "dismissed", "reason": "Only fixed-size stack buffer; written solely by g_snprintf(..., sizeof(pid_str), \"%d\", getpid()) which is length-bounded and a pid cannot approach 64 chars." },
+    { "anchor": "const char *command = \"/bin/sh\" / argv[rest_argv_start + 1] (lines 31, 81)", "disposition": "dismissed", "reason": "Command is the operator's own choice, exec'd as a discrete argv element to bwrap (no shell), so no injection beyond running the user's chosen program in the sandbox." },
+    { "anchor": "argv split loop / argv[i][0] (lines 58-67, 79-81)", "disposition": "dismissed", "reason": "Indexes NUL-terminated argv strings within [1,argc); rest_argv_start/rest_argc bookkeeping is sound for the ranges used." },
+    { "anchor": "g_file_load_contents / g_key_file_load_from_data(metakey, metadata_contents, metadata_size, 0) (lines 90-95)", "disposition": "finding", "reason": "Untrusted metadata file is the source of all subsequently-trusted values; input-validation and NUL-robustness contract." },
+    { "anchor": "extensionof_ref / extensionof_tag from [ExtensionOf] (lines 109-121)", "disposition": "dismissed", "reason": "Attacker-influenced but used to select extension groups / prefix-match \"app/\"; covered by the metadata-trust finding, no distinct memory contract." },
+    { "anchor": "id = g_key_file_get_string(...KEY_NAME) (line 123)", "disposition": "dismissed", "reason": "Untrusted, becomes FLATPAK_ID env and a data-dir/subdir component; env passed as discrete argv, data-dir path handling folded into the extension-path finding." },
+    { "anchor": "runtime_pref / runtime_ref / arch (lines 132-140)", "disposition": "dismissed", "reason": "Untrusted ref string parsed strictly by flatpak_decomposed_new_from_pref which fails closed; arch flows to env as a discrete argv element." },
+    { "anchor": "x_subdir = last_dot + 1 (line 234); parent_id = g_strndup(id, last_dot - id) (line 222)", "disposition": "dismissed", "reason": "x_subdir aliases into id (not freed separately, correctly a plain char*); strrchr/g_strndup arithmetic is bounded by the found dot; feeds the path-build finding rather than a bug of its own." },
+    { "anchor": "x_dir / x_subdir_suffix + g_build_filename extension_point/extension_tmpfs_point (lines 241-265)", "disposition": "finding", "reason": "Metadata-derived path segments joined without ../absolute neutralization, then used as bwrap mount destinations — path traversal / injection." },
+    { "anchor": "flatpak_context_allow_host_fs(app_context) + flatpak_context_merge (lines 274-275)", "disposition": "finding", "reason": "Unconditional host-fs grant merged with untrusted-metadata permissions under DEVEL flags — permissive sandbox / exposure contract." },
+    { "anchor": "run_flags |= flatpak_context_get_run_flags(app_context) (line 289)", "disposition": "dismissed", "reason": "Metadata can add run flags, but this is subsumed by the allow_host_fs / permissive-context finding; not a distinct memory bug." },
+    { "anchor": "flatpak_bwrap_add_args(bwrap, \"--tmpfs\", extension_tmpfs_point) (lines 330-331) and \"--bind\", res_files, extension_point (lines 380-381)", "disposition": "finding", "reason": "Sink where the metadata-derived extension paths reach bwrap; same path-traversal finding as the g_build_filename anchor (grouped)." },
+    { "anchor": "\"--setenv\" FLATPAK_DEST/FLATPAK_ID/FLATPAK_ARCH dest/id/arch (lines 344-346)", "disposition": "dismissed", "reason": "Untrusted values set as env, but passed as discrete argv tokens to bwrap (no shell), so they cannot break argument tokenization." },
+    { "anchor": "opt_bind_mounts parse: strchr('='), *split++ = 0, \"--bind\" split opt_bind_mounts[i] (lines 400-413)", "disposition": "finding", "reason": "Operator-controlled arbitrary bind mounts with in-place split; low severity (user's own privilege) but noted for parsing edge and sandbox-weakening interaction." },
+    { "anchor": "flatpak_bwrap_append_argsv(bwrap, &argv[rest_argv_start + 2], rest_argc - 2) (lines 429-431)", "disposition": "finding", "reason": "rest_argc - 2 is -1 when only a directory is supplied; the callee must treat the count as signed or it becomes a huge unsigned length → OOB read." },
+    { "anchor": "pid_path = g_build_filename(instance_id_host_dir, \"pid\") / g_file_set_contents(..., NULL) (lines 436-437)", "disposition": "finding", "reason": "Ignored write error and assumed-non-NULL instance_id_host_dir; low severity, produced by trusted flatpak code." },
+    { "anchor": "execvpe(flatpak_get_bwrap(), (char**)bwrap->argv->pdata, bwrap->envp) (line 441)", "disposition": "dismissed", "reason": "The exec sink; safe in itself (argv NULL-terminated at line 433, direct exec of the trusted bwrap path). Risk lives in what was placed into argv/envp, covered by the other findings." },
+    { "anchor": "child_setup(bwrap->fds) (line 440)", "disposition": "dismissed", "reason": "Clears O_CLOEXEC on the sandbox fds before exec as intended; no attacker-controlled data involved." }
+  ],
+  "findings": [
+    {
+      "title": "Untrusted metadata directory/suffix flows into bwrap mount destination without path-traversal neutralization",
+      "anchor": "extension_point / extension_tmpfs_point = g_build_filename(\"/app\"|\"/usr\", x_dir, x_subdir, ...) then --tmpfs/--bind <that>",
+      "file": "corpus/train/train_0269_cwe74.c",
+      "line": "246-265, 330-331, 380-381",
+      "code": "      x_subdir_suffix = g_key_file_get_string (x_metakey, x_group,\n                                               FLATPAK_METADATA_KEY_SUBDIRECTORY_SUFFIX,\n                                               NULL);\n      ...\n          bare_extension_point = g_build_filename (\"/usr\", x_dir, x_subdir, NULL);\n\n      extension_point = g_build_filename (bare_extension_point, x_subdir_suffix, NULL);",
+      "bug_class": "Path traversal / injection of untrusted data into a downstream mount-path consumer (bubblewrap)",
+      "cwe": "CWE-22",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0269_cwe74.c (and flatpak_bwrap_add_args / bubblewrap, implementation not fully provided)",
+      "invariant": "Extension `directory`/`subdirectory-suffix` values (and the id-derived `x_subdir`) must be validated as a single relative sub-path — rejecting `..`, leading `/`, and empty components — before being joined and used as a `--tmpfs`/`--bind` destination inside the sandbox.",
+      "failure_mode": "A crafted parent-extension metadata whose `directory`/`subdirectory-suffix` contains `..` or an absolute path makes `extension_point`/`extension_tmpfs_point` resolve outside the intended /app or /usr subtree; g_build_filename does not canonicalize, so the tmpfs mount or the res_files bind lands at an attacker-chosen path in the sandbox namespace, potentially shadowing runtime files the build then trusts. Impact is confined to the build sandbox but subverts its intended layout.",
+      "cve_analog": "",
+      "what_to_confirm": "Whether flatpak validates x_dir/x_subdir_suffix for `..`/absolute components before g_build_filename, or whether bwrap rejects such destinations; confirm the mount destination cannot escape the /app or /usr prefix."
+    },
+    {
+      "title": "Signed count 'rest_argc - 2' can be -1 and is passed as an argv length",
+      "anchor": "flatpak_bwrap_append_argsv (bwrap, &argv[rest_argv_start + 2], rest_argc - 2)",
+      "file": "corpus/train/train_0269_cwe74.c",
+      "line": "429-431",
+      "code": "  flatpak_bwrap_append_argsv (bwrap,\n                              &argv[rest_argv_start + 2],\n                              rest_argc - 2);",
+      "bug_class": "Signed/unsigned length mishandling leading to out-of-bounds pointer read",
+      "cwe": "CWE-125",
+      "severity": "low",
+      "where_it_lives": "implementation (file not provided) — flatpak_bwrap_append_argsv",
+      "invariant": "The count argument must be treated as a signed int and a non-positive value must copy zero elements; the base pointer &argv[rest_argv_start + 2] is only valid when at least that many trailing args exist.",
+      "failure_mode": "When the user supplies only a DIRECTORY (no command), rest_argc == 1 so the count is -1, and &argv[rest_argv_start + 2] may point at or past the NULL terminator. If the callee stores the count in an unsigned/size_t or loops `i < count` without also stopping at a NULL entry, -1 becomes a huge length and it dereferences out-of-bounds argv pointers (crash or info leak). Even the count of 0 (directory+command only) must copy nothing.",
+      "cve_analog": "",
+      "what_to_confirm": "The signature and loop bound of flatpak_bwrap_append_argsv — confirm the length parameter is signed int and that negative/zero counts copy nothing rather than being reinterpreted as unsigned."
+    },
+    {
+      "title": "Build sandbox unconditionally grants host filesystem and merges untrusted-metadata permissions under DEVEL/relaxed seccomp",
+      "anchor": "flatpak_context_allow_host_fs (app_context); flatpak_context_merge (app_context, arg_context);",
+      "file": "corpus/train/train_0269_cwe74.c",
+      "line": "268-289",
+      "code": "  app_context = flatpak_app_compute_permissions (metakey,\n                                                 runtime_metakey,\n                                                 error);\n  ...\n  flatpak_context_allow_host_fs (app_context);\n  flatpak_context_merge (app_context, arg_context);",
+      "bug_class": "Permissive sandbox / exposure of resource to wrong sphere",
+      "cwe": "CWE-668",
+      "severity": "medium",
+      "where_it_lives": "corpus/train/train_0269_cwe74.c",
+      "invariant": "`flatpak build` must only be invoked against build directories the operator trusts; the tool should not silently escalate the build sandbox beyond the intended host-fs grant based solely on untrusted metadata, and the operator must understand the embedded command runs with host FS visible and relaxed seccomp (FLATPAK_RUN_FLAG_DEVEL).",
+      "failure_mode": "`app_context` is computed from the untrusted `metakey` (line 268), then host-filesystem access is granted unconditionally and additional permissions/run-flags from the metadata [Context] are merged (lines 275, 289) with DEVEL seccomp relaxation (line 282). Pointing `flatpak build` at a hostile directory therefore runs its command (default /bin/sh, or an attacker-chosen argv) with broad host access — effectively the user's own privileges plus a weakened sandbox. This is by design for a developer tool but is a genuine trust contract, not a hardened boundary.",
+      "cve_analog": "",
+      "what_to_confirm": "Which permissions from metadata `flatpak_app_compute_permissions` honors for `build`, and whether any metadata-declared [Context] entry can widen the sandbox beyond the intended host-fs grant."
+    },
+    {
+      "title": "Untrusted metadata key-file is the trust root for all sandbox configuration",
+      "anchor": "g_key_file_load_from_data (metakey, metadata_contents, metadata_size, 0, error)",
+      "file": "corpus/train/train_0269_cwe74.c",
+      "line": "90-95",
+      "code": "  if (!g_file_load_contents (metadata, cancellable, &metadata_contents, &metadata_size, NULL, error))\n    return FALSE;\n\n  metakey = g_key_file_new ();\n  if (!g_key_file_load_from_data (metakey, metadata_contents, metadata_size, 0, error))\n    return FALSE;",
+      "bug_class": "Improper input validation of externally-controlled configuration",
+      "cwe": "CWE-20",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0269_cwe74.c",
+      "invariant": "Values read from the build-directory metadata must be validated before use (strict ref parsing, path-segment constraints, no silent permission widening), and parsing must be robust to embedded NUL bytes and duplicate keys so the parsed view matches any view shown to or relied on by the user.",
+      "failure_mode": "The metadata file is loaded from a caller-supplied directory and every downstream decision (paths, permissions, env, run flags) trusts it. If the parser or consumers mishandle malformed input — e.g. an embedded NUL truncating a value, or a permission string that is displayed differently than it is applied — the effective sandbox can diverge from expectations. This finding is the umbrella that the path-traversal and permissive-context findings specialize.",
+      "cve_analog": "",
+      "what_to_confirm": "How each g_key_file_get_string result is validated before use, and whether GKeyFile parsing here is safe against embedded NULs / duplicate keys."
+    },
+    {
+      "title": "Operator-supplied --bind-mount options add arbitrary host binds via in-place split",
+      "anchor": "char *split = strchr(opt_bind_mounts[i], '='); *split++ = 0; flatpak_bwrap_add_args(bwrap, \"--bind\", split, opt_bind_mounts[i], NULL)",
+      "file": "corpus/train/train_0269_cwe74.c",
+      "line": "400-413",
+      "code": "      char *split = strchr (opt_bind_mounts[i], '=');\n      if (split == NULL)\n        {\n          g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,\n                       _(\"Missing '=' in bind mount option '%s'\"), opt_bind_mounts[i]);\n          return FALSE;\n        }\n\n      *split++ = 0;\n      flatpak_bwrap_add_args (bwrap,\n                              \"--bind\", split, opt_bind_mounts[i],\n                              NULL);",
+      "bug_class": "Unvalidated bind-mount source/destination (operator-controlled)",
+      "cwe": "CWE-20",
+      "severity": "low",
+      "where_it_lives": "corpus/train/train_0269_cwe74.c",
+      "invariant": "These values are the invoking user's deliberate choices, so no privilege boundary is crossed; the only requirement is correct parsing (split on first '=' handles empty source and '='-containing paths acceptably).",
+      "failure_mode": "The option binds any host path to any sandbox destination with no validation, and `*split++ = 0` splits on the first '=' so a source path containing '=' is truncated and `dest=` yields an empty source. Combined with the host-fs grant this further thins the build sandbox, but since it is operator-controlled (not metadata) the impact does not cross a trust boundary. Included for completeness of the argument-construction surface.",
+      "cve_analog": "",
+      "what_to_confirm": "That opt_bind_mounts is only reachable via explicit CLI flags (never from metadata), and that bwrap rejects nonexistent/empty bind sources gracefully."
+    }
+  ],
+  "audit_checklist": [
+    "Confirm x_dir / x_subdir_suffix (and id-derived x_subdir) are validated for `..`, leading `/`, and empty components before g_build_filename, or that bwrap refuses mount destinations that escape /app or /usr.",
+    "Verify flatpak_bwrap_append_argsv's length parameter is a signed int and that rest_argc - 2 == -1 (directory-only invocation) copies zero args rather than being reinterpreted as a huge unsigned length.",
+    "Establish the documented trust model for `flatpak build`: that the build directory and its metadata are operator-trusted, and check whether any metadata [Context] entry can widen the sandbox beyond the intended flatpak_context_allow_host_fs grant.",
+    "Confirm GKeyFile parsing of the metadata is robust to embedded NUL bytes and duplicate keys so parsed permissions match what is applied/displayed.",
+    "Check that FLATPAK_DEST/FLATPAK_ID/FLATPAK_ARCH and all metadata-derived strings only ever reach bwrap as discrete argv tokens (never through a shell) so they cannot inject additional arguments.",
+    "Confirm instance_id_host_dir returned by flatpak_run_add_app_info_args is non-NULL on success before g_build_filename/g_file_set_contents, and decide whether the ignored pid-file write error is acceptable.",
+    "Verify child_setup/execvpe hand a NULL-terminated argv (g_ptr_array_add(..., NULL) at line 433) and that no fd cleared of O_CLOEXEC leaks unintended host resources into the sandbox."
+  ]
+}
