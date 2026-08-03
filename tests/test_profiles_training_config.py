@@ -64,16 +64,40 @@ def test_training_config_laptop():
     assert cfg["profile"] == "laptop"
     assert cfg["batch_size"] == 16
     assert cfg["fp16"] is True and cfg["bf16"] is False
-    # the laptop profile serves the 7b model so it fits a <16GB GPU
+    # 12-16GB tier: the 14b q4 (9GB) + an 8k KV cache (1.5GB) measured 100% on
+    # GPU on a 12227MiB card, so this tier serves the 14b, not the 7b.
     _, prof = profiles.select_profile(name="laptop")
+    assert prof["ollama_model"] == "qwen2.5-coder:14b"
+    assert prof["ollama_num_ctx"] == 8192
+
+
+def test_training_config_laptop_small_keeps_the_7b():
+    # Below ~11.5GB the 14b cannot stay resident; spilling layers to host RAM
+    # does not fail, it just crawls — which is worse than a smaller model.
+    _, prof = profiles.select_profile(name="laptop-small")
     assert prof["ollama_model"] == "qwen2.5-coder:7b"
+    assert prof["ollama_num_ctx"] == 8192
 
 
-def test_detect_profile_routes_small_gpu_to_laptop(monkeypatch):
+def test_detect_profile_routes_12gb_gpu_to_laptop(monkeypatch):
     # A discrete CUDA GPU with <16GB VRAM must not get the 4090 profile (whose
-    # 14b model won't fit) — it should fall through to the laptop profile.
+    # 16k-context KV cache won't fit) — it gets the laptop tier.
     monkeypatch.setattr(profiles, "_gpu_name", lambda: "NVIDIA GeForce RTX 5070 Ti Laptop GPU")
     monkeypatch.setattr(profiles, "_gpu_mem_mib", lambda: 12227)
+    assert profiles.detect_profile() == "laptop"
+
+
+def test_detect_profile_routes_small_gpu_to_laptop_small(monkeypatch):
+    monkeypatch.setattr(profiles, "_gpu_name", lambda: "NVIDIA GeForce RTX 3070")
+    monkeypatch.setattr(profiles, "_gpu_mem_mib", lambda: 8192)
+    assert profiles.detect_profile() == "laptop-small"
+
+
+def test_detect_profile_vram_tier_boundary(monkeypatch):
+    monkeypatch.setattr(profiles, "_gpu_name", lambda: "NVIDIA GeForce RTX 3080")
+    monkeypatch.setattr(profiles, "_gpu_mem_mib", lambda: profiles._SMALL_GPU_VRAM_MIB - 1)
+    assert profiles.detect_profile() == "laptop-small"
+    monkeypatch.setattr(profiles, "_gpu_mem_mib", lambda: profiles._SMALL_GPU_VRAM_MIB)
     assert profiles.detect_profile() == "laptop"
 
 
@@ -127,3 +151,64 @@ def test_emit_training_env_shell_assignments(capsys):
     assert "CCR_BATCH=8" in out
     # cpu -> no precision flag (empty)
     assert "CCR_PRECISION_FLAG=\n" in out or out.rstrip().endswith("CCR_PRECISION_FLAG=")
+
+
+# --- hardware-aware model recommendation ------------------------------------
+# What decides whether a model runs well is residency: weights + KV cache must
+# fit in VRAM, or llama.cpp offloads layers to host RAM and it crawls. These
+# guard the arithmetic that drives ccr.sh's "optimal model" advice.
+
+def test_footprint_matches_measured_residency():
+    e14 = [m for m in profiles.MODEL_CATALOG if m["tag"].endswith(":14b")][0]
+    # Measured on an RTX 5070 Ti Laptop: `ollama ps` reported 10GB for the 14b
+    # at ctx 8192; the model must predict that within a few hundred MiB.
+    assert 10400 <= profiles.model_footprint_mib(e14, 8192) <= 11100
+    # Doubling the context adds exactly one KV cache's worth, not a fixed slab.
+    kv8 = profiles.model_footprint_mib(e14, 8192) - e14["weights_mib"]
+    kv16 = profiles.model_footprint_mib(e14, 16384) - e14["weights_mib"]
+    assert abs(kv16 - 2 * kv8) <= 1
+
+
+def test_recommend_picks_largest_fully_resident_model():
+    assert profiles.recommend_model(vram_mib=12227, num_ctx=8192)["tag"] == "qwen2.5-coder:14b"
+    assert profiles.recommend_model(vram_mib=24564, num_ctx=16384)["tag"] == "qwen2.5-coder:14b"
+    assert profiles.recommend_model(vram_mib=49140, num_ctx=16384)["tag"] == "qwen2.5-coder:32b"
+    assert profiles.recommend_model(vram_mib=8192, num_ctx=8192)["tag"] == "qwen2.5-coder:7b"
+
+
+def test_recommend_downgrades_when_the_context_grows():
+    # The SAME 12GB card holds the 14b at 8192 but not at 16384 — the KV cache,
+    # not the weights, is what pushes it over.
+    small_ctx = profiles.recommend_model(vram_mib=12227, num_ctx=8192)
+    big_ctx = profiles.recommend_model(vram_mib=12227, num_ctx=16384)
+    assert small_ctx["tag"] == "qwen2.5-coder:14b"
+    assert big_ctx["tag"] == "qwen2.5-coder:7b"
+
+
+def test_recommend_without_a_gpu_reports_that_it_does_not_fit():
+    rec = profiles.recommend_model(vram_mib=None, num_ctx=8192)
+    assert rec["tag"] == "qwen2.5-coder:7b" and rec["fits"] is False
+    assert "no CUDA GPU" in rec["reason"]
+
+
+def test_recommend_prefers_a_pulled_model_and_names_the_upgrade():
+    rec = profiles.recommend_model(vram_mib=12227, num_ctx=8192,
+                                   installed=["qwen2.5-coder:7b"])
+    assert rec["tag"] == "qwen2.5-coder:7b"          # do not name an absent model
+    assert rec["alternatives"] == ["qwen2.5-coder:14b"]
+    assert "not pulled" in rec["reason"]
+
+
+def test_tag_present_never_matches_a_different_size():
+    have = ["qwen2.5-coder:7b", "qwen2.5-coder:14b"]
+    assert profiles.tag_present("qwen2.5-coder:14b", have) is True
+    # Verified regression: base-name matching made every size look pulled.
+    assert profiles.tag_present("qwen2.5-coder:32b", have) is False
+    # A tag with no ':size' may still resolve to any pulled variant.
+    assert profiles.tag_present("qwen2.5-coder", have) is True
+
+
+def test_detect_hardware_reports_the_fields_ccr_needs():
+    hw = profiles.detect_hardware()
+    assert set(hw) == {"gpu", "vram_mib", "ram_mib", "arch"}
+    assert hw["arch"]
