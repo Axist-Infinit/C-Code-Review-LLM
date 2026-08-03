@@ -230,7 +230,42 @@ baseline is measured), then attempt the 32B as an upgrade.
 
 ---
 
-## 6. Open items
+## 6. Schema versioning — read before rebuilding the SFT set
+
+The reviewer prompt is versioned (`surface_review.build_system_prompt(version)`):
+
+| version | finding fields | top-level fields |
+|---|---|---|
+| v1 | title, anchor, file, line, code, bug_class, cwe, severity, where_it_lives, invariant, failure_mode, cve_analog, what_to_confirm | subsystem, provenance, trust_boundary, what_the_code_does, what_could_go_wrong, summary, reviewed_anchors, findings, audit_checklist |
+| **v2** (inference default) | v1 **+ `exploitation`, `fix`** | v1 **+ `lesson`, `secondary_observations`** |
+
+**The 325 teacher reviews in `corpus/reviews/` are v1** — they were generated
+before v2 existed, so none of them carries `fix`/`exploitation`/`lesson`/
+`secondary_observations` (verified: 0/325 for all four).
+
+That matters because `build_surface_sft.py` builds the training *prompt* from the
+same function inference uses. Pairing a **v2 prompt** with **v1 completions** shows
+the model, 325 times, that the correct response omits those fields — so the
+fine-tune would actively teach it to drop exactly what v2 was added for.
+
+The builder therefore **auto-detects the corpus version and pins the prompt to it**,
+printing a per-field coverage report:
+
+```
+[schema] teacher corpus supports v1 (inference default is v2); building prompts at v1
+[schema]   exploitation   present in 0/325 reviews (0%)
+[schema]   fix            present in 0/325 reviews (0%)
+...
+```
+
+`--schema 2` forces v2 and prints a loud warning. **To actually distil the v2
+fields, regenerate the teacher reviews with the v2 prompt** (the corpus pipeline is
+`scripts/py/emit_surface_prompts.py` → teacher pass → `corpus/reviews/`); that is a
+teacher-model run, not a local one. Until then, training at v1 is the correct
+choice: prompt and completion stay consistent, and the v2 fields keep coming from
+the base model's own instruction-following at inference time.
+
+## 7. Open items
 
 - [ ] Run the fine-tune on the Spark (§4). Everything upstream is staged.
 - [ ] Score tuned vs. baseline on the 80 held-out refs + the DHCP anchor.

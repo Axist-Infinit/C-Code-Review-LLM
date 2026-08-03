@@ -17,7 +17,17 @@ say(){ printf "\n\033[1;36m[one-click]\033[0m %s\n" "$*"; }
 warn(){ printf "\033[1;33m[warn]\033[0m %s\n" "$*"; }
 SUDO="$(command -v sudo || true)"
 say "WSL2 host: $(uname -a)"
-if command -v apt-get >/dev/null; then $SUDO apt-get update -y && $SUDO apt-get install -y git git-lfs python3 python3-venv python3-pip build-essential; fi
+# Guarded on privilege: without sudo (and not root) `apt-get update` exits 100
+# and `set -e` aborts the whole train run before the venv exists. The apt step
+# is a convenience; skip it and continue on an unprivileged box.
+if command -v apt-get >/dev/null; then
+  if [[ -n "$SUDO" || "$(id -u)" -eq 0 ]]; then
+    $SUDO apt-get update -y && $SUDO apt-get install -y git git-lfs python3 python3-venv python3-pip build-essential
+  else
+    warn "no sudo and not root: skipping the apt step (run continues)."
+    warn "Install by hand if a later step fails: git git-lfs python3 python3-venv python3-pip build-essential"
+  fi
+fi
 git lfs install || true
 [[ -d "$VENV" ]] || $PY -m venv "$VENV"
 source "$VENV/bin/activate"

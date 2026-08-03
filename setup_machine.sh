@@ -17,10 +17,19 @@ warn(){ printf "\033[1;33m[warn]\033[0m %s\n" "$*"; }
 say "Host: $(uname -srm)"
 
 # --- system deps ------------------------------------------------------------
+# Guarded on privilege: without sudo (and not root) `apt-get update` exits 100,
+# and under `set -e` that killed the whole setup before the venv was even made.
+# The apt packages are a convenience — the venv/torch/deps steps below do not
+# need root — so a sudo-less box SKIPS this and continues.
 SUDO="$(command -v sudo || true)"
 if command -v apt-get >/dev/null; then
-  $SUDO apt-get update -y && $SUDO apt-get install -y \
-    git python3 python3-venv python3-pip build-essential zstd
+  if [[ -n "$SUDO" || "$(id -u)" -eq 0 ]]; then
+    $SUDO apt-get update -y && $SUDO apt-get install -y \
+      git python3 python3-venv python3-pip build-essential zstd
+  else
+    warn "no sudo and not root: skipping the apt step (setup continues)."
+    warn "If something below fails, install by hand: git python3 python3-venv python3-pip build-essential zstd"
+  fi
 fi
 
 # --- venv -------------------------------------------------------------------
