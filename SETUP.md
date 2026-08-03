@@ -28,6 +28,12 @@ cd C-Code-Review-LLM
 ./setup_machine.sh
 ```
 
+> Prefer a guided run? `./ccr.sh` → **Setup** does the same work step by step
+> (venv, torch, tree-sitter, GraphCodeBERT base, Ollama) and reports exactly
+> what is still missing. The same menu then covers training, tuning and
+> reviewing. On a box without `sudo`, `setup_machine.sh` now skips the `apt`
+> step and continues instead of aborting.
+
 Installs system deps, creates `.venv`, installs the right torch wheel for the
 detected GPU/arch (**torch only** — torchvision ≥0.25 breaks `datasets`),
 installs pinned python deps, fetches the GraphCodeBERT base, and pulls the

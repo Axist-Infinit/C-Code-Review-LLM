@@ -3,7 +3,33 @@
 Local, offline-capable C/C++ vulnerability scanner:
 **GraphCodeBERT classifier triage → local Ollama LLM explanations → HTML/JSON/SARIF reports.**
 
-## Quick start
+## Easiest start — the menu
+
+```bash
+./ccr.sh          # no arguments; ./review.sh is an alias for the same menu
+```
+
+One interactive menu covers the whole lifecycle — **install → train → tune →
+review**. Drop the C/C++ files you want reviewed into `review_inbox/`, pick
+**1) Review the inbox**, and it runs every lane this machine can actually
+support:
+
+| lane | what it does | needs |
+|---|---|---|
+| fast | model-free pattern scan + explainer (LLM if Ollama is up, else regex) | nothing — pure stdlib |
+| deep | attack-surface / contract review of whole files **including headers** | a running Ollama |
+| full | GraphCodeBERT classifier triage + explainer + deep | torch + a trained `vuln-model/` |
+
+`auto` (the default) = fast + deep-when-Ollama-is-up. Results land in
+`scan_out/report.html`, `scan_out/surface/surface_report.md` and SARIF, with a
+severity roll-up printed in the terminal. The menu shows what is missing before
+a long job starts, and echoes the plain command behind every action so anything
+it does can be reproduced by hand. Settings (profile, model tag, lane, recall
+samples, context window, threshold) persist in `.ccr/config`.
+
+The rest of this document is the underlying CLI that the menu drives.
+
+## Quick start (CLI)
 
 Setup hub: **[SETUP.md](SETUP.md)** · per-machine runbooks:
 **[SETUP_4090.md](SETUP_4090.md)** (x86_64 / sm_89) ·
@@ -29,11 +55,19 @@ Outputs land in `scan_out/`: `classifier_findings.json`, `llm_findings.json`, `r
 The pipeline auto-detects which machine it is on (`profiles.py`) and sizes
 batches / picks the Ollama model accordingly. Profiles live in `profiles.json`:
 
-| profile | detected via | classifier | explainer |
-|---|---|---|---|
-| `4090` | GPU name contains "4090" (or any discrete CUDA GPU) | batch 64, fp16 | `qwen2.5-coder:14b` |
-| `spark` | aarch64 / GB10 | batch 128, bf16 | `qwen2.5-coder:32b` |
-| `cpu` | no CUDA | batch 8, fp32 | `qwen2.5-coder:7b` |
+| profile | detected via | classifier | explainer | ctx |
+|---|---|---|---|---|
+| `4090` | "4090" in the GPU name, or ≥16GB VRAM | batch 64, fp16 | `qwen2.5-coder:14b` | 16384 |
+| `spark` | aarch64 / GB10 | batch 128, bf16 | `qwen2.5-coder:32b` | 16384 |
+| `laptop` | discrete CUDA GPU, 11.5–16GB VRAM | batch 16, fp16 | `qwen2.5-coder:14b` | 8192 |
+| `laptop-small` | discrete CUDA GPU, <11.5GB VRAM | batch 16, fp16 | `qwen2.5-coder:7b` | 8192 |
+| `cpu` | no CUDA | batch 8, fp32 | `qwen2.5-coder:7b` | 4096 |
+
+The `laptop` tier runs the **same 14b** as the 4090 — only the context differs,
+because the KV cache is what a 12GB card cannot spare (9.0GB weights + 1.5GB at
+ctx 8192 = ~10.5GB, measured 100% on GPU; at 16384 it is ~12.0GB and spills to
+host RAM, where it does not fail — it just crawls). Below ~11.5GB only the 7b
+stays resident, hence `laptop-small`.
 
 Override anytime: `CCR_PROFILE=spark ./scan_repo.sh` or `--profile spark`.
 The trained classifier moves between machines via `pack_model.sh` / `unpack_model.sh`.
@@ -148,6 +182,72 @@ SAMPLES=2 MODELS=qwen2.5-coder:14b,qwen2.5-coder:32b ./surface_scan.sh SRC   # s
   opts into an LLM consolidation pass when a critic model fits in memory.
 - Reviews headers the body-scanners skip; pooling reached ~9/10 of a Claude
   reference threat model on the systemd DHCP headers, fully offline.
+
+#### Report format (Opus-shaped)
+
+Every review renders to **Markdown and self-contained HTML** (`--md` / `--html`;
+`ccr.sh` and `surface_scan.sh` write both, plus JSON and SARIF), laid out the way
+a senior reviewer writes it up:
+
+```
+Part 1 — What the code does      ordered walkthrough, each step: file:lines, code, explanation
+Part 2 — What could go wrong     one step per distinct risk
+Findings                         strongest first; each carries:
+    invariant / failure mode     what must hold, and how it breaks
+    Why it matters               `exploitation` — how the primitive escalates to real impact
+    The fix                      `fix` — the concrete patched code, not advice
+Secondary observations           smaller notes that are not full findings
+The lesson                       the transferable auditing rule
+Anchors reviewed / Audit checklist
+```
+
+The last four come from **schema v2** (`build_system_prompt`). The HTML inlines
+its CSS and fetches nothing, so it opens over `file://` on an air-gapped box and
+is light/dark aware. Two things worth knowing:
+
+- **Schema and prompt are versioned together.** The critic pass rewrites the whole
+  review, so a v1 critic prompt silently *deleted* the v2 fields from a v2 draft —
+  `build_critic_prompt(version)` now tracks the reviewer's schema.
+- **Where a field is defined matters more than how emphatically it is asked for.**
+  Appended after the ~13k-char prompt, `exploitation` was emitted 0/7 times; spliced
+  *inside* the `findings` key list, 7/7. Keep v2 fields inline (there is a test).
+
+#### Sizing the model to your GPU
+
+The context window sizes the KV cache, which shares VRAM with the weights, so
+`--num-ctx` defaults to the **profile's** `ollama_num_ctx` (it used to be a
+hardcoded 16384, which pushed a 14b past a 12 GB card into host RAM — where it
+does not fail, it just crawls). Explicit `--num-ctx` still wins.
+
+| VRAM | model (q4) | weights | KV @ 8192 | fits |
+|---|---|---|---|---|
+| 12 GB | `qwen2.5-coder:14b` | 9.0 GB | 1.5 GB | yes at ctx 8192; **not** at 16384 (~12.0 GB) |
+| 24 GB | `qwen2.5-coder:14b` | 9.0 GB | 3.0 GB @16384 | comfortably |
+| 24 GB | `qwen2.5-coder:32b` | ~20 GB | 1.5 GB | tight but yes at ctx 8192 |
+
+Model size is the dominant quality lever: measured composite vs an Opus
+reference is **14b = 81.1, 32b = 86.1** (see `TRAINING_SURFACE_LORA.md`).
+
+You do not have to work this out by hand — `./ccr.sh` → **Setup → Hardware**
+reads real VRAM via `nvidia-smi`, computes weights + KV for each model at your
+context, and names the largest one that stays fully resident (it also reports what
+is pulled, and offers to pull the recommendation). Same logic from the CLI:
+
+```bash
+python3 profiles.py --recommend-model
+```
+
+#### If a review fails
+
+A local model intermittently stops mid-JSON — a degenerate repetition inside a
+`"code"` string truncates the reply. Measured on `qwen2.5-coder:7b`, the *same*
+request both succeeded and failed across repeats, so it is a bad draw, not a bad
+setup. Each sample therefore gets `MAX_SAMPLE_ATTEMPTS` (3) draws with the
+temperature nudged up to break the loop, and a still-truncated reply is salvaged
+when it carries findings. The failure messages distinguish the three real causes:
+backend unreachable, backend answered HTTP 404 (`ollama pull <tag>`), and backend
+answered but the output was unusable. A larger model and fewer files per review
+both make the truncation rarer.
 
 ### Compare the local model against Claude Opus (`compare_review.py`)
 

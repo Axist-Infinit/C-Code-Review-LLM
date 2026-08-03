@@ -4,6 +4,10 @@ Prereqs (Ubuntu/WSL Ubuntu):
   - git, git-lfs, python3 (>= 3.11 for the ML lane), python3-venv, python3-pip, curl, zstd
   - Optional: NVIDIA GPU + driver + CUDA runtime (script handles CUDA wheels)
 
+Easiest (interactive, covers install/train/tune/review in one menu):
+  bash ./ccr.sh
+  -> drop C/C++ files in review_inbox/ and pick "1) Review the inbox"
+
 Quick start (ONLINE machine):
   1) unzip this bundle and cd into the folder
   2) run:  bash ./one_click_unlock_fetch_train_relock.sh
