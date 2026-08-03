@@ -134,11 +134,69 @@ def test_render_walkthrough_and_per_finding_code():
                         "code": "strcpy(d, s);", "cwe": "CWE-120", "severity": "high",
                         "failure_mode": "overflow"}]}
     md = sr.render_markdown(rv, ["snip.c"])
-    assert "## What is this code doing?" in md and "**snip.c:1-2**" in md  # file-attributed
+    # Part 1 / Part 2 mirrors how a senior reviewer writes this up.
+    assert "## Part 1 — What the code does" in md and "**snip.c:1-2**" in md
     assert "declares an 8-byte buffer" in md
-    assert "## What could go wrong?" in md and "an over-long s overflows d" in md
+    assert "## Part 2 — What could go wrong" in md and "an over-long s overflows d" in md
     assert "snip.c:2" in md                          # per-finding location citation
     assert "```c\nstrcpy(d, s);\n```" in md          # quoted code snippet
+
+
+# --- schema v2 rendering ----------------------------------------------------
+
+_V2_REVIEW = {
+    "subsystem": "keyring",
+    "what_the_code_does": [{"file": "k.c", "lines": "1-2", "code": "a();",
+                            "explanation": "does a"}],
+    "what_could_go_wrong": [],
+    "reviewed_anchors": [{"anchor": "key_put", "disposition": "finding", "reason": ""}],
+    "findings": [{"title": "Ref leak", "anchor": "key_put", "file": "k.c", "line": "39-44",
+                  "code": "goto error2;", "cwe": "CWE-416", "severity": "critical",
+                  "failure_mode": "reference never released",
+                  "exploitation": "wrap the 32-bit counter, then the next put frees it",
+                  "fix": "key_put(keyring);\ngoto error2;",
+                  "what_to_confirm": "every exit path releases"}],
+    "lesson": "a held reference is an obligation on every exit path",
+    "secondary_observations": ["the okay: label is dead code"],
+}
+
+
+def test_markdown_renders_v2_fix_exploitation_and_lesson():
+    md = sr.render_markdown(_V2_REVIEW, ["k.c"])
+    assert "**Why it matters:** wrap the 32-bit counter" in md
+    assert "**The fix**" in md and "key_put(keyring);" in md
+    assert "## The lesson" in md and "obligation on every exit path" in md
+    assert "## Secondary observations" in md and "okay: label is dead code" in md
+
+
+def test_markdown_omits_v2_sections_on_a_v1_review():
+    # A v1 teacher review must not render empty "The fix"/"lesson" scaffolding.
+    v1 = {k: v for k, v in _V2_REVIEW.items()
+          if k not in ("lesson", "secondary_observations")}
+    v1["findings"] = [{k: v for k, v in _V2_REVIEW["findings"][0].items()
+                       if k not in ("fix", "exploitation")}]
+    md = sr.render_markdown(v1, ["k.c"])
+    assert "The fix" not in md and "The lesson" not in md
+    assert "Why it matters" not in md and "Secondary observations" not in md
+
+
+def test_render_html_is_self_contained_and_escapes_model_output():
+    hostile = json.loads(json.dumps(_V2_REVIEW))
+    hostile["findings"][0]["title"] = '<script>alert("xss")</script>'
+    html = sr.render_html(hostile, ["k.c"])
+    assert html.startswith("<!doctype html>") and html.rstrip().endswith("</html>")
+    # self-contained: no external fetches, so it opens over file:// on an air-gapped box
+    for remote in ("http://", "https://", "<script", "src="):
+        assert remote not in html.lower().replace("&lt;script", ""), remote
+    assert "&lt;script&gt;" in html                      # the payload is escaped, not live
+    assert "Part 1 — What the code does" in html
+    assert "The fix" in html and "Why it matters" in html and "The lesson" in html
+    assert 'class="badge critical"' in html              # severity styling
+
+
+def test_render_html_handles_an_empty_review():
+    html = sr.render_html({"findings": [], "reviewed_anchors": []}, ["k.c"])
+    assert "<!doctype html>" in html and "No findings" in html
 
 
 def test_canonicalize_cwes_fixes_direction_without_merging():
@@ -472,7 +530,9 @@ def test_findings_to_pipeline_maps_schema():
     assert first["file"] == "playground/dhcp-protocol.h"
     assert first["start_line"] == 18 and first["end_line"] == 18
     assert first["match_lines"] == [18]
-    assert first["score"] == 1.0
+    # Confidence is derived from severity, not a flat 1.0 — a constant score
+    # gives SARIF/PR triage nothing to rank by. See test_pipeline_confidence_*.
+    assert first["score"] == sr._SEVERITY_CONFIDENCE["high"]
     assert first["issue"] == "hlen overflow"
     assert first["cwe"] == "CWE-120" and first["bug_class"] == "Buffer copy without size check"
     assert first["severity"] == "high"
@@ -598,7 +658,159 @@ def test_main_exits_nonzero_only_when_all_samples_fail(monkeypatch, tmp_path):
         raise urllib.error.URLError("connection refused")
     with pytest.raises(SystemExit) as exc:
         _run_main(monkeypatch, tmp_path, ["--models", "bad1,bad2"], fake)
-    assert "all" in str(exc.value)
+    # A transport failure must be named as such — it is the one case where
+    # "unreachable" is the truth (see the parse-failure test below).
+    assert "unreachable" in str(exc.value)
+
+
+# --- truncated-reply handling ----------------------------------------------
+# A local model intermittently stops mid-JSON (degenerate repetition inside a
+# "code" string). Measured on qwen2.5-coder:7b, the SAME request both succeeded
+# and failed across repeats. Before retries existed, the default single-sample
+# run discarded the whole review on one bad draw and reported it as
+# "backend unreachable?", which sent debugging in the wrong direction.
+
+_TRUNCATED_WITH_FINDING = (
+    '{"subsystem": "keyring", "findings": [{"title": "leak", "anchor": "key_put", '
+    '"file": "x.c", "line": "5", "cwe": "CWE-911", "severity": "high", '
+    '"failure_mode": "ref leaked"}, {"title": "cut off here'
+)
+_TRUNCATED_NO_FINDING = '{"subsystem": "keyring", "what_the_code_does": [{"code": "aaaa'
+
+
+@pytest.mark.parametrize("text,expect", [
+    ('{"a": 1, "b": "unterminated', {"a": 1}),
+    ('{"f": [{"t": "x"}, {"t": "y"}, {"t": "z', {"f": [{"t": "x"}, {"t": "y"}]}),
+    ('{"a": [1, 2, 3], "b": ', {"a": [1, 2, 3]}),
+    ('{"a": 1}', {"a": 1}),
+])
+def test_repair_truncated_json_recovers_complete_elements(text, expect):
+    assert json.loads(sr._repair_truncated_json(text)) == expect
+
+
+@pytest.mark.parametrize("text", ["", "not json at all", '"'])
+def test_repair_truncated_json_gives_up_cleanly(text):
+    assert sr._repair_truncated_json(text) is None
+
+
+def test_main_retries_a_truncated_reply_then_succeeds(monkeypatch, tmp_path, capsys):
+    calls = {"n": 0}
+
+    def fake(url, model, context, num_ctx, extra_system="", temperature=0.3, timeout=1800):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise sr.ReplyParseError("Unterminated string", _TRUNCATED_WITH_FINDING)
+        return json.loads(json.dumps(_GOOD_REVIEW))
+
+    out_json, _ = _run_main(monkeypatch, tmp_path, [], fake)
+    printed = capsys.readouterr().out
+    assert "attempt 1/" in printed and "unusable JSON" in printed
+    assert calls["n"] == 2                       # retried exactly once
+    review = json.loads(out_json.read_text())
+    assert review["findings"][0]["cwe"] == "CWE-120"   # the good draw won
+
+
+def test_main_salvages_a_truncated_reply_that_carries_findings(monkeypatch, tmp_path, capsys):
+    def fake(url, model, context, num_ctx, extra_system="", temperature=0.3, timeout=1800):
+        raise sr.ReplyParseError("Unterminated string", _TRUNCATED_WITH_FINDING)
+
+    out_json, _ = _run_main(monkeypatch, tmp_path, [], fake)
+    printed = capsys.readouterr().out
+    assert "salvaged a truncated reply" in printed
+    review = json.loads(out_json.read_text())
+    assert [f["cwe"] for f in review["findings"]] == ["CWE-911"]
+
+
+def test_main_refuses_a_salvage_with_no_findings(monkeypatch, tmp_path):
+    # A zero-finding salvage is indistinguishable from "the code is clean"
+    # downstream, so it must FAIL loudly instead of masquerading as a review.
+    def fake(url, model, context, num_ctx, extra_system="", temperature=0.3, timeout=1800):
+        raise sr.ReplyParseError("Unterminated string", _TRUNCATED_NO_FINDING)
+
+    with pytest.raises(SystemExit) as exc:
+        _run_main(monkeypatch, tmp_path, [], fake)
+    msg = str(exc.value)
+    assert "unusable" in msg and "unreachable" not in msg   # do not blame the backend
+
+
+# --- schema versioning ------------------------------------------------------
+# The reviewer prompt, the critic prompt and the SFT completions must all
+# describe the SAME schema. A v2 prompt trained against v1 completions teaches
+# the model to omit the new fields; a v1 critic silently strips them at runtime.
+
+def test_system_prompt_v2_adds_the_new_fields():
+    v1, v2 = sr.build_system_prompt(1), sr.build_system_prompt(2)
+    assert len(v2) > len(v1)
+    for field in sr.SCHEMA_V2_FINDING_FIELDS + sr.SCHEMA_V2_TOP_FIELDS:
+        assert f'"{field}"' not in v1, field
+        assert f'"{field}"' in v2, field
+    assert sr.SYSTEM_PROMPT == sr.build_system_prompt(sr.SCHEMA_VERSION)
+
+
+def test_v2_fields_are_spliced_inside_the_schema_not_appended():
+    # Measured: appended after the ~13k-char prompt, "exploitation" was emitted
+    # 0/7 times — the model follows the finding schema where it is DEFINED. Each
+    # v2 finding field must therefore sit inside the "findings" key list, before
+    # the audit_checklist key that closes it.
+    v2 = sr.build_system_prompt(2)
+    findings_at = v2.index('"findings": array of objects')
+    checklist_at = v2.index('"audit_checklist"')
+    for field in sr.SCHEMA_V2_FINDING_FIELDS:
+        assert findings_at < v2.index(f'"{field}"') < checklist_at, field
+    # and the prompt must not merely trail off with them at the very end
+    assert not v2.rstrip().endswith(sr._V2_TOP_FIELDS.rstrip())
+
+
+def test_critic_prompt_tracks_the_reviewer_schema():
+    # Verified regression: the critic REWRITES the review, so a v1 critic prompt
+    # dropped "exploitation"/"secondary_observations" out of a v2 draft.
+    c1, c2 = sr.build_critic_prompt(1), sr.build_critic_prompt(2)
+    assert c2.startswith(c1)
+    for field in sr.SCHEMA_V2_FINDING_FIELDS + sr.SCHEMA_V2_TOP_FIELDS:
+        assert f'"{field}"' not in c1, field
+        assert f'"{field}"' in c2, field
+    assert sr.CRITIC_SYSTEM_PROMPT == sr.build_critic_prompt(sr.SCHEMA_VERSION)
+
+
+def test_num_ctx_defaults_to_the_profile_and_stays_overridable(monkeypatch, tmp_path):
+    # The context window sizes the KV cache, which shares VRAM with the weights,
+    # so it is a per-machine quantity. A hardcoded 16384 here overrode the
+    # profile's own ollama_num_ctx (which the explainer already honours) and
+    # pushed a 14b past a 12GB card's VRAM into host RAM.
+    seen = []
+
+    def fake(url, model, context, num_ctx, extra_system="", temperature=0.3, timeout=1800):
+        seen.append(num_ctx)
+        return json.loads(json.dumps(_GOOD_REVIEW))
+
+    _run_main(monkeypatch, tmp_path, [], fake)                    # _run_main uses --profile cpu
+    assert seen == [sr.select_profile("cpu")[1]["ollama_num_ctx"]]
+    seen.clear()
+    _run_main(monkeypatch, tmp_path, ["--num-ctx", "2048"], fake)  # explicit flag still wins
+    assert seen == [2048]
+
+
+def test_main_reports_http_404_as_a_missing_model_not_as_unreachable(monkeypatch, tmp_path):
+    # HTTPError subclasses URLError. Reporting "unreachable" for a server that
+    # ANSWERED 404 (the tag simply is not pulled) sends debugging the wrong way.
+    def fake(url, model, context, num_ctx, extra_system="", temperature=0.3, timeout=1800):
+        raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+
+    with pytest.raises(SystemExit) as exc:
+        _run_main(monkeypatch, tmp_path, ["--models", "ghost"], fake)
+    msg = str(exc.value)
+    assert "ollama pull ghost" in msg and "unreachable" not in msg
+
+
+def test_main_parse_failures_do_not_blame_the_backend(monkeypatch, tmp_path, capsys):
+    def fake(url, model, context, num_ctx, extra_system="", temperature=0.3, timeout=1800):
+        raise sr.ReplyParseError("Unterminated string", "")
+
+    with pytest.raises(SystemExit) as exc:
+        _run_main(monkeypatch, tmp_path, [], fake)
+    printed = capsys.readouterr().out
+    assert printed.count("attempt ") == sr.MAX_SAMPLE_ATTEMPTS   # all attempts used
+    assert "answered" in str(exc.value)
 
 
 def test_main_dedupes_anchors_and_writes_pipeline_findings(monkeypatch, tmp_path):
@@ -692,3 +904,149 @@ def test_write_skip_outputs_emits_valid_empty_pipeline(tmp_path):
     review = json.load(open(Args.json_out))
     assert review["findings"] == [] and review["_skipped"] == "backend unreachable"
     assert "Skipped" in open(Args.md_out).read()
+
+
+# --- mechanical false-positive gate -----------------------------------------
+# An external senior review of this lane on a kernel refcount bug scored it 1
+# correct finding out of 4, and two of the proposed patches would have crashed
+# the kernel (key_put() on an ERR_PTR). These lock in the gate that screens them,
+# and — most importantly — that it never eats the TRUE finding.
+
+_SRC_KEYRING = """\
+long join_session_keyring(const char *name)
+{
+        new = prepare_creds();
+        keyring = find_keyring_by_name(name, false);
+        if (PTR_ERR(keyring) == -ENOKEY) {
+                keyring = keyring_alloc(name, old->uid, old->gid, old);
+                if (IS_ERR(keyring)) {
+                        ret = PTR_ERR(keyring);
+                        goto error2;
+                }
+        } else if (IS_ERR(keyring)) {
+                ret = PTR_ERR(keyring);
+                goto error2;
+        } else if (keyring == new->session_keyring) {
+                ret = 0;
+                goto error2;
+        }
+        ret = install_session_keyring_to_cred(new, keyring);
+        commit_creds(new);
+        key_put(keyring);
+error2:
+        mutex_unlock(&key_session_mutex);
+error:
+        abort_creds(new);
+        return ret;
+}
+"""
+
+# 1-based line numbers into _SRC_KEYRING
+_LN_ALLOC_ERR = 8        # inside `if (IS_ERR(keyring))` after keyring_alloc
+_LN_ALREADY = 17         # inside `else if (keyring == new->session_keyring)`
+
+
+def _write_src(tmp_path):
+    p = tmp_path / "keyring.c"
+    p.write_text(_SRC_KEYRING)
+    return str(p)
+
+
+def test_enclosing_condition_does_not_straddle_adjacent_branches():
+    # The bug this replaced: a +/-6-line window around the session-keyring branch
+    # reached back into the preceding IS_ERR branch and suppressed the TRUE finding.
+    lines = _SRC_KEYRING.splitlines()
+    assert "IS_ERR" in sr.enclosing_condition(lines, _LN_ALLOC_ERR)
+    already = sr.enclosing_condition(lines, _LN_ALREADY)
+    assert "session_keyring" in already and "IS_ERR" not in already
+
+
+def test_gate_suppresses_a_release_inside_an_is_err_guard(tmp_path):
+    src = _write_src(tmp_path)
+    review = {"findings": [{
+        "title": "leak on alloc failure", "file": src, "line": str(_LN_ALLOC_ERR),
+        "severity": "high", "where_it_lives": "implementation (file not provided)",
+        "fix": "if (IS_ERR(keyring)) {\n ret = PTR_ERR(keyring);\n key_put(keyring);\n}"}]}
+    report = sr.validate_findings(review, [src])
+    assert report["suppressed"] == 1 and review["findings"] == []
+    reason = review["suppressed_findings"][0]["suppressed_reason"]
+    assert "error pointer" in reason and "ERR_PTR" in reason
+
+
+def test_gate_KEEPS_the_real_cve_finding(tmp_path):
+    # THE regression that matters: CVE-2016-0728's correct patch releases on the
+    # valid-object path and carries no IS_ERR guard. A gate that eats this is
+    # worse than no gate at all.
+    src = _write_src(tmp_path)
+    review = {"findings": [{
+        "title": "leak when already the session keyring", "file": src,
+        "line": str(_LN_ALREADY), "severity": "critical", "cve_analog": "CVE-2016-0728",
+        "anchor": "keyring == new->session_keyring",
+        "fix": "if (keyring == new->session_keyring) {\n key_put(keyring);\n ret = 0;\n"
+               " goto error2;\n}"}]}
+    report = sr.validate_findings(review, [src])
+    assert report["suppressed"] == 0
+    assert len(review["findings"]) == 1
+    assert review["findings"][0]["fix"].startswith("if (keyring ==")   # patch intact
+
+
+def test_gate_withholds_an_unconditional_release_at_a_join_label(tmp_path):
+    src = _write_src(tmp_path)
+    review = {"findings": [{
+        "title": "leak on error paths", "file": src, "line": "20", "severity": "high",
+        "anchor": "error2:",
+        "fix": "error2:\n mutex_unlock(&key_session_mutex);\n key_put(keyring);\n"
+               " goto error;"}]}
+    sr.validate_findings(review, [src])
+    f = review["findings"][0]
+    assert "join label" in " ".join(f["review_flags"])
+    assert f["fix_withheld"].startswith("error2:")      # kept for audit
+    assert "withheld" in f["fix"]                        # not offered as safe
+
+
+def test_gate_flags_near_duplicate_exploitation_narratives(tmp_path):
+    # Exact-string comparison catches NOTHING here: the observed narratives
+    # differed by a few words each while making the identical claim.
+    src = _write_src(tmp_path)
+    a = ("An unprivileged user can repeatedly trigger the allocation failure path, "
+         "wrapping the reference count to zero.")
+    b = ("An unprivileged user can repeatedly trigger the find failure path, "
+         "wrapping the reference count to zero.")
+    assert a != b
+    review = {"findings": [
+        {"title": "one", "file": src, "line": "17", "exploitation": a, "severity": "high"},
+        {"title": "two", "file": src, "line": "17", "exploitation": b, "severity": "high"}]}
+    report = sr.validate_findings(review, [src])
+    assert report["duplicate_narratives"] == 2
+    for f in review["findings"]:
+        assert any("near-duplicate" in fl for fl in f["review_flags"])
+
+
+def test_gate_corrects_a_false_file_not_provided_claim(tmp_path):
+    src = _write_src(tmp_path)
+    review = {"findings": [{"title": "t", "file": src, "line": "3", "severity": "low",
+                            "where_it_lives": "implementation (file not provided)"}]}
+    sr.validate_findings(review, [src])
+    assert review["findings"][0]["where_it_lives"] == src
+
+
+def test_gate_reports_a_100pct_anchor_conversion_rate(tmp_path):
+    src = _write_src(tmp_path)
+    review = {"findings": [], "reviewed_anchors": [
+        {"anchor": "a", "disposition": "finding"}, {"anchor": "b", "disposition": "finding"}]}
+    report = sr.validate_findings(review, [src])
+    assert report["all_anchors_became_findings"] is True and report["dismissed"] == 0
+
+
+def test_pipeline_confidence_is_calibrated_not_flat():
+    # A flat 1.0 on every finding leaves SARIF with no triage ranking at all.
+    review = {"findings": [
+        {"title": "crit", "file": "a.c", "line": "1", "severity": "critical"},
+        {"title": "low", "file": "a.c", "line": "2", "severity": "low"},
+        {"title": "flagged", "file": "a.c", "line": "3", "severity": "critical",
+         "review_flags": ["cloned narrative"], "fix_withheld": "x"}]}
+    scores = [e["score"] for e in sr.findings_to_pipeline(review)]
+    assert len(set(scores)) == 3, scores            # not all identical
+    assert scores[0] > scores[1]                    # critical outranks low
+    assert scores[2] < scores[0]                    # flags dock confidence
+    assert all(0.0 < s <= 1.0 for s in scores)

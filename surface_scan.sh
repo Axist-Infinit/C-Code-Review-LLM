@@ -46,6 +46,7 @@ echo "[surface] reviewing: ${PATHS[*]}"
 python3 ./surface_review.py "${PATHS[@]}" \
   --json         "$OUTDIR/surface_review.json" \
   --md           "$OUTDIR/surface_report.md" \
+  --html         "$OUTDIR/surface_report.html" \
   --pipeline-out "$OUTDIR/surface_findings.json" \
   --ollama-url   "$OLLAMA_URL" \
   $PROFILE_ARG ${EXTRA[@]+"${EXTRA[@]}"}
@@ -54,6 +55,7 @@ python3 ./surface_review.py "${PATHS[@]}" \
 python3 ./to_sarif.py "$OUTDIR/surface_findings.json" -o "$OUTDIR/surface.sarif" || true
 
 echo
+echo "[OK] HTML report     : $OUTDIR/surface_report.html"
 echo "[OK] Markdown report : $OUTDIR/surface_report.md"
 echo "[OK] Raw review JSON : $OUTDIR/surface_review.json"
 echo "[OK] Pipeline JSON   : $OUTDIR/surface_findings.json"

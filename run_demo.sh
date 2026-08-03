@@ -34,6 +34,7 @@ if curl -fsS "$OLLAMA_URL/api/tags" >/dev/null 2>&1; then
   python ./surface_review.py "$SRC" \
     --json "$OUTDIR/surface_review.json" \
     --md   "$OUTDIR/surface_report.md" \
+    --html "$OUTDIR/surface_report.html" \
     --pipeline-out "$OUTDIR/surface_findings.json" \
     --ollama-url "$OLLAMA_URL" --soft-fail $PROFILE_ARG
   python ./to_sarif.py "$OUTDIR/surface_findings.json" -o "$OUTDIR/surface.sarif" || true
