@@ -31,6 +31,7 @@ import sys
 import urllib.error
 
 import providers
+import schemas
 from providers import make_backend, resolve_specs
 from profiles import select_profile, add_profile_arg
 from local_vuln_scanner import list_sources
@@ -499,24 +500,37 @@ def _chat_content(resp):
     return providers.parse_json_reply(providers.OllamaBackend.content_of(resp))
 
 
-def chat_review(backend, context, num_ctx, extra_system="", temperature=0.3, timeout=1800):
+def review_json_schema():
+    """The review document schema, matching the prompt's SCHEMA_VERSION.
+
+    Returned as a function so a --schema-version override (and the SFT
+    builder's v1 reproduction) cannot drift from the prompt that asked for it.
+    """
+    return schemas.review_schema(SCHEMA_VERSION)
+
+
+def chat_review(backend, context, num_ctx, extra_system="", temperature=0.3,
+                timeout=1800, schema=None):
     """Pass 1: one independent review of the whole context."""
-    content = backend.chat(
+    return backend.chat_json(
         [{"role": "system", "content": SYSTEM_PROMPT + extra_system},
          {"role": "user", "content": context}],
-        temperature=temperature, num_ctx=num_ctx, timeout=timeout)
-    return providers.parse_json_reply(content)
+        schema=schema, temperature=temperature, num_ctx=num_ctx, timeout=timeout)
 
 
-def chat_critique(backend, context, draft, num_ctx, extra_system="", timeout=1800):
-    """Second pass: hand the draft review back for completion + de-hallucination."""
+def chat_critique(backend, context, draft, num_ctx, extra_system="", timeout=1800,
+                  schema=None):
+    """Second pass: hand the draft review back for completion + de-hallucination.
+
+    The critic REWRITES the whole document, so it is the pass that silently
+    dropped v2 keys before; it gets the same schema as pass 1 for that reason.
+    """
     user = (f"{context}\n\nDRAFT REVIEW TO CORRECT AND COMPLETE (JSON):\n"
             f"{json.dumps(draft, indent=2)}")
-    content = backend.chat(
+    return backend.chat_json(
         [{"role": "system", "content": CRITIC_SYSTEM_PROMPT + extra_system},
          {"role": "user", "content": user}],
-        temperature=0.2, num_ctx=num_ctx, timeout=timeout)
-    return providers.parse_json_reply(content)
+        schema=schema, temperature=0.2, num_ctx=num_ctx, timeout=timeout)
 
 
 # Back-compat wrappers: the pipeline now passes a backend, but these keep the
@@ -579,16 +593,16 @@ explanation}} steps — keep them thorough) and every finding's file/line/code
 citations. Rank findings strongest-first; each finding distinct."""
 
 
-def chat_consolidate(backend, context, pooled, num_ctx, extra_system="", timeout=1800):
+def chat_consolidate(backend, context, pooled, num_ctx, extra_system="", timeout=1800,
+                     schema=None):
     """Union+dedup+de-hallucinate findings pooled from multiple review samples."""
     user = (f"{context}\n\nPOOLED FINDINGS FROM MULTIPLE INDEPENDENT REVIEWS "
             f"(consolidate per your instructions; duplicates and conflicts are "
             f"expected):\n{json.dumps(pooled, indent=2)}")
-    content = backend.chat(
+    return backend.chat_json(
         [{"role": "system", "content": CONSOLIDATE_SYSTEM_PROMPT + extra_system},
          {"role": "user", "content": user}],
-        temperature=0.2, num_ctx=num_ctx, timeout=timeout)
-    return providers.parse_json_reply(content)
+        schema=schema, temperature=0.2, num_ctx=num_ctx, timeout=timeout)
 
 
 def ollama_consolidate(base_url, model, context, pooled, num_ctx, extra_system="",
@@ -1518,6 +1532,13 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=providers.DEFAULT_MAX_TOKENS,
                     help="Output-token cap for hosted providers (ignored by Ollama). "
                          "A full review document is long; too small a cap truncates it.")
+    ap.add_argument("--no-structured-output", action="store_true",
+                    help="Do not send the review JSON Schema to the backend. "
+                         "Structured output is on by default (Ollama >= 0.5 "
+                         "constrains sampling to it; hosted providers enforce it "
+                         "via tool-calling), which is what stops a model omitting "
+                         "required keys like 'exploitation'. Turn it off if a "
+                         "model degrades under a constrained decoder.")
     ap.add_argument("--allow-remote", action="store_true",
                     help="Permit a non-local provider. Required for anything but "
                          "ollama:, because a remote model means the source under "
@@ -1569,10 +1590,13 @@ def main():
     except ValueError as e:
         sys.exit(f"[ERR] bad model spec: {e}")
 
+    review_schema = None if args.no_structured_output else review_json_schema()
+
     n_runs = len(backends) * max(1, args.samples)
     print(f"[profile] {prof_name}: models={[b.spec for b in backends]} "
           f"samples/model={max(1, args.samples)} "
-          f"-> {n_runs} run(s); critic={critic_backend.spec}; num_ctx={args.num_ctx}")
+          f"-> {n_runs} run(s); critic={critic_backend.spec}; num_ctx={args.num_ctx}; "
+          f"schema={'v' + str(SCHEMA_VERSION) if review_schema else 'off'}")
     print(f"[review] {len(files)} file(s) together: {', '.join(files)}")
 
     context = build_context(files)
@@ -1608,7 +1632,8 @@ def main():
                 temp = min(base_temp + 0.15 * (attempt - 1), 1.0)
                 try:
                     rev = chat_review(backend, context, args.num_ctx,
-                                      extra_system, temperature=temp)
+                                      extra_system, temperature=temp,
+                                      schema=review_schema)
                     if not isinstance(rev, dict):
                         # Ollama's format:"json" guarantees valid JSON, not a JSON
                         # OBJECT — a reply parsing to []/42/"x" must be skipped like
@@ -1706,7 +1731,8 @@ def main():
         if not args.no_critic:
             try:
                 critiqued = chat_critique(critic_backend, context, review,
-                                          args.num_ctx, extra_system)
+                                          args.num_ctx, extra_system,
+                                          schema=review_schema)
                 if not isinstance(critiqued, dict):
                     raise ValueError(f"critic reply parsed to "
                                      f"{type(critiqued).__name__}, expected a JSON object")
@@ -1728,8 +1754,9 @@ def main():
             # Optional: an LLM union/dedup pass. Isolated so a slow/failed pass
             # degrades gracefully to the deterministic deduper below.
             try:
-                consolidated = chat_consolidate(critic_backend, context,
-                                                pooled, args.num_ctx, extra_system)
+                consolidated = chat_consolidate(critic_backend, context, pooled,
+                                                args.num_ctx, extra_system,
+                                                schema=review_schema)
                 if not isinstance(consolidated, dict):
                     raise ValueError(f"consolidation reply parsed to "
                                      f"{type(consolidated).__name__}, expected a JSON object")

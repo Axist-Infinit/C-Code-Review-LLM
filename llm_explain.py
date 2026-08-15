@@ -16,6 +16,7 @@ import threading
 import urllib.error
 
 import providers
+import schemas
 from providers import make_backend, resolve_specs
 from profiles import select_profile, add_profile_arg
 from explain_findings import (explain_snippet, score_to_confidence, write_html,
@@ -129,18 +130,22 @@ def build_explain_messages(snippet, file_path, lines):
             {"role": "user", "content": user}]
 
 
-def backend_chat_fn(backend, timeout=600):
+def backend_chat_fn(backend, timeout=600, schema=schemas.EXPLAIN_SCHEMA):
     """Adapt a ChatBackend to the chat_fn(url, model, snippet, file, lines, num_ctx)
     shape explain_finding calls.
 
     url/model are ignored — the backend already carries them. Keeping the old
     positional shape means explain_finding, run_explanations and every test that
     injects a fake chat_fn are untouched by the provider change.
+
+    The schema constrains severity to the allow-list normalize_severity would
+    otherwise have to repair after the fact, and requires the narrative keys the
+    reports render. Pass schema=None to ask for plain JSON instead.
     """
     def chat_fn(_url, _model, snippet, file_path, lines, num_ctx):
-        content = backend.chat(build_explain_messages(snippet, file_path, lines),
-                               temperature=0.2, num_ctx=num_ctx, timeout=timeout)
-        return providers.parse_json_reply(content)
+        return backend.chat_json(build_explain_messages(snippet, file_path, lines),
+                                 schema=schema, temperature=0.2, num_ctx=num_ctx,
+                                 timeout=timeout)
     return chat_fn
 
 
@@ -415,6 +420,10 @@ def main():
     ap.add_argument("--ollama-url", default=os.environ.get("OLLAMA_HOST", "http://localhost:11434"))
     ap.add_argument("--max-tokens", type=int, default=providers.DEFAULT_MAX_TOKENS,
                     help="Output-token cap for hosted providers (ignored by Ollama)")
+    ap.add_argument("--no-structured-output", action="store_true",
+                    help="Do not send the explanation JSON Schema to the backend. "
+                         "On by default; it pins severity to the allow-list and "
+                         "requires the narrative keys the reports render.")
     ap.add_argument("--allow-remote", action="store_true",
                     help="Permit a non-local provider. Required for anything but "
                          "ollama:, because a remote model means the snippets under "
@@ -495,7 +504,10 @@ def main():
                   f"{entry.get('severity') or 'n/a'} {entry.get('cwe', '')}{note}")
 
     partial = checkpoint_path(args.out)
-    extra = {"chat_fn": backend_chat_fn(chat_backend)} if chat_backend else {}
+    extra = ({"chat_fn": backend_chat_fn(
+        chat_backend,
+        schema=None if args.no_structured_output else schemas.EXPLAIN_SCHEMA)}
+        if chat_backend else {})
     out_entries = run_explanations(
         findings, backend=backend, model=model, ollama_url=args.ollama_url,
         num_ctx=num_ctx, workers=workers, progress=_progress, checkpoint=partial,

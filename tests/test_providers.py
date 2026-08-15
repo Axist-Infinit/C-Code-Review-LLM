@@ -372,3 +372,153 @@ def test_concurrent_client_lookups_share_one_client(monkeypatch):
     for t in threads:
         t.join()
     assert len(set(id(c) for c in seen)) == 1      # every thread got the same client
+
+
+# --- structured output -------------------------------------------------------
+
+class _Msg:
+    def __init__(self, content, usage=None):
+        self.content = content
+        self.usage_metadata = usage
+
+
+def test_ollama_sends_the_schema_as_format(monkeypatch):
+    # Ollama >= 0.5 constrains sampling to a JSON Schema passed as `format`.
+    sent = {}
+
+    def capture(req, timeout=None):
+        sent.update(json.loads(req.data))
+        return _body({"message": {"content": '{"ok": true}'}})
+    monkeypatch.setattr("urllib.request.urlopen", capture)
+    schema = {"type": "object", "properties": {"ok": {"type": "boolean"}}}
+    p.OllamaBackend("m").chat_json([{"role": "user", "content": "hi"}], schema=schema)
+    assert sent["format"] == schema
+
+
+def test_ollama_without_a_schema_still_asks_for_plain_json(monkeypatch):
+    sent = {}
+
+    def capture(req, timeout=None):
+        sent.update(json.loads(req.data))
+        return _body({"message": {"content": '{"ok": true}'}})
+    monkeypatch.setattr("urllib.request.urlopen", capture)
+    p.OllamaBackend("m").chat_json([{"role": "user", "content": "hi"}])
+    assert sent["format"] == "json"
+
+
+def test_ollama_older_than_0_5_degrades_to_json_mode(monkeypatch, capsys):
+    # A structured-output upgrade must never break a working install: an old
+    # server 400s the schema object, so retry once in plain JSON mode and latch.
+    formats = []
+
+    def capture(req, timeout=None):
+        payload = json.loads(req.data)
+        formats.append(payload.get("format"))
+        if isinstance(payload.get("format"), dict):
+            raise urllib.error.HTTPError("u", 400, "Bad Request", {}, None)
+        return _body({"message": {"content": '{"ok": true}'}})
+    monkeypatch.setattr("urllib.request.urlopen", capture)
+
+    b = p.OllamaBackend("m")
+    schema = {"type": "object"}
+    assert b.chat_json([{"role": "user", "content": "hi"}], schema=schema) == {"ok": True}
+    assert formats == [schema, "json"]
+    assert "Ollama >= 0.5" in capsys.readouterr().out
+    # Latched: the second call does not re-pay for the rejection.
+    formats.clear()
+    b.chat_json([{"role": "user", "content": "hi"}], schema=schema)
+    assert formats == ["json"]
+
+
+def test_a_non_400_rejection_is_not_mistaken_for_an_old_server(monkeypatch):
+    def boom(req, timeout=None):
+        raise urllib.error.HTTPError("u", 404, "Not Found", {}, None)
+    monkeypatch.setattr("urllib.request.urlopen", boom)
+    b = p.OllamaBackend("ghost")
+    with pytest.raises(p.RequestRejected):
+        b.chat_json([{"role": "user", "content": "hi"}], schema={"type": "object"})
+    assert b._schema_unsupported is False       # not latched by an unrelated error
+
+
+def _structured_backend(monkeypatch, result, spec="anthropic:claude-opus-5"):
+    seen = {}
+
+    class _Structured:
+        def invoke(self, messages):
+            return result
+
+    class _Client:
+        def invoke(self, messages):
+            return _Msg('{"from": "text-mode"}')
+
+        def with_structured_output(self, schema, include_raw=False):
+            seen["schema"], seen["include_raw"] = schema, include_raw
+            return _Structured()
+
+    b = p.make_backend(spec)
+    monkeypatch.setattr(b, "_client", lambda *a, **k: _Client())
+    return b, seen
+
+
+def test_langchain_uses_native_structured_output(monkeypatch):
+    b, seen = _structured_backend(monkeypatch, {
+        "raw": _Msg('{"ok": true}', {"input_tokens": 9, "output_tokens": 3}),
+        "parsed": {"ok": True}, "parsing_error": None})
+    schema = {"title": "X", "type": "object"}
+    assert b.chat_json([{"role": "user", "content": "u"}], schema=schema) == {"ok": True}
+    assert seen["schema"] is schema
+    # include_raw is not a detail: without it both the token usage and the raw
+    # text that salvage needs are discarded by the structured-output wrapper.
+    assert seen["include_raw"] is True
+    assert b.usage["input_tokens"] == 9 and b.usage["calls"] == 1
+
+
+def test_langchain_falls_back_to_text_when_no_schema_is_given(monkeypatch):
+    b, seen = _structured_backend(monkeypatch, None)
+    assert b.chat_json([{"role": "user", "content": "u"}]) == {"from": "text-mode"}
+    assert "schema" not in seen
+
+
+def test_structured_parse_failure_is_salvageable(monkeypatch):
+    # A structured-output failure must reach the caller as a ReplyParseError
+    # carrying the raw text, so surface_review's retry-then-salvage applies
+    # exactly as it does for Ollama.
+    truncated = '{"findings": [{"title": "cut off'
+    b, _ = _structured_backend(monkeypatch, {
+        "raw": _Msg(truncated), "parsed": None, "parsing_error": "invalid json"})
+    with pytest.raises(p.ReplyParseError) as exc:
+        b.chat_json([{"role": "user", "content": "u"}], schema={"type": "object"})
+    assert exc.value.content == truncated
+
+
+def test_provider_without_structured_output_degrades_once(monkeypatch, capsys):
+    calls = []
+
+    class _Client:
+        def invoke(self, messages):
+            calls.append(messages)
+            return _Msg('{"from": "text-mode"}')
+
+        def with_structured_output(self, schema, include_raw=False):
+            raise NotImplementedError("this integration has no structured output")
+
+    b = p.make_backend("anthropic:claude-opus-5")
+    monkeypatch.setattr(b, "_client", lambda *a, **k: _Client())
+    schema = {"type": "object"}
+    assert b.chat_json([{"role": "user", "content": "u"}], schema=schema) \
+        == {"from": "text-mode"}
+    assert "does not support structured output" in capsys.readouterr().out
+    assert b._structured_unsupported is True     # latched, not retried per call
+    assert b.chat_json([{"role": "user", "content": "u"}], schema=schema) \
+        == {"from": "text-mode"}
+
+
+def test_pydantic_style_parsed_objects_are_accepted(monkeypatch):
+    class _Model:
+        def model_dump(self):
+            return {"ok": True}
+
+    b, _ = _structured_backend(monkeypatch, {
+        "raw": _Msg("{}"), "parsed": _Model(), "parsing_error": None})
+    assert b.chat_json([{"role": "user", "content": "u"}],
+                       schema={"type": "object"}) == {"ok": True}

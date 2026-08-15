@@ -116,6 +116,47 @@ requests plus a critic per file group. `--max-tokens` caps the reply (hosted
 providers only; too small a cap truncates the review document), and the
 `[usage]` line reports what a run actually spent.
 
+## Structured output
+
+On by default. The review document and the per-finding explanation are declared
+as JSON Schemas in `schemas.py` and sent with every request, so the shape is
+enforced by the decoder rather than requested politely:
+
+| Backend | Mechanism |
+|---|---|
+| Ollama >= 0.5 | the schema is passed as `format`, constraining sampling |
+| LangChain providers | `with_structured_output(schema, include_raw=True)` → the provider's tool-calling / json_schema mode |
+| Ollama < 0.5 | HTTP 400 on the schema → one warning, then plain JSON mode for the rest of the run |
+| An integration without structured output | one warning, then JSON-mode parsing |
+
+The prompts are unchanged. Their field descriptions are the reviewer's actual
+guidance ("say what an attacker actually does and what they end up with") and no
+schema can carry that — the schema enforces the *shape* the prompt asks for.
+
+Two concrete wins. `surface_review.py`'s splice comment records `exploitation`
+being emitted **0 out of 7 times** on qwen2.5-coder:14b when it was described
+late in the prompt; moving the description earlier was a workaround, and a
+required key is the actual fix. And the explanation schema pins `severity` to
+the allow-list that `normalize_severity` was repairing after the fact, so an
+out-of-vocabulary value never reaches a SARIF ruleId.
+
+The schema requires **only what the prompt marks REQUIRED** and leaves
+everything else optional, because the pipeline backfills missing keys and an
+over-tight schema turns a usable partial reply into a failed sample. That line
+is held by tests: all 325 Claude-authored reviews in `corpus/reviews/` are
+validated against the schema for their version, so a future tightening that
+would reject teacher-quality output fails CI. (Those tests need `jsonschema`;
+they skip cleanly without it.)
+
+`_repair_truncated_json` stays. Constrained decoding removes the wrong-shape
+failure class, not the "local model falls into degenerate repetition and stops
+mid-document" one, and a structured-output parse failure is still raised as a
+`ReplyParseError` carrying the raw text so the existing retry-then-salvage path
+applies unchanged.
+
+Turn it off per run with `--no-structured-output` on either tool, if a model
+degrades under a constrained decoder.
+
 ## Failure modes
 
 Backends normalise their errors into three classes so the pipeline's retry and
@@ -145,11 +186,6 @@ actually reviews C better against your own rubric.
 
 ## Not yet done
 
-- **Provider-native structured output.** `surface_review._repair_truncated_json`
-  exists because a local model in JSON mode stops mid-document. Tool-calling
-  providers can be given the review schema directly via
-  `with_structured_output`, which removes most of that failure class. The
-  repair path stays regardless — it is still load-bearing for Ollama.
 - **Response caching.** A LangChain SQLite cache would make re-reviewing an
   unchanged file free.
 - **Rate-limit-aware concurrency.** `llm_explain` sizes its thread pool from the

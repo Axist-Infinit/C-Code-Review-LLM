@@ -9,6 +9,7 @@ import json
 import pytest
 
 import llm_explain
+import schemas
 from llm_explain import (
     apply_corroboration_floor,
     explain_finding,
@@ -429,8 +430,15 @@ def test_heuristic_lane_is_the_only_no_model_lane():
 
 
 def test_backend_chat_fn_adapts_any_backend_and_parses_the_reply():
-    class _Stub:
+    import providers
+
+    # Subclasses the real ChatBackend so the inherited chat_json contract
+    # (schema-constrained chat + parse, preserving ReplyParseError) is exercised.
+    class _Stub(providers.ChatBackend):
+        provider = "stub"
+
         def __init__(self):
+            super().__init__("stub-model")
             self.seen = None
 
         def chat(self, messages, **kw):
@@ -446,3 +454,7 @@ def test_backend_chat_fn_adapts_any_backend_and_parses_the_reply():
     assert SNIPPET_BEGIN in messages[1]["content"]      # snippet still fenced
     assert "C++" in messages[1]["content"]              # language hint preserved
     assert kw["num_ctx"] == 4096
+    # The explanation schema went down with the request: severity is pinned to
+    # the allow-list rather than repaired afterwards by normalize_severity.
+    assert kw["schema"]["properties"]["severity"]["enum"] == schemas.SEVERITIES
+    assert "what_could_go_wrong" in kw["schema"]["required"]

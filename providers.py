@@ -244,8 +244,22 @@ class ChatBackend:
         return self.provider in LOCAL_PROVIDERS
 
     def chat(self, messages, *, temperature=0.2, num_ctx=None, timeout=600,
-             json_mode=True):
+             json_mode=True, schema=None):
         raise NotImplementedError
+
+    def chat_json(self, messages, *, schema=None, temperature=0.2, num_ctx=None,
+                  timeout=600):
+        """Chat and return the reply PARSED as an object.
+
+        The base implementation goes through chat() and parses the text, which
+        is what keeps ReplyParseError carrying the raw reply — surface_review
+        salvages a truncated document from it, and losing that would turn a
+        recoverable sample into a discarded one. A backend with provider-native
+        structured output overrides this, and must preserve the same contract.
+        """
+        return parse_json_reply(self.chat(
+            messages, schema=schema, temperature=temperature, num_ctx=num_ctx,
+            timeout=timeout))
 
     def probe(self):
         """Return (reachable, model_present) without doing billable work."""
@@ -272,6 +286,9 @@ class OllamaBackend(ChatBackend):
         super().__init__(model, spec=spec or f"ollama:{model}")
         self.base_url = normalize_url(
             base_url or os.environ.get("OLLAMA_HOST") or DEFAULT_OLLAMA_URL)
+        # Latched on the first HTTP 400 for a schema `format`, so an old server
+        # costs one rejected request per run rather than one per call.
+        self._schema_unsupported = False
 
     @staticmethod
     def content_of(resp):
@@ -297,7 +314,25 @@ class OllamaBackend(ChatBackend):
         return content
 
     def chat(self, messages, *, temperature=0.2, num_ctx=None, timeout=600,
-             json_mode=True):
+             json_mode=True, schema=None):
+        # Ollama >= 0.5 accepts a JSON Schema as `format` and constrains
+        # sampling to it. An older server rejects the object with HTTP 400; we
+        # degrade to plain JSON mode once, remember it, and carry on — a
+        # structured-output upgrade must never break a working install.
+        use_schema = schema is not None and not self._schema_unsupported
+        try:
+            return self._post(messages, temperature, num_ctx, timeout,
+                              schema if use_schema else ("json" if json_mode else None))
+        except RequestRejected as rj:
+            if not use_schema or rj.code != 400:
+                raise
+            self._schema_unsupported = True
+            print(f"[warn] {self.base_url} rejected a JSON-Schema format "
+                  f"(needs Ollama >= 0.5); falling back to plain JSON mode")
+        return self._post(messages, temperature, num_ctx, timeout,
+                          "json" if json_mode else None)
+
+    def _post(self, messages, temperature, num_ctx, timeout, fmt):
         options = {"temperature": temperature}
         if num_ctx:
             options["num_ctx"] = num_ctx
@@ -307,8 +342,8 @@ class OllamaBackend(ChatBackend):
             "stream": False,
             "options": options,
         }
-        if json_mode:
-            payload["format"] = "json"
+        if fmt is not None:
+            payload["format"] = fmt
         req = urllib.request.Request(
             f"{self.base_url}/api/chat",
             data=json.dumps(payload).encode("utf-8"),
@@ -372,6 +407,9 @@ class LangChainBackend(ChatBackend):
         # calls it from every worker thread, so an unguarded cache would
         # construct a duplicate SDK client per concurrent miss.
         self._clients_lock = threading.Lock()
+        # Latched when an integration turns out not to implement structured
+        # output, so the fallback costs one failed attempt per run, not per call.
+        self._structured_unsupported = False
 
     @property
     def _lc_provider(self):
@@ -479,11 +517,61 @@ class LangChainBackend(ChatBackend):
     }
 
     def chat(self, messages, *, temperature=0.2, num_ctx=None, timeout=600,
-             json_mode=True):
+             json_mode=True, schema=None):
         client = self._client(temperature, num_ctx=num_ctx, timeout=timeout,
                               json_mode=json_mode)
+        reply = self._invoke(client, messages)
+        self._record_usage(reply)
+        return self._content_of(reply)
+
+    def chat_json(self, messages, *, schema=None, temperature=0.2, num_ctx=None,
+                  timeout=600):
+        """Use the provider's own structured-output mode when a schema is given.
+
+        with_structured_output routes the schema to tool-calling / json_schema
+        mode, so the shape is enforced by the provider rather than by asking
+        nicely. include_raw=True is essential and not a detail: without it the
+        raw AIMessage is discarded, which would lose BOTH the token usage this
+        run reports and the raw text that surface_review salvages a truncated
+        document from.
+
+        Falls back to plain text + parse for any provider whose integration
+        does not implement structured output.
+        """
+        if schema is None or self._structured_unsupported:
+            return super().chat_json(messages, schema=schema, temperature=temperature,
+                                     num_ctx=num_ctx, timeout=timeout)
+        client = self._client(temperature, num_ctx=num_ctx, timeout=timeout,
+                              json_mode=True)
         try:
-            reply = client.invoke(self._to_lc_messages(messages))
+            structured = client.with_structured_output(schema, include_raw=True)
+        except (NotImplementedError, TypeError, ValueError) as e:
+            self._structured_unsupported = True
+            print(f"[warn] {self.spec} does not support structured output "
+                  f"({type(e).__name__}); falling back to JSON-mode parsing")
+            return super().chat_json(messages, schema=schema, temperature=temperature,
+                                     num_ctx=num_ctx, timeout=timeout)
+
+        result = self._invoke(structured, messages)
+        raw = result.get("raw") if isinstance(result, dict) else None
+        if raw is not None:
+            self._record_usage(raw)
+        parsed = result.get("parsed") if isinstance(result, dict) else result
+        if isinstance(parsed, dict):
+            return parsed
+        if parsed is not None and hasattr(parsed, "model_dump"):   # a Pydantic schema
+            return parsed.model_dump()
+        # Structured output failed to produce an object. Surface it as a parse
+        # error carrying whatever text did arrive, so the caller's existing
+        # retry-then-salvage path applies exactly as it does for Ollama.
+        err = (result.get("parsing_error") if isinstance(result, dict) else None) or \
+            f"structured output returned {type(parsed).__name__}"
+        text = self._content_of(raw) if raw is not None else ""
+        raise ReplyParseError(f"{self.spec}: {err}", text)
+
+    def _invoke(self, client, messages):
+        try:
+            return client.invoke(self._to_lc_messages(messages))
         except BackendError:
             raise
         except Exception as e:
@@ -493,8 +581,6 @@ class LangChainBackend(ChatBackend):
             code = getattr(e, "status_code", None) or getattr(e, "code", None)
             raise RequestRejected(f"{self.spec}: {name}: {e}",
                                   code=code if isinstance(code, int) else None) from e
-        self._record_usage(reply)
-        return self._content_of(reply)
 
     def _record_usage(self, reply):
         meta = getattr(reply, "usage_metadata", None)
