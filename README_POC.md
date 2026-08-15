@@ -72,6 +72,26 @@ stays resident, hence `laptop-small`.
 Override anytime: `CCR_PROFILE=spark ./scan_repo.sh` or `--profile spark`.
 The trained classifier moves between machines via `pack_model.sh` / `unpack_model.sh`.
 
+## Model providers (local Ollama, or an existing hosted model)
+
+The reviewer holds no model: both LLM lanes speak JSON to a chat endpoint, and
+`providers.py` is the one place that endpoint is chosen. A model is named by a
+`provider:model` spec, and a **bare tag still means Ollama**, so everything above
+keeps working untouched:
+
+```bash
+python surface_review.py src/*.c --md report.md                       # profile's local model
+python surface_review.py src/*.c --md report.md --allow-remote \
+    --models anthropic:claude-opus-5 --critic-model openai:gpt-5      # hosted, cross-provider critic
+```
+
+Anything other than a local spec needs `--allow-remote`, because it sends the
+code under review off this machine. Non-Ollama providers additionally need
+`pip install -r requirements-langchain.txt` plus that provider's integration
+package — the default offline path stays stdlib-only and air-gappable.
+
+Full details, precedence rules, cost notes and failure modes: **`MODEL_PROVIDERS.md`**.
+
 ## Pipeline tools
 
 - `local_vuln_scanner.py SRC -o OUT` — classifier scan. Scores whole functions

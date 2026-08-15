@@ -612,7 +612,7 @@ def _run_main(monkeypatch, tmp_path, argv_extra, fake_review):
     src.write_text("void f(char *s) { char b[8]; strcpy(b, s); }\n")
     out_json = tmp_path / "review.json"
     out_pipe = tmp_path / "pipeline.json"
-    monkeypatch.setattr(sr, "ollama_review", fake_review)
+    monkeypatch.setattr(sr, "chat_review", fake_review)
     monkeypatch.setattr(sys, "argv",
                         ["surface_review.py", str(src), "--no-critic", "--no-kb",
                          "--profile", "cpu", "--json", str(out_json),
@@ -623,14 +623,15 @@ def _run_main(monkeypatch, tmp_path, argv_extra, fake_review):
 
 
 def test_main_skips_failed_samples_and_pools_the_rest(monkeypatch, tmp_path, capsys):
-    def fake(url, model, context, num_ctx, extra_system="", temperature=0.3, timeout=1800):
-        if model == "bad":
+    def fake(backend, context, num_ctx, extra_system="", temperature=0.3,
+             timeout=1800, schema=None):
+        if backend.model == "bad":
             raise urllib.error.URLError("connection refused")
         return json.loads(json.dumps(_GOOD_REVIEW))
     out_json, out_pipe = _run_main(monkeypatch, tmp_path,
                                    ["--models", "bad,good", "--samples", "2"], fake)
     printed = capsys.readouterr().out
-    assert "[sample bad#1] FAILED" in printed and "skipping" in printed
+    assert "[sample ollama:bad#1] FAILED" in printed and "skipping" in printed
     review = json.loads(out_json.read_text())
     assert len(review["findings"]) == 1
     assert review["findings"][0]["cwe"] == "CWE-120"
@@ -641,20 +642,22 @@ def test_main_skips_sample_whose_reply_is_non_dict_json(monkeypatch, tmp_path, c
     # JSON OBJECT; a reply parsing to [] escaped the per-sample try/except and
     # crashed the whole multi-model run with AttributeError. It must be warned
     # about and skipped like any other failed sample.
-    def fake(url, model, context, num_ctx, extra_system="", temperature=0.3, timeout=1800):
-        if model == "weird":
+    def fake(backend, context, num_ctx, extra_system="", temperature=0.3,
+             timeout=1800, schema=None):
+        if backend.model == "weird":
             return []          # valid JSON, but not a JSON object
         return json.loads(json.dumps(_GOOD_REVIEW))
     out_json, _ = _run_main(monkeypatch, tmp_path, ["--models", "weird,good"], fake)
     printed = capsys.readouterr().out
-    assert "[sample weird#1] FAILED" in printed and "skipping" in printed
+    assert "[sample ollama:weird#1] FAILED" in printed and "skipping" in printed
     review = json.loads(out_json.read_text())
     assert len(review["findings"]) == 1
     assert review["findings"][0]["cwe"] == "CWE-120"
 
 
 def test_main_exits_nonzero_only_when_all_samples_fail(monkeypatch, tmp_path):
-    def fake(url, model, context, num_ctx, extra_system="", temperature=0.3, timeout=1800):
+    def fake(backend, context, num_ctx, extra_system="", temperature=0.3,
+             timeout=1800, schema=None):
         raise urllib.error.URLError("connection refused")
     with pytest.raises(SystemExit) as exc:
         _run_main(monkeypatch, tmp_path, ["--models", "bad1,bad2"], fake)
@@ -696,7 +699,8 @@ def test_repair_truncated_json_gives_up_cleanly(text):
 def test_main_retries_a_truncated_reply_then_succeeds(monkeypatch, tmp_path, capsys):
     calls = {"n": 0}
 
-    def fake(url, model, context, num_ctx, extra_system="", temperature=0.3, timeout=1800):
+    def fake(backend, context, num_ctx, extra_system="", temperature=0.3,
+             timeout=1800, schema=None):
         calls["n"] += 1
         if calls["n"] == 1:
             raise sr.ReplyParseError("Unterminated string", _TRUNCATED_WITH_FINDING)
@@ -711,7 +715,8 @@ def test_main_retries_a_truncated_reply_then_succeeds(monkeypatch, tmp_path, cap
 
 
 def test_main_salvages_a_truncated_reply_that_carries_findings(monkeypatch, tmp_path, capsys):
-    def fake(url, model, context, num_ctx, extra_system="", temperature=0.3, timeout=1800):
+    def fake(backend, context, num_ctx, extra_system="", temperature=0.3,
+             timeout=1800, schema=None):
         raise sr.ReplyParseError("Unterminated string", _TRUNCATED_WITH_FINDING)
 
     out_json, _ = _run_main(monkeypatch, tmp_path, [], fake)
@@ -724,7 +729,8 @@ def test_main_salvages_a_truncated_reply_that_carries_findings(monkeypatch, tmp_
 def test_main_refuses_a_salvage_with_no_findings(monkeypatch, tmp_path):
     # A zero-finding salvage is indistinguishable from "the code is clean"
     # downstream, so it must FAIL loudly instead of masquerading as a review.
-    def fake(url, model, context, num_ctx, extra_system="", temperature=0.3, timeout=1800):
+    def fake(backend, context, num_ctx, extra_system="", temperature=0.3,
+             timeout=1800, schema=None):
         raise sr.ReplyParseError("Unterminated string", _TRUNCATED_NO_FINDING)
 
     with pytest.raises(SystemExit) as exc:
@@ -779,7 +785,8 @@ def test_num_ctx_defaults_to_the_profile_and_stays_overridable(monkeypatch, tmp_
     # pushed a 14b past a 12GB card's VRAM into host RAM.
     seen = []
 
-    def fake(url, model, context, num_ctx, extra_system="", temperature=0.3, timeout=1800):
+    def fake(backend, context, num_ctx, extra_system="", temperature=0.3,
+             timeout=1800, schema=None):
         seen.append(num_ctx)
         return json.loads(json.dumps(_GOOD_REVIEW))
 
@@ -793,17 +800,22 @@ def test_num_ctx_defaults_to_the_profile_and_stays_overridable(monkeypatch, tmp_
 def test_main_reports_http_404_as_a_missing_model_not_as_unreachable(monkeypatch, tmp_path):
     # HTTPError subclasses URLError. Reporting "unreachable" for a server that
     # ANSWERED 404 (the tag simply is not pulled) sends debugging the wrong way.
-    def fake(url, model, context, num_ctx, extra_system="", temperature=0.3, timeout=1800):
-        raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+    # Driven through the REAL OllamaBackend: only urlopen is faked, so the
+    # 404 -> "not pulled" mapping under test is the one the pipeline uses.
+    def boom(req, timeout=None):
+        raise urllib.error.HTTPError(getattr(req, "full_url", "u"), 404,
+                                     "Not Found", {}, None)
+    monkeypatch.setattr("urllib.request.urlopen", boom)
 
     with pytest.raises(SystemExit) as exc:
-        _run_main(monkeypatch, tmp_path, ["--models", "ghost"], fake)
+        _run_main(monkeypatch, tmp_path, ["--models", "ghost"], sr.chat_review)
     msg = str(exc.value)
     assert "ollama pull ghost" in msg and "unreachable" not in msg
 
 
 def test_main_parse_failures_do_not_blame_the_backend(monkeypatch, tmp_path, capsys):
-    def fake(url, model, context, num_ctx, extra_system="", temperature=0.3, timeout=1800):
+    def fake(backend, context, num_ctx, extra_system="", temperature=0.3,
+             timeout=1800, schema=None):
         raise sr.ReplyParseError("Unterminated string", "")
 
     with pytest.raises(SystemExit) as exc:
@@ -814,7 +826,8 @@ def test_main_parse_failures_do_not_blame_the_backend(monkeypatch, tmp_path, cap
 
 
 def test_main_dedupes_anchors_and_writes_pipeline_findings(monkeypatch, tmp_path):
-    def fake(url, model, context, num_ctx, extra_system="", temperature=0.3, timeout=1800):
+    def fake(backend, context, num_ctx, extra_system="", temperature=0.3,
+             timeout=1800, schema=None):
         return json.loads(json.dumps(_GOOD_REVIEW))
     out_json, out_pipe = _run_main(monkeypatch, tmp_path, [], fake)
     review = json.loads(out_json.read_text())
@@ -1050,3 +1063,91 @@ def test_pipeline_confidence_is_calibrated_not_flat():
     assert scores[0] > scores[1]                    # critical outranks low
     assert scores[2] < scores[0]                    # flags dock confidence
     assert all(0.0 < s <= 1.0 for s in scores)
+
+
+# --- provider seam ----------------------------------------------------------
+# The point of providers.py is that none of the review logic above learns which
+# model answered. These drive main() through a NON-Ollama backend to prove it.
+
+def test_main_runs_a_remote_provider_end_to_end(monkeypatch, tmp_path, capsys):
+    import providers
+
+    calls, schemas_seen = [], []
+
+    class _Reply:
+        content = json.dumps(_GOOD_REVIEW)
+        usage_metadata = {"input_tokens": 100, "output_tokens": 40}
+
+    class _Structured:
+        """What with_structured_output(..., include_raw=True) returns."""
+
+        def __init__(self, schema):
+            self.schema = schema
+
+        def invoke(self, messages):
+            calls.append(messages)
+            return {"raw": _Reply(), "parsed": json.loads(_Reply.content),
+                    "parsing_error": None}
+
+    class _Client:
+        def invoke(self, messages):
+            calls.append(messages)
+            return _Reply()
+
+        def with_structured_output(self, schema, include_raw=False):
+            assert include_raw, "raw must be kept: usage + salvage depend on it"
+            schemas_seen.append(schema)
+            return _Structured(schema)
+
+    # Only the LangChain client construction is stubbed; the spec parsing,
+    # message mapping, usage accounting and JSON handling are the real ones.
+    monkeypatch.setattr(providers.LangChainBackend, "_client",
+                        lambda self, *a, **k: _Client())
+    src = tmp_path / "x.c"
+    src.write_text("void f(char *s) { char b[8]; strcpy(b, s); }\n")
+    out_json = tmp_path / "review.json"
+    monkeypatch.setattr(sys, "argv",
+                        ["surface_review.py", str(src), "--no-critic", "--no-kb",
+                         "--profile", "cpu", "--json", str(out_json),
+                         "--md", str(tmp_path / "r.md"),
+                         "--model", "anthropic:claude-opus-5", "--allow-remote"])
+    sr.main()
+
+    review = json.loads(out_json.read_text())
+    assert review["findings"][0]["cwe"] == "CWE-120"
+    # The system+user turns reached the provider in LangChain's role vocabulary.
+    assert [role for role, _ in calls[0]] == ["system", "human"]
+    printed = capsys.readouterr().out
+    assert "[egress]" in printed                       # remote use is announced
+    assert "100 input + 40 output tokens" in printed   # and its cost is reported
+    # The provider was handed the review schema, not just asked for JSON.
+    assert schemas_seen and schemas_seen[0]["title"] == "SecurityReview"
+    assert "exploitation" in schemas_seen[0]["properties"]["findings"]["items"]["required"]
+
+
+def test_main_refuses_a_remote_provider_without_allow_remote(monkeypatch, tmp_path):
+    # The tool's premise is reviewing code too sensitive to hand around, so a
+    # remote provider must never be reachable by accepting a default.
+    src = tmp_path / "x.c"
+    src.write_text("void f(void) {}\n")
+    monkeypatch.setattr(sys, "argv",
+                        ["surface_review.py", str(src), "--profile", "cpu",
+                         "--model", "openai:gpt-5"])
+    with pytest.raises(SystemExit) as exc:
+        sr.main()
+    assert "REMOTE provider" in str(exc.value) and "--allow-remote" in str(exc.value)
+
+
+def test_main_still_defaults_to_the_profiles_local_ollama_model(monkeypatch, tmp_path):
+    # Back-compat: profiles.json carries ollama_model, not model. An install
+    # that predates the provider seam must keep running locally, unprompted.
+    monkeypatch.delenv("CCR_MODEL", raising=False)
+    seen = []
+
+    def fake(backend, context, num_ctx, extra_system="", temperature=0.3,
+             timeout=1800, schema=None):
+        seen.append(backend.spec)
+        return json.loads(json.dumps(_GOOD_REVIEW))
+
+    _run_main(monkeypatch, tmp_path, [], fake)
+    assert seen == ["ollama:qwen2.5-coder:7b"]         # the cpu profile's tag
