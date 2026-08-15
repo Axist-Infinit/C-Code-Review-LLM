@@ -8,6 +8,7 @@ import json
 
 import pytest
 
+import llm_explain
 from llm_explain import (
     apply_corroboration_floor,
     explain_finding,
@@ -399,3 +400,49 @@ def test_user_message_carries_language_hint(monkeypatch):
     user = captured["payload"]["messages"][1]["content"]
     assert "Language: C" in user
     assert "Language: C++" not in user
+
+
+# --- provider seam ----------------------------------------------------------
+# explain_finding must take the model lane for ANY provider name, not just the
+# literal "ollama", and any ChatBackend must be usable as its chat_fn.
+
+def test_explain_finding_uses_the_model_lane_for_any_provider():
+    def fake_chat(url, model, snippet, file, lines, num_ctx):
+        return {"is_vulnerable": True, "issue": "overflow", "cwe": "CWE-120",
+                "severity": "high", "what_code_does": "copies a string",
+                "what_could_go_wrong": "can overflow", "vulnerability": "overflow",
+                "explanation": "unbounded copy", "fix": "use strlcpy"}
+    f = {"file": "a.c", "start_line": 1, "end_line": 2, "score": 0.9,
+         "snippet": "strcpy(d, s);"}
+    e = explain_finding(f, backend="anthropic", model="claude-opus-5",
+                        ollama_url=None, num_ctx=0, chat_fn=fake_chat)
+    assert e["backend"] == "anthropic"          # the provider is recorded as-is
+    assert e["is_vulnerable"] is True
+
+
+def test_heuristic_lane_is_the_only_no_model_lane():
+    f = {"file": "a.c", "start_line": 1, "end_line": 1, "score": 0.9,
+         "snippet": "gets(buf);"}
+    e = explain_finding(f, backend=llm_explain.HEURISTIC_BACKEND, model=None,
+                        ollama_url=None, num_ctx=0)
+    assert e["backend"] == "heuristic"
+
+
+def test_backend_chat_fn_adapts_any_backend_and_parses_the_reply():
+    class _Stub:
+        def __init__(self):
+            self.seen = None
+
+        def chat(self, messages, **kw):
+            self.seen = (messages, kw)
+            return '```json\n{"is_vulnerable": false}\n```'   # fenced, as a hosted model often replies
+
+    stub = _Stub()
+    out = llm_explain.backend_chat_fn(stub)("ignored", "ignored", "int x;",
+                                            "a.cpp", "1-1", 4096)
+    assert out == {"is_vulnerable": False}
+    messages, kw = stub.seen
+    assert [m["role"] for m in messages] == ["system", "user"]
+    assert SNIPPET_BEGIN in messages[1]["content"]      # snippet still fenced
+    assert "C++" in messages[1]["content"]              # language hint preserved
+    assert kw["num_ctx"] == 4096

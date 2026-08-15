@@ -29,8 +29,9 @@ import os
 import re
 import sys
 import urllib.error
-import urllib.request
 
+import providers
+from providers import make_backend, resolve_specs
 from profiles import select_profile, add_profile_arg
 from local_vuln_scanner import list_sources
 
@@ -432,22 +433,15 @@ def _normalize_ollama_url(url):
     """Ollama's native OLLAMA_HOST is a bare host:port (e.g. "127.0.0.1:11434");
     urllib needs a scheme or it raises "unknown url type". Prepend http:// when
     no scheme is present; pass through full URLs unchanged."""
-    if url and "://" not in url:
-        return "http://" + url
-    return url
+    return providers.normalize_url(url)
 
 
-class ReplyParseError(ValueError):
-    """A reply arrived but is not parseable JSON.
-
-    Distinct from a transport error: the backend WAS reachable, so the caller
-    must retry / salvage rather than report "Ollama unreachable". Carries the
-    raw ``content`` so a truncated reply can still be salvaged.
-    """
-
-    def __init__(self, message, content=""):
-        super().__init__(message)
-        self.content = content
+# The error taxonomy now lives in providers.py so every backend raises the same
+# three classes; re-exported here because the whole pipeline (and its tests)
+# refer to ReplyParseError by this name.
+ReplyParseError = providers.ReplyParseError
+TransportError = providers.TransportError
+RequestRejected = providers.RequestRejected
 
 
 def _repair_truncated_json(text):
@@ -497,71 +491,46 @@ def _repair_truncated_json(text):
 def _chat_content(resp):
     """Extract and JSON-parse the model's reply from an Ollama /api/chat body.
 
-    Ollama normally returns {"message": {"content": "<json string>"}}, but on
-    some errors/timeouts it returns {"message": null} or a non-object body. A
-    bare resp.get("message", {}).get("content") then raises AttributeError,
-    which is NOT in the sampling loop's except tuple and would abort an entire
-    multi-hour multi-sample run. Raise ValueError instead so the caller's
-    per-sample fallback handles it. Mirrors llm_explain.parse_chat_response.
+    Envelope handling moved to providers.OllamaBackend so every backend agrees
+    on it; kept here because it is this module's documented parse entry point.
+    A malformed envelope raises ValueError (not AttributeError) so the caller's
+    per-sample fallback handles it instead of aborting a multi-hour run.
     """
-    if not isinstance(resp, dict):
-        raise ValueError(f"non-object chat response body: {type(resp).__name__}")
-    message = resp.get("message")
-    if not isinstance(message, dict):
-        raise ValueError(f"chat response 'message' is {type(message).__name__}, not an object")
-    content = message.get("content")
-    if not isinstance(content, str):
-        raise ValueError(f"chat response 'content' is {type(content).__name__}, not a string")
-    try:
-        return json.loads(content)
-    except json.JSONDecodeError as e:
-        # Keep the raw text with the error so the caller can retry, then salvage.
-        raise ReplyParseError(f"{e} [reply was {len(content)} chars]", content) from e
+    return providers.parse_json_reply(providers.OllamaBackend.content_of(resp))
 
 
-def ollama_review(base_url, model, context, num_ctx, extra_system="", temperature=0.3, timeout=1800):
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT + extra_system},
-            {"role": "user", "content": context},
-        ],
-        "format": "json",
-        "stream": False,
-        "options": {"temperature": temperature, "num_ctx": num_ctx},
-    }
-    req = urllib.request.Request(
-        f"{base_url}/api/chat",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        resp = json.load(r)
-    return _chat_content(resp)
+def chat_review(backend, context, num_ctx, extra_system="", temperature=0.3, timeout=1800):
+    """Pass 1: one independent review of the whole context."""
+    content = backend.chat(
+        [{"role": "system", "content": SYSTEM_PROMPT + extra_system},
+         {"role": "user", "content": context}],
+        temperature=temperature, num_ctx=num_ctx, timeout=timeout)
+    return providers.parse_json_reply(content)
 
 
-def ollama_critique(base_url, model, context, draft, num_ctx, extra_system="", timeout=1800):
+def chat_critique(backend, context, draft, num_ctx, extra_system="", timeout=1800):
     """Second pass: hand the draft review back for completion + de-hallucination."""
     user = (f"{context}\n\nDRAFT REVIEW TO CORRECT AND COMPLETE (JSON):\n"
             f"{json.dumps(draft, indent=2)}")
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": CRITIC_SYSTEM_PROMPT + extra_system},
-            {"role": "user", "content": user},
-        ],
-        "format": "json",
-        "stream": False,
-        "options": {"temperature": 0.2, "num_ctx": num_ctx},
-    }
-    req = urllib.request.Request(
-        f"{base_url}/api/chat",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        resp = json.load(r)
-    return _chat_content(resp)
+    content = backend.chat(
+        [{"role": "system", "content": CRITIC_SYSTEM_PROMPT + extra_system},
+         {"role": "user", "content": user}],
+        temperature=0.2, num_ctx=num_ctx, timeout=timeout)
+    return providers.parse_json_reply(content)
+
+
+# Back-compat wrappers: the pipeline now passes a backend, but these keep the
+# old (base_url, model, ...) call shape working for anything outside this repo.
+def ollama_review(base_url, model, context, num_ctx, extra_system="",
+                  temperature=0.3, timeout=1800):
+    return chat_review(providers.OllamaBackend(model, base_url=base_url), context,
+                       num_ctx, extra_system, temperature=temperature, timeout=timeout)
+
+
+def ollama_critique(base_url, model, context, draft, num_ctx, extra_system="",
+                    timeout=1800):
+    return chat_critique(providers.OllamaBackend(model, base_url=base_url), context,
+                         draft, num_ctx, extra_system, timeout=timeout)
 
 
 CONSOLIDATE_SYSTEM_PROMPT = f"""\
@@ -610,29 +579,22 @@ explanation}} steps — keep them thorough) and every finding's file/line/code
 citations. Rank findings strongest-first; each finding distinct."""
 
 
-def ollama_consolidate(base_url, model, context, pooled, num_ctx, extra_system="", timeout=1800):
+def chat_consolidate(backend, context, pooled, num_ctx, extra_system="", timeout=1800):
     """Union+dedup+de-hallucinate findings pooled from multiple review samples."""
     user = (f"{context}\n\nPOOLED FINDINGS FROM MULTIPLE INDEPENDENT REVIEWS "
             f"(consolidate per your instructions; duplicates and conflicts are "
             f"expected):\n{json.dumps(pooled, indent=2)}")
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": CONSOLIDATE_SYSTEM_PROMPT + extra_system},
-            {"role": "user", "content": user},
-        ],
-        "format": "json",
-        "stream": False,
-        "options": {"temperature": 0.2, "num_ctx": num_ctx},
-    }
-    req = urllib.request.Request(
-        f"{base_url}/api/chat",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        resp = json.load(r)
-    return _chat_content(resp)
+    content = backend.chat(
+        [{"role": "system", "content": CONSOLIDATE_SYSTEM_PROMPT + extra_system},
+         {"role": "user", "content": user}],
+        temperature=0.2, num_ctx=num_ctx, timeout=timeout)
+    return providers.parse_json_reply(content)
+
+
+def ollama_consolidate(base_url, model, context, pooled, num_ctx, extra_system="",
+                       timeout=1800):
+    return chat_consolidate(providers.OllamaBackend(model, base_url=base_url), context,
+                            pooled, num_ctx, extra_system, timeout=timeout)
 
 
 # C type keywords are not identifying — keying on them merges unrelated fields
@@ -1514,7 +1476,11 @@ def main():
     ap.add_argument("--pipeline-out", dest="pipeline_out",
                     help="Write findings in the scan-pipeline schema here "
                          "({\"findings\": [...]}; consumable by to_sarif.py / annotate_pr.py)")
-    ap.add_argument("--model", default=None, help="Override the profile's Ollama model tag")
+    ap.add_argument("--model", default=None,
+                    help="Model spec, 'provider:model'. A bare tag means Ollama. "
+                         "e.g. qwen2.5-coder:14b | ollama:qwen2.5-coder:32b | "
+                         "anthropic:claude-opus-5 | openai:gpt-5. "
+                         "Default: $CCR_MODEL, else the profile's model.")
     ap.add_argument("--models", default=None,
                     help="Comma-separated models to sample for the union finisher "
                          "(e.g. 'qwen2.5-coder:14b,qwen2.5-coder:32b'). Overrides --model.")
@@ -1546,6 +1512,13 @@ def main():
                          "pipeline when Ollama may be down.")
     ap.add_argument("--kb", default=KB_PATH, help="Path to the retrieval-hint KB JSON")
     ap.add_argument("--ollama-url", default=os.environ.get("OLLAMA_HOST", "http://localhost:11434"))
+    ap.add_argument("--max-tokens", type=int, default=providers.DEFAULT_MAX_TOKENS,
+                    help="Output-token cap for hosted providers (ignored by Ollama). "
+                         "A full review document is long; too small a cap truncates it.")
+    ap.add_argument("--allow-remote", action="store_true",
+                    help="Permit a non-local provider. Required for anything but "
+                         "ollama:, because a remote model means the source under "
+                         "review is sent off this machine.")
     add_profile_arg(ap)
     args = ap.parse_args()
 
@@ -1566,12 +1539,37 @@ def main():
     # --num-ctx still wins.
     if args.num_ctx is None:
         args.num_ctx = int(prof.get("ollama_num_ctx", 16384))
-    models = ([m.strip() for m in args.models.split(",") if m.strip()]
-              if args.models else [args.model or prof["ollama_model"]])
-    critic_model = args.critic_model or models[-1]
-    n_runs = len(models) * max(1, args.samples)
-    print(f"[profile] {prof_name}: models={models} samples/model={max(1, args.samples)} "
-          f"-> {n_runs} run(s); critic={critic_model}; num_ctx={args.num_ctx}")
+    # A model is now named by a spec ("provider:model"), not just an Ollama tag.
+    # A bare tag still parses to Ollama, so existing profiles and command lines
+    # keep working; see providers.parse_spec.
+    try:
+        specs = resolve_specs(args.models or args.model, profile=prof)
+    except ValueError as e:
+        sys.exit(f"[ERR] {e}")
+    critic_spec = args.critic_model or specs[-1]
+
+    # A remote provider ships the code under review to a third party. For a
+    # tool whose premise is reviewing code too sensitive to hand around, that
+    # is an explicit decision, not a default.
+    warning = providers.egress_warning(specs + [critic_spec])
+    if warning:
+        if not args.allow_remote:
+            sys.exit(f"[ERR] {warning}\n       Pass --allow-remote to send it anyway.")
+        print(warning)
+
+    try:
+        backends = [make_backend(s, base_url=args.ollama_url,
+                                 max_tokens=args.max_tokens) for s in specs]
+        critic_backend = (backends[-1] if critic_spec == specs[-1]
+                          else make_backend(critic_spec, base_url=args.ollama_url,
+                                            max_tokens=args.max_tokens))
+    except ValueError as e:
+        sys.exit(f"[ERR] bad model spec: {e}")
+
+    n_runs = len(backends) * max(1, args.samples)
+    print(f"[profile] {prof_name}: models={[b.spec for b in backends]} "
+          f"samples/model={max(1, args.samples)} "
+          f"-> {n_runs} run(s); critic={critic_backend.spec}; num_ctx={args.num_ctx}")
     print(f"[review] {len(files)} file(s) together: {', '.join(files)}")
 
     context = build_context(files)
@@ -1598,16 +1596,16 @@ def main():
     samples = []
     transport_fail = parse_fail = http_fail = 0
     http_detail = ""
-    for m in models:
+    for backend in backends:
         for k in range(max(1, args.samples)):
             base_temp = 0.3 if k == 0 else 0.6
-            src = f"{m}#{k + 1}"
+            src = f"{backend.spec}#{k + 1}"
             rev, last_raw, temp, fail_kind = None, "", base_temp, None
             for attempt in range(1, MAX_SAMPLE_ATTEMPTS + 1):
                 temp = min(base_temp + 0.15 * (attempt - 1), 1.0)
                 try:
-                    rev = ollama_review(args.ollama_url, m, context, args.num_ctx,
-                                        extra_system, temperature=temp)
+                    rev = chat_review(backend, context, args.num_ctx,
+                                      extra_system, temperature=temp)
                     if not isinstance(rev, dict):
                         # Ollama's format:"json" guarantees valid JSON, not a JSON
                         # OBJECT — a reply parsing to []/42/"x" must be skipped like
@@ -1621,18 +1619,20 @@ def main():
                     last_raw = pe.content or last_raw
                     print(f"[sample {src}] attempt {attempt}/{MAX_SAMPLE_ATTEMPTS}: "
                           f"unusable JSON ({pe})")
-                except urllib.error.HTTPError as he:
+                except (RequestRejected, urllib.error.HTTPError) as he:
                     # The server ANSWERED — it just refused the request (404 = the
-                    # model tag is not pulled). Calling that "unreachable" sends
-                    # debugging in exactly the wrong direction. HTTPError is a
-                    # URLError subclass, so this except must come first.
+                    # model tag is not pulled, 401 = bad key, 429 = rate limited).
+                    # Calling that "unreachable" sends debugging in exactly the
+                    # wrong direction. Both classes subclass OSError/URLError, so
+                    # this except must come before the transport one.
                     rev, fail_kind = None, "http"
-                    http_detail = (f"model '{m}' is not pulled on that server "
-                                   f"(ollama pull {m})") if he.code == 404 else str(he)
-                    print(f"[sample {src}] backend answered HTTP {he.code}: "
+                    http_detail = str(he)
+                    code = getattr(he, "code", None)
+                    print(f"[sample {src}] request rejected"
+                          f"{f' (HTTP {code})' if code else ''}: "
                           f"{http_detail}; not retrying")
                     break
-                except (urllib.error.URLError, OSError) as te:
+                except (TransportError, urllib.error.URLError, OSError) as te:
                     # A refused/dead backend will not heal on retry — stop here, and
                     # record it as TRANSPORT so the final message names the real cause.
                     rev, fail_kind = None, "transport"
@@ -1672,15 +1672,17 @@ def main():
             print(f"[sample {src}] {len(rev.get('findings', []))} findings "
                   f"(temp={temp:.2f})")
     if not samples:
+        where = (args.ollama_url if all(b.is_local for b in backends)
+                 else ", ".join(b.spec for b in backends))
         if http_fail and not parse_fail:
-            reason = (f"Ollama at {args.ollama_url} rejected the request: {http_detail}")
+            reason = f"the backend ({where}) rejected the request: {http_detail}"
         elif transport_fail and not parse_fail:
-            reason = (f"Ollama unreachable at {args.ollama_url} "
+            reason = (f"backend unreachable at {where} "
                       f"({transport_fail} of {n_runs} sample(s) could not connect)")
         else:
             reason = (f"the model returned unusable (truncated) JSON on every attempt "
                       f"— {n_runs} sample(s) x {MAX_SAMPLE_ATTEMPTS} attempts. The backend "
-                      f"at {args.ollama_url} answered, so this is a model/output problem: "
+                      f"at {where} answered, so this is a model/output problem: "
                       f"re-run, review fewer files at once, or use a larger model "
                       f"(e.g. --model qwen2.5-coder:14b --num-ctx 8192)")
         if args.soft_fail:
@@ -1700,8 +1702,8 @@ def main():
         review = samples[0][1]
         if not args.no_critic:
             try:
-                critiqued = ollama_critique(args.ollama_url, critic_model, context, review,
-                                            args.num_ctx, extra_system)
+                critiqued = chat_critique(critic_backend, context, review,
+                                          args.num_ctx, extra_system)
                 if not isinstance(critiqued, dict):
                     raise ValueError(f"critic reply parsed to "
                                      f"{type(critiqued).__name__}, expected a JSON object")
@@ -1723,8 +1725,8 @@ def main():
             # Optional: an LLM union/dedup pass. Isolated so a slow/failed pass
             # degrades gracefully to the deterministic deduper below.
             try:
-                consolidated = ollama_consolidate(args.ollama_url, critic_model, context,
-                                                  pooled, args.num_ctx, extra_system)
+                consolidated = chat_consolidate(critic_backend, context,
+                                                pooled, args.num_ctx, extra_system)
                 if not isinstance(consolidated, dict):
                     raise ValueError(f"consolidation reply parsed to "
                                      f"{type(consolidated).__name__}, expected a JSON object")
@@ -1764,6 +1766,10 @@ def main():
     anchors = review.get("reviewed_anchors", [])
     print(f"[OK] {len(anchors)} anchors enumerated, {len(findings)} findings; "
           f"subsystem: {review.get('subsystem','?')}")
+    # Hosted providers bill on tokens, so a run has to be able to say what it spent.
+    usage = providers.format_usage(set(backends) | {critic_backend})
+    if usage:
+        print(usage)
 
     if args.json_out:
         os.makedirs(os.path.dirname(args.json_out) or ".", exist_ok=True)

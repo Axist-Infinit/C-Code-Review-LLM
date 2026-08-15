@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""LLM explanation layer: enrich classifier findings via a local Ollama model.
+"""LLM explanation layer: enrich classifier findings via a chat model.
 
-The model is selected by hardware profile (4090 -> qwen2.5-coder:14b,
-DGX Spark -> qwen2.5-coder:32b). Runs fully offline once the model is pulled.
-Falls back to the heuristic regex explainer when Ollama is unavailable.
+The model is named by a spec ("provider:model", see providers.py). A bare tag
+is Ollama, selected by hardware profile (4090 -> qwen2.5-coder:14b, DGX Spark
+-> qwen2.5-coder:32b) and running fully offline once pulled; any other provider
+LangChain can reach works too. Falls back to the heuristic regex explainer,
+per finding, whenever the model call fails.
 """
 import argparse
 import json
@@ -12,8 +14,9 @@ import re
 import sys
 import threading
 import urllib.error
-import urllib.request
 
+import providers
+from providers import make_backend, resolve_specs
 from profiles import select_profile, add_profile_arg
 from explain_findings import (explain_snippet, score_to_confidence, write_html,
                               cwe_for_patterns, structured_explanation,
@@ -25,6 +28,11 @@ from explain_findings import (explain_snippet, score_to_confidence, write_html,
 # the snippet cannot steer the review (prompt-injection hardening).
 SNIPPET_BEGIN = "<<<BEGIN_UNTRUSTED_CODE>>>"
 SNIPPET_END = "<<<END_UNTRUSTED_CODE>>>"
+
+# The no-model lane. Every other backend value names a model provider
+# ("ollama", "anthropic", ...) and takes the chat path, so adding a provider
+# never needs a change here.
+HEURISTIC_BACKEND = "heuristic"
 
 SYSTEM_PROMPT = (
     "You are an expert C/C++ security code reviewer. You are given a code snippet that "
@@ -71,15 +79,8 @@ SYSTEM_PROMPT = (
 
 
 def ollama_available(base_url, model, timeout=5):
-    """Return (reachable, model_present)."""
-    try:
-        with urllib.request.urlopen(f"{base_url}/api/tags", timeout=timeout) as r:
-            tags = json.load(r)
-        names = {m.get("name", "") for m in tags.get("models", [])}
-        present = any(n == model or n.split(":")[0] == model.split(":")[0] for n in names)
-        return True, present
-    except (urllib.error.URLError, OSError, json.JSONDecodeError):
-        return False, False
+    """Return (reachable, model_present) for an Ollama server."""
+    return providers.OllamaBackend(model, base_url=base_url).probe(timeout=timeout)
 
 
 # Fallback extension mapping used when local_vuln_scanner is unimportable;
@@ -111,41 +112,43 @@ def parse_chat_response(resp):
     per-finding heuristic fallback handles it instead of an AttributeError/
     TypeError escaping the except tuple and aborting the whole run.
     """
-    if not isinstance(resp, dict):
-        raise ValueError(f"non-object chat response body: {type(resp).__name__}")
-    message = resp.get("message")
-    if not isinstance(message, dict):
-        raise ValueError(f"chat response 'message' is {type(message).__name__}, not an object")
-    content = message.get("content")
-    if not isinstance(content, str):
-        raise ValueError(f"chat response 'content' is {type(content).__name__}, not a string")
-    return json.loads(content)
+    return json.loads(providers.OllamaBackend.content_of(resp))
 
 
-def ollama_chat(base_url, model, snippet, file_path, lines, num_ctx, timeout=600):
-    # Fence the untrusted snippet with explicit markers (matched in SYSTEM_PROMPT)
-    # so in-code instructions cannot be confused with the reviewer's task.
+def build_explain_messages(snippet, file_path, lines):
+    """The system+user turn for one finding.
+
+    Fences the untrusted snippet with explicit markers (matched in
+    SYSTEM_PROMPT) so in-code instructions cannot be confused with the
+    reviewer's task.
+    """
     user = (f"File: {file_path} (lines {lines})\n"
             f"Language: {language_hint(file_path)}\n\n"
             f"{SNIPPET_BEGIN}\n{snippet}\n{SNIPPET_END}")
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user},
-        ],
-        "format": "json",
-        "stream": False,
-        "options": {"temperature": 0.2, "num_ctx": num_ctx},
-    }
-    req = urllib.request.Request(
-        f"{base_url}/api/chat",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        resp = json.load(r)
-    return parse_chat_response(resp)
+    return [{"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user}]
+
+
+def backend_chat_fn(backend, timeout=600):
+    """Adapt a ChatBackend to the chat_fn(url, model, snippet, file, lines, num_ctx)
+    shape explain_finding calls.
+
+    url/model are ignored — the backend already carries them. Keeping the old
+    positional shape means explain_finding, run_explanations and every test that
+    injects a fake chat_fn are untouched by the provider change.
+    """
+    def chat_fn(_url, _model, snippet, file_path, lines, num_ctx):
+        content = backend.chat(build_explain_messages(snippet, file_path, lines),
+                               temperature=0.2, num_ctx=num_ctx, timeout=timeout)
+        return providers.parse_json_reply(content)
+    return chat_fn
+
+
+def ollama_chat(base_url, model, snippet, file_path, lines, num_ctx, timeout=600):
+    """Back-compat entry point: one Ollama call for one finding."""
+    return backend_chat_fn(providers.OllamaBackend(model, base_url=base_url),
+                           timeout=timeout)(base_url, model, snippet, file_path,
+                                            lines, num_ctx)
 
 
 def heuristic_entry(f):
@@ -233,11 +236,13 @@ def apply_corroboration_floor(entry, score, matched, floor=CORROBORATION_SCORE_F
 def explain_finding(f, *, backend, model, ollama_url, num_ctx, chat_fn=ollama_chat):
     """Produce one explanation entry for a single classifier finding.
 
-    backend is "ollama" or "heuristic". All network access goes through chat_fn
-    (injectable so tests can drive the Ollama path without a server). If an
-    Ollama call fails, we fall back to the heuristic explainer for THIS finding
-    only — one bad call never aborts the run — and record the error under
-    "llm_error" for observability.
+    backend is HEURISTIC_BACKEND, or the name of the model lane in use
+    ("ollama", "anthropic", ...) — anything but "heuristic" takes the model
+    path. All network access goes through chat_fn (injectable so tests can
+    drive the model path without a server, and so any provider can be plugged
+    in via backend_chat_fn). If a model call fails, we fall back to the
+    heuristic explainer for THIS finding only — one bad call never aborts the
+    run — and record the error under "llm_error" for observability.
     """
     lines = f"{f.get('start_line')}-{f.get('end_line')}"
     entry = {
@@ -251,7 +256,7 @@ def explain_finding(f, *, backend, model, ollama_url, num_ctx, chat_fn=ollama_ch
     # numbers; pass them through so SARIF/PR annotators can anchor tightly.
     if f.get("match_lines") is not None:
         entry["match_lines"] = f["match_lines"]
-    if backend != "ollama":
+    if backend == HEURISTIC_BACKEND:
         entry.update(heuristic_entry(f))
         return entry
     try:
@@ -290,7 +295,7 @@ def explain_finding(f, *, backend, model, ollama_url, num_ctx, chat_fn=ollama_ch
             if cwe != str(llm.get("cwe", "") or "").strip():
                 field_fallbacks.append("cwe")
         entry.update({
-            "backend": "ollama", "model": model,
+            "backend": backend, "model": model,
             "is_vulnerable": bool(llm.get("is_vulnerable")),
             "issue": str(llm.get("issue", "")),
             "cwe": cwe,
@@ -344,9 +349,10 @@ def run_explanations(findings, *, backend, model, ollama_url, num_ctx,
                      checkpoint=None):
     """Explain all findings, returning entries in the SAME order as `findings`.
 
-    For the Ollama backend the work is spread across up to `workers` threads:
-    Ollama serves requests concurrently when OLLAMA_NUM_PARALLEL > 1, and even
-    when it serializes, overlapping the HTTP round-trips removes idle time. The
+    For a model backend the work is spread across up to `workers` threads:
+    Ollama serves requests concurrently when OLLAMA_NUM_PARALLEL > 1, a hosted
+    provider serves them concurrently up to your rate limit, and even when the
+    server serializes, overlapping the round-trips removes idle time. The
     heuristic backend is pure-CPU regex and always runs inline. `progress(done,
     total, entry)` is invoked (thread-safe via the caller's lock) per completion.
     When `checkpoint` is a path, every completed entry is appended there as
@@ -375,7 +381,7 @@ def run_explanations(findings, *, backend, model, ollama_url, num_ctx,
         if progress:
             progress(done, total, entry)
 
-    effective = max(1, min(workers, total)) if backend == "ollama" else 1
+    effective = max(1, min(workers, total)) if backend != HEURISTIC_BACKEND else 1
     if effective <= 1:
         for idx, f in enumerate(findings):
             _, entry = work(idx, f)
@@ -392,19 +398,31 @@ def run_explanations(findings, *, backend, model, ollama_url, num_ctx,
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Explain classifier findings via local Ollama LLM")
+    ap = argparse.ArgumentParser(description="Explain classifier findings via a chat model")
     ap.add_argument("inp", nargs="?", help="classifier_findings.json")
     ap.add_argument("--inp", dest="inp_flag", help="Alternative to the positional input path")
     ap.add_argument("--out", required=True, help="Output JSON path (llm_findings.json)")
     ap.add_argument("--html", help="Optional HTML report path")
-    ap.add_argument("--model", default=None, help="Override the profile's Ollama model tag")
+    ap.add_argument("--model", default=None,
+                    help="Model spec, 'provider:model'. A bare tag means Ollama. "
+                         "e.g. qwen2.5-coder:14b | anthropic:claude-opus-5. "
+                         "Default: $CCR_MODEL, else the profile's model.")
     ap.add_argument("--top-k", type=int, default=None, help="Explain only the top-K findings by score")
     ap.add_argument("--workers", type=int, default=None,
-                    help="Parallel Ollama requests (default: profile max_workers). "
-                         "Tune alongside OLLAMA_NUM_PARALLEL on the Ollama server.")
+                    help="Parallel model requests (default: profile max_workers). "
+                         "For Ollama, tune alongside OLLAMA_NUM_PARALLEL on the server; "
+                         "for a hosted provider, keep it under your rate limit.")
     ap.add_argument("--ollama-url", default=os.environ.get("OLLAMA_HOST", "http://localhost:11434"))
-    ap.add_argument("--backend", choices=["auto", "ollama", "heuristic"], default="auto",
-                    help="auto = Ollama if reachable, else heuristic fallback")
+    ap.add_argument("--max-tokens", type=int, default=providers.DEFAULT_MAX_TOKENS,
+                    help="Output-token cap for hosted providers (ignored by Ollama)")
+    ap.add_argument("--allow-remote", action="store_true",
+                    help="Permit a non-local provider. Required for anything but "
+                         "ollama:, because a remote model means the snippets under "
+                         "review are sent off this machine.")
+    ap.add_argument("--backend", choices=["auto", "ollama", "llm", "heuristic"],
+                    default="auto",
+                    help="auto = the model if reachable, else heuristic fallback. "
+                         "'llm'/'ollama' force the model lane and fail if it is down.")
     add_profile_arg(ap)
     args = ap.parse_args()
 
@@ -413,7 +431,11 @@ def main():
         ap.error("input file required (positional or --inp)")
 
     prof_name, prof = select_profile(args.profile)
-    model = args.model or prof["ollama_model"]
+    try:
+        spec = resolve_specs(args.model, profile=prof)[0]
+    except ValueError as e:
+        sys.exit(f"[ERR] {e}")
+    model = spec
     top_k = args.top_k if args.top_k is not None else prof["explainer_top_k"]
     num_ctx = prof["ollama_num_ctx"]
 
@@ -422,27 +444,44 @@ def main():
     if top_k > 0:
         findings = findings[:top_k]
 
-    backend = args.backend
-    if backend in ("auto", "ollama"):
-        reachable, present = ollama_available(args.ollama_url, model)
+    # A remote provider ships every explained snippet off this machine. Explicit
+    # opt-in, so no one leaks a client's source by accepting a default.
+    warning = providers.egress_warning([spec])
+    if warning and args.backend != HEURISTIC_BACKEND:
+        if not args.allow_remote:
+            sys.exit(f"[ERR] {warning}\n       Pass --allow-remote to send it anyway.")
+        print(warning)
+
+    backend, chat_backend = args.backend, None
+    if backend != HEURISTIC_BACKEND:
+        forced = backend in ("ollama", "llm")
+        try:
+            chat_backend = make_backend(spec, base_url=args.ollama_url,
+                                        max_tokens=args.max_tokens)
+        except ValueError as e:
+            sys.exit(f"[ERR] bad model spec {spec!r}: {e}")
+        reachable, present = chat_backend.probe()
         if not reachable:
-            msg = f"Ollama not reachable at {args.ollama_url}"
-            if backend == "ollama":
+            msg = f"model backend {spec!r} not reachable"
+            if forced:
                 sys.exit(f"[ERR] {msg}")
             print(f"[WARN] {msg}; falling back to heuristic explainer")
-            backend = "heuristic"
+            backend = HEURISTIC_BACKEND
         elif not present:
-            msg = f"Model {model!r} not found in Ollama (try: ollama pull {model})"
-            if backend == "ollama":
+            msg = f"Model {chat_backend.model!r} not found in Ollama " \
+                  f"(try: ollama pull {chat_backend.model})"
+            if forced:
                 sys.exit(f"[ERR] {msg}")
             print(f"[WARN] {msg}; falling back to heuristic explainer")
-            backend = "heuristic"
+            backend = HEURISTIC_BACKEND
         else:
-            backend = "ollama"
-            print(f"[profile] {prof_name}: ollama model={model} ctx={num_ctx} top_k={top_k}")
+            backend = chat_backend.provider
+            print(f"[profile] {prof_name}: model={spec} ctx={num_ctx} top_k={top_k}")
+        if backend == HEURISTIC_BACKEND:
+            chat_backend = None
 
     workers = args.workers if args.workers is not None else prof.get("max_workers", 1)
-    if backend == "ollama":
+    if backend != HEURISTIC_BACKEND:
         print(f"[explain] {len(findings)} findings via {max(1, min(workers, len(findings)))} "
               f"worker(s)")
 
@@ -456,13 +495,16 @@ def main():
                   f"{entry.get('severity') or 'n/a'} {entry.get('cwe', '')}{note}")
 
     partial = checkpoint_path(args.out)
+    extra = {"chat_fn": backend_chat_fn(chat_backend)} if chat_backend else {}
     out_entries = run_explanations(
         findings, backend=backend, model=model, ollama_url=args.ollama_url,
         num_ctx=num_ctx, workers=workers, progress=_progress, checkpoint=partial,
+        **extra,
     )
 
     write_json_atomic(args.out, {
-        "backend": backend, "model": model if backend == "ollama" else None,
+        "backend": backend,
+        "model": model if backend != HEURISTIC_BACKEND else None,
         "profile": prof_name, "explanations": out_entries,
     })
     if os.path.exists(partial):  # full output landed; the checkpoint is obsolete
