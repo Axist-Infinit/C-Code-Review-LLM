@@ -62,6 +62,15 @@ pip install langchain-anthropic          # the integration for the provider you 
 export ANTHROPIC_API_KEY=...
 ```
 
+`--ollama-url` is only ever sent to a local backend. To point an
+OpenAI-compatible endpoint (vLLM, TGI, a gateway) somewhere else, set
+`$CCR_API_BASE`:
+
+```bash
+CCR_API_BASE=http://gpu-box:8000/v1 OPENAI_API_KEY=x \
+    python surface_review.py src/*.c --model openai:qwen2.5-coder-32b --allow-remote
+```
+
 ## Running
 
 ```bash

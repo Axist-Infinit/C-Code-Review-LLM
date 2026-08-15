@@ -283,3 +283,92 @@ def test_format_usage_reports_across_backends(monkeypatch):
     b.usage.update(calls=1, input_tokens=10, output_tokens=5)
     assert p.format_usage([a, b]) == "[usage] 3 call(s), 110 input + 55 output tokens"
     assert p.format_usage([p.OllamaBackend("m")]) == ""       # nothing counted
+
+
+# --- endpoint routing (regression) -------------------------------------------
+# --ollama-url always has a value, so callers pass base_url unconditionally.
+# Forwarding it to a hosted provider pointed that provider's client at
+# localhost:11434 — the request never reached the API, and whatever was
+# listening on that port received the code under review.
+
+def test_ollama_url_is_not_forwarded_to_a_hosted_provider():
+    b = p.make_backend("anthropic:claude-opus-5", base_url="http://localhost:11434")
+    assert b.base_url is None
+
+
+def test_ollama_url_is_forwarded_to_local_backends():
+    assert p.make_backend("qwen:7b", base_url="http://box:11434").base_url \
+        == "http://box:11434"
+    assert p.make_backend("lc-ollama:qwen:7b", base_url="http://box:11434").base_url \
+        == "http://box:11434"
+
+
+def test_hosted_endpoint_override_comes_from_ccr_api_base(monkeypatch):
+    # The escape hatch for an OpenAI-compatible vLLM/TGI server.
+    monkeypatch.setenv("CCR_API_BASE", "http://gpu-box:8000/v1")
+    assert p.make_backend("openai:qwen", base_url="http://localhost:11434").base_url \
+        == "http://gpu-box:8000/v1"
+
+
+def test_hosted_client_is_built_with_the_right_endpoint(monkeypatch):
+    # Constructs a REAL ChatAnthropic: the stubbed-client tests above never
+    # reach _client, which is exactly how the base_url bug went unnoticed.
+    pytest.importorskip("langchain_anthropic")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy")
+    monkeypatch.delenv("CCR_API_BASE", raising=False)
+    b = p.make_backend("anthropic:claude-opus-5", base_url="http://localhost:11434")
+    client = b._client(0.3, timeout=1800)
+    assert "11434" not in str(getattr(client, "anthropic_api_url", ""))
+    assert client.max_tokens == p.DEFAULT_MAX_TOKENS
+    assert client.temperature == 0.3
+
+
+def test_azure_is_not_pre_rejected_for_a_missing_api_key(monkeypatch):
+    # Azure authenticates with AAD tokens too; pre-checking a key would reject
+    # a valid setup before the SDK ever gets a say.
+    monkeypatch.delenv("AZURE_OPENAI_API_KEY", raising=False)
+    assert "azure_openai" not in p._PROVIDER_ENV_KEY
+
+
+# --- concurrency (regression) ------------------------------------------------
+# llm_explain drives ONE backend from up to max_workers threads.
+
+def test_usage_counters_survive_concurrent_calls():
+    # `d[k] += n` is a read-modify-write and loses updates under the GIL —
+    # measured ~19% undercount at 8 threads before the lock. Under-reporting a
+    # hosted bill is the one number a caller cannot afford to have wrong.
+    import threading
+    b = p.OllamaBackend("m")
+
+    def hammer():
+        for _ in range(5000):
+            b._record_usage({"prompt_eval_count": 1, "eval_count": 2})
+
+    threads = [threading.Thread(target=hammer) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert b.usage == {"calls": 40000, "input_tokens": 40000, "output_tokens": 80000}
+
+
+def test_concurrent_client_lookups_share_one_client(monkeypatch):
+    import threading
+    built = []
+    b = p.make_backend("anthropic:claude-opus-5")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy")
+
+    def fake_init(model, model_provider=None, **kw):
+        obj = object()
+        built.append(obj)
+        return obj
+    monkeypatch.setattr(b, "_init_chat_model", lambda: fake_init)
+
+    seen = []
+    threads = [threading.Thread(target=lambda: seen.append(b._client(0.2)))
+               for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(set(id(c) for c in seen)) == 1      # every thread got the same client

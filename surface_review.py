@@ -1482,13 +1482,16 @@ def main():
                          "anthropic:claude-opus-5 | openai:gpt-5. "
                          "Default: $CCR_MODEL, else the profile's model.")
     ap.add_argument("--models", default=None,
-                    help="Comma-separated models to sample for the union finisher "
-                         "(e.g. 'qwen2.5-coder:14b,qwen2.5-coder:32b'). Overrides --model.")
+                    help="Comma-separated model specs to sample for the union finisher "
+                         "(e.g. 'qwen2.5-coder:14b,anthropic:claude-opus-5'). "
+                         "May mix providers. Overrides --model.")
     ap.add_argument("--samples", type=int, default=1,
                     help="Review samples per model (>1 enables the union+dedup finisher; "
                          "samples after the first use a higher temperature for diversity)")
     ap.add_argument("--critic-model", default=None,
-                    help="Model for the consolidation/critic pass (default: last sampled model)")
+                    help="Model spec for the consolidation/critic pass (default: last "
+                         "sampled model). A DIFFERENT provider here de-hallucinates "
+                         "better than a model critiquing its own draft.")
     ap.add_argument("--llm-consolidate", action="store_true",
                     help="Use an LLM consolidation pass over the pool instead of the "
                          "deterministic topic deduper (needs a critic-model that fits in VRAM)")

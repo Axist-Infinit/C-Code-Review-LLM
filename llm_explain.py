@@ -510,6 +510,11 @@ def main():
     if os.path.exists(partial):  # full output landed; the checkpoint is obsolete
         os.remove(partial)
     print(f"[OK] {len(out_entries)} explanations -> {args.out}")
+    # This lane fans out across workers, so it is the one most able to run up a
+    # hosted bill; report what it spent.
+    usage = providers.format_usage([chat_backend]) if chat_backend else ""
+    if usage:
+        print(usage)
 
     if args.html:
         # adapt to the heuristic HTML renderer's expected fields

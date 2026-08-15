@@ -39,6 +39,7 @@ in exactly the wrong direction:
 """
 import json
 import os
+import threading
 import urllib.error
 import urllib.request
 
@@ -66,11 +67,13 @@ LOCAL_PROVIDERS = {"ollama", "lc-ollama"}
 DEFAULT_MAX_TOKENS = 8192
 
 # Named so the error message can say which key is missing instead of surfacing
-# the provider SDK's own less specific complaint.
+# the provider SDK's own less specific complaint. Listed here ONLY for providers
+# where an API key in the environment is the sole auth path — azure_openai
+# (AAD tokens), bedrock (AWS credential chain) and vertexai (ADC) all
+# authenticate without one, so pre-checking a key would reject a valid setup.
 _PROVIDER_ENV_KEY = {
     "anthropic": "ANTHROPIC_API_KEY",
     "openai": "OPENAI_API_KEY",
-    "azure_openai": "AZURE_OPENAI_API_KEY",
     "groq": "GROQ_API_KEY",
     "cohere": "COHERE_API_KEY",
     "fireworks": "FIREWORKS_API_KEY",
@@ -224,6 +227,17 @@ class ChatBackend:
         # {input_tokens, output_tokens} accumulated across calls; a hosted
         # provider bills on these, so a run must be able to report them.
         self.usage = {"input_tokens": 0, "output_tokens": 0, "calls": 0}
+        # llm_explain drives ONE backend from up to max_workers threads, and
+        # `d[k] += n` is a read-modify-write that loses updates under the GIL —
+        # measured ~19% undercount at 8 threads. Under-reporting a hosted bill
+        # is exactly the number the caller cannot afford to have wrong.
+        self._usage_lock = threading.Lock()
+
+    def _add_usage(self, input_tokens=0, output_tokens=0):
+        with self._usage_lock:
+            self.usage["calls"] += 1
+            self.usage["input_tokens"] += int(input_tokens or 0)
+            self.usage["output_tokens"] += int(output_tokens or 0)
 
     @property
     def is_local(self):
@@ -315,10 +329,8 @@ class OllamaBackend(ChatBackend):
         return content
 
     def _record_usage(self, resp):
-        self.usage["calls"] += 1
-        if isinstance(resp, dict):
-            self.usage["input_tokens"] += int(resp.get("prompt_eval_count") or 0)
-            self.usage["output_tokens"] += int(resp.get("eval_count") or 0)
+        resp = resp if isinstance(resp, dict) else {}
+        self._add_usage(resp.get("prompt_eval_count"), resp.get("eval_count"))
 
     def probe(self, timeout=5):
         """Return (reachable, model_present) by listing /api/tags."""
@@ -356,6 +368,10 @@ class LangChainBackend(ChatBackend):
         self.max_tokens = max_tokens
         self.model_kwargs = model_kwargs
         self._clients = {}
+        # Guards the client cache: the explainer builds its chat_fn once and
+        # calls it from every worker thread, so an unguarded cache would
+        # construct a duplicate SDK client per concurrent miss.
+        self._clients_lock = threading.Lock()
 
     @property
     def _lc_provider(self):
@@ -381,8 +397,9 @@ class LangChainBackend(ChatBackend):
 
     def _client(self, temperature, num_ctx=None, timeout=None, json_mode=True):
         key = (temperature, num_ctx, timeout, json_mode)
-        if key in self._clients:
-            return self._clients[key]
+        with self._clients_lock:
+            if key in self._clients:
+                return self._clients[key]
         init_chat_model = self._init_chat_model()
         kwargs = dict(self.model_kwargs)
         if temperature is not None:
@@ -415,8 +432,10 @@ class LangChainBackend(ChatBackend):
         except Exception as e:                # pragma: no cover - provider-specific
             raise RequestRejected(
                 f"could not construct {self.spec}: {type(e).__name__}: {e}") from e
-        self._clients[key] = client
-        return client
+        with self._clients_lock:
+            # A racing thread may have won; either client is equivalent, so keep
+            # whichever landed first and let this one go.
+            return self._clients.setdefault(key, client)
 
     @staticmethod
     def _to_lc_messages(messages):
@@ -478,11 +497,9 @@ class LangChainBackend(ChatBackend):
         return self._content_of(reply)
 
     def _record_usage(self, reply):
-        self.usage["calls"] += 1
         meta = getattr(reply, "usage_metadata", None)
-        if isinstance(meta, dict):
-            self.usage["input_tokens"] += int(meta.get("input_tokens") or 0)
-            self.usage["output_tokens"] += int(meta.get("output_tokens") or 0)
+        meta = meta if isinstance(meta, dict) else {}
+        self._add_usage(meta.get("input_tokens"), meta.get("output_tokens"))
 
     def probe(self, timeout=5):
         """Constructability check only — a hosted probe would be billable."""
@@ -494,12 +511,21 @@ class LangChainBackend(ChatBackend):
 
 
 def make_backend(spec, *, base_url=None, max_tokens=DEFAULT_MAX_TOKENS, **kwargs):
-    """Build the backend named by a model spec. See parse_spec() for the grammar."""
+    """Build the backend named by a model spec. See parse_spec() for the grammar.
+
+    ``base_url`` is the OLLAMA endpoint and is forwarded ONLY to local backends.
+    Callers pass it unconditionally (it comes from --ollama-url, which always
+    has a value), so forwarding it to a hosted provider would silently point
+    that provider's client at localhost:11434. A non-local endpoint override —
+    for an OpenAI-compatible vLLM/TGI server, say — comes from $CCR_API_BASE
+    instead, which is only set when it is actually meant.
+    """
     provider, model = parse_spec(spec)
     if provider == "ollama":
         return OllamaBackend(model, base_url=base_url, spec=f"ollama:{model}")
+    lc_base = base_url if provider in LOCAL_PROVIDERS else os.environ.get("CCR_API_BASE")
     return LangChainBackend(provider, model, spec=f"{provider}:{model}",
-                            base_url=base_url, max_tokens=max_tokens, **kwargs)
+                            base_url=lc_base or None, max_tokens=max_tokens, **kwargs)
 
 
 def resolve_specs(explicit=None, profile=None, env_var="CCR_MODEL"):
